@@ -1,0 +1,289 @@
+"""The engine: ties the deterministic modules into the supervisor's operations.
+
+CRITICAL INVARIANT: the engine NEVER calls a model. ``next_work`` emits a WorkItem;
+the supervisor dispatches it on the execution lane; ``record`` ingests the returned
+StageResult (cost ledger + status). Every model call therefore produces a ledger
+row keyed by its actual lane — an unattributed call is structurally impossible
+(closes as-built D6).
+"""
+
+from __future__ import annotations
+
+import uuid
+from datetime import UTC, datetime
+
+from adapters.project.base import ProjectConfig
+
+from .capacity import DEFAULT_CAPACITY, CapacityPolicy
+from .cost_ledger import CostLedger
+from .dag import Dag
+from .errors import CapacityExhausted, ContractError
+from .model_table import DEFAULT_MODEL_TABLE, ModelTable
+from .retry import error_signature
+from .schemas.enums import (
+    ExecutionLane,
+    ExecutionMode,
+    Provider,
+    ResultStatus,
+    RunState,
+    TaskState,
+)
+from .schemas.status import Run, Task, TaskRef
+from .schemas.work import LanePolicy, StageResult, WorkItem
+from .stages import STAGE_SPECS, render_prompt
+from .state_machine import apply_result, begin_stage, is_done, next_stage, resume_point
+from .status_store import StatusStore
+
+INTERACTIVE_CLAUDE = LanePolicy(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE)
+
+
+def _now() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class Engine:
+    """Deterministic orchestration over one run. Single-task flow for Phase 3a
+    (the DAG/capacity machinery is wired and tested for the 3b scheduler)."""
+
+    def __init__(
+        self,
+        store: StatusStore,
+        ledger: CostLedger,
+        project: ProjectConfig,
+        *,
+        model_table: ModelTable = DEFAULT_MODEL_TABLE,
+        capacity: CapacityPolicy = DEFAULT_CAPACITY,
+        max_attempts: int = 3,
+        breaker_threshold: int = 2,
+        concurrency_ceiling: int = 1,
+    ) -> None:
+        self.store = store
+        self.ledger = ledger
+        self.project = project
+        self.models = model_table
+        self.capacity = capacity
+        self.max_attempts = max_attempts
+        self.breaker_threshold = breaker_threshold
+        self.concurrency_ceiling = concurrency_ceiling
+
+    # --- run/task setup -------------------------------------------------------
+    def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
+        run = Run(run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane, state=RunState.RUNNING)
+        self.store.save_run(run)
+        return run
+
+    def add_task(self, run_id: str, task_id: str, lane: ExecutionLane | None = None) -> Task:
+        spec = self.project.task_source.resolve(task_id)
+        run = self.store.load_run(run_id)
+        task = Task(
+            task_id=task_id,
+            run_id=run_id,
+            created_at=_now(),
+            updated_at=_now(),
+            state=TaskState.PENDING,
+            title=spec.title,
+            issue_number=spec.issue_number,
+            depends_on=spec.depends_on,
+            execution_lane=lane or run.lane,
+            max_attempts=self.max_attempts,
+        )
+        self.store.save_task(task)
+        run.task_refs.append(TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json"))
+        run.dependency_graph[task_id] = list(spec.depends_on)
+        run.updated_at = _now()
+        self.store.save_run(run)
+        return task
+
+    # --- ready (DAG + capacity) ----------------------------------------------
+    def ready(self, run_id: str, *, util_pct: float = 0.0) -> list[str]:
+        run = self.store.load_run(run_id)
+        states = {ref.task_id: ref.state for ref in run.task_refs}
+        dag = Dag(run.dependency_graph)
+        candidates = dag.ready_tasks(states)
+        limit = self.capacity.dispatch_limit(util_pct, self.concurrency_ceiling)
+        return candidates[:limit]
+
+    # --- dispatch / record ----------------------------------------------------
+    def next_work(self, run_id: str, task_id: str, *, util_pct: float = 0.0) -> WorkItem | None:
+        if self.capacity.at_capacity(util_pct):
+            raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
+        task = self.store.load_task(run_id, task_id)
+        stage = next_stage(task)
+        if stage is None:
+            return None
+
+        spec = STAGE_SPECS[stage]
+        model = self.models.model_for_role(spec.model_role)
+        rec = task.stages[stage]
+        attempt = rec.attempt + 1 if rec.error else 0
+        learnings = "\n".join(task.learnings)
+        prompt = render_prompt(
+            stage, task_id=task_id, title=task.title, body="", learnings=learnings
+        )
+        work = WorkItem.create(
+            id=f"wi-{uuid.uuid4().hex[:12]}",
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
+            prompt=prompt,
+            schema_ref=spec.schema_ref,
+            model=model,
+            lane_policy=INTERACTIVE_CLAUDE,
+            created_at=_now(),
+            attempt=attempt,
+        )
+        begin_stage(task, stage, now=_now(), model=model, attempt=attempt)
+        task.state = TaskState.RUNNING
+        task.pending_work_item_id = work.id
+        task.pending_content_hash = work.content_hash
+        self.store.save_task(task)
+        self._set_ref_state(run_id, task_id, TaskState.RUNNING)
+        return work
+
+    def record(self, run_id: str, result: StageResult) -> dict:
+        task = self.store.load_task(run_id, result.task_id)
+        if task.pending_work_item_id and result.work_item_id != task.pending_work_item_id:
+            raise ContractError(
+                f"result work_item_id {result.work_item_id} != pending {task.pending_work_item_id}"
+            )
+        if task.pending_content_hash and result.content_hash != task.pending_content_hash:
+            raise ContractError("result content_hash does not match the dispatched WorkItem")
+
+        # Cost ledger: EVERY call recorded, authoritative pricing from the model table.
+        cost = self.models.cost_usd(result.model, result.token_usage)
+        self.ledger.record(result)
+
+        lane_clean = (
+            result.lane_used.execution_mode is INTERACTIVE_CLAUDE.execution_mode
+            and result.lane_used.provider is INTERACTIVE_CLAUDE.provider
+        )
+
+        apply_result(task, result, now=_now(), cost_usd=cost)
+        task.pending_work_item_id = None
+        task.pending_content_hash = None
+
+        outcome: str
+        if result.status is ResultStatus.SUCCESS:
+            task.error_signatures = []  # streak resets on a clean stage
+            if is_done(task):
+                task.state = TaskState.COMPLETED
+                self._finalize_complete(run_id, task)
+                outcome = "task_completed"
+            else:
+                task.state = TaskState.RUNNING
+                outcome = "stage_completed"
+        else:
+            outcome = self._handle_failure(task, result)
+
+        self.store.save_task(task)
+        self._set_ref_state(run_id, result.task_id, task.state)
+        return {
+            "recorded": True,
+            "outcome": outcome,
+            "task_state": task.state.value,
+            "stage": result.stage.value,
+            "cost_usd": cost,
+            "lane_attributed": lane_clean,
+            "next_stage": (s.value if (s := next_stage(task)) else None),
+        }
+
+    def _handle_failure(self, task: Task, result: StageResult) -> str:
+        failures = None
+        if result.structured_output:
+            failures = result.structured_output.get("failures")
+        sig = error_signature(result.stage, failures=failures, error=result.error)
+        task.error_signatures.append(sig)
+        task.learnings.append(f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}")
+
+        attempts_done = result.attempt + 1
+        trailing = self._trailing_identical(task.error_signatures)
+        breaker_tripped = trailing >= self.breaker_threshold
+        if attempts_done >= task.max_attempts or breaker_tripped:
+            task.state = TaskState.FAILED
+            return "task_failed_breaker" if breaker_tripped else "task_failed_max_attempts"
+        task.state = TaskState.RETRYING
+        return "stage_failed_will_retry"
+
+    @staticmethod
+    def _trailing_identical(sigs: list[str]) -> int:
+        if not sigs:
+            return 0
+        last = sigs[-1]
+        n = 0
+        for s in reversed(sigs):
+            if s == last:
+                n += 1
+            else:
+                break
+        return n
+
+    # --- resume / status ------------------------------------------------------
+    def resume(self, run_id: str) -> dict:
+        run = self.store.load_run(run_id)
+        out = {}
+        for ref in run.task_refs:
+            task = self.store.load_task(run_id, ref.task_id)
+            rp = resume_point(task)
+            out[ref.task_id] = rp.value if rp else None
+        return out
+
+    def status(self, run_id: str) -> dict:
+        run = self.store.load_run(run_id)
+        progress = run.progress()
+        tasks = {}
+        for ref in run.task_refs:
+            task = self.store.load_task(run_id, ref.task_id)
+            tasks[ref.task_id] = {
+                "state": task.state.value,
+                "current_stage": task.current_stage.value if task.current_stage else None,
+                "stages": {s.value: r.status.value for s, r in task.stages.items()},
+                "pr_url": task.pr_url,
+            }
+        return {
+            "run_id": run_id,
+            "run_state": run.state.value,
+            "progress": progress.model_dump(),
+            "tasks": tasks,
+            "cost": self.ledger.summary(),
+            "lane_audit": self.lane_audit(run_id),
+        }
+
+    def lane_audit(self, run_id: str) -> dict:
+        """Confirm every recorded model call ran on its intended lane (no hidden claude -p)."""
+        rows = self.ledger.rows()
+        by_lane: dict[str, int] = {}
+        unattributed = 0
+        for row in rows:
+            lane = row.get("lane") or "UNKNOWN"
+            prov = row.get("provider") or "UNKNOWN"
+            key = f"{lane}:{prov}"
+            by_lane[key] = by_lane.get(key, 0) + 1
+            if lane == "UNKNOWN" or prov == "UNKNOWN":
+                unattributed += 1
+        # Phase 3a: the only sanctioned lane is interactive:claude.
+        off_lane = sum(n for k, n in by_lane.items() if k != "interactive:claude")
+        return {
+            "total_calls": len(rows),
+            "by_lane": by_lane,
+            "unattributed": unattributed,
+            "off_lane": off_lane,
+            "clean": unattributed == 0 and off_lane == 0,
+        }
+
+    # --- helpers --------------------------------------------------------------
+    def _set_ref_state(self, run_id: str, task_id: str, state: TaskState) -> None:
+        def mut(run: Run) -> None:
+            for ref in run.task_refs:
+                if ref.task_id == task_id:
+                    ref.state = state
+
+        self.store.update_run(run_id, mut)
+
+    def _finalize_complete(self, run_id: str, task: Task) -> None:
+        if task.pr_url:
+            self.project.task_source.mark_complete(task.task_id, task.pr_url)
+        run = self.store.load_run(run_id)
+        if all(r.state in (TaskState.COMPLETED,) for r in run.task_refs if r.task_id != task.task_id) and len(run.task_refs) <= 1:
+            run.state = RunState.COMPLETED
+            run.updated_at = _now()
+            self.store.save_run(run)
