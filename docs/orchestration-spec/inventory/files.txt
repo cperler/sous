@@ -1,0 +1,189 @@
+# files.txt — full repo census with owner assignment (GENERATED, Part 0)
+# Root: /Users/craigperler/Development/heysoo/  | census of .claude/** + runtime artifacts.
+# RULE: every path → exactly one agent OR the explicit exclusion list. .worktrees/** excluded (dup trees).
+# ASSERTION RESULT: 159 .claude files + runtime-artifact globs all dispositioned. PARTITION COMPLETE.
+#
+# ============================ OWNED BY MAPPING AGENT ============================
+#
+# --- Agent 1: batch scheduler ---
+.claude/scripts/ralph-loop.sh
+#
+# --- Agent 2 (2a/2b): shared engine (function→owner split in functions.txt) ---
+.claude/scripts/lib/orchestrator-common.sh
+#
+# --- Agent 3: per-task pipeline ---
+.claude/scripts/implement-orchestrator.sh
+#
+# --- Agent 4: monitor / observability (D5) ---
+.claude/scripts/monitor-orchestrator.sh
+#
+# --- Agent 5: legacy batch mode (D5) ---
+.claude/scripts/batch-orchestrator.sh
+#
+# --- Agent 6: lib helpers A ---
+.claude/scripts/lib/status-file-helpers.sh
+.claude/scripts/lib/classify-failures.sh
+.claude/scripts/lib/regression-helpers.sh
+.claude/scripts/lib/detect-change-scope.sh
+.claude/scripts/lib/track-test-commit.sh
+#
+# --- Agent 7: lib helpers B (+ port-registry.json data) ---
+.claude/scripts/lib/run-tests-direct.sh
+.claude/scripts/lib/build-incremental-test-prompt.sh
+.claude/scripts/lib/select-incremental-test-agent.sh
+.claude/scripts/lib/port-registry.sh
+.claude/scripts/lib/reset-infra.sh
+.claude/port-registry.json
+#
+# --- Agent 8: schemas (17) ---
+.claude/scripts/schemas/implement-issue-complete.json
+.claude/scripts/schemas/implement-issue-evaluate.json
+.claude/scripts/schemas/implement-issue-fix.json
+.claude/scripts/schemas/implement-issue-implement.json
+.claude/scripts/schemas/implement-issue-plan.json
+.claude/scripts/schemas/implement-issue-pr.json
+.claude/scripts/schemas/implement-issue-research.json
+.claude/scripts/schemas/implement-issue-review.json
+.claude/scripts/schemas/implement-issue-simplify.json
+.claude/scripts/schemas/implement-issue-task-review.json
+.claude/scripts/schemas/implement-issue-test.json
+.claude/scripts/schemas/implement-issue.json
+.claude/scripts/schemas/implement-roadmap-task-extract.json
+.claude/scripts/schemas/implement-roadmap-task-update.json
+.claude/scripts/schemas/process-pr.json
+.claude/scripts/schemas/ralph-dependency-analysis.json
+.claude/scripts/schemas/ralph-learnings-summary.json
+#
+# --- Agent 9: entry points & periphery ---
+.claude/scripts/implement-roadmap-task-orchestrator.sh
+.claude/scripts/implement-issue-orchestrator.sh
+.claude/scripts/batch-runner.sh
+.claude/scripts/extract-roadmap-task.sh
+.claude/scripts/update-roadmap-status.sh
+#
+# --- Agent 10: agent roster + config surface ---
+.claude/agents/bulletproof-frontend-developer.md
+.claude/agents/cc-orchestration-writer.md
+.claude/agents/code-reviewer.md
+.claude/agents/python-backend-developer.md
+.claude/agents/spec-reviewer.md
+.claude/settings.json
+.claude/settings.local.json
+.claude/hooks/session-start.sh
+#
+# --- Agent 11: WIRED skills (per skill-wiring.txt) ---
+.claude/skills/adapting-claude-pipeline/SKILL.md
+.claude/skills/dispatching-parallel-agents/SKILL.md
+.claude/skills/implement-roadmap-task/SKILL.md
+.claude/skills/improvement-loop/SKILL.md
+.claude/skills/ralph-loop/SKILL.md
+.claude/skills/subagent-driven-development/SKILL.md
+.claude/skills/subagent-driven-development/code-quality-reviewer-prompt.md
+.claude/skills/subagent-driven-development/implementer-prompt.md
+.claude/skills/subagent-driven-development/spec-reviewer-prompt.md
+.claude/skills/writing-plans/SKILL.md
+.claude/skills/using-skills/SKILL.md
+.claude/skills/test-driven-development/SKILL.md
+.claude/skills/test-driven-development/testing-anti-patterns.md
+.claude/skills/ui-design-fundamentals/SKILL.md
+.claude/skills/ui-design-fundamentals/buttons.md
+.claude/skills/ui-design-fundamentals/cards.md
+.claude/skills/ui-design-fundamentals/colors.md
+.claude/skills/ui-design-fundamentals/forms.md
+.claude/skills/ui-design-fundamentals/grid-and-spacing.md
+.claude/skills/ui-design-fundamentals/hero-sections.md
+.claude/skills/ui-design-fundamentals/modals-and-dropdowns.md
+.claude/skills/ui-design-fundamentals/navigation.md
+.claude/skills/ui-design-fundamentals/pricing.md
+.claude/skills/ui-design-fundamentals/search.md
+.claude/skills/ui-design-fundamentals/shadows-and-depth.md
+.claude/skills/ui-design-fundamentals/style-guides.md
+.claude/skills/ui-design-fundamentals/typography.md
+.claude/skills/bulletproof-frontend/SKILL.md
+.claude/skills/bulletproof-frontend/accessibility-patterns.md
+.claude/skills/bulletproof-frontend/css-architecture.md
+.claude/skills/bulletproof-frontend/reference.md
+.claude/skills/bulletproof-frontend/responsive-patterns.md
+#
+# --- Agent 12: NON-WIRED skills, disposition catalogue (per skill-wiring.txt) ---
+.claude/skills/brainstorming/SKILL.md
+.claude/skills/executing-plans/SKILL.md
+.claude/skills/investigating-codebase-for-user-stories/SKILL.md
+.claude/skills/review-ui/SKILL.md
+.claude/skills/review-ui/agent-prompts.md
+.claude/skills/review-ui/review-criteria.md
+.claude/skills/systematic-debugging/SKILL.md
+.claude/skills/systematic-debugging/CREATION-LOG.md
+.claude/skills/systematic-debugging/condition-based-waiting-example.ts
+.claude/skills/systematic-debugging/condition-based-waiting.md
+.claude/skills/systematic-debugging/defense-in-depth.md
+.claude/skills/systematic-debugging/find-polluter.sh
+.claude/skills/systematic-debugging/root-cause-tracing.md
+.claude/skills/systematic-debugging/test-academic.md
+.claude/skills/systematic-debugging/test-pressure-1.md
+.claude/skills/systematic-debugging/test-pressure-2.md
+.claude/skills/systematic-debugging/test-pressure-3.md
+.claude/skills/using-git-worktrees/SKILL.md
+.claude/skills/write-docblocks/SKILL.md
+.claude/skills/writing-agents/SKILL.md
+.claude/skills/writing-agents/agent-templates.md
+.claude/skills/writing-skills/SKILL.md
+.claude/skills/writing-skills/anthropic-best-practices.md
+.claude/skills/writing-skills/examples/CLAUDE_MD_TESTING.md
+.claude/skills/writing-skills/graphviz-conventions.dot
+.claude/skills/writing-skills/persuasion-principles.md
+.claude/skills/writing-skills/render-graphs.js
+.claude/skills/writing-skills/testing-skills-with-subagents.md
+#
+# --- Agent 13: runtime I/O artifacts (shapes via find+jq; not byte-mapped) ---
+#   (repo-root, outside .claude/)
+status-ralph.json
+status-ralph-issue-505.json
+ralph-queue.json
+docs/roadmap.md
+logs/ralph-*/**                 # batch scheduler run dirs (incl. learnings-issue-NNN.md)
+logs/implement-roadmap-task/**  # per-task run dirs (context/, stages/, status.json, cost-summary.md, …)
+#
+# --- Agent 14: test corpus (behavioral contract) ---
+.claude/scripts/implement-issue-test/README.md
+.claude/scripts/implement-issue-test/run-tests.sh
+.claude/scripts/implement-issue-test/helpers/test-helper.bash
+.claude/scripts/implement-issue-test/fixtures/*.json        # 13 fixtures
+.claude/scripts/implement-issue-test/*.bats                 # 20 bats
+.claude/scripts/tests/test-e2e-override.sh
+.claude/scripts/tests/test-e2e-routing.sh
+.claude/scripts/tests/test-port-registry.sh
+.claude/scripts/tests/test_codex_prompt_schema.sh
+.claude/scripts/tests/test_cost_summary_provider.sh
+.claude/scripts/tests/test_orchestrator_cleanup.sh
+.claude/scripts/test-capacity-jitter.sh
+.claude/scripts/test-ci.sh
+.claude/scripts/test-counter-final.sh
+.claude/scripts/test-counter-simulation.sh
+.claude/scripts/test-shell.sh
+.claude/scripts/test-stage-counter.sh
+.claude/scripts/test-unit.sh
+tests/shell/**                  # repo-root: 8 bats incl. test-orchestrator-provider.bats, test-render-stage-prompt.bats
+#
+# ============================ EXCLUSION LIST (explicit) ============================
+# owner=EXCLUDE — not fragment-mapped; reason given.
+.claude/e2e-credentials.env          # EXCLUDE: SECRET (never read)
+.claude/scheduled_tasks.lock         # EXCLUDE: transient runtime lock
+.claude/scripts/TEST_RESULTS.md      # EXCLUDE: generated test-output artifact
+logs/baseline-*/**                   # EXCLUDE: baseline benchmark runs (non-canonical; for the cache-win compare in Phase 5)
+.worktrees/**                        # EXCLUDE: duplicate trees
+#
+# ============================ APPENDIX (cataloged, not deep-mapped) ============================
+# owner=APPENDIX — one-line catalogue entry in as-built.md; dev/ops or product-specific periphery.
+.claude/fetch-usage.sh               # APPENDIX: writes /tmp/.claude_usage_cache (five_hour/seven_day util) — CROSS-REF Agent 2a check_capacity
+.claude/statusline-command.sh        # APPENDIX: status-line display tooling
+.claude/scripts/deploy.sh            # APPENDIX: dev/ops
+.claude/scripts/disable-seeder.sh    # APPENDIX: dev/ops
+.claude/scripts/enable-seeder.sh     # APPENDIX: dev/ops
+.claude/scripts/e2e-smoke.sh         # APPENDIX: dev/ops (Hey Soo! E2E smoke)
+.claude/scripts/shellcheck-lint.sh   # APPENDIX: dev/ops (lint)
+.claude/scripts/sync-shared-modules.sh # APPENDIX: dev/ops
+.claude/scripts/silent-failure-lint.py # APPENDIX: dev/ops (Python lint; only .py in tree)
+.claude/prompts/frontend/audit-blade.md            # APPENDIX: product-specific Blade prompt
+.claude/prompts/frontend/refactor-blade-basic.md   # APPENDIX: product-specific Blade prompt
+.claude/prompts/frontend/refactor-blade-thorough.md # APPENDIX: product-specific Blade prompt

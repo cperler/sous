@@ -1,0 +1,53 @@
+# env-vars.txt — environment knob census (GENERATED, Part 0)
+# Source: /Users/craigperler/Development/heysoo/.claude/{scripts,hooks}
+# NAMES ONLY — values redacted. SECURITY: secret/credential files are NEVER read into
+# this inventory. Exclusion list (do not read): e2e-credentials.env (+ any *.env).
+#
+# A) Externally-configurable knobs — read with a default (${VAR:-…}/${VAR:=}/${VAR:?}).
+#    38 names. These are the env-overridable surface the adapter/registry must document.
+AGENT
+BASELINE_E2E_TIMEOUT
+BASELINE_UNIT_TIMEOUT
+BASE_BRANCH
+BRANCH
+EXECUTION_MODE
+FORCE_MODE
+GITHUB_REPO
+HEYSOO_E2E_SMOKE_DRY_RUN          # Hey Soo!-specific
+HEYSOO_TEST_EMAIL                 # Hey Soo!-specific
+HEYSOO_URL                        # Hey Soo!-specific
+ISSUE_NUMBER
+LOG_BASE
+LOG_FILE
+MAX_TASK_REVIEW_ATTEMPTS
+MOCK_CLAUDE_EXIT_CODE             # test-harness knob
+MOCK_CLAUDE_RESPONSE             # test-harness knob
+MOCK_COMMAND_LOG                # test-harness knob
+MOCK_GH_EXIT_CODE               # test-harness knob
+MOCK_GIT_EXIT_CODE              # test-harness knob
+MOCK_NPM_EXIT_CODE              # test-harness knob
+MOCK_UV_EXIT_CODE               # test-harness knob
+ORCHESTRATOR_EMAIL
+ORCHESTRATOR_PROVIDER             # ADR-062 global provider switch
+RESET_AT
+RESUME_TASK
+RETRY_AFTER
+SCRIPT_DIR
+STAGE_COUNTER
+STAGE_TIMEOUT
+STAGE_TIMEOUT_FINAL_OVERRIDE
+STAGE_TIMEOUT_OVERRIDE
+STATUS_FILE
+TASKS
+TASK_ID
+TASK_PROVIDER                     # per-task :codex routing
+TMPDIR
+WORKTREE
+#
+# B) In-script tunable constants (MAX_CONCURRENT, MODEL_CHAIN, CODEX_ELIGIBLE_STAGES,
+#    MAX_QUALITY_ITERATIONS, MAX_TEST_ITERATIONS, CIRCUIT_BREAKER_IDENTICAL, …) are NOT
+#    env-overridable here — they are defined in-script and captured per-fragment §6,
+#    rolled up by the synthesis env-var registry. Raw superset of all 234 UPPER_CASE
+#    identifiers referenced is reproducible via:
+#      grep -rhoE '\$\{?[A-Z][A-Z0-9_]{2,}\}?|^[[:space:]]*[A-Z][A-Z0-9_]{2,}=' scripts hooks
+#    The completeness critic diffs the spec's env-var registry against (A) + the §6 rollup.

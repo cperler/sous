@@ -1,0 +1,33 @@
+# skill-wiring.txt — evidence-driven skill classification (GENERATED, Part 0)
+# Method: grep each skill name across scripts/, agents/, hooks/, settings*, prompts/ (pipeline
+# wiring) + within-skills cross-refs. The Agent 11 (wired) vs Agent 12 (disposition) split is
+# DERIVED FROM THIS EVIDENCE, not assumed. 20 skills total → 11 wired, 9 non-wired.
+#
+# Correction vs. an earlier assumed split: ui-design-fundamentals (agent-referenced) and
+# using-skills (hook-injected) were found wired — moved into Agent 11.
+#
+# === WIRED → Agent 11 (11 skills) ===
+# SKILL                          WIRING TYPE              EVIDENCE
+adapting-claude-pipeline         entry-point/methodology  §5 bootstrap (role); 0 script refs
+dispatching-parallel-agents      entry-point/methodology  orchestration methodology; 0 script refs
+subagent-driven-development      entry-point/methodology  orchestration methodology; 0 script refs (3 cross-skill)
+ralph-loop                       script-referenced        ralph-loop.sh + status files (18 refs)
+implement-roadmap-task           script-referenced        implement-roadmap-task-orchestrator.sh + logs/ (18 refs)
+improvement-loop                 script-referenced        orchestrator-common.sh:812/845/851 emits /improvement-loop (4 refs)
+writing-plans                    script-referenced        implement-orchestrator.sh:793 (plan stage)
+using-skills                     hook-injected            hooks/session-start.sh:12 (injected into every session)
+test-driven-development          agent-referenced         agents/python-backend-developer.md:219
+ui-design-fundamentals           agent-referenced         agents/bulletproof-frontend-developer.md:23  [PRODUCT-SPECIFIC → adapter drop-in]
+bulletproof-frontend             script+agent-referenced  30 refs (batch/implement-orchestrator, select-incremental-test-agent, agents)  [PRODUCT-SPECIFIC → adapter drop-in]
+#
+# === NON-WIRED → Agent 12 disposition catalogue (9 skills) ===
+# SKILL                                    DISPOSITION TAG       (0 pipeline refs; cross-skill only)
+brainstorming                              methodology-port
+executing-plans                            methodology-port
+systematic-debugging                       methodology-port
+using-git-worktrees                        methodology-port
+writing-agents                             methodology-port
+writing-skills                             methodology-port
+review-ui                                  product-specific
+investigating-codebase-for-user-stories    superfluous/stale
+write-docblocks                            superfluous/stale
