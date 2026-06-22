@@ -60,6 +60,9 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
     r = sub.add_parser("ready")
     r.add_argument("--util", type=float, default=0.0)
+    d = sub.add_parser("dispatchable")
+    d.add_argument("--util", type=float, default=0.0)
+    d.add_argument("--max-concurrent", type=int, default=3)
     sub.add_parser("resume")
     sub.add_parser("status")
 
@@ -80,6 +83,13 @@ def main(argv: list[str] | None = None) -> int:
         _emit(eng.record(args.run, result))
     elif args.cmd == "ready":
         _emit({"ready": eng.ready(args.run, util_pct=args.util)})
+    elif args.cmd == "dispatchable":
+        from .scheduler import Scheduler
+
+        sched = Scheduler(eng, max_concurrent=args.max_concurrent)
+        ready = sched.dispatchable(args.run)
+        limit = eng.capacity.dispatch_limit(args.util, args.max_concurrent)
+        _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit]})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
