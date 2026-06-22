@@ -109,9 +109,13 @@ def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = N
             argv += ["--json-schema", sp]
         invocation = f"claude -p --model {work.model}" + (f" --agent {work.agent}" if work.agent else "")
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True)  # noqa: S603
+            proc = subprocess.run(argv, capture_output=True, text=True, timeout=work.timeout_s)  # noqa: S603
         except FileNotFoundError as exc:  # pragma: no cover - env dependent
             return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
+        except subprocess.TimeoutExpired:
+            # A hung CLI must not hang the scheduler — fail the dispatch on timeout.
+            return RawResult(None, exit_code=124,
+                             error=f"timed out after {work.timeout_s}s", invocation=invocation)
         if proc.returncode != 0:
             return RawResult(None, exit_code=proc.returncode, error=proc.stderr.strip()[:500],
                              raw_output=proc.stdout, invocation=invocation)
@@ -139,13 +143,17 @@ def codex_cli_transport() -> Transport:
     def run(work: WorkItem) -> RawResult:
         with tempfile.TemporaryDirectory() as td:
             last = Path(td) / "last.json"
-            argv = ["codex", "exec", "--full-auto", "--skip-git-repo-check",
+            argv = ["codex", "exec", "-m", work.model, "--full-auto", "--skip-git-repo-check",
                     "--json", "--output-last-message", str(last), work.prompt]
             invocation = f"codex exec --json (model {work.model})"
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True)  # noqa: S603
+                proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
+                                      timeout=work.timeout_s)
             except FileNotFoundError as exc:  # pragma: no cover - env dependent
                 return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
+            except subprocess.TimeoutExpired:
+                return RawResult(None, exit_code=124,
+                                 error=f"timed out after {work.timeout_s}s", invocation=invocation)
             structured = None
             if last.exists():
                 txt = last.read_text().strip()

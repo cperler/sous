@@ -84,6 +84,19 @@ class Engine:
     def add_task(self, run_id: str, task_id: str, lane: ExecutionLane | None = None) -> Task:
         spec = self.project.task_source.resolve(task_id)
         run = self.store.load_run(run_id)
+        # Register the task ref + dependency edge as a locked read-modify-write so a
+        # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
+        # Done BEFORE writing the task doc so a duplicate never clobbers an existing
+        # task's persisted progress.
+        def _register(r: Run) -> None:
+            if any(ref.task_id == task_id for ref in r.task_refs):
+                raise ContractError(f"task {task_id} already added to run {run_id}")
+            r.task_refs.append(
+                TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json")
+            )
+            r.dependency_graph[task_id] = list(spec.depends_on)
+
+        self.store.update_run(run_id, _register)
         task = Task(
             task_id=task_id,
             run_id=run_id,
@@ -99,10 +112,6 @@ class Engine:
             max_attempts=self.max_attempts,
         )
         self.store.save_task(task)
-        run.task_refs.append(TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json"))
-        run.dependency_graph[task_id] = list(spec.depends_on)
-        run.updated_at = _now()
-        self.store.save_run(run)
         return task
 
     # --- ready (DAG + capacity) ----------------------------------------------
@@ -115,10 +124,21 @@ class Engine:
         return candidates[:limit]
 
     # --- dispatch / record ----------------------------------------------------
-    def next_work(self, run_id: str, task_id: str, *, util_pct: float = 0.0) -> WorkItem | None:
+    def next_work(
+        self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
+    ) -> WorkItem | None:
         if self.capacity.at_capacity(util_pct):
             raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
         task = self.store.load_task(run_id, task_id)
+        # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
+        # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
+        # so recovery is the explicit resume=True path — never a silent re-dispatch that
+        # would overwrite the lease and make the in-flight result fail contract checks.
+        if task.pending_work_item_id is not None and not resume:
+            raise ContractError(
+                f"task {task_id} has an outstanding dispatch {task.pending_work_item_id}; "
+                f"record its result or re-dispatch with resume=True"
+            )
         stage = next_stage(task)
         if stage is None:
             return None
@@ -155,11 +175,22 @@ class Engine:
             created_at=_now(),
             attempt=attempt,
         )
-        begin_stage(task, stage, now=_now(), model=model, attempt=attempt)
-        task.state = TaskState.RUNNING
-        task.pending_work_item_id = work.id
-        task.pending_content_hash = work.content_hash
-        self.store.save_task(task)
+        # Commit the dispatch as a locked read-modify-write: re-check the lease and
+        # that the stage hasn't advanced under us, so two concurrent next_work calls
+        # can't both claim the task — the loser sees the moved lease/stage and raises.
+        def _commit(t: Task) -> None:
+            if t.pending_work_item_id is not None and not resume:
+                raise ContractError(
+                    f"task {task_id} dispatch raced: lease {t.pending_work_item_id} taken"
+                )
+            if next_stage(t) is not stage:
+                raise ContractError(f"task {task_id} stage advanced under dispatch of {stage.value}")
+            begin_stage(t, stage, now=_now(), model=model, attempt=attempt)
+            t.state = TaskState.RUNNING
+            t.pending_work_item_id = work.id
+            t.pending_content_hash = work.content_hash
+
+        self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
         self.store.append_event(
             run_id,
@@ -193,6 +224,28 @@ class Engine:
             )
         if result.content_hash != task.pending_content_hash:
             raise ContractError("result content_hash does not match the dispatched WorkItem")
+        # content_hash is an echoed string; the result still carries its OWN
+        # stage/model/attempt/run_id, and those drive pricing (result.model) and which
+        # stage record we fold into (result.stage). Bind them to what was actually
+        # dispatched so a buggy runner or hand-edited result can't complete the wrong
+        # stage or price the wrong model. task.current_stage is the dispatched stage
+        # (begin_stage set it; a dispatch is outstanding).
+        if result.run_id != run_id:
+            raise ContractError(f"result run_id {result.run_id} != dispatched {run_id}")
+        dispatched_stage = task.current_stage
+        if result.stage is not dispatched_stage:
+            raise ContractError(
+                f"result stage {result.stage} != dispatched {dispatched_stage}"
+            )
+        dispatched = task.stages[dispatched_stage]
+        if result.model != dispatched.model:
+            raise ContractError(
+                f"result model {result.model!r} != dispatched {dispatched.model!r}"
+            )
+        if result.attempt != dispatched.attempt:
+            raise ContractError(
+                f"result attempt {result.attempt} != dispatched {dispatched.attempt}"
+            )
 
         # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
         # and the engine share one model table; compute once, in the ledger).

@@ -9,7 +9,7 @@ import pytest
 import adapters.execution.transport as T
 from adapters.execution.codex import CodexRunner
 from adapters.execution.runners import build_registry, registry_runner
-from adapters.execution.transport import RawResult, _codex_usage
+from adapters.execution.transport import RawResult, _codex_usage, codex_cli_transport
 from orchestrator.cli import _engine
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
@@ -20,6 +20,11 @@ from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, St
 from orchestrator.schemas.work import LanePolicy, WorkItem
 from orchestrator.status_store import StatusStore
 from tests.conftest import FakeProject, make_result
+
+
+def _eng(tmp_path) -> Engine:
+    return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), FakeProject())
+
 
 CODEX = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=Provider.CODEX)
 
@@ -120,3 +125,88 @@ def test_cost_summary_written_at_finalize(tmp_path) -> None:
     while (w := eng.next_work("r1", "t1")) is not None:
         eng.record("r1", make_result(w))
     assert (tmp_path / "cost-summary.md").exists()  # finalized
+
+
+# --- codex feedback (post-3a/3b/4/5 engine pass) -----------------------------
+
+# F1: record() binds the result's self-described stage/model to what was dispatched.
+def test_record_rejects_mismatched_stage(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = eng.next_work("r1", "t1")  # intake dispatched
+    # work_item_id + content_hash still echo correctly, but stage is tampered.
+    tampered = make_result(w).model_copy(update={"stage": Stage.DELIVER})
+    with pytest.raises(ContractError):
+        eng.record("r1", tampered)
+
+
+def test_record_rejects_mismatched_model(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = eng.next_work("r1", "t1")
+    tampered = make_result(w).model_copy(update={"model": "evil-cheap-model"})
+    with pytest.raises(ContractError):
+        eng.record("r1", tampered)
+
+
+# F2: an outstanding dispatch is a lease — normal next_work refuses; resume is explicit.
+def test_next_work_refuses_inflight_redispatch(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w1 = eng.next_work("r1", "t1")  # leased, not recorded
+    with pytest.raises(ContractError):
+        eng.next_work("r1", "t1")  # would overwrite the lease
+    w2 = eng.next_work("r1", "t1", resume=True)  # explicit recovery
+    assert w2.id == w1.id or w2.stage is w1.stage  # same crashed stage re-emitted
+
+
+def test_scheduler_skips_leased_task(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.next_work("r1", "t1")  # leased (in-flight), never recorded
+    assert Scheduler(eng).dispatchable("r1") == []  # not re-dispatchable while leased
+
+
+# F5: add_task is an atomic registration and rejects a duplicate without clobbering.
+def test_add_task_rejects_duplicate(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # advance past intake
+    with pytest.raises(ContractError):
+        eng.add_task("r1", "t1")  # duplicate
+    # the existing task's progress survived (not clobbered by a fresh Task doc)
+    task = eng.store.load_task("r1", "t1")
+    assert task.stages[Stage.INTAKE].status.value == "completed"
+    assert len(eng.store.load_run("r1").task_refs) == 1
+
+
+# F3: the codex transport actually passes -m <model> (was silently defaulting).
+def test_codex_transport_passes_model(monkeypatch) -> None:
+    seen = {}
+
+    def fake_run(argv, *a, **k):
+        seen["argv"] = argv
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(T.subprocess, "run", fake_run)
+    wi = WorkItem.create(id="wi", run_id="r", task_id="t", stage=Stage.IMPLEMENT, prompt="p",
+                         schema_ref="implement", model="gpt-5-codex", lane_policy=CODEX, created_at="t")
+    codex_cli_transport()(wi)
+    assert "-m" in seen["argv"] and "gpt-5-codex" in seen["argv"]
+
+
+# F4: a hung CLI times out into a failed RawResult instead of hanging the scheduler.
+def test_transport_timeout_is_failure(monkeypatch) -> None:
+    def boom(*a, **k):
+        raise T.subprocess.TimeoutExpired(cmd="claude", timeout=k.get("timeout"))
+
+    monkeypatch.setattr(T.subprocess, "run", boom)
+    wi = WorkItem.create(id="wi", run_id="r", task_id="t", stage=Stage.IMPLEMENT, prompt="p",
+                         schema_ref="implement", model="m", lane_policy=CODEX, created_at="t", timeout_s=5)
+    raw = T.claude_cli_transport()(wi)
+    assert raw.structured_output is None and raw.exit_code == 124 and "timed out" in raw.error

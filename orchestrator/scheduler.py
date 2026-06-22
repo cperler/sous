@@ -43,6 +43,11 @@ class Scheduler:
                 continue
             if dag.unmet_deps(ref.task_id, states):
                 continue
+            # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
+            # re-dispatchable on the normal path — it needs explicit resume, not a
+            # silent re-pick that would overwrite the outstanding WorkItem.
+            if self.engine.store.load_task(run_id, ref.task_id).pending_work_item_id is not None:
+                continue
             out.append(ref.task_id)
         return out
 

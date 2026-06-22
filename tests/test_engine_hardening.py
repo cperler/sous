@@ -62,8 +62,11 @@ def test_crash_does_not_reset_attempt(tmp_path, project) -> None:
     eng.record("r1", make_result(w1, status=ResultStatus.FAILURE, error="boom", structured_output={}))
     w2 = eng.next_work("r1", "t1")  # retry -> attempt 1
     assert w2.attempt == 1
-    # simulate a crash: w2 dispatched (RUNNING) but never recorded; re-dispatch
-    w3 = eng.next_work("r1", "t1")
+    # simulate a crash: w2 dispatched (RUNNING) but never recorded. A normal
+    # next_work now refuses (the lease is held); recovery is the explicit resume path.
+    with pytest.raises(ContractError):
+        eng.next_work("r1", "t1")
+    w3 = eng.next_work("r1", "t1", resume=True)
     assert w3.stage is Stage.IMPLEMENT and w3.attempt == 1  # SAME attempt, not reset to 0
 
 
