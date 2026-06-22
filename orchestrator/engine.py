@@ -242,7 +242,8 @@ class Engine:
         self.store.write_stage_markdown(result.task_id, seq, result.stage.value, render_stage(payload))
         self.store.save_task(task)
         self.store.write_task_index(result.task_id, render_task_index(task))
-        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, self.ledger.summary()))
+        # cost-summary.md is written at run finalization and on status() — NOT on
+        # every record (that re-read the whole ledger each time: O(N^2) on long runs).
         self._set_ref_state(run_id, result.task_id, task.state)
         self.store.append_event(
             run_id,
@@ -324,23 +325,28 @@ class Engine:
                 "stages": {s.value: r.status.value for s, r in task.stages.items()},
                 "pr_url": task.pr_url,
             }
+        # One ledger read shared by the summary, the audit, and the cost-summary.md
+        # refresh (status() used to read the ledger twice).
+        rows = self.ledger.rows()
+        summary = self.ledger.summary(rows=rows)
+        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, summary))
         return {
             "run_id": run_id,
             "run_state": run.state.value,
             "progress": progress.model_dump(),
             "tasks": tasks,
-            "cost": self.ledger.summary(),
-            "lane_audit": self.lane_audit(run_id),
+            "cost": summary,
+            "lane_audit": self.lane_audit(run_id, rows=rows),
         }
 
-    def lane_audit(self, run_id: str) -> dict:
+    def lane_audit(self, run_id: str, *, rows: list[dict] | None = None) -> dict:
         """Every recorded model call ran on a sanctioned, attributed lane.
 
         Generalized beyond 3a: 'sanctioned' = the registry's served (mode, provider)
         cells, so the audit holds for headless/codex once those runners are
         registered. The failure mode it catches is a hidden/unattributed call —
         not a deliberately-selected lane (target.md §4: attribution, not abstinence)."""
-        rows = self.ledger.rows()
+        rows = self.ledger.rows() if rows is None else rows
         sanctioned = {f"{m.value}:{p.value}" for (m, p) in self.registry.sanctioned()}
         by_lane: dict[str, int] = {}
         unattributed = 0
@@ -414,3 +420,5 @@ class Engine:
                 {"ts": _now(), "type": "run_finalized", "run_id": run_id,
                  "state": new_state.value},
             )
+        # Final cost report (the per-record write was removed for O(N^2)).
+        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, self.ledger.summary()))

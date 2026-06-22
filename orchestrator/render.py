@@ -16,19 +16,22 @@ from .schemas.status import Task
 
 def render_cost_summary(run_id: str, summary: dict) -> str:
     """Render `ledger.summary()` into cost-summary.md."""
+    # Defensive: a present-but-None value or a partial by_model bucket must not crash
+    # the render (it runs at run finalization).
+    total_cost = summary.get("total_cost_usd") or 0.0
     lines = [
         f"# Cost summary — {run_id}",
         "",
-        f"- Invocations: **{summary.get('total_invocations', 0)}**",
-        f"- Total cost: **${summary.get('total_cost_usd', 0):.4f}**",
+        f"- Invocations: **{summary.get('total_invocations') or 0}**",
+        f"- Total cost: **${total_cost:.4f}**",
         "",
         "| Model | Invocations | Input tok | Output tok | Cost (USD) |",
         "|---|---:|---:|---:|---:|",
     ]
     for model, m in sorted(summary.get("by_model", {}).items()):
         lines.append(
-            f"| `{model}` | {m['invocations']} | {m['input_tokens']} | "
-            f"{m['output_tokens']} | ${m['cost_usd']:.4f} |"
+            f"| `{model}` | {m.get('invocations', 0)} | {m.get('input_tokens', 0)} | "
+            f"{m.get('output_tokens', 0)} | ${(m.get('cost_usd') or 0.0):.4f} |"
         )
     lines += ["", "_Priced from the single model table; raw rows in `stage-costs.jsonl`._", ""]
     return "\n".join(lines)

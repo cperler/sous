@@ -66,7 +66,9 @@ class {cls}:
         return _NOOP
 
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]:
-        return _NOOP
+        # FAIL-CLOSED: errors loudly until you set this, so a run before the TODOs
+        # are filled does not vacuously pass. Replace with e.g. ["uv","run","pytest","-q"].
+        return ["sh", "-c", "echo 'orchestrator: set {name} test_unit_cmd' >&2; exit 1"]
 
     def test_e2e_cmd(self, files: list[str] | None = None) -> list[str]:
         return _NOOP

@@ -57,7 +57,8 @@ class CodexRunner:
     def _verdict(self, work: WorkItem, raw: RawResult) -> ResultStatus:
         if raw.exit_code != 0 or raw.error:
             return ResultStatus.TIMEOUT if raw.exit_code == 124 else ResultStatus.FAILURE
-        if raw.structured_output is None:
+        # Output must be a JSON object (a list/scalar is not a valid stage result).
+        if not isinstance(raw.structured_output, dict):
             return ResultStatus.SCHEMA_VIOLATION
         # TIGHTENED: full schema validation, not just required-keys-present.
         schema = self._schema_provider(work.schema_ref) if self._schema_provider else None

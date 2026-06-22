@@ -20,7 +20,7 @@ from collections.abc import Callable
 
 from .dag import Dag
 from .engine import Engine
-from .errors import CapacityExhausted
+from .errors import CapacityExhausted, ContractError
 from .schemas.enums import TERMINAL_TASK_STATES
 from .schemas.work import StageResult, WorkItem
 
@@ -66,13 +66,15 @@ class Scheduler:
 
         results = runner(work)
         by_id = {r.work_item_id: r for r in results}
-        recorded = 0
+        # The runner contract is one StageResult per dispatched WorkItem. A missing
+        # result would leave the task RUNNING with an outstanding dispatch and re-
+        # dispatch forever — fail fast instead of silently looping.
+        missing = [w.id for w in work if w.id not in by_id]
+        if missing:
+            raise ContractError(f"runner returned no StageResult for work item(s): {missing}")
         for w in work:
-            r = by_id.get(w.id)
-            if r is not None:
-                self.engine.record(run_id, r)
-                recorded += 1
-        return {"dispatched": len(work), "recorded": recorded, "ready": len(ready), "limit": limit}
+            self.engine.record(run_id, by_id[w.id])
+        return {"dispatched": len(work), "recorded": len(work), "ready": len(ready), "limit": limit}
 
     def run(self, run_id: str, runner: Runner, *, util_pct: float = 0.0, max_ticks: int = 10_000) -> dict:
         """Loop until no task is dispatchable (all terminal or capacity-stalled).

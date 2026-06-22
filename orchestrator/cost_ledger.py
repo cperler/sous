@@ -62,16 +62,20 @@ class CostLedger:
         with self.path.open("r", encoding="utf-8") as fh:
             return [json.loads(line) for line in fh if line.strip()]
 
-    def summary(self) -> dict:
-        """Aggregate the ledger: totals plus a per-model breakdown."""
+    def summary(self, rows: list[dict] | None = None) -> dict:
+        """Aggregate the ledger: totals plus a per-model breakdown.
+
+        Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once
+        and shares it. Tolerant of a malformed/partial row via ``.get`` defaults."""
         by_model: dict[str, dict] = {}
         total_cost = 0.0
         total_invocations = 0
-        for row in self.rows():
+        for row in (self.rows() if rows is None else rows):
             total_invocations += 1
-            total_cost += row["cost_usd"]
+            cost = row.get("cost_usd") or 0.0
+            total_cost += cost
             bucket = by_model.setdefault(
-                row["model"],
+                row.get("model", "unknown"),
                 {
                     "invocations": 0,
                     "input_tokens": 0,
@@ -80,9 +84,9 @@ class CostLedger:
                 },
             )
             bucket["invocations"] += 1
-            bucket["input_tokens"] += row["input_tokens"]
-            bucket["output_tokens"] += row["output_tokens"]
-            bucket["cost_usd"] = round(bucket["cost_usd"] + row["cost_usd"], 6)
+            bucket["input_tokens"] += row.get("input_tokens", 0) or 0
+            bucket["output_tokens"] += row.get("output_tokens", 0) or 0
+            bucket["cost_usd"] = round(bucket["cost_usd"] + cost, 6)
         return {
             "total_cost_usd": round(total_cost, 6),
             "total_invocations": total_invocations,

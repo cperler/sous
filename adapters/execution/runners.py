@@ -9,6 +9,8 @@ dispatches in-process cells (headless/codex) — exactly the headless/codex mode
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
 
@@ -43,18 +45,23 @@ def build_registry(
     return reg
 
 
-def registry_runner(registry: Registry):
+def registry_runner(registry: Registry, *, max_workers: int | None = None):
     """A Scheduler Runner that dispatches each WorkItem via its cell's in-process runner.
 
     Raises (via Registry.resolve) if a WorkItem targets an external cell (interactive),
-    which is the correct failure: headless drive can't run an interactive lane.
+    which is the correct failure: headless drive can't run an interactive lane. The
+    batch is dispatched concurrently (runners are subprocess-bound; the batch size is
+    already capped upstream by the engine's capacity dispatch_limit), order preserved.
     """
 
     def run(workitems: list[WorkItem]) -> list[StageResult]:
-        out: list[StageResult] = []
-        for w in workitems:
-            runner = registry.resolve(w.lane_policy)
-            out.append(runner.dispatch(w))
-        return out
+        if not workitems:
+            return []
+        # Resolve first so an external/missing cell raises before any work starts.
+        pairs = [(w, registry.resolve(w.lane_policy)) for w in workitems]
+        workers = max_workers or len(pairs)
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futures = [ex.submit(runner.dispatch, w) for (w, runner) in pairs]
+            return [f.result() for f in futures]
 
     return run

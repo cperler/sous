@@ -43,6 +43,9 @@ def to_stage_result(
     provider: Provider,
 ) -> StageResult:
     """Build the engine-facing StageResult from a runner's RawResult + verdict."""
+    # StageResult.structured_output is dict|None; a non-dict payload (list/scalar)
+    # is coerced to None here (the raw text is preserved in raw_output).
+    structured = raw.structured_output if isinstance(raw.structured_output, dict) else None
     return StageResult(
         work_item_id=work.id,
         content_hash=work.content_hash,
@@ -52,7 +55,7 @@ def to_stage_result(
         attempt=work.attempt,
         model=work.model,
         status=status,
-        structured_output=raw.structured_output,
+        structured_output=structured,
         raw_output=raw.raw_output,
         error=raw.error,
         lane_used=LaneUsed(
@@ -73,6 +76,27 @@ def _usage_from(d: dict) -> TokenUsage:
     )
 
 
+def _codex_usage(events_stdout: str) -> TokenUsage:
+    """Best-effort token usage from the codex JSONL event stream.
+
+    Codex emits `--json` events; scan for the last object carrying a `usage`
+    (directly or under `msg`). Returns zeros if none is found (so codex cost is
+    captured when codex reports it, instead of always 0)."""
+    usage = TokenUsage()
+    for line in events_stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        u = ev.get("usage") or (ev.get("msg") or {}).get("usage")
+        if isinstance(u, dict):
+            usage = _usage_from({"usage": u})
+    return usage
+
+
 def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = None) -> Transport:
     """Real headless×claude transport: shells ``claude -p ... --output-format json``."""
 
@@ -91,8 +115,16 @@ def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = N
         if proc.returncode != 0:
             return RawResult(None, exit_code=proc.returncode, error=proc.stderr.strip()[:500],
                              raw_output=proc.stdout, invocation=invocation)
-        data = json.loads(proc.stdout) if proc.stdout.strip() else {}
-        structured = data.get("structured_output") or data.get("result")
+        try:
+            data = json.loads(proc.stdout) if proc.stdout.strip() else {}
+        except json.JSONDecodeError as exc:
+            # Exit 0 but non-JSON stdout (banner/notice): fail the dispatch, never
+            # let the exception escape (every dispatch must yield a StageResult).
+            return RawResult(None, raw_output=proc.stdout, exit_code=0,
+                             error=f"non-JSON output: {exc}", invocation=invocation)
+        # Presence check, not truthiness: a valid-but-empty structured_output ({})
+        # must not fall through to the prose `result`.
+        structured = data["structured_output"] if "structured_output" in data else data.get("result")
         if isinstance(structured, str):
             structured = None  # prose, not structured
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
@@ -121,7 +153,8 @@ def codex_cli_transport() -> Transport:
                     structured = json.loads(txt)
                 except json.JSONDecodeError:
                     structured = None
-            return RawResult(structured, raw_output=proc.stdout, exit_code=proc.returncode,
+            return RawResult(structured, usage=_codex_usage(proc.stdout), raw_output=proc.stdout,
+                             exit_code=proc.returncode,
                              error=(proc.stderr.strip()[:500] or None) if proc.returncode else None,
                              invocation=invocation)
 

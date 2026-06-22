@@ -42,9 +42,13 @@ def _engine(args: argparse.Namespace) -> Engine:
 
     # Config-only execution mode (interactive×claude default; headless = in-process).
     mode = ExecutionMode(getattr(args, "mode", "interactive"))
+    if args.cmd == "run-headless":
+        mode = ExecutionMode.HEADLESS  # this command drives in-process; force the lane
     provider = Provider(args.provider) if getattr(args, "provider", None) else None
     interactive = mode is ExecutionMode.INTERACTIVE and provider is not Provider.CODEX
-    registry = build_registry(include_interactive=interactive)
+    # Codex full-validation needs the project's schemas (optional hook); wire it through.
+    schema_provider = getattr(project, "schema_for", None)
+    registry = build_registry(include_interactive=interactive, codex_schema_provider=schema_provider)
     router = Router(execution_mode=mode, orchestrator_provider=provider)
     return Engine(store, ledger, project, router=router, registry=registry)
 
@@ -58,7 +62,8 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root", required=True, help="status/ledger directory for the run")
     p.add_argument("--run", required=True, help="run id")
-    p.add_argument("--project", default="adapters.project.heysoo", help="project-config module")
+    p.add_argument("--project", required=True,
+                   help="project-config module (e.g. adapters.project.heysoo)")
     p.add_argument("--mode", default="interactive", choices=["interactive", "headless"],
                    help="execution mode (config-only lane selection)")
     p.add_argument("--provider", default=None, choices=["claude", "codex"],
