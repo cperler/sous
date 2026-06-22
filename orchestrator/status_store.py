@@ -214,3 +214,24 @@ class StatusStore:
         path = d / f"{seq:02d}-{stage}.json"
         self._atomic_write(path, json.dumps(payload, indent=2, default=str))
         return path
+
+    def write_stage_markdown(self, task_id: str, seq: int, stage: str, text: str) -> Path:
+        """Human-readable per-stage Markdown alongside the JSON record."""
+        d = self._stages_dir(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{seq:02d}-{stage}.md"
+        self._atomic_write(path, text)
+        return path
+
+    def write_task_index(self, task_id: str, text: str) -> Path:
+        d = self._stages_dir(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "index.md"
+        self._atomic_write(path, text)
+        return path
+
+    def write_run_artifact(self, name: str, text: str) -> Path:
+        """Write a run-level text artifact (e.g. cost-summary.md) under the root."""
+        path = self.root / name
+        self._atomic_write(path, text)
+        return path

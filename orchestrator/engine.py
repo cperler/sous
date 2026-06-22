@@ -19,6 +19,7 @@ from .cost_ledger import CostLedger
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
+from .render import render_cost_summary, render_stage, render_task_index
 from .retry import CircuitBreaker, error_signature
 from .schemas.enums import (
     TERMINAL_TASK_STATES,
@@ -212,28 +213,29 @@ class Engine:
         else:
             outcome = self._handle_failure(task, result)
 
-        # Durable per-stage log (the interactive-lane analog of stages/NN-*.*).
+        # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
         task.stage_counter += 1
-        self.store.write_stage_log(
-            result.task_id,
-            task.stage_counter,
-            result.stage.value,
-            {
-                "work_item_id": result.work_item_id,
-                "stage": result.stage.value,
-                "attempt": result.attempt,
-                "status": result.status.value,
-                "outcome": outcome,
-                "model": result.model,
-                "lane_used": result.lane_used.model_dump(),
-                "cost_usd": cost,
-                "structured_output": result.structured_output,
-                "raw_output": result.raw_output,
-                "error": result.error,
-                "completed_at": result.completed_at,
-            },
-        )
+        payload = {
+            "work_item_id": result.work_item_id,
+            "stage": result.stage.value,
+            "task_id": result.task_id,
+            "attempt": result.attempt,
+            "status": result.status.value,
+            "outcome": outcome,
+            "model": result.model,
+            "lane_used": result.lane_used.model_dump(),
+            "cost_usd": cost,
+            "structured_output": result.structured_output,
+            "raw_output": result.raw_output,
+            "error": result.error,
+            "completed_at": result.completed_at,
+        }
+        seq = task.stage_counter
+        self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
+        self.store.write_stage_markdown(result.task_id, seq, result.stage.value, render_stage(payload))
         self.store.save_task(task)
+        self.store.write_task_index(result.task_id, render_task_index(task))
+        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, self.ledger.summary()))
         self._set_ref_state(run_id, result.task_id, task.state)
         self.store.append_event(
             run_id,
