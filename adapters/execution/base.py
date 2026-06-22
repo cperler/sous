@@ -91,6 +91,16 @@ class Registry:
             )
         return self._runners[desc.cell]
 
+    def sanctioned(self) -> set[tuple[ExecutionMode, Provider]]:
+        """The (mode, provider) cells that are actually served (not explicit-empty).
+
+        A model call is 'attributed/clean' iff its lane is one of these — this is
+        how the lane audit generalizes beyond the 3a hardcoded interactive:claude.
+        """
+        return {
+            cell for cell, desc in self._descriptors.items() if desc.status is not EXPLICIT_EMPTY
+        }
+
     def assert_cells_covered(self, required: list[LanePolicy]) -> None:
         missing = [
             (p.execution_mode.value, p.provider.value)

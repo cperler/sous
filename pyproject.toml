@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Deterministic orchestration engine + interactive execution lane (Phase 3a)"
 requires-python = ">=3.11"
 dependencies = [
+    "jsonschema>=4.26.0",
     "pydantic>=2.6",
 ]
 

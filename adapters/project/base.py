@@ -24,6 +24,7 @@ class TaskSpec(BaseModel):
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
+    provider_tag: str | None = None  # e.g. "codex" — per-task provider routing tag
 
 
 @runtime_checkable

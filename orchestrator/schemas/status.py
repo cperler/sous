@@ -68,6 +68,7 @@ class Task(BaseModel):
     max_attempts: int = 3
     title: str = ""
     body: str = ""  # task-source description (e.g. the GitHub issue body) — feeds prompts
+    provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     execution_lane: ExecutionLane = ExecutionLane.FULL

@@ -12,6 +12,7 @@ from __future__ import annotations
 import uuid
 from datetime import UTC, datetime
 
+from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
 
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy
@@ -21,23 +22,20 @@ from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
 from .render import render_cost_summary, render_stage, render_task_index
 from .retry import CircuitBreaker, error_signature
+from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
     TERMINAL_TASK_STATES,
     ExecutionLane,
-    ExecutionMode,
-    Provider,
     ResultStatus,
     RunState,
     StageStatus,
     TaskState,
 )
 from .schemas.status import Run, Task, TaskRef
-from .schemas.work import LanePolicy, StageResult, WorkItem
+from .schemas.work import StageResult, WorkItem
 from .stages import STAGE_SPECS, render_prompt
 from .state_machine import apply_result, begin_stage, is_done, next_stage, resume_point
 from .status_store import StatusStore
-
-INTERACTIVE_CLAUDE = LanePolicy(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE)
 
 
 def _now() -> str:
@@ -56,6 +54,8 @@ class Engine:
         *,
         model_table: ModelTable = DEFAULT_MODEL_TABLE,
         capacity: CapacityPolicy = DEFAULT_CAPACITY,
+        router: Router = DEFAULT_ROUTER,
+        registry: Registry | None = None,
         max_attempts: int = 3,
         breaker_threshold: int = 2,
         concurrency_ceiling: int = 1,
@@ -67,6 +67,10 @@ class Engine:
         # Single pricing source: the ledger prices with the engine's model table.
         self.ledger.model_table = model_table
         self.capacity = capacity
+        self.router = router
+        # The registry defines which (mode, provider) cells are sanctioned (for the
+        # lane audit). Default = interactive×claude (3a/3b).
+        self.registry = registry if registry is not None else default_registry()
         self.max_attempts = max_attempts
         self.breaker_threshold = breaker_threshold
         self.concurrency_ceiling = concurrency_ceiling
@@ -88,6 +92,7 @@ class Engine:
             state=TaskState.PENDING,
             title=spec.title,
             body=spec.body,
+            provider_tag=spec.provider_tag,
             issue_number=spec.issue_number,
             depends_on=spec.depends_on,
             execution_lane=lane or run.lane,
@@ -136,6 +141,7 @@ class Engine:
             stage, task_id=task_id, title=task.title, body=task.body, learnings=learnings
         )
         agent = self.project.agent_for(stage, spec.agent_role)
+        lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -145,7 +151,7 @@ class Engine:
             schema_ref=spec.schema_ref,
             model=model,
             agent=agent,
-            lane_policy=INTERACTIVE_CLAUDE,
+            lane_policy=lane,
             created_at=_now(),
             attempt=attempt,
         )
@@ -192,10 +198,11 @@ class Engine:
         # and the engine share one model table; compute once, in the ledger).
         cost = self.ledger.record(result)["cost_usd"]
 
+        # Attributed/clean iff the lane actually used is a sanctioned (registered) cell.
         lane_clean = (
-            result.lane_used.execution_mode is INTERACTIVE_CLAUDE.execution_mode
-            and result.lane_used.provider is INTERACTIVE_CLAUDE.provider
-        )
+            result.lane_used.execution_mode,
+            result.lane_used.provider,
+        ) in self.registry.sanctioned()
 
         apply_result(task, result, now=_now(), cost_usd=cost)
         task.pending_work_item_id = None
@@ -327,8 +334,14 @@ class Engine:
         }
 
     def lane_audit(self, run_id: str) -> dict:
-        """Confirm every recorded model call ran on its intended lane (no hidden claude -p)."""
+        """Every recorded model call ran on a sanctioned, attributed lane.
+
+        Generalized beyond 3a: 'sanctioned' = the registry's served (mode, provider)
+        cells, so the audit holds for headless/codex once those runners are
+        registered. The failure mode it catches is a hidden/unattributed call —
+        not a deliberately-selected lane (target.md §4: attribution, not abstinence)."""
         rows = self.ledger.rows()
+        sanctioned = {f"{m.value}:{p.value}" for (m, p) in self.registry.sanctioned()}
         by_lane: dict[str, int] = {}
         unattributed = 0
         for row in rows:
@@ -338,11 +351,11 @@ class Engine:
             by_lane[key] = by_lane.get(key, 0) + 1
             if lane == "UNKNOWN" or prov == "UNKNOWN":
                 unattributed += 1
-        # Phase 3a: the only sanctioned lane is interactive:claude.
-        off_lane = sum(n for k, n in by_lane.items() if k != "interactive:claude")
+        off_lane = sum(n for k, n in by_lane.items() if k not in sanctioned)
         return {
             "total_calls": len(rows),
             "by_lane": by_lane,
+            "sanctioned_lanes": sorted(sanctioned),
             "unattributed": unattributed,
             "off_lane": off_lane,
             "clean": unattributed == 0 and off_lane == 0,

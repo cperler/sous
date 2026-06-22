@@ -13,11 +13,13 @@ import json
 import sys
 from pathlib import Path
 
+from adapters.execution.runners import build_registry
 from adapters.project.base import ProjectConfig
 
 from .cost_ledger import CostLedger
 from .engine import Engine
-from .schemas.enums import ExecutionLane
+from .routing import Router
+from .schemas.enums import ExecutionLane, ExecutionMode, Provider
 from .schemas.work import StageResult
 
 
@@ -37,7 +39,14 @@ def _engine(args: argparse.Namespace) -> Engine:
     store = StatusStore(root)
     ledger = CostLedger(root / "stage-costs.jsonl")
     project = _load_project(args.project)
-    return Engine(store, ledger, project)
+
+    # Config-only execution mode (interactive×claude default; headless = in-process).
+    mode = ExecutionMode(getattr(args, "mode", "interactive"))
+    provider = Provider(args.provider) if getattr(args, "provider", None) else None
+    interactive = mode is ExecutionMode.INTERACTIVE and provider is not Provider.CODEX
+    registry = build_registry(include_interactive=interactive)
+    router = Router(execution_mode=mode, orchestrator_provider=provider)
+    return Engine(store, ledger, project, router=router, registry=registry)
 
 
 def _emit(obj) -> None:
@@ -50,6 +59,10 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--root", required=True, help="status/ledger directory for the run")
     p.add_argument("--run", required=True, help="run id")
     p.add_argument("--project", default="adapters.project.heysoo", help="project-config module")
+    p.add_argument("--mode", default="interactive", choices=["interactive", "headless"],
+                   help="execution mode (config-only lane selection)")
+    p.add_argument("--provider", default=None, choices=["claude", "codex"],
+                   help="global provider override (ORCHESTRATOR_PROVIDER)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init-run").add_argument("--lane", default="full")
@@ -63,6 +76,9 @@ def main(argv: list[str] | None = None) -> int:
     d = sub.add_parser("dispatchable")
     d.add_argument("--util", type=float, default=0.0)
     d.add_argument("--max-concurrent", type=int, default=3)
+    rh = sub.add_parser("run-headless", help="drive the whole run in-process (headless mode)")
+    rh.add_argument("--util", type=float, default=0.0)
+    rh.add_argument("--max-concurrent", type=int, default=3)
     sub.add_parser("resume")
     sub.add_parser("status")
 
@@ -90,6 +106,13 @@ def main(argv: list[str] | None = None) -> int:
         ready = sched.dispatchable(args.run)
         limit = eng.capacity.dispatch_limit(args.util, args.max_concurrent)
         _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit]})
+    elif args.cmd == "run-headless":
+        from adapters.execution.runners import registry_runner
+
+        from .scheduler import Scheduler
+
+        sched = Scheduler(eng, max_concurrent=args.max_concurrent)
+        _emit(sched.run(args.run, registry_runner(eng.registry), util_pct=args.util))
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
