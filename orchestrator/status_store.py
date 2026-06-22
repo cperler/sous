@@ -60,6 +60,10 @@ class StatusStore:
     def _events_path(self) -> Path:
         return self.root / "events.jsonl"
 
+    def _stages_dir(self, task_id: str) -> Path:
+        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        return self.root / "stages" / safe
+
     # ---- atomic write ---------------------------------------------------
 
     def _atomic_write(self, path: Path, text: str) -> None:
@@ -194,4 +198,19 @@ class StatusStore:
         path = self._events_path
         with self.with_lock(path), open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
-            fh.flush()
+
+    def write_stage_log(
+        self, task_id: str, seq: int, stage: str, payload: dict
+    ) -> Path:
+        """Persist one stage's durable record to stages/<task>/NN-<stage>.json.
+
+        This is the per-stage log tree (the interactive-lane analog of the bash
+        system's stages/NN-stage.* files); it captures the StageResult including
+        structured_output and raw_output. Returns the path written.
+        """
+
+        d = self._stages_dir(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / f"{seq:02d}-{stage}.json"
+        self._atomic_write(path, json.dumps(payload, indent=2, default=str))
+        return path

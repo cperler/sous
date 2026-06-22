@@ -74,6 +74,7 @@ class Task(BaseModel):
     pr_number: int | None = None
     pr_url: str | None = None
     current_stage: Stage | None = None
+    stage_counter: int = 0  # monotonic count of recorded stage executions (log sequence)
     stages: dict[Stage, StageRecord] = Field(default_factory=_new_stage_map)
     resume_cursor: ResumeCursor | None = None
     error_signatures: list[str] = Field(default_factory=list)

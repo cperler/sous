@@ -154,6 +154,20 @@ class Engine:
         task.pending_content_hash = work.content_hash
         self.store.save_task(task)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
+        self.store.append_event(
+            run_id,
+            {
+                "ts": _now(),
+                "type": "stage_dispatched",
+                "run_id": run_id,
+                "task_id": task_id,
+                "stage": stage.value,
+                "attempt": attempt,
+                "model": model,
+                "agent": agent,
+                "work_item_id": work.id,
+            },
+        )
         return work
 
     def record(self, run_id: str, result: StageResult) -> dict:
@@ -198,8 +212,46 @@ class Engine:
         else:
             outcome = self._handle_failure(task, result)
 
+        # Durable per-stage log (the interactive-lane analog of stages/NN-*.*).
+        task.stage_counter += 1
+        self.store.write_stage_log(
+            result.task_id,
+            task.stage_counter,
+            result.stage.value,
+            {
+                "work_item_id": result.work_item_id,
+                "stage": result.stage.value,
+                "attempt": result.attempt,
+                "status": result.status.value,
+                "outcome": outcome,
+                "model": result.model,
+                "lane_used": result.lane_used.model_dump(),
+                "cost_usd": cost,
+                "structured_output": result.structured_output,
+                "raw_output": result.raw_output,
+                "error": result.error,
+                "completed_at": result.completed_at,
+            },
+        )
         self.store.save_task(task)
         self._set_ref_state(run_id, result.task_id, task.state)
+        self.store.append_event(
+            run_id,
+            {
+                "ts": _now(),
+                "type": "stage_recorded",
+                "run_id": run_id,
+                "task_id": result.task_id,
+                "stage": result.stage.value,
+                "attempt": result.attempt,
+                "status": result.status.value,
+                "outcome": outcome,
+                "lane": result.lane_used.execution_mode.value,
+                "provider": result.lane_used.provider.value,
+                "cost_usd": cost,
+                "task_state": task.state.value,
+            },
+        )
         # Post-transition run-level effects: cascade-block dependents of a failed task,
         # mark_complete + finalize the run when everything is terminal.
         if task.state is TaskState.FAILED:
@@ -306,6 +358,11 @@ class Engine:
     def _on_task_completed(self, run_id: str, task: Task) -> None:
         if task.pr_url:
             self.project.task_source.mark_complete(task.task_id, task.pr_url)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "task_completed", "run_id": run_id,
+             "task_id": task.task_id, "pr_url": task.pr_url},
+        )
 
     def _cascade_from(self, run_id: str, failed_task_id: str) -> None:
         """Transitively cascade-block every dependent of a failed task (fix D14)."""
@@ -320,6 +377,11 @@ class Engine:
                 run_id, tid, lambda t: setattr(t, "state", TaskState.CASCADE_BLOCKED)
             )
             self._set_ref_state(run_id, tid, TaskState.CASCADE_BLOCKED)
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "cascade_blocked", "run_id": run_id,
+                 "task_id": tid, "caused_by": failed_task_id},
+            )
 
     def _maybe_finalize_run(self, run_id: str) -> None:
         """Finalize the run once every task is terminal (multi-task aware)."""
@@ -332,3 +394,8 @@ class Engine:
         new_state = RunState.FAILED if any_failed else RunState.COMPLETED
         if run.state is not new_state:
             self.store.update_run(run_id, lambda r: setattr(r, "state", new_state))
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "run_finalized", "run_id": run_id,
+                 "state": new_state.value},
+            )
