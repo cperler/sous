@@ -46,10 +46,16 @@ def is_done(task: Task) -> bool:
 
 
 def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int = 0) -> None:
-    """Mark a stage running and point the resume cursor at it."""
+    """Mark a stage running and point the resume cursor at it.
+
+    Clears completed_at/error from any prior attempt so a RUNNING record with a
+    null completed_at is an unambiguous crash marker (resume_point relies on this).
+    """
     rec = task.stages[stage]
     rec.status = StageStatus.RUNNING
     rec.started_at = now
+    rec.completed_at = None
+    rec.error = None
     rec.attempt = attempt
     rec.model = model
     task.current_stage = stage

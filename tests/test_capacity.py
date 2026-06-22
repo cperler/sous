@@ -44,8 +44,13 @@ def test_sleep_min_clamp() -> None:
 
 
 def test_sleep_max_clamp() -> None:
-    # huge reset -> clamp to max_sleep (3600) before jitter.
+    # huge reset -> clamp to max_sleep (3600).
     assert P.sleep_seconds(reset_epoch=10_000_000, now_epoch=0, jitter_s=0) == 3600
+
+
+def test_sleep_cap_includes_jitter() -> None:
+    # Regression: jitter must NOT push the total past max_sleep_s (was 3600+300=3900).
+    assert P.sleep_seconds(reset_epoch=10_000_000, now_epoch=0, jitter_s=300) == 3600
 
 
 def test_jitter_out_of_range_rejected() -> None:

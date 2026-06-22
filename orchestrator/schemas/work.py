@@ -88,6 +88,7 @@ class WorkItem(BaseModel):
     prompt: str  # fully rendered by the engine
     schema_ref: str  # key/path the runner fetches; the engine does not interpret it
     model: str
+    agent: str | None = None  # persona the runner dispatches (from the project roster)
     lane_policy: LanePolicy
     timeout_s: int | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
@@ -105,6 +106,7 @@ class WorkItem(BaseModel):
         model: str,
         lane_policy: LanePolicy,
         created_at: str,
+        agent: str | None = None,
         attempt: int = 0,
         timeout_s: int | None = None,
     ) -> WorkItem:
@@ -120,6 +122,7 @@ class WorkItem(BaseModel):
                 lane_policy=lane_policy,
                 attempt=attempt,
             ),
+            agent=agent,
             run_id=run_id,
             task_id=task_id,
             stage=stage,

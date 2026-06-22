@@ -133,8 +133,15 @@ class StatusStore:
 
     # ---- run API --------------------------------------------------------
 
-    def save_run(self, run: Run) -> None:
+    def _write_run(self, run: Run) -> None:
+        """Unlocked atomic write — callers hold the run lock."""
         self._atomic_write(self._run_path(run.run_id), run.model_dump_json(indent=2))
+
+    def save_run(self, run: Run) -> None:
+        # Public writers take the lock so a direct save can't clobber a concurrent
+        # locked read-modify-write (the unlocked path was a lost-update race).
+        with self.with_lock(self._run_path(run.run_id)):
+            self._write_run(run)
 
     def load_run(self, run_id: str) -> Run:
         return Run.model_validate(self._read_json(self._run_path(run_id)))
@@ -145,15 +152,20 @@ class StatusStore:
             run = self.load_run(run_id)
             mutator(run)
             run.updated_at = _utc_now_iso()
-            self.save_run(run)
+            self._write_run(run)  # already under the lock
             return run
 
     # ---- task API -------------------------------------------------------
 
-    def save_task(self, task: Task) -> None:
+    def _write_task(self, task: Task) -> None:
+        """Unlocked atomic write — callers hold the task lock."""
         self._atomic_write(
             self._task_path(task.run_id, task.task_id), task.model_dump_json(indent=2)
         )
+
+    def save_task(self, task: Task) -> None:
+        with self.with_lock(self._task_path(task.run_id, task.task_id)):
+            self._write_task(task)
 
     def load_task(self, run_id: str, task_id: str) -> Task:
         return Task.model_validate(self._read_json(self._task_path(run_id, task_id)))
@@ -166,7 +178,7 @@ class StatusStore:
             task = self.load_task(run_id, task_id)
             mutator(task)
             task.updated_at = _utc_now_iso()
-            self.save_task(task)
+            self._write_task(task)  # already under the lock
             return task
 
     # ---- audit sidecar --------------------------------------------------

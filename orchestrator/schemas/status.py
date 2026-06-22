@@ -67,6 +67,7 @@ class Task(BaseModel):
     attempt: int = 0
     max_attempts: int = 3
     title: str = ""
+    body: str = ""  # task-source description (e.g. the GitHub issue body) — feeds prompts
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     execution_lane: ExecutionLane = ExecutionLane.FULL

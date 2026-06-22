@@ -2,8 +2,9 @@
 
 Implements the engine's ``FailureClassifier`` Protocol. The taxonomy conventions
 (``.spec.ts`` -> e2e, ``test_*.py``/``conftest.py`` -> unit, ``*.bats`` -> shell)
-and the regexes (ported from the bash ``classify-failures.sh`` / ``regression-helpers.sh``)
-live HERE in project-config, not in the engine.
+and the regexes (Python reimplementations equivalent to the bash
+``classify-failures.sh`` / ``regression-helpers.sh`` behavior — a rebuild, not a
+fork of the reference scripts) live HERE in project-config, not in the engine.
 """
 
 from __future__ import annotations

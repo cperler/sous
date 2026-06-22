@@ -57,8 +57,9 @@ class CapacityPolicy:
         if not (0 <= jitter_s <= self.max_jitter_s):
             raise ValueError(f"jitter_s must be in [0, {self.max_jitter_s}]")
         base = (reset_epoch - now_epoch) + self.buffer_s
-        clamped = max(self.min_sleep_s, min(int(base), self.max_sleep_s))
-        return clamped + jitter_s
+        floored = max(self.min_sleep_s, int(base))
+        # Cap INCLUDES jitter — max_sleep_s is a hard ceiling on the total wait.
+        return min(floored + jitter_s, self.max_sleep_s)
 
 
 DEFAULT_CAPACITY = CapacityPolicy()

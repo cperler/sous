@@ -64,10 +64,17 @@ const thunks = items.map((wi) => async () => {
   try {
     const res = await agent(wi.prompt, {
       model: wi.model,
+      agentType: wi.agent || undefined, // persona from the project roster
       schema: args.schemas ? args.schemas[wi.schema_ref] : undefined,
       label: `${wi.stage}:${wi.task_id}`,
     })
-    return toStageResult(wi, { structured_output: res, usage: res && res.usage })
+    // With a schema, agent() returns the validated object itself (the structured
+    // output). Per-call token usage is NOT on that object; if the Workflow runtime
+    // exposes usage (e.g. res.__usage or a sibling channel) wire it here, otherwise
+    // it stays 0 and the engine prices 0 for this call. KNOWN LIMITATION: interactive
+    // token usage may be uncapturable in-sandbox — the supervisor reconciles total
+    // run cost from the session's own usage when exact per-stage cost is needed.
+    return toStageResult(wi, { structured_output: res, usage: res && res.__usage })
   } catch (e) {
     return toStageResult(wi, { error: String((e && e.message) || e) })
   }

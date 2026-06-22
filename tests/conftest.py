@@ -23,9 +23,16 @@ class FakeClassifier:
 class FakeTaskSource:
     def __init__(self) -> None:
         self.completed: list[tuple[str, str | None]] = []
+        self.deps: dict[str, list[str]] = {}  # task_id -> depends_on (test-configurable)
 
     def resolve(self, task_id: str) -> TaskSpec:
-        return TaskSpec(task_id=task_id, title=f"Fake {task_id}", body="do it", issue_number=42)
+        return TaskSpec(
+            task_id=task_id,
+            title=f"Fake {task_id}",
+            body="do it",
+            issue_number=42,
+            depends_on=self.deps.get(task_id, []),
+        )
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         self.completed.append((task_id, pr_url))

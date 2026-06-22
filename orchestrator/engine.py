@@ -19,13 +19,15 @@ from .cost_ledger import CostLedger
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
-from .retry import error_signature
+from .retry import CircuitBreaker, error_signature
 from .schemas.enums import (
+    TERMINAL_TASK_STATES,
     ExecutionLane,
     ExecutionMode,
     Provider,
     ResultStatus,
     RunState,
+    StageStatus,
     TaskState,
 )
 from .schemas.status import Run, Task, TaskRef
@@ -61,6 +63,8 @@ class Engine:
         self.ledger = ledger
         self.project = project
         self.models = model_table
+        # Single pricing source: the ledger prices with the engine's model table.
+        self.ledger.model_table = model_table
         self.capacity = capacity
         self.max_attempts = max_attempts
         self.breaker_threshold = breaker_threshold
@@ -82,6 +86,7 @@ class Engine:
             updated_at=_now(),
             state=TaskState.PENDING,
             title=spec.title,
+            body=spec.body,
             issue_number=spec.issue_number,
             depends_on=spec.depends_on,
             execution_lane=lane or run.lane,
@@ -115,11 +120,21 @@ class Engine:
         spec = STAGE_SPECS[stage]
         model = self.models.model_for_role(spec.model_role)
         rec = task.stages[stage]
-        attempt = rec.attempt + 1 if rec.error else 0
+        # Attempt is derived from the persisted stage status, not rec.error:
+        #  - RUNNING  -> a crash mid-stage; re-dispatch the SAME attempt (don't reset)
+        #  - FAILED   -> a real retry; bump
+        #  - else     -> first attempt
+        if rec.status is StageStatus.RUNNING:
+            attempt = rec.attempt
+        elif rec.status is StageStatus.FAILED:
+            attempt = rec.attempt + 1
+        else:
+            attempt = 0
         learnings = "\n".join(task.learnings)
         prompt = render_prompt(
-            stage, task_id=task_id, title=task.title, body="", learnings=learnings
+            stage, task_id=task_id, title=task.title, body=task.body, learnings=learnings
         )
+        agent = self.project.agent_for(stage, spec.agent_role)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -128,6 +143,7 @@ class Engine:
             prompt=prompt,
             schema_ref=spec.schema_ref,
             model=model,
+            agent=agent,
             lane_policy=INTERACTIVE_CLAUDE,
             created_at=_now(),
             attempt=attempt,
@@ -142,16 +158,24 @@ class Engine:
 
     def record(self, run_id: str, result: StageResult) -> dict:
         task = self.store.load_task(run_id, result.task_id)
-        if task.pending_work_item_id and result.work_item_id != task.pending_work_item_id:
+        # A result is only valid against the WorkItem currently outstanding for this
+        # task. No outstanding dispatch (pending is None) => a replay/duplicate; reject
+        # so a stale result can never be re-folded into an already-advanced stage.
+        if task.pending_work_item_id is None:
+            raise ContractError(
+                f"no dispatch outstanding for task {result.task_id} — refusing replayed result "
+                f"{result.work_item_id}"
+            )
+        if result.work_item_id != task.pending_work_item_id:
             raise ContractError(
                 f"result work_item_id {result.work_item_id} != pending {task.pending_work_item_id}"
             )
-        if task.pending_content_hash and result.content_hash != task.pending_content_hash:
+        if result.content_hash != task.pending_content_hash:
             raise ContractError("result content_hash does not match the dispatched WorkItem")
 
-        # Cost ledger: EVERY call recorded, authoritative pricing from the model table.
-        cost = self.models.cost_usd(result.model, result.token_usage)
-        self.ledger.record(result)
+        # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
+        # and the engine share one model table; compute once, in the ledger).
+        cost = self.ledger.record(result)["cost_usd"]
 
         lane_clean = (
             result.lane_used.execution_mode is INTERACTIVE_CLAUDE.execution_mode
@@ -167,7 +191,6 @@ class Engine:
             task.error_signatures = []  # streak resets on a clean stage
             if is_done(task):
                 task.state = TaskState.COMPLETED
-                self._finalize_complete(run_id, task)
                 outcome = "task_completed"
             else:
                 task.state = TaskState.RUNNING
@@ -177,6 +200,13 @@ class Engine:
 
         self.store.save_task(task)
         self._set_ref_state(run_id, result.task_id, task.state)
+        # Post-transition run-level effects: cascade-block dependents of a failed task,
+        # mark_complete + finalize the run when everything is terminal.
+        if task.state is TaskState.FAILED:
+            self._cascade_from(run_id, result.task_id)
+        if task.state is TaskState.COMPLETED:
+            self._on_task_completed(run_id, task)
+        self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
             "outcome": outcome,
@@ -193,29 +223,23 @@ class Engine:
             failures = result.structured_output.get("failures")
         sig = error_signature(result.stage, failures=failures, error=result.error)
         task.error_signatures.append(sig)
-        task.learnings.append(f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}")
+        task.learnings.append(
+            f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"
+        )
 
+        # Reuse the tested CircuitBreaker over the persisted signature streak.
+        breaker = CircuitBreaker(self.breaker_threshold)
+        for s in task.error_signatures:
+            breaker.observe(s)
+        # result.attempt is trustworthy: content_hash (which includes attempt) was
+        # validated against the dispatched WorkItem, so it equals the engine's count.
         attempts_done = result.attempt + 1
-        trailing = self._trailing_identical(task.error_signatures)
-        breaker_tripped = trailing >= self.breaker_threshold
-        if attempts_done >= task.max_attempts or breaker_tripped:
+        if attempts_done >= task.max_attempts or breaker.tripped:
             task.state = TaskState.FAILED
-            return "task_failed_breaker" if breaker_tripped else "task_failed_max_attempts"
+            task.error_signatures = []  # don't carry a poisoned streak into a re-queue
+            return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
         task.state = TaskState.RETRYING
         return "stage_failed_will_retry"
-
-    @staticmethod
-    def _trailing_identical(sigs: list[str]) -> int:
-        if not sigs:
-            return 0
-        last = sigs[-1]
-        n = 0
-        for s in reversed(sigs):
-            if s == last:
-                n += 1
-            else:
-                break
-        return n
 
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
@@ -279,11 +303,32 @@ class Engine:
 
         self.store.update_run(run_id, mut)
 
-    def _finalize_complete(self, run_id: str, task: Task) -> None:
+    def _on_task_completed(self, run_id: str, task: Task) -> None:
         if task.pr_url:
             self.project.task_source.mark_complete(task.task_id, task.pr_url)
+
+    def _cascade_from(self, run_id: str, failed_task_id: str) -> None:
+        """Transitively cascade-block every dependent of a failed task (fix D14)."""
         run = self.store.load_run(run_id)
-        if all(r.state in (TaskState.COMPLETED,) for r in run.task_refs if r.task_id != task.task_id) and len(run.task_refs) <= 1:
-            run.state = RunState.COMPLETED
-            run.updated_at = _now()
-            self.store.save_run(run)
+        if not run.dependency_graph:
+            return
+        states = {ref.task_id: ref.state for ref in run.task_refs}
+        states[failed_task_id] = TaskState.FAILED
+        blocked = Dag(run.dependency_graph).transitive_cascade(failed_task_id, states)
+        for tid in blocked:
+            self.store.update_task(
+                run_id, tid, lambda t: setattr(t, "state", TaskState.CASCADE_BLOCKED)
+            )
+            self._set_ref_state(run_id, tid, TaskState.CASCADE_BLOCKED)
+
+    def _maybe_finalize_run(self, run_id: str) -> None:
+        """Finalize the run once every task is terminal (multi-task aware)."""
+        run = self.store.load_run(run_id)
+        if not run.task_refs or not all(r.state in TERMINAL_TASK_STATES for r in run.task_refs):
+            return
+        any_failed = any(
+            r.state in (TaskState.FAILED, TaskState.CASCADE_BLOCKED) for r in run.task_refs
+        )
+        new_state = RunState.FAILED if any_failed else RunState.COMPLETED
+        if run.state is not new_state:
+            self.store.update_run(run_id, lambda r: setattr(r, "state", new_state))
