@@ -225,3 +225,53 @@ def test_rows_empty_when_no_file(tmp_path: Path) -> None:
     assert ledger.rows() == []
     assert ledger.summary()["total_invocations"] == 0
     assert ledger.total_attributed() == 0.0
+
+
+# --- cost analysis: per-stage/-task breakdown + the session-reuse win ----------
+
+def test_analysis_session_reuse_win_worked_example(tmp_path: Path) -> None:
+    """Opus, in=$5/Mtok, read=10%, write=125%. Stage 1 writes 1M cache tokens
+    ($6.25), stage 2 reads 1M cache tokens ($0.50). Total $6.75. The uncached
+    counterfactual bills both as fresh input: 2M * $5/Mtok = $10.00, so the
+    session-reuse win is $3.25 (32.5% of uncached)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(make_result(work_item_id="w1", stage=Stage.INTAKE, cache_write=1_000_000))
+    ledger.record(make_result(work_item_id="w2", stage=Stage.IMPLEMENT, cache_read=1_000_000))
+
+    a = ledger.analysis()
+    assert a["total_cost_usd"] == 6.75
+    reuse = a["session_reuse"]
+    assert reuse["cache_read_savings_usd"] == 4.5
+    assert reuse["cache_write_premium_usd"] == 1.25
+    assert reuse["net_win_usd"] == 3.25
+    assert reuse["uncached_cost_usd"] == 10.0
+    assert reuse["win_pct"] == 32.5
+    assert reuse["cache_hit_ratio"] == 0.5  # 1M read / 2M input-side
+    # per-stage breakdown keyed by stage, ordered-agnostic content
+    assert a["by_stage"]["intake"]["cache_write_tokens"] == 1_000_000
+    assert a["by_stage"]["intake"]["cost_usd"] == 6.25
+    assert a["by_stage"]["implement"]["cache_read_tokens"] == 1_000_000
+    assert a["by_stage"]["implement"]["cost_usd"] == 0.5
+    assert a["by_task"]["task-1"]["invocations"] == 2
+
+
+def test_analysis_unpriced_model_excluded_from_counterfactual(tmp_path: Path) -> None:
+    """A model absent from the price table still counts toward spend (its recorded
+    cost) but is excluded from the cache counterfactual and named in unpriced_models."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"stage": "implement", "task_id": "t", "model": "gpt-5-codex", "cost_usd": 2.0,
+         "input_tokens": 100, "output_tokens": 50, "cache_read_tokens": 999, "cache_write_tokens": 0},
+    ]
+    a = ledger.analysis(rows=rows)
+    assert a["total_cost_usd"] == 2.0  # spend still counted
+    assert a["session_reuse"]["cache_read_savings_usd"] == 0.0  # not priced
+    assert a["session_reuse"]["unpriced_models"] == ["gpt-5-codex"]
+
+
+def test_analysis_empty_is_zeroed(tmp_path: Path) -> None:
+    a = CostLedger(tmp_path / "stage-costs.jsonl").analysis()
+    assert a["total_cost_usd"] == 0.0
+    assert a["session_reuse"]["win_pct"] == 0.0
+    assert a["session_reuse"]["cache_hit_ratio"] == 0.0
+    assert a["by_stage"] == {} and a["by_task"] == {}

@@ -20,7 +20,7 @@ from .cost_ledger import CostLedger
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
-from .render import render_cost_summary, render_stage, render_task_index
+from .render import render_cost_report, render_cost_summary, render_stage, render_task_index
 from .retry import CircuitBreaker, error_signature
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
@@ -383,6 +383,9 @@ class Engine:
         rows = self.ledger.rows()
         summary = self.ledger.summary(rows=rows)
         self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, summary))
+        self.store.write_run_artifact(
+            "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
+        )
         return {
             "run_id": run_id,
             "run_state": run.state.value,
@@ -473,5 +476,11 @@ class Engine:
                 {"ts": _now(), "type": "run_finalized", "run_id": run_id,
                  "state": new_state.value},
             )
-        # Final cost report (the per-record write was removed for O(N^2)).
-        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, self.ledger.summary()))
+        # Final cost artifacts (the per-record write was removed for O(N^2)).
+        rows = self.ledger.rows()
+        self.store.write_run_artifact(
+            "cost-summary.md", render_cost_summary(run_id, self.ledger.summary(rows=rows))
+        )
+        self.store.write_run_artifact(
+            "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
+        )

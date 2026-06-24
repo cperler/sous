@@ -86,6 +86,7 @@ def main(argv: list[str] | None = None) -> int:
     rh.add_argument("--max-concurrent", type=int, default=3)
     sub.add_parser("resume")
     sub.add_parser("status")
+    sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
 
     args = p.parse_args(argv)
     eng = _engine(args)
@@ -122,6 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
         _emit(eng.status(args.run))
+    elif args.cmd == "cost-report":
+        _emit(eng.ledger.analysis())
     else:  # pragma: no cover
         p.error(f"unknown command {args.cmd}")
     return 0

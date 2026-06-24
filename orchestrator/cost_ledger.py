@@ -96,3 +96,84 @@ class CostLedger:
     def total_attributed(self) -> float:
         """Convenience: total cost attributed across the whole ledger."""
         return self.summary()["total_cost_usd"]
+
+    def analysis(self, rows: list[dict] | None = None) -> dict:
+        """Rich cost report: per-stage + per-task breakdowns and the session-reuse win.
+
+        The rebuild's thesis is that chaining the collapsed stages in ONE session
+        reuses the prompt cache, so most input-side tokens come back as cheap
+        ``cache_read`` (billed at ``cache_read_mult`` of input) instead of fresh input.
+        This quantifies that: the win is what those reads saved vs. an uncached
+        counterfactual, net of the ``cache_write`` premium paid to establish the cache.
+
+        Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once.
+        Tolerant of malformed rows (``.get`` defaults) and of models absent from the
+        price table — those still count toward spend but are excluded from the
+        counterfactual (and named in ``unpriced_models``)."""
+        rows = self.rows() if rows is None else rows
+
+        def _bump(d: dict, key: str, cost: float, ci: int, co: int, cr: int, cw: int) -> None:
+            b = d.setdefault(key, {"invocations": 0, "input_tokens": 0, "output_tokens": 0,
+                                   "cache_read_tokens": 0, "cache_write_tokens": 0, "cost_usd": 0.0})
+            b["invocations"] += 1
+            b["input_tokens"] += ci
+            b["output_tokens"] += co
+            b["cache_read_tokens"] += cr
+            b["cache_write_tokens"] += cw
+            b["cost_usd"] = round(b["cost_usd"] + cost, 6)
+
+        by_stage: dict[str, dict] = {}
+        by_task: dict[str, dict] = {}
+        total_cost = 0.0
+        fresh_input = output = cache_read = cache_write = 0
+        cache_read_savings = 0.0  # money saved: reads billed at read_mult, not full input
+        cache_write_premium = 0.0  # money spent: writes billed above plain input
+        unpriced: set[str] = set()
+
+        for row in rows:
+            cost = row.get("cost_usd") or 0.0
+            model = row.get("model", "unknown")
+            ci = row.get("input_tokens", 0) or 0
+            co = row.get("output_tokens", 0) or 0
+            cr = row.get("cache_read_tokens", 0) or 0
+            cw = row.get("cache_write_tokens", 0) or 0
+            total_cost += cost
+            fresh_input += ci
+            output += co
+            cache_read += cr
+            cache_write += cw
+            _bump(by_stage, row.get("stage", "unknown"), cost, ci, co, cr, cw)
+            _bump(by_task, row.get("task_id", "unknown"), cost, ci, co, cr, cw)
+            try:
+                info = self.model_table.info(model)
+            except KeyError:
+                unpriced.add(model)
+                continue
+            in_price = info.input_per_mtok
+            cache_read_savings += cr * in_price * (1.0 - info.cache_read_mult) / 1_000_000
+            cache_write_premium += cw * in_price * (info.cache_write_mult - 1.0) / 1_000_000
+
+        # uncached counterfactual: every input-side token billed once at full input
+        # price (no read discount, no write premium) => actual + net_win.
+        net_win = cache_read_savings - cache_write_premium
+        uncached_cost = total_cost + net_win
+        input_side = fresh_input + cache_read + cache_write
+        return {
+            "total_cost_usd": round(total_cost, 6),
+            "by_stage": by_stage,
+            "by_task": by_task,
+            "session_reuse": {
+                "cache_read_tokens": cache_read,
+                "cache_write_tokens": cache_write,
+                "fresh_input_tokens": fresh_input,
+                "output_tokens": output,
+                # share of input-side tokens served from cache (the reuse rate)
+                "cache_hit_ratio": round(cache_read / input_side, 4) if input_side else 0.0,
+                "cache_read_savings_usd": round(cache_read_savings, 6),
+                "cache_write_premium_usd": round(cache_write_premium, 6),
+                "net_win_usd": round(net_win, 6),
+                "uncached_cost_usd": round(uncached_cost, 6),
+                "win_pct": round(100.0 * net_win / uncached_cost, 2) if uncached_cost else 0.0,
+                "unpriced_models": sorted(unpriced),
+            },
+        }
