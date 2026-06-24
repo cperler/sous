@@ -31,7 +31,9 @@ _TASK_FAILED_OUTCOMES = {"task_failed_breaker", "task_failed_max_attempts"}
 
 
 def _is_failure_status(status: str) -> bool:
-    return status not in ("success", "skipped")
+    # rate_limited is a transient re-queue (graceful fallback), not a real failure —
+    # it must not inflate the failure-pattern table a human reads.
+    return status not in ("success", "skipped", "rate_limited")
 
 
 def _failures_of(log: dict) -> list[str] | None:

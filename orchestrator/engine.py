@@ -135,6 +135,11 @@ class Engine:
     def next_work(
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
     ) -> WorkItem | None:
+        # Capacity backpressure first: at the per-call gate, no new dispatch (the
+        # caller waits). This gates EVERY path — including a rate-limit re-queue — so
+        # graceful fallback never over-subscribes an already-saturated API.
+        if self.capacity.at_capacity(util_pct):
+            raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
         task = self.store.load_task(run_id, task_id)
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
@@ -152,14 +157,10 @@ class Engine:
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
         lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
-        # Model selection with graceful fallback (closes the dead MODEL_CHAIN wiring):
-        # a queued rate-limit fallback or capacity pressure can pick a cheaper model.
-        # Returns None only when at capacity with nothing cheaper to fall back to.
-        model = self._dispatch_model(task, spec.model_role, lane, util_pct)
-        if model is None:
-            raise CapacityExhausted(
-                f"at capacity ({util_pct}% >= per-call gate) and no cheaper fallback model"
-            )
+        # Graceful model fallback: a queued fallback model (set when a prior dispatch of
+        # this stage was rate-limited) overrides the role default so the retry runs on a
+        # cheaper model. Consumed in the commit below.
+        model = task.pending_fallback_model or self.models.model_for_role(spec.model_role)
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump
@@ -283,15 +284,18 @@ class Engine:
         )
         # A rate-limit with a cheaper model still available is transient — re-queue the
         # SAME stage+attempt on that model rather than burning a retry or tripping the
-        # breaker. At the floor (nothing cheaper), it degrades to a normal failure.
+        # breaker. Gated on the lane's allow_fallback (so the flag is honored, not dead).
+        # At the floor / with fallback disabled, it degrades to a normal failure (bounded:
+        # the worst case walks the chain once then fails out via the attempt counter).
+        lane_allows_fallback = self.router.lane_for(result.stage, task).allow_fallback
         fallback_model = (
             self.models.fallback_after(result.model)
-            if effective.status is ResultStatus.RATE_LIMITED else None
+            if effective.status is ResultStatus.RATE_LIMITED and lane_allows_fallback else None
         )
         if effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
             effective = effective.model_copy(update={
                 "status": ResultStatus.FAILURE,
-                "error": "rate-limited at the floor model; no cheaper fallback available",
+                "error": "rate-limited with no cheaper fallback available (floor model or fallback disabled)",
             })
 
         task.pending_work_item_id = None
@@ -381,41 +385,26 @@ class Engine:
             "next_stage": (s.value if (s := next_stage(task)) else None),
         }
 
-    def _dispatch_model(self, task: Task, role: str, lane, util_pct: float) -> str | None:
-        """Pick the model for a dispatch, applying graceful fallback (target.md §3/§4).
-
-        Precedence: (1) a queued rate-limit fallback model for this stage wins; (2) under
-        capacity pressure, degrade to the cheapest chain model instead of stalling; (3)
-        otherwise the role's default. Returns None only when we're at capacity AND already
-        at the floor model (nothing cheaper) — the caller then waits. Fallback is gated on
-        the lane policy's ``allow_fallback`` (now actually consumed)."""
-        base = self.models.model_for_role(role)
-        if task.pending_fallback_model:
-            return task.pending_fallback_model
-        if self.capacity.at_capacity(util_pct):
-            floor = self.models.cheapest()
-            if lane.allow_fallback and base != floor:
-                return floor  # run the lighter model instead of sleeping
-            return None  # already cheapest (or fallback off) — caller must wait
-        return base
-
     def _stage_gate(self, result: StageResult) -> str | None:
         """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.
 
         The collapsed test stage folds in the as-built 'test-validate' step (§6.1): a
-        green test run is necessary but not sufficient — the tests must actually exercise
-        the change (not vacuous/tautological/always-green). A runner that reports the test
-        stage succeeded but does not affirm ``tests_meaningful`` is vetoed here, so the
-        stage retries-with-learnings rather than shipping unverified tests. Fail-closed:
-        the affirmation must be explicit."""
+        green run is necessary but not sufficient — the tests must actually exercise the
+        change. The runner is asked to self-report ``tests_meaningful``; if it explicitly
+        reports ``false`` we veto (retry-with-learnings) rather than ship vacuous tests.
+
+        Fail-OPEN on a MISSING field: nothing enforces this soft field on the interactive/
+        headless lanes (no JSON schema), so a model that simply omits it must not dead-end
+        otherwise-green work — only an explicit ``false`` is a veto. (A stronger, schema-
+        or independent-reviewer-enforced version is tracked in DEFERRED.)"""
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
-        if not out.get("tests_meaningful", False):
+        if out.get("tests_meaningful") is False:  # explicit self-report only
             return (
-                "test-validate gate: the test run passed but was not affirmed to "
-                "meaningfully exercise the change (tests_meaningful != true). Add/adjust "
-                "assertions so the tests would fail if this change regressed."
+                "test-validate gate: the runner reported the tests do not meaningfully "
+                "exercise the change (tests_meaningful=false). Add/adjust assertions so "
+                "the tests would fail if this change regressed."
             )
         return None
 
@@ -478,9 +467,9 @@ class Engine:
         rows = self.ledger.rows()
         summary = self.ledger.summary(rows=rows)
         self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, summary))
-        self.store.write_run_artifact(
-            "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
-        )
+        # cost-report.md (the richer per-stage/-task + session-reuse breakdown) is NOT
+        # written here: status() is the cheap poll path and analysis() re-scans the whole
+        # ledger. It is produced at run finalize and on demand via the `cost-report` CLI.
         return {
             "run_id": run_id,
             "run_state": run.state.value,

@@ -11,7 +11,6 @@ import pytest
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import CapacityExhausted
-from orchestrator.model_table import DEFAULT_MODEL_TABLE as MT
 from orchestrator.schemas.enums import (
     ExecutionMode,
     Provider,
@@ -37,38 +36,38 @@ def _advance_to(eng, target: Stage):
     return w
 
 
-# --- capacity-aware downgrade (#2) -------------------------------------------
+# --- capacity backpressure (no silent model downgrade) -----------------------
 
-def test_capacity_downgrades_instead_of_raising(tmp_path, project) -> None:
-    """A deep-reason stage at capacity runs the floor model instead of stalling."""
+def test_capacity_raises_for_every_path(tmp_path, project) -> None:
+    """At/over the per-call gate, next_work refuses to dispatch (the caller waits) —
+    capacity is backpressure, not a silent model downgrade."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake at util 0
-    # scope normally = opus (deep_reason); at capacity it degrades to the cheapest.
-    w = eng.next_work("r1", "t1", util_pct=95)
-    assert w.stage is Stage.SCOPE
-    assert w.model == MT.cheapest()  # haiku, not opus
-
-
-def test_capacity_raises_when_already_at_floor(tmp_path, project) -> None:
-    """Intake already uses the floor model — at capacity there's nothing cheaper, so wait."""
-    eng = _engine(tmp_path, project)
-    eng.create_run("r1")
-    eng.add_task("r1", "t1")
-    # intake role = cheap_shell = floor model; can't downgrade -> CapacityExhausted
     with pytest.raises(CapacityExhausted):
         eng.next_work("r1", "t1", util_pct=95)
 
 
-def test_no_downgrade_when_fallback_disabled(tmp_path, project) -> None:
-    from orchestrator.routing import Router
-    eng = _engine(tmp_path, project, router=Router(allow_fallback=False))
+def test_below_gate_dispatches_role_default(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
-    with pytest.raises(CapacityExhausted):  # scope can't downgrade -> wait
-        eng.next_work("r1", "t1", util_pct=95)
+    w = eng.next_work("r1", "t1", util_pct=50)  # below the gate
+    assert w.stage is Stage.SCOPE and w.model == "claude-opus-4-8"  # role default, no downgrade
+
+
+def test_rate_limit_fallback_respects_capacity_gate(tmp_path, project) -> None:
+    """A queued rate-limit fallback still obeys backpressure: at capacity, next_work
+    waits; once capacity frees, it dispatches the cheaper model."""
+    eng = _engine(tmp_path, project)
+    w = _advance_to(eng, Stage.SCOPE)
+    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+    with pytest.raises(CapacityExhausted):
+        eng.next_work("r1", "t1", util_pct=95)  # over capacity -> still waits
+    nxt = eng.next_work("r1", "t1", util_pct=0)  # capacity frees
+    assert nxt.model == "claude-sonnet-4-6"  # the queued fallback, not lost
 
 
 # --- rate-limit re-dispatch on a cheaper model (#1) --------------------------
@@ -92,6 +91,17 @@ def test_rate_limit_requeues_on_cheaper_model(tmp_path, project) -> None:
     assert eng.store.load_task("r1", "t1").pending_fallback_model is None
 
 
+def test_rate_limit_no_fallback_when_lane_disallows(tmp_path, project) -> None:
+    """allow_fallback is honored (not dead): with it off, a rate-limit is a hard failure."""
+    from orchestrator.routing import Router
+    eng = _engine(tmp_path, project, router=Router(allow_fallback=False),
+                  max_attempts=3, breaker_threshold=9)
+    w = _advance_to(eng, Stage.SCOPE)
+    out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+    assert out["outcome"] == "stage_failed_will_retry"  # no graceful re-queue
+    assert eng.store.load_task("r1", "t1").pending_fallback_model is None
+
+
 def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     w = _advance_to(eng, Stage.SCOPE)  # opus
@@ -105,8 +115,8 @@ def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
 def test_rate_limit_at_floor_becomes_failure(tmp_path, project) -> None:
     """Rate-limited on the cheapest model (nothing to fall back to) -> normal failure."""
     eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9)
-    w = _advance_to(eng, Stage.INTAKE)  # intake uses the floor model
-    assert w.model == MT.cheapest()
+    w = _advance_to(eng, Stage.INTAKE)  # intake uses the floor model (haiku)
+    assert w.model == "claude-haiku-4-5"
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_failed_will_retry"  # degraded to a real failure
     task = eng.store.load_task("r1", "t1")

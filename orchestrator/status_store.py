@@ -218,10 +218,17 @@ class StatusStore:
         d = self._stages_dir(task_id)
         if not d.exists():
             return []
-        out: list[dict] = []
-        for path in sorted(d.glob("*.json")):
-            out.append(json.loads(path.read_text(encoding="utf-8")))
-        return out
+
+        def _seq(path: Path) -> tuple[int, str]:
+            # Sort by the numeric NN- prefix, not lexically (NN is only 2-padded, so
+            # "100-" would sort before "99-" under a plain string sort).
+            head = path.name.split("-", 1)[0]
+            return (int(head), path.name) if head.isdigit() else (1 << 30, path.name)
+
+        return [
+            json.loads(path.read_text(encoding="utf-8"))
+            for path in sorted(d.glob("*.json"), key=_seq)
+        ]
 
     def write_stage_log(
         self, task_id: str, seq: int, stage: str, payload: dict

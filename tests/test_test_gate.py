@@ -56,15 +56,18 @@ def test_gate_passes_when_tests_affirmed_meaningful(tmp_path, project) -> None:
     assert out["next_stage"] == "deliver"
 
 
-def test_gate_fails_closed_when_field_missing(tmp_path, project) -> None:
-    """A test result omitting tests_meaningful is treated as unverified (vetoed)."""
+def test_gate_fails_open_when_field_missing(tmp_path, project) -> None:
+    """Fail-OPEN on a missing field: nothing enforces tests_meaningful on the
+    interactive/headless lanes, so a runner that omits it must not dead-end green
+    work — only an explicit `false` is a veto."""
     eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9)
     w = _advance_to_test(eng)
     out = eng.record("r1", make_result(
         w, status=ResultStatus.SUCCESS,
         structured_output={"passed": True, "failures": []},  # no tests_meaningful
     ))
-    assert out["outcome"] == "stage_failed_will_retry"
+    assert out["outcome"] == "stage_completed"  # not vetoed
+    assert out["next_stage"] == "deliver"
 
 
 def test_gate_only_applies_to_test_stage(tmp_path, project) -> None:

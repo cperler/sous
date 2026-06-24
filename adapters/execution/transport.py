@@ -35,9 +35,12 @@ Transport = Callable[[WorkItem], RawResult]
 
 # Substrings that mark a transient rate-limit / overload (→ ResultStatus.RATE_LIMITED,
 # which the engine answers by re-dispatching on a cheaper model). Case-insensitive.
+# Kept narrow + API-specific on purpose: broad words like "capacity" or "quota" also
+# appear in hard errors (disk capacity, disk quota) and would misroute a real failure
+# around the retry/breaker accounting, so they are deliberately excluded.
 _RATE_LIMIT_MARKERS = (
     "rate limit", "rate_limit", "ratelimit", "429", "too many requests",
-    "overloaded", "usage limit", "quota", "capacity",
+    "overloaded", "usage limit", "rate-limited",
 )
 
 

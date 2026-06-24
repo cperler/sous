@@ -48,4 +48,4 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     report = _run(capsys, *base, "cost-report")
     assert set(report["by_stage"]) == {"intake", "scope", "implement", "test", "deliver", "review"}
     assert "net_win_usd" in report["session_reuse"]
-    assert (tmp_path / "cost-report.md").exists()  # written as a side artifact on status()
+    assert (tmp_path / "cost-report.md").exists()  # written at run finalize
