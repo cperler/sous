@@ -17,7 +17,7 @@ from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .base import EXPLICIT_EMPTY, SUPPORTED, CapabilityDescriptor
-from .transport import RawResult, Transport, codex_cli_transport, to_stage_result
+from .transport import RawResult, Transport, codex_cli_transport, is_rate_limited, to_stage_result
 
 # schema_ref -> JSON Schema dict (or None if unknown -> can't full-validate).
 SchemaProvider = Callable[[str], dict | None]
@@ -56,7 +56,11 @@ class CodexRunner:
 
     def _verdict(self, work: WorkItem, raw: RawResult) -> ResultStatus:
         if raw.exit_code != 0 or raw.error:
-            return ResultStatus.TIMEOUT if raw.exit_code == 124 else ResultStatus.FAILURE
+            if raw.exit_code == 124:
+                return ResultStatus.TIMEOUT
+            if is_rate_limited(raw):
+                return ResultStatus.RATE_LIMITED  # engine retries on a cheaper model
+            return ResultStatus.FAILURE
         # Output must be a JSON object (a list/scalar is not a valid stage result).
         if not isinstance(raw.structured_output, dict):
             return ResultStatus.SCHEMA_VIOLATION

@@ -33,6 +33,19 @@ class RawResult:
 
 Transport = Callable[[WorkItem], RawResult]
 
+# Substrings that mark a transient rate-limit / overload (→ ResultStatus.RATE_LIMITED,
+# which the engine answers by re-dispatching on a cheaper model). Case-insensitive.
+_RATE_LIMIT_MARKERS = (
+    "rate limit", "rate_limit", "ratelimit", "429", "too many requests",
+    "overloaded", "usage limit", "quota", "capacity",
+)
+
+
+def is_rate_limited(raw: RawResult) -> bool:
+    """True if a RawResult's error looks like a transient rate-limit / overload."""
+    text = (raw.error or "").lower()
+    return bool(text) and any(m in text for m in _RATE_LIMIT_MARKERS)
+
 
 def to_stage_result(
     work: WorkItem,

@@ -13,7 +13,7 @@ from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .base import SUPPORTED, CapabilityDescriptor
-from .transport import RawResult, Transport, claude_cli_transport, to_stage_result
+from .transport import RawResult, Transport, claude_cli_transport, is_rate_limited, to_stage_result
 
 
 class HeadlessClaudeRunner:
@@ -36,7 +36,12 @@ class HeadlessClaudeRunner:
     def dispatch(self, work: WorkItem) -> StageResult:
         raw: RawResult = self._transport(work)
         if raw.exit_code != 0 or raw.error:
-            status = ResultStatus.TIMEOUT if raw.exit_code == 124 else ResultStatus.FAILURE
+            if raw.exit_code == 124:
+                status = ResultStatus.TIMEOUT
+            elif is_rate_limited(raw):
+                status = ResultStatus.RATE_LIMITED  # engine retries on a cheaper model
+            else:
+                status = ResultStatus.FAILURE
         elif raw.structured_output is None:
             status = ResultStatus.SCHEMA_VIOLATION
         else:

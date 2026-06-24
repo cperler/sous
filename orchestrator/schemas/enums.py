@@ -83,6 +83,7 @@ class ResultStatus(StrEnum):
     SCHEMA_VIOLATION = "schema_violation"
     FAILURE = "failure"
     TIMEOUT = "timeout"
+    RATE_LIMITED = "rate_limited"  # transient: re-dispatch on a cheaper model (graceful fallback)
 
 
 class ExecutionLane(StrEnum):

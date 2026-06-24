@@ -135,8 +135,6 @@ class Engine:
     def next_work(
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
     ) -> WorkItem | None:
-        if self.capacity.at_capacity(util_pct):
-            raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
         task = self.store.load_task(run_id, task_id)
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
@@ -152,10 +150,18 @@ class Engine:
             return None
 
         spec = STAGE_SPECS[stage]
-        model = self.models.model_for_role(spec.model_role)
         rec = task.stages[stage]
+        lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
+        # Model selection with graceful fallback (closes the dead MODEL_CHAIN wiring):
+        # a queued rate-limit fallback or capacity pressure can pick a cheaper model.
+        # Returns None only when at capacity with nothing cheaper to fall back to.
+        model = self._dispatch_model(task, spec.model_role, lane, util_pct)
+        if model is None:
+            raise CapacityExhausted(
+                f"at capacity ({util_pct}% >= per-call gate) and no cheaper fallback model"
+            )
         # Attempt is derived from the persisted stage status, not rec.error:
-        #  - RUNNING  -> a crash mid-stage; re-dispatch the SAME attempt (don't reset)
+        #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump
         #  - else     -> first attempt
         if rec.status is StageStatus.RUNNING:
@@ -169,7 +175,6 @@ class Engine:
             stage, task_id=task_id, title=task.title, body=task.body, learnings=learnings
         )
         agent = self.project.agent_for(stage, spec.agent_role)
-        lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -197,6 +202,7 @@ class Engine:
             t.state = TaskState.RUNNING
             t.pending_work_item_id = work.id
             t.pending_content_hash = work.content_hash
+            t.pending_fallback_model = None  # consumed into this dispatch's model
 
         self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
@@ -275,22 +281,46 @@ class Engine:
             result if gate_error is None
             else result.model_copy(update={"status": ResultStatus.FAILURE, "error": gate_error})
         )
+        # A rate-limit with a cheaper model still available is transient — re-queue the
+        # SAME stage+attempt on that model rather than burning a retry or tripping the
+        # breaker. At the floor (nothing cheaper), it degrades to a normal failure.
+        fallback_model = (
+            self.models.fallback_after(result.model)
+            if effective.status is ResultStatus.RATE_LIMITED else None
+        )
+        if effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
+            effective = effective.model_copy(update={
+                "status": ResultStatus.FAILURE,
+                "error": "rate-limited at the floor model; no cheaper fallback available",
+            })
 
-        apply_result(task, effective, now=_now(), cost_usd=cost)
         task.pending_work_item_id = None
         task.pending_content_hash = None
 
         outcome: str
-        if effective.status is ResultStatus.SUCCESS:
-            task.error_signatures = []  # streak resets on a clean stage
-            if is_done(task):
-                task.state = TaskState.COMPLETED
-                outcome = "task_completed"
-            else:
-                task.state = TaskState.RUNNING
-                outcome = "stage_completed"
+        if effective.status is ResultStatus.RATE_LIMITED:
+            # Transient: re-queue the stage (RUNNING marker keeps the attempt) on the
+            # cheaper model; no apply_result/learnings/breaker, but cost is recorded.
+            rec = task.stages[result.stage]
+            rec.status = StageStatus.RUNNING
+            rec.completed_at = None
+            rec.error = None
+            task.pending_fallback_model = fallback_model
+            task.state = TaskState.RETRYING
+            task.updated_at = _now()
+            outcome = "stage_rate_limited_fallback"
         else:
-            outcome = self._handle_failure(task, effective)
+            apply_result(task, effective, now=_now(), cost_usd=cost)
+            if effective.status is ResultStatus.SUCCESS:
+                task.error_signatures = []  # streak resets on a clean stage
+                if is_done(task):
+                    task.state = TaskState.COMPLETED
+                    outcome = "task_completed"
+                else:
+                    task.state = TaskState.RUNNING
+                    outcome = "stage_completed"
+            else:
+                outcome = self._handle_failure(task, effective)
 
         # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
         task.stage_counter += 1
@@ -350,6 +380,24 @@ class Engine:
             "lane_attributed": lane_clean,
             "next_stage": (s.value if (s := next_stage(task)) else None),
         }
+
+    def _dispatch_model(self, task: Task, role: str, lane, util_pct: float) -> str | None:
+        """Pick the model for a dispatch, applying graceful fallback (target.md §3/§4).
+
+        Precedence: (1) a queued rate-limit fallback model for this stage wins; (2) under
+        capacity pressure, degrade to the cheapest chain model instead of stalling; (3)
+        otherwise the role's default. Returns None only when we're at capacity AND already
+        at the floor model (nothing cheaper) — the caller then waits. Fallback is gated on
+        the lane policy's ``allow_fallback`` (now actually consumed)."""
+        base = self.models.model_for_role(role)
+        if task.pending_fallback_model:
+            return task.pending_fallback_model
+        if self.capacity.at_capacity(util_pct):
+            floor = self.models.cheapest()
+            if lane.allow_fallback and base != floor:
+                return floor  # run the lighter model instead of sleeping
+            return None  # already cheapest (or fallback off) — caller must wait
+        return base
 
     def _stage_gate(self, result: StageResult) -> str | None:
         """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.

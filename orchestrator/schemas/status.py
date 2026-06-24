@@ -84,6 +84,9 @@ class Task(BaseModel):
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
     pending_content_hash: str | None = None
+    # Set when a rate-limited dispatch re-queues the current stage on a cheaper model;
+    # consumed by the next next_work() for this stage (graceful fallback).
+    pending_fallback_model: str | None = None
 
     @property
     def is_terminal(self) -> bool:

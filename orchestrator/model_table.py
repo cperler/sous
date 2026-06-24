@@ -79,5 +79,9 @@ class ModelTable:
             return None
         return MODEL_CHAIN[idx + 1] if idx + 1 < len(MODEL_CHAIN) else None
 
+    def cheapest(self) -> str:
+        """The floor of the fallback chain (used to degrade under capacity pressure)."""
+        return MODEL_CHAIN[-1]
+
 
 DEFAULT_MODEL_TABLE = ModelTable()

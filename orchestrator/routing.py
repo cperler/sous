@@ -28,7 +28,7 @@ class Router:
     execution_mode: ExecutionMode = ExecutionMode.INTERACTIVE
     orchestrator_provider: Provider | None = None  # global switch (None => per-task/claude)
     codex_eligible_stages: frozenset[Stage] = field(default_factory=lambda: DEFAULT_CODEX_ELIGIBLE)
-    allow_fallback: bool = False
+    allow_fallback: bool = True  # permit graceful model fallback (capacity downgrade + rate-limit)
 
     def _provider(self, stage: Stage, task: Task) -> Provider:
         if self.orchestrator_provider is Provider.CODEX:
