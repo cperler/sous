@@ -93,6 +93,66 @@ def _cost_breakdown_table(heading: str, col: str, buckets: dict) -> list[str]:
     return lines
 
 
+def render_retrospective(retro: dict) -> str:
+    """Render `build_retrospective()` into retrospective.md."""
+    t = retro.get("totals", {})
+    lines = [
+        f"# Failure retrospective — {retro.get('run_id', '?')}",
+        "",
+        f"Run state: **{retro.get('run_state', '?')}** — "
+        f"{t.get('completed', 0)} completed · {t.get('failed', 0)} failed · "
+        f"{t.get('cascade_blocked', 0)} cascade-blocked of {t.get('total', 0)} tasks.",
+    ]
+
+    failed = retro.get("failed_tasks", [])
+    if failed:
+        lines += ["", "## Failed tasks", ""]
+        for f in failed:
+            reason = (f.get("terminal_reason") or "failed").replace("_", " ")
+            lines.append(
+                f"### `{f['task_id']}` — {f.get('title') or '(no title)'}"
+            )
+            lines.append(
+                f"- Failed at **{f.get('failing_stage') or '?'}** after "
+                f"**{f.get('attempts', 0)}** attempt(s) — _{reason}_"
+            )
+            if f.get("final_error"):
+                lines.append(f"- Final error: `{str(f['final_error'])[:300]}`")
+            if f.get("blocked_dependents"):
+                lines.append(
+                    f"- Blocked dependents: {', '.join(f'`{d}`' for d in f['blocked_dependents'])}"
+                )
+            if f.get("learnings"):
+                lines += ["- What the retries learned:"]
+                lines += [f"  {i + 1}. {ln}" for i, ln in enumerate(f["learnings"])]
+            lines.append("")
+
+    if retro.get("cascade_blocked_tasks"):
+        blocked = ", ".join(f"`{t}`" for t in retro["cascade_blocked_tasks"])
+        lines += [f"## Cascade-blocked (never ran): {blocked}", ""]
+
+    patterns = retro.get("patterns", [])
+    if patterns:
+        lines += [
+            "## Recurring failure patterns",
+            "",
+            "| Sig | Stage | Occurrences | Tasks | Plateau | Cross-task | Sample |",
+            "|---|---|---:|---|:---:|:---:|---|",
+        ]
+        for p in patterns:
+            sample = (p.get("sample_error") or "").replace("|", "\\|").replace("\n", " ")[:80]
+            lines.append(
+                f"| `{p['signature']}` | {p['stage']} | {p['occurrences']} | "
+                f"{', '.join(p['tasks'])} | {'✓' if p['within_task_plateau'] else ''} | "
+                f"{'✓' if p['cross_task'] else ''} | {sample} |"
+            )
+        lines.append("")
+    elif not failed:
+        lines += ["", "_No failures recorded._", ""]
+
+    return "\n".join(lines)
+
+
 def render_stage(payload: dict) -> str:
     """Render one stage's durable record (the write_stage_log payload) to Markdown."""
     lane = payload.get("lane_used") or {}

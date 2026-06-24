@@ -87,6 +87,7 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("resume")
     sub.add_parser("status")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
+    sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
 
     args = p.parse_args(argv)
     eng = _engine(args)
@@ -125,6 +126,8 @@ def main(argv: list[str] | None = None) -> int:
         _emit(eng.status(args.run))
     elif args.cmd == "cost-report":
         _emit(eng.ledger.analysis())
+    elif args.cmd == "retrospective":
+        _emit(eng.retrospective(args.run))
     else:  # pragma: no cover
         p.error(f"unknown command {args.cmd}")
     return 0

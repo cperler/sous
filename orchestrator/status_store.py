@@ -199,6 +199,30 @@ class StatusStore:
         with self.with_lock(path), open(path, "a", encoding="utf-8") as fh:
             fh.write(line)
 
+    def read_events(self, run_id: str | None = None) -> list[dict]:
+        """Read the events.jsonl timeline (optionally filtered to one run)."""
+        path = self._events_path
+        if not path.exists():
+            return []
+        out: list[dict] = []
+        for line in path.read_text(encoding="utf-8").splitlines():
+            if not line.strip():
+                continue
+            ev = json.loads(line)
+            if run_id is None or ev.get("run_id") == run_id:
+                out.append(ev)
+        return out
+
+    def read_stage_logs(self, task_id: str) -> list[dict]:
+        """Read a task's durable per-stage JSON records in sequence order."""
+        d = self._stages_dir(task_id)
+        if not d.exists():
+            return []
+        out: list[dict] = []
+        for path in sorted(d.glob("*.json")):
+            out.append(json.loads(path.read_text(encoding="utf-8")))
+        return out
+
     def write_stage_log(
         self, task_id: str, seq: int, stage: str, payload: dict
     ) -> Path:

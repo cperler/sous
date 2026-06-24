@@ -20,7 +20,14 @@ from .cost_ledger import CostLedger
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
-from .render import render_cost_report, render_cost_summary, render_stage, render_task_index
+from .render import (
+    render_cost_report,
+    render_cost_summary,
+    render_retrospective,
+    render_stage,
+    render_task_index,
+)
+from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
@@ -366,6 +373,14 @@ class Engine:
             out[ref.task_id] = rp.value if rp else None
         return out
 
+    def retrospective(self, run_id: str) -> dict:
+        """Structured failure retrospective over the run's durable artifacts."""
+        run = self.store.load_run(run_id)
+        tasks = [self.store.load_task(run_id, ref.task_id) for ref in run.task_refs]
+        events = self.store.read_events(run_id)
+        stage_logs = {t.task_id: self.store.read_stage_logs(t.task_id) for t in tasks}
+        return build_retrospective(run, tasks, events, stage_logs)
+
     def status(self, run_id: str) -> dict:
         run = self.store.load_run(run_id)
         progress = run.progress()
@@ -484,3 +499,13 @@ class Engine:
         self.store.write_run_artifact(
             "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
         )
+        # Auto-generate the failure retrospective only when the run actually failed —
+        # there is nothing to retrospect on a clean run.
+        if new_state is RunState.FAILED:
+            self.store.write_run_artifact(
+                "retrospective.md", render_retrospective(self.retrospective(run_id))
+            )
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "retrospective_emitted", "run_id": run_id},
+            )
