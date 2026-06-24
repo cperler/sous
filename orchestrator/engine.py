@@ -35,6 +35,7 @@ from .schemas.enums import (
     ExecutionLane,
     ResultStatus,
     RunState,
+    Stage,
     StageStatus,
     TaskState,
 )
@@ -264,12 +265,23 @@ class Engine:
             result.lane_used.provider,
         ) in self.registry.sanctioned()
 
-        apply_result(task, result, now=_now(), cost_usd=cost)
+        # Deterministic stage gate (the "verify" half of the collapsed test stage,
+        # target.md §6.1): a runner-reported SUCCESS can still be vetoed by the engine.
+        # Today: the test stage must affirm its tests are meaningful — a green run that
+        # doesn't is downgraded to a failure so it retries-with-learnings instead of
+        # shipping vacuous tests. Cost is still recorded above (the model did run).
+        gate_error = self._stage_gate(result) if result.status is ResultStatus.SUCCESS else None
+        effective = (
+            result if gate_error is None
+            else result.model_copy(update={"status": ResultStatus.FAILURE, "error": gate_error})
+        )
+
+        apply_result(task, effective, now=_now(), cost_usd=cost)
         task.pending_work_item_id = None
         task.pending_content_hash = None
 
         outcome: str
-        if result.status is ResultStatus.SUCCESS:
+        if effective.status is ResultStatus.SUCCESS:
             task.error_signatures = []  # streak resets on a clean stage
             if is_done(task):
                 task.state = TaskState.COMPLETED
@@ -278,7 +290,7 @@ class Engine:
                 task.state = TaskState.RUNNING
                 outcome = "stage_completed"
         else:
-            outcome = self._handle_failure(task, result)
+            outcome = self._handle_failure(task, effective)
 
         # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
         task.stage_counter += 1
@@ -287,14 +299,14 @@ class Engine:
             "stage": result.stage.value,
             "task_id": result.task_id,
             "attempt": result.attempt,
-            "status": result.status.value,
+            "status": effective.status.value,
             "outcome": outcome,
             "model": result.model,
             "lane_used": result.lane_used.model_dump(),
             "cost_usd": cost,
             "structured_output": result.structured_output,
             "raw_output": result.raw_output,
-            "error": result.error,
+            "error": effective.error,
             "completed_at": result.completed_at,
         }
         seq = task.stage_counter
@@ -314,7 +326,7 @@ class Engine:
                 "task_id": result.task_id,
                 "stage": result.stage.value,
                 "attempt": result.attempt,
-                "status": result.status.value,
+                "status": effective.status.value,
                 "outcome": outcome,
                 "lane": result.lane_used.execution_mode.value,
                 "provider": result.lane_used.provider.value,
@@ -338,6 +350,26 @@ class Engine:
             "lane_attributed": lane_clean,
             "next_stage": (s.value if (s := next_stage(task)) else None),
         }
+
+    def _stage_gate(self, result: StageResult) -> str | None:
+        """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.
+
+        The collapsed test stage folds in the as-built 'test-validate' step (§6.1): a
+        green test run is necessary but not sufficient — the tests must actually exercise
+        the change (not vacuous/tautological/always-green). A runner that reports the test
+        stage succeeded but does not affirm ``tests_meaningful`` is vetoed here, so the
+        stage retries-with-learnings rather than shipping unverified tests. Fail-closed:
+        the affirmation must be explicit."""
+        if result.stage is not Stage.TEST:
+            return None
+        out = result.structured_output or {}
+        if not out.get("tests_meaningful", False):
+            return (
+                "test-validate gate: the test run passed but was not affirmed to "
+                "meaningfully exercise the change (tests_meaningful != true). Add/adjust "
+                "assertions so the tests would fail if this change regressed."
+            )
+        return None
 
     def _handle_failure(self, task: Task, result: StageResult) -> str:
         failures = None

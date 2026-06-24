@@ -72,8 +72,12 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "TEST for task {task_id} ({title}).\n"
             "Run the project's tests for the changed files, fix regressions you "
             "introduced (not inherited failures), and re-run until green or no "
-            "progress.\n{learnings}"
-            "Return: passed, failures (list of failing test ids)."
+            "progress. Then VERIFY the tests are meaningful: they must exercise THIS "
+            "change and would fail if it regressed — not vacuous, tautological, or "
+            "always-green.\n{learnings}"
+            "Return: passed, failures (list of failing test ids), tests_meaningful "
+            "(bool — only true if the tests genuinely cover the change), "
+            "validation_notes (what the tests assert / any gaps)."
         ),
     ),
     Stage.DELIVER: StageSpec(

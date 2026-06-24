@@ -117,7 +117,8 @@ def _default_output(stage: Stage) -> dict:
         Stage.INTAKE: {"branch": "issue-42", "worktree": "/wt/42", "baseline_captured": True},
         Stage.SCOPE: {"feasible": True, "plan": ["subtask-1"]},
         Stage.IMPLEMENT: {"files_changed": ["a.py"], "summary": "done", "committed": True},
-        Stage.TEST: {"passed": True, "failures": []},
+        Stage.TEST: {"passed": True, "failures": [], "tests_meaningful": True,
+                     "validation_notes": "asserts the changed behavior"},
         Stage.DELIVER: {"pr_number": 1234, "pr_url": "https://github.com/x/y/pull/1234"},
         Stage.REVIEW: {"approved": True, "issues": []},
     }[stage]
