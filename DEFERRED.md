@@ -15,6 +15,13 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
 - **2026-06-23 — post-gate build.** Queuing was deprioritized as rarely-used in practice,
   so built kept rows instead: **rich per-stage cost reports + the session-reuse-win
   measurement** and **retrospective auto-generation** (both retired below). 4 kept rows remain.
+- **2026-06-24 — log-corpus audit.** Sampled 33 of 61 real bash-orchestrator run logs
+  (4 parallel readers) against the rebuild. Confirmed the test-validate "verify" half was
+  thinned → **built it as an engine gate** (commit `478ce7d`). Found 5 further code-verified
+  gaps (added to Active above): graceful fallback wiring (dead code), capacity-aware
+  downgrade, committed-work timeout recovery, infra-failure reset, review-loop convergence.
+  Over-flagged by the readers but confirmed already-present (no action): lite/micro lanes,
+  transitive cascade, capacity throttle, baseline capture, cost JSONL, codex-eligible stages.
 
 ## Active
 
@@ -26,6 +33,11 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
 | Capacity-throttle jitter tuning | capacity policy (OC:2077) | Port the clamp+jitter mechanism now; tune the jitter window after real data | **KEEP.** Mechanism shipped; the live batch (heysoo PRs #556–559) is too small to tune the jitter window. | After a larger real multi-task batch yields throughput/cost data |
 | Port-registry parallel-worktree concurrency for the headless lane | helpers (`port-registry.sh`) | Interactive mode uses in-session workflow concurrency; OS-process port allocation is only needed for parallel headless worktrees | **KEEP (partial).** `registry_runner` does in-process `ThreadPoolExecutor` parallel dispatch, but OS-process port allocation + per-dispatch worktree isolation for parallel headless runs is unbuilt. | When parallel headless worktree runs land (pairs with the promoted unattended mode) |
 | Monitor poll/render/liveness dashboard surplus | monitor D5 (~60–70%) | Made free by in-session `/workflows` on the default lane; only the unattended/observability slice was ported | **KEEP.** `events.jsonl` timeline + markdown renderers cover the in-session need; a standalone cross-session dashboard is unbuilt. | If a headless/cross-session run needs a standalone dashboard (pairs with unattended mode) |
+| **Graceful fallback wiring (rate-limit → model chain + codex→claude fallthrough)** | log-audit 2026-06-24 (model_table/routing) | The MODEL_CHAIN, `fallback_after()`, and `LanePolicy.allow_fallback` exist but are **never consumed** — fallback is dead data, not behavior. Old runs fell down opus→sonnet→haiku on rate-limit (with backoff) and codex→claude on a provider error. | **NEW (substance).** Genuine resilience gap; half-built. A live rate-limit or codex hiccup currently fails the stage (→retry same lane) instead of degrading. | Top candidate — wire the existing chain into the dispatch/retry path |
+| **Capacity-aware model downgrade (vs. sleep)** | log-audit 2026-06-24 (capacity) | At ≥cap we `sleep_seconds`; old runs tried a lighter model "instead of sleeping" to keep throughput. `capacity.py` only gates admission + concurrency count. | **NEW (substance, pairs with fallback).** Throughput/cost lever; folds naturally into the same fallback mechanism. | Build alongside fallback wiring |
+| **Timeout/crash recovery via committed-work detection** | log-audit 2026-06-24 (resume) | Old runs checked git for committed work on a timed-out stage and reclassified `timed_out → completed`; we blindly re-dispatch on resume (risk: redo/duplicate already-committed work). Heysoo #548 is a live bug in their version. | **NEW (substance).** Correctness + wasted-work gap on the resume path; somewhat adapter-coupled (needs git inspection). | When resume robustness matters / a real run hits a stage timeout |
+| **Infra-failure classification + reset loop** | log-audit 2026-06-24 (test loop) | Old runs distinguished "test runner broke" (exit code ≠ parsed failures) from real failures, counted consecutive infra failures, and ran `infra_reset` after N. We have the `infra_reset()` command but no wiring; a broken runner reads as a normal test failure. | **NEW (substance, medium).** Prevents false-fail death spirals. The classifier interface can express it. | When a real run hits flaky infra / false-fail spirals |
+| Review-loop convergence auto-approval (net-new-issue detection) | log-audit 2026-06-24 (review loop) | Old runs iterated review and auto-approved once remaining issues were all net-new (prior fixed). | **NEW — bundle with the known-thinned iterative review/quality loop.** Only meaningful once that loop is restored; the convergence math is the valuable half. | If/when the iterative review+simplify loop is restored |
 
 ## Retired
 
