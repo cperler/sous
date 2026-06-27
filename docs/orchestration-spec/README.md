@@ -1,22 +1,29 @@
 # Orchestration spec — build artifacts
 
-Produced in phase order (see `../orchestration-template-plan.md`).
+The Phase 1–2 artifacts of the rebuild (see `../orchestration-template-plan.md`).
+**Both phases are complete** and the engine was built from them; the rebuild is done
+(see the repo `README.md` and `../../DEFERRED.md` for current status). These remain as
+the design record — they are not living docs of the running code.
 
-## Phase 1 — ground-truth extraction (current)
-Fan out one mapping agent per source unit in the reference system
-(`/Users/craigperler/Development/heysoo/.claude/`), each filling
-`fragment-template.md` for its file(s), every claim in §§4–7 citing
-`absolute-path:line`. An adversarial verifier refutes each fragment; a
-synthesis agent merges them into `as-built.md`. Full instructions: plan §1.
+## Phase 1 — ground-truth extraction (complete)
+One mapping agent per source unit in the **reference** system
+(`/Users/craigperler/Development/heysoo/.claude/`) filled `fragment-template.md` for its
+file(s), every §§4–7 claim citing `absolute-path:line`; an adversarial verifier refuted
+each; a synthesis agent merged them.
 
-- Fragments land in `fragments/`.
-- Synthesized spec is `as-built.md`.
+- Fragments: `fragments/` — per-source extractions.
+- Consolidated sections: `sections/` — the merged, topic-organized spec.
+- Synthesized spec: `as-built.md`.
 
-## Phase 2 — target spec
-`target.md` (not yet created): the implementation-agnostic design with the
-engine/adapter split and banked fixes. Seeds `../../DEFERRED.md`.
+These describe the **read-only reference bash system**, not this repo's Python code — they
+are a faithful extraction and stay accurate as long as the reference doesn't change.
 
-## Starting Phase 1
-Open a fresh session with THIS repo as cwd, then follow plan §1. The fan-out is
-file-targeted — every agent receives an absolute path into the reference system,
-so cwd being this (empty) repo is fine.
+## Phase 2 — target spec (complete)
+`target.md`: the implementation-agnostic design the rebuild was built from — the
+engine/adapter split, the orthogonal lane axes, the collapsed 6-stage map, the versioned
+status schema, and the banked fixes. The traceability table (§2) dispositions every
+as-built behavior; `defer` rows seeded `../../DEFERRED.md`. Where the build deviated from
+the target, the delta lives in `../../DEFERRED.md` + git history, not here.
+
+## Phase 5 retrospective
+`retrospective.md` — the dogfood/generalize retrospective.

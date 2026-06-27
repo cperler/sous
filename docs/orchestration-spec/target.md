@@ -3,7 +3,10 @@
 > Implementation-agnostic design for the rebuilt orchestration system, derived from
 > the verified as-built (`as-built.md` + `sections/`). The last reviewable artifact
 > before code. Banks the design-doc §5 fixes and the engine/adapter split.
-> **Phase 2 — stop at the review gate. No Phase 3 code.**
+> **Status: this is the design the engine was built from (Phases 3–5 complete).** It
+> reads as the original Phase-2 intent; where the build deviated (e.g. the capacity-aware
+> downgrade reverted, the test-validate gate landing fail-open, provider fallthrough
+> deferred), the delta lives in `../../DEFERRED.md` + git history, not inline here.
 >
 > Reading order: §1 principles → §2 traceability (the parity ledger) → §3 engine API →
 > §4 execution adapter → §5 project-config adapter → §6 banked fixes → §7 status schema →

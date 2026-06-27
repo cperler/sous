@@ -1,8 +1,11 @@
 # Orchestration Template — Implementation Plan
 
 > Operationalizes `docs/orchestration-template.md` §6 into sequenced, executable
-> phases. Resolves the §7 open decisions. Written 2026-06-12. Status: **awaiting
-> review — no build work started.**
+> phases. Resolves the §7 open decisions. Written 2026-06-12.
+> **Status (historical record): all phases (1–5) COMPLETE.** This is the plan as
+> written at the start; it was followed through to a built, tested, live-proven engine.
+> For current status see the repo `README.md`; for what's intentionally still unbuilt
+> see `DEFERRED.md`. Phase headings below are kept as the original plan.
 
 ---
 
