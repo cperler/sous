@@ -1,0 +1,16 @@
+{
+  "_comment": "EXAMPLE Claude Code hook: format edited TS/JS files with prettier. Merge into the project's .claude/settings.json under \"hooks\". Adjust the event name / matcher / env var to your Claude Code version before relying on it.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_FILE_PATH\"; case \"$f\" in *.ts|*.tsx|*.js|*.jsx) pnpm exec prettier --write \"$f\" >/dev/null 2>&1 || true;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}

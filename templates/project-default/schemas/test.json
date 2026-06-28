@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "test",
+  "description": "Stage output contract: tests run + the test-validate self-report (the 'verify' half). tests_meaningful is required so a codex runner that omits it is a SCHEMA_VIOLATION (the schema-enforced form of the engine's fail-open gate).",
+  "type": "object",
+  "required": ["passed", "failures", "tests_meaningful"],
+  "properties": {
+    "passed": {"type": "boolean"},
+    "failures": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "ids of failing tests (empty when green)"
+    },
+    "tests_meaningful": {
+      "type": "boolean",
+      "description": "true only if the tests genuinely exercise the change (would fail if it regressed)"
+    },
+    "validation_notes": {"type": "string", "description": "what the tests assert / any gaps"}
+  },
+  "additionalProperties": true
+}

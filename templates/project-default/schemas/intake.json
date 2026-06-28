@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "intake",
+  "description": "Stage output contract: an isolated worktree/branch was prepared and a test baseline captured.",
+  "type": "object",
+  "required": ["branch", "worktree", "baseline_captured"],
+  "properties": {
+    "branch": {"type": "string"},
+    "worktree": {"type": "string"},
+    "baseline_captured": {"type": "boolean"},
+    "baseline": {"type": "string", "description": "optional human note about the captured baseline"}
+  },
+  "additionalProperties": true
+}

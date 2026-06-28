@@ -1,0 +1,68 @@
+# Project starter-kit menu.
+#
+# The bootstrap skill (run_targets/project_bootstrap_skill.md) and the profile-driven
+# scaffold read this to decide WHICH assets to roll into a new project, based on the
+# project's stack profile (languages + layers). Agents/hooks carry stack `tags`; an
+# empty `tags` list means "generic, always available". Stage schemas are universal.
+#
+# Edit this file (and the assets it points at) to customize what every future
+# scaffolded project starts from — this is the "default project template" source.
+
+[meta]
+version = "1"
+description = "Default orchestration starter kit: agents, skills, hooks, schemas."
+
+# ── Agents: which stage (sub-)role each can serve + the stack tags that select it ──
+[agents.generic-implementer]
+roles = ["implement"]
+tags = []                       # fallback implementer when no stack agent fits
+[agents.code-reviewer]
+roles = ["review"]
+tags = []
+[agents.spec-reviewer]
+roles = ["review:spec"]
+tags = []
+[agents.test-validator]
+roles = ["test"]
+tags = []
+[agents.docstring-writer]
+roles = ["docstring"]
+tags = []
+[agents.python-backend-developer]
+roles = ["implement", "test"]
+tags = ["python"]
+[agents.typescript-frontend-developer]
+roles = ["implement:frontend"]
+tags = ["typescript"]
+
+# ── Hooks: example .claude hooks, stack-tagged (optional, off unless selected) ──
+[hooks.python-format]
+tags = ["python"]
+description = "Run ruff format on edited Python files."
+[hooks.typescript-format]
+tags = ["typescript"]
+description = "Run prettier on edited TS/JS files."
+
+# ── Skills: the run-target supervisor skills (always copied) ──
+[skills]
+always = ["supervisor_skill", "scheduler_skill"]
+
+# ── Stack -> default adapter commands (the interview maps answers to these) ──
+[commands.python]
+install = ["uv", "sync"]
+test_unit = ["uv", "run", "pytest", "-q"]
+typecheck = ["uv", "run", "mypy", "."]
+[commands.typescript]
+install = ["pnpm", "install"]
+test_unit = ["pnpm", "test"]
+test_e2e = ["pnpm", "exec", "playwright", "test"]
+typecheck = ["pnpm", "exec", "tsc", "--noEmit"]
+[commands.node]
+install = ["npm", "ci"]
+test_unit = ["npm", "test"]
+[commands.go]
+install = ["go", "mod", "download"]
+test_unit = ["go", "test", "./..."]
+[commands.rust]
+install = ["cargo", "fetch"]
+test_unit = ["cargo", "test"]

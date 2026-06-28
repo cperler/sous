@@ -1,0 +1,49 @@
+---
+name: orchestrate-task-interactive
+description: Drive one task through the engine on the interactive×claude lane. Thin supervisor — all deterministic logic lives in the `orchestrator` CLI; this skill only sequences calls.
+---
+
+# Supervisor — interactive×claude lane
+
+You are the **supervisor**. The deterministic logic (stage order, retry, cost,
+status, capacity) lives in the `orchestrator` engine CLI. Your only job is the loop:
+**ask what's ready → dispatch via the Workflow shim → record the result → repeat.**
+You never call a model directly and you never run `claude -p`.
+
+## Constants
+- `ROOT` = the run's status/ledger dir (e.g. `runs/<run-id>`).
+- `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
+- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`, the reference; or your own).
+- Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
+
+## One-time setup
+1. `… init-run --lane full` (or `lite`/`micro`).
+2. `… add-task --task "$TASK"` (resolves the issue via the GitHub task source).
+
+## The loop (repeat until the task is terminal)
+1. **next**: `WORK=$(… next --task "$TASK" --util "$UTIL")`.
+   - If `WORK` is `null`, the task is done — stop.
+   - `UTIL` is the current 5h utilization %; the engine turns it into the binding
+     dispatch limit. **Do not exceed the engine's limit** even though the Workflow
+     cap could allow more — the engine's number is the policy, the Workflow cap is a
+     ceiling.
+2. **dispatch**: invoke the **Workflow shim** (`run_targets/workflow_shim.js`) with
+   `{ workItems: [WORK], dispatchLimit: <engine limit>, now: <ISO timestamp>, schemas: {...} }`.
+   The shim calls `agent()` in-session and **returns** an array of `StageResult`
+   objects (it cannot write to disk). It does the actual work in the task's worktree.
+3. **persist + record**: write each returned `StageResult` to a temp file and run
+   `… record --result <file>`. Read the JSON outcome:
+   - `task_completed` → the PR is open; stop (success).
+   - `task_failed_*` → stop (failure); surface the reason.
+   - `stage_completed` / `stage_failed_will_retry` → loop again (the engine re-emits
+     the same stage with appended learnings on a retry).
+
+## Resumability
+Because the shim only returns results **on Workflow completion**, a session death
+mid-dispatch loses only the in-flight **batch** — re-run from `… next`/`… resume`
+and the engine re-emits the un-recorded stage. Keep batches small.
+
+## Audit (every gate)
+Run `… status` and check `lane_audit.clean == true`: every recorded model call must
+be `interactive:claude` with zero `unattributed`/`off_lane`. A hidden `claude -p`
+would show up here — there should be none.

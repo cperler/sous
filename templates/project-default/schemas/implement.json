@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "implement",
+  "description": "Stage output contract: the planned change was implemented and committed.",
+  "type": "object",
+  "required": ["files_changed", "summary", "committed"],
+  "properties": {
+    "files_changed": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "summary": {"type": "string"},
+    "committed": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

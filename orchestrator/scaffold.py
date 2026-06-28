@@ -51,10 +51,14 @@ _SCHEMA_DIR = ".claude/schemas"
 
 _NOOP = ["true"]
 
-# TODO: map each stage (sub-)role to an agent for this project (None = default).
+# Stage (sub-)role -> agent name. Defaults reference the generic starter-kit agents
+# (templates/project-default/agents/); the bootstrap swaps in stack-specific implement
+# agents (e.g. python-backend-developer) per the project profile.
 _ROSTER: dict[str, str] = {{
-    "implement": "implementer",
+    "implement": "generic-implementer",
+    "test": "test-validator",
     "review": "code-reviewer",
+    "review:spec": "spec-reviewer",
     "docstring": "docstring-writer",
 }}
 

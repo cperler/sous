@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "review",
+  "description": "Stage output contract: the PR was reviewed against the task goal and code quality.",
+  "type": "object",
+  "required": ["approved", "issues"],
+  "properties": {
+    "approved": {"type": "boolean"},
+    "issues": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "outstanding issues (empty when approved)"
+    }
+  },
+  "additionalProperties": true
+}
