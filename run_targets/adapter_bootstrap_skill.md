@@ -1,39 +1,106 @@
 ---
 name: adapt-orchestration-pipeline
-description: Stand up the orchestration template for a NEW repo by generating and filling in a project-config adapter. The engine is never edited — only the adapter.
+description: Stand up (or re-tune) the orchestration template for a project. Detect the stack, confirm a profile with the user, generate the adapter + seed the starter kit, and verify. Re-callable to tune an existing project from its run artifacts. The engine is never edited — only the adapter + the project's .claude/.
 ---
 
-# Adapt the pipeline to a new project (the §5 bootstrap)
+# Bootstrap a project for orchestration (the §5 interview)
 
-Goal: make the orchestration engine drive a new repo by writing ONE adapter. Ports
-the `adapting-claude-pipeline` workflow. The engine, scheduler, runners, and CLI are
-untouched; all project-specific knowledge lives in `adapters/project/<name>/`.
+You are the **bootstrap supervisor**. Standing up a project means composing a *profile*
+(stack + commands + roster + task source) and letting the deterministic scaffold turn it
+into a project-config adapter + a seeded `.claude/` starter kit. You detect and interview;
+`orchestrator-scaffold` does the file generation. **Never edit `orchestrator/`** — if a
+project concern seems to need an engine change, it belongs in the adapter.
 
-## 1. Generate the skeleton
+Constants: `PROJECT` = the adapter/package name; `REPO` = the target project's root dir;
+`DEST` = where the adapter package goes (default `adapters/project`).
+
+---
+
+## A. First run — stand up a project
+
+### 1. Detect (don't ask cold)
 ```
-uv run orchestrator-scaffold --name <project> --dest adapters/project
+uv run orchestrator-scaffold --detect "$REPO" --name "$PROJECT"
 ```
-This writes a WORKING skeleton (`config.py`, `classifier.py`, `task_source.py`,
-`__init__.py`) that already satisfies the `ProjectConfig` protocol with no-op defaults
-and a local-JSON task source — so it imports and runs immediately. You harden it next.
+This prints a **draft `profile.toml`**: detected `languages` (from `pyproject.toml` /
+`package.json` / `tsconfig.json` / `go.mod` / `Cargo.toml`), `commands` (refined by the
+detected package manager — uv/poetry/pip, pnpm/yarn/npm — and an `e2e` command only if a
+`playwright.config.*` exists), a `roster` (stack implement agents + the generic
+reviewers/test-validator), and a `task_source` guess (`github-issues` if a GitHub remote,
+else `local-file`).
 
-## 2. Audit the repo — Keep / Modify / Replace / Delete
-Inspect the target repo and fill the TODOs:
-- **Commands** (`install_cmd`, `test_unit_cmd`, `test_e2e_cmd`, `test_shell_cmd`,
-  `typecheck_cmd`, `infra_reset`): the real build/test/lint commands. Delete layers
-  the project lacks (leave the no-op `["true"]`).
-- **`classifier`** (taxonomy): how this project's test output maps to unit/e2e/shell
-  failures, and how a changed file maps to its impacted tests.
-- **`task_source`**: keep the local-JSON source, or replace with the project's real
-  source (GitHub Issues — see `adapters/project/heysoo/task_source.py` — a tracker, etc.).
-- **`agent_for`** (roster): the agent personas for implement/review/docstring stages;
-  delete unused roles.
+### 2. Confirm (detect-then-confirm)
+Show the user the draft and use **AskUserQuestion** to correct it, not to answer from
+scratch. Confirm/adjust:
+- **Languages** — did detection miss or over-call a stack?
+- **Commands** — are `test_unit` / `install` / `typecheck` / `test_e2e` actually how this
+  repo builds and tests? (Check `package.json` scripts, Makefile targets, CI.)
+- **Task source** — GitHub Issues, or a local `tasks.json`?
+- **Roster** — keep the detected implement agent(s), or swap one.
+Write the confirmed profile to a file, e.g. `/tmp/<PROJECT>-profile.toml`.
 
-## 3. Verify
-- `python -c "import adapters.project.<project> as a; from adapters.project.base import ProjectConfig; assert isinstance(a.get_config(), ProjectConfig)"`
-- Dry-run a task: `… --project adapters.project.<project> --mode headless run-headless`
-  (or the interactive supervisor loop). Confirm `status.lane_audit.clean == true`.
+### 3. Generate
+```
+uv run orchestrator-scaffold --name "$PROJECT" --profile /tmp/<PROJECT>-profile.toml \
+    --dest "$DEST" --into "$REPO"
+```
+This writes the adapter (`$DEST/<PROJECT>/`: `profile.toml`, generated `config.py`,
+write-once `classifier.py` / `task_source.py`) and **seeds the stack's kit** into
+`$REPO/.claude/` (agents, skills, example hooks). `config.py` is a regenerated VIEW of
+`profile.toml` — hand-edits go in the profile (or re-run), never in `config.py`.
+
+### 4. Finish what the profile can't infer (Keep / Modify / Replace / Delete)
+- **`classifier.py`** (Replace) — map THIS project's test output to unit/e2e/shell failures
+  and changed-file → impacted-tests. The generated default matches `^FAILED <name>`.
+- **`task_source.py`** (Replace, only if `task_source = github-issues`) — swap the generated
+  `LocalTaskSource` for a GitHub-Issues source; copy the shape from
+  `adapters/project/heysoo/task_source.py`.
+- **Hooks** (Modify) — the seeded `$REPO/.claude/hooks/*.json` are examples; merge them into
+  the project's `.claude/settings.json` and adjust to its Claude Code version.
+
+### 5. Verify
+- Imports + satisfies the contract:
+  `uv run python -c "import adapters.project.<PROJECT> as a; from adapters.project.base import ProjectConfig; assert isinstance(a.get_config(), ProjectConfig)"`
+- A stage resolves (and the roster/agent names resolve in `$REPO/.claude/agents/`): run the
+  interactive supervisor loop (`run_targets/supervisor_skill.md`) or
+  `--project adapters.project.<PROJECT> run-headless` on a throwaway task, and confirm
+  `status` shows `lane_audit.clean == true`.
+
+---
+
+## B. Re-run — tune an existing project
+
+The scaffold is idempotent and additive, so re-running is safe. Use this after some real
+runs, or when the stack grows.
+
+### 1. Read the current state + the evidence
+- The persisted `$DEST/<PROJECT>/profile.toml` (what's configured now).
+- Run artifacts from a run's root dir, if present:
+  - `retrospective.md` — recurring failure patterns (which stage/signature keeps failing).
+  - `cost-report.md` — per-stage cost + the session-reuse win (which stages are cheap).
+  - `events.jsonl` — the timeline.
+
+### 2. Propose data-informed deltas (judgment — surface them, get approval)
+- A stage that keeps failing the same way in `retrospective.md` → propose a stronger or
+  different agent for that role (swap the roster entry), or note a missing classifier rule.
+- A cheap, file-patching stage (`implement`/`test`) in `cost-report.md` → propose routing it
+  to codex (a per-task `:codex` provider tag) to cut cost.
+- A newly-added language → add it (its agents/commands roll in automatically).
+- **Do not auto-apply.** Present the proposals; the human decides.
+
+### 3. Apply additively
+Write only the *delta* into a profile file (e.g. just the new language, or the swapped
+roster entry) and re-run:
+```
+uv run orchestrator-scaffold --name "$PROJECT" --profile /tmp/<PROJECT>-delta.toml --dest "$DEST" --into "$REPO"
+```
+The scaffold unions languages, re-derives defaults for new ones, and re-applies hand-
+overrides — `classifier.py` / `task_source.py` are never clobbered, and only newly-selected
+kit assets are seeded.
+
+---
 
 ## Invariant
-If you find yourself editing anything under `orchestrator/`, stop — that means a
-project concern leaked into the engine. The correct fix is almost always in the adapter.
+If you find yourself editing anything under `orchestrator/`, stop — a project concern leaked
+into the engine. The fix is almost always in the adapter (`$DEST/<PROJECT>/`) or the
+profile.

@@ -8,11 +8,11 @@ implementation plan, and the as-built/target spec.
 ## Status
 **Built.** Phases 1–5 complete (per-task engine → batch scheduler → second execution
 mode + codex → dogfood/generalize) plus two engine-hardening passes and a workflow
-code-review pass. 146 pytest cases green, ruff clean; live-proven on real heysoo issues.
+code-review pass. 171 pytest cases green, ruff clean; live-proven on real heysoo issues.
 Ongoing work is incremental — pick from `DEFERRED.md` or fix-forward.
 
 ## Working norms
-- **Tests + lint, every change:** `uv run pytest` (146 cases) and `uv run ruff check .`
+- **Tests + lint, every change:** `uv run pytest` (171 cases) and `uv run ruff check .`
   must stay green. Add a regression test with each fix.
 - **`DEFERRED.md` is the scope ledger.** Nothing is silently dropped: anything cut,
   thinned, or found-missing gets a row, re-dispositioned at each gate (promote / keep /

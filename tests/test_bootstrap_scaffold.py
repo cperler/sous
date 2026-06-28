@@ -6,6 +6,7 @@ import importlib
 import sys
 
 from orchestrator.scaffold import (
+    detect_profile,
     load_kit_manifest,
     merge_profiles,
     profile_from_languages,
@@ -15,6 +16,16 @@ from orchestrator.scaffold import (
 )
 
 MANIFEST = load_kit_manifest()
+
+
+def _repo(tmp_path, files: dict[str, str], _ctr=[0]):  # noqa: B006 - unique dir per call
+    _ctr[0] += 1
+    root = tmp_path / f"repo{_ctr[0]}"
+    for rel, content in files.items():
+        p = root / rel
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(content)
+    return root
 
 
 def _import_adapter(dest, name: str):
@@ -101,6 +112,71 @@ def test_rerun_adds_language_without_clobbering_handedits(tmp_path) -> None:
     assert rp.roster["implement:frontend"] == "typescript-frontend-developer"  # added
     assert "# HAND-EDITED" in classifier.read_text()                     # not clobbered
     assert (proj / ".claude" / "agents" / "typescript-frontend-developer.md").exists()  # newly seeded
+
+
+# --- stack detection (Phase 3 Part A) ----------------------------------------
+
+def test_detect_python_uv(tmp_path) -> None:
+    root = _repo(tmp_path, {"pyproject.toml": "[project]\nname='x'\n", "uv.lock": ""})
+    p = detect_profile(root, "svc", MANIFEST)
+    assert p.languages == ["python"]
+    assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]  # manifest default (uv)
+    assert p.roster["implement"] == "python-backend-developer"
+    assert p.task_source == "local-file"
+
+
+def test_detect_python_poetry(tmp_path) -> None:
+    root = _repo(tmp_path, {"pyproject.toml": "[tool.poetry]\n", "poetry.lock": ""})
+    p = detect_profile(root, "svc", MANIFEST)
+    assert p.commands["test_unit"] == ["poetry", "run", "pytest", "-q"]
+    assert p.commands["install"] == ["poetry", "install"]
+
+
+def test_detect_typescript_pnpm_with_playwright(tmp_path) -> None:
+    root = _repo(tmp_path, {
+        "tsconfig.json": "{}", "pnpm-lock.yaml": "", "playwright.config.ts": "export default {}",
+    })
+    p = detect_profile(root, "ui", MANIFEST)
+    assert p.languages == ["typescript"]
+    assert p.commands["test_unit"] == ["pnpm", "test"]
+    assert p.commands["test_e2e"] == ["pnpm", "exec", "playwright", "test"]  # playwright present
+
+
+def test_detect_drops_e2e_without_playwright(tmp_path) -> None:
+    root = _repo(tmp_path, {"tsconfig.json": "{}", "pnpm-lock.yaml": ""})
+    p = detect_profile(root, "ui", MANIFEST)
+    assert "test_e2e" not in p.commands  # no playwright -> no e2e command
+
+
+def test_detect_node_vs_typescript(tmp_path) -> None:
+    root = _repo(tmp_path, {"package.json": '{"name":"x"}', "package-lock.json": ""})
+    p = detect_profile(root, "svc", MANIFEST)
+    assert p.languages == ["node"]  # package.json without typescript
+    assert p.commands["install"] == ["npm", "ci"]
+
+
+def test_detect_mixed_python_first_wins_shared_keys(tmp_path) -> None:
+    root = _repo(tmp_path, {
+        "pyproject.toml": "[project]\n", "uv.lock": "",
+        "tsconfig.json": "{}", "pnpm-lock.yaml": "", "playwright.config.ts": "",
+    })
+    p = detect_profile(root, "svc", MANIFEST)
+    assert set(p.languages) == {"python", "typescript"}
+    assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]   # python (first) wins
+    assert p.commands["test_e2e"] == ["pnpm", "exec", "playwright", "test"]  # ts contributes e2e
+
+
+def test_detect_go_and_rust(tmp_path) -> None:
+    assert detect_profile(_repo(tmp_path, {"go.mod": "module x"}), "g", MANIFEST).languages == ["go"]
+    assert detect_profile(_repo(tmp_path, {"Cargo.toml": "[package]"}), "r", MANIFEST).languages == ["rust"]
+
+
+def test_detect_github_task_source(tmp_path) -> None:
+    root = _repo(tmp_path, {
+        "pyproject.toml": "[project]\n",
+        ".git/config": '[remote "origin"]\n\turl = git@github.com:me/repo.git\n',
+    })
+    assert detect_profile(root, "svc", MANIFEST).task_source == "github-issues"
 
 
 def test_merge_is_additive_and_incoming_wins() -> None:

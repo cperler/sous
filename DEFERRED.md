@@ -39,8 +39,10 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
   **Phase 2**: `orchestrator-scaffold` now consumes a `profile.toml` (stack → commands + roster
   + kit selection), generates the adapter as a regenerated view of the profile, seeds the
   stack-appropriate `.claude/` kit into the project (`--into`), and is idempotent/additive on
-  re-run (hand-overrides preserved). **Phase 3** (next): the interview/tune skill that composes
-  the profile (detect → ask → scaffold → verify; re-callable with run-data proposals).
+  re-run (hand-overrides preserved). **Phase 3**: a deterministic stack detector
+  (`orchestrator-scaffold --detect` → draft profile from manifests/lockfiles) + the rewritten
+  `adapter_bootstrap_skill.md` interview/tune flow (detect → confirm → scaffold → verify;
+  re-callable to tune from `retrospective.md` / `cost-report.md`). **Bootstrap arc complete.**
 
 ## Active
 

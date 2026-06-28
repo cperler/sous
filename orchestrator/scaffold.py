@@ -129,6 +129,103 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
 
 
 # ---------------------------------------------------------------------------------------
+# Stack detection (the deterministic first-guess the interview skill presents)
+# ---------------------------------------------------------------------------------------
+
+# Package-manager command sets, keyed by lockfile-detected PM. These OVERRIDE the
+# manifest's per-language defaults (a lockfile is stronger evidence than the default PM).
+_PM_COMMANDS: dict[str, dict[str, list[str]]] = {
+    "poetry": {"install": ["poetry", "install"], "test_unit": ["poetry", "run", "pytest", "-q"],
+               "typecheck": ["poetry", "run", "mypy", "."]},
+    "pip": {"install": ["pip", "install", "-r", "requirements.txt"],
+            "test_unit": ["python", "-m", "pytest", "-q"]},
+    "pnpm": {"install": ["pnpm", "install"], "test_unit": ["pnpm", "test"],
+             "typecheck": ["pnpm", "exec", "tsc", "--noEmit"],
+             "test_e2e": ["pnpm", "exec", "playwright", "test"]},
+    "yarn": {"install": ["yarn", "install"], "test_unit": ["yarn", "test"],
+             "typecheck": ["yarn", "tsc", "--noEmit"], "test_e2e": ["yarn", "playwright", "test"]},
+    "npm": {"install": ["npm", "ci"], "test_unit": ["npm", "test"],
+            "typecheck": ["npm", "exec", "tsc", "--noEmit"],
+            "test_e2e": ["npm", "exec", "playwright", "test"]},
+}
+
+
+def _detect_languages(root: Path) -> list[str]:
+    langs: list[str] = []
+    if any((root / f).exists() for f in ("pyproject.toml", "setup.py", "setup.cfg", "requirements.txt")):
+        langs.append("python")
+    pkg = root / "package.json"
+    if (root / "tsconfig.json").exists() or (pkg.exists() and "typescript" in pkg.read_text(errors="ignore")):
+        langs.append("typescript")
+    elif pkg.exists():
+        langs.append("node")
+    if (root / "go.mod").exists():
+        langs.append("go")
+    if (root / "Cargo.toml").exists():
+        langs.append("rust")
+    return langs
+
+
+def _python_pm(root: Path) -> str:
+    if (root / "poetry.lock").exists():
+        return "poetry"
+    if (root / "requirements.txt").exists() and not (root / "pyproject.toml").exists():
+        return "pip"
+    return "uv"  # uv.lock or pyproject default — manifest default, no override
+
+
+def _js_pm(root: Path) -> str:
+    if (root / "pnpm-lock.yaml").exists():
+        return "pnpm"
+    if (root / "yarn.lock").exists():
+        return "yarn"
+    return "npm"
+
+
+def _has_playwright(root: Path) -> bool:
+    if any(root.glob("playwright.config.*")):
+        return True
+    pkg = root / "package.json"
+    return pkg.exists() and "playwright" in pkg.read_text(errors="ignore")
+
+
+def _detect_commands(root: Path, languages: list[str], manifest: dict) -> dict[str, list[str]]:
+    """Per-language commands (manifest default refined by the detected package manager),
+    merged in language order so the FIRST language wins genuinely-shared keys (test_unit)."""
+    cmds: dict[str, list[str]] = {}
+    for lang in languages:
+        lang_cmds = {k: list(v) for k, v in manifest.get("commands", {}).get(lang, {}).items()}
+        pm = _python_pm(root) if lang == "python" else _js_pm(root) if lang in ("typescript", "node") else None
+        if pm and pm in _PM_COMMANDS:
+            lang_cmds.update({k: list(v) for k, v in _PM_COMMANDS[pm].items()})
+        for k, v in lang_cmds.items():
+            cmds.setdefault(k, v)  # first language claims a shared key
+    if not _has_playwright(root):
+        cmds.pop("test_e2e", None)  # only keep an e2e command if the project actually has e2e
+    return cmds
+
+
+def _detect_task_source(root: Path) -> str:
+    cfg = root / ".git" / "config"
+    if cfg.exists() and "github.com" in cfg.read_text(errors="ignore"):
+        return "github-issues"
+    return "local-file"
+
+
+def detect_profile(repo_root: str | Path, name: str, manifest: dict) -> Profile:
+    """Deterministic stack detection -> a draft Profile the interview presents for confirmation.
+
+    Reuses ``profile_from_languages`` for roster/seed, then refines commands from lockfiles
+    and guesses the task source. The human corrects this draft (detect-then-confirm)."""
+    root = Path(repo_root)
+    languages = _detect_languages(root)
+    profile = profile_from_languages(name, languages, manifest)
+    profile.commands = _detect_commands(root, languages, manifest)
+    profile.task_source = _detect_task_source(root)
+    return profile
+
+
+# ---------------------------------------------------------------------------------------
 # TOML (write) — tiny serializer for the constrained profile shape (stdlib has no writer)
 # ---------------------------------------------------------------------------------------
 
@@ -151,8 +248,8 @@ def _toml_value(v: object) -> str:
     raise TypeError(f"unsupported TOML value: {v!r}")
 
 
-def write_profile(profile: Profile, path: Path) -> None:
-    """Serialize a Profile to ``profile.toml`` (dependency-free; read back with tomllib)."""
+def profile_to_toml(profile: Profile) -> str:
+    """Serialize a Profile to TOML text (dependency-free; read back with tomllib)."""
     lines = [
         "# Generated by orchestrator-scaffold; the source of truth for this adapter.",
         "# Edit here (or re-run the bootstrap) — config.py is regenerated from this file.",
@@ -169,7 +266,11 @@ def write_profile(profile: Profile, path: Path) -> None:
         if data:
             lines += ["", f"[{section}]"]
             lines += [f"{_toml_key(k)} = {_toml_value(v)}" for k, v in data.items()]
-    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return "\n".join(lines) + "\n"
+
+
+def write_profile(profile: Profile, path: Path) -> None:
+    path.write_text(profile_to_toml(profile), encoding="utf-8")
 
 
 def read_profile(path: Path) -> Profile:
@@ -415,14 +516,24 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI s
 
     p = argparse.ArgumentParser(prog="orchestrator-scaffold",
                                 description="Generate a project-config adapter from a profile.")
-    p.add_argument("--name", required=True, help="adapter/project name (e.g. my-service)")
+    p.add_argument("--name", help="adapter/project name (defaults to the --detect repo's dir name)")
     p.add_argument("--dest", default="adapters/project", help="destination dir for the package")
     p.add_argument("--profile", help="path to a profile.toml (the interview writes this)")
     p.add_argument("--languages", help="comma-separated stack to synthesize a profile from (e.g. python,typescript)")
     p.add_argument("--into", help="target project root to seed .claude/ assets into")
+    p.add_argument("--detect", help="detect a repo's stack and PRINT a draft profile.toml (no files written)")
     args = p.parse_args(argv)
 
     manifest = load_kit_manifest()
+
+    # --detect is the interview's first step: print a draft profile for the human to confirm.
+    if args.detect:
+        name = args.name or Path(args.detect).resolve().name
+        print(profile_to_toml(detect_profile(args.detect, name, manifest)), end="")
+        return 0
+
+    if not args.name:
+        p.error("--name is required (unless using --detect)")
     if args.profile:
         prof: Profile | None = read_profile(Path(args.profile))
     elif args.languages:

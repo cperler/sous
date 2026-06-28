@@ -8,7 +8,7 @@ It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 `.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
 
 **Status: built and live-proven.** Phases 1–5 complete plus two engine-hardening passes
-and a workflow code-review pass. 146 pytest cases green, ruff clean. Driven real GitHub
+and a workflow code-review pass. 171 pytest cases green, ruff clean. Driven real GitHub
 issues to merged/draft PRs on the reference project (heysoo PRs #556–#560) with clean
 lane-attribution audits. Remaining/known-thinned scope is tracked in `DEFERRED.md`.
 
@@ -61,7 +61,7 @@ adapters/
   execution/             interactive shim, headless_claude, codex, registry, transport
   project/{base,heysoo,selfhost}/   the reference adapter + a self-host adapter
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
-tests/                   pytest suite (146)
+tests/                   pytest suite (171)
 docs/                    design doc, plan, and the as-built/target spec (see below)
 DEFERRED.md              the deferred-scope ledger (reviewed at every gate)
 ```
@@ -88,14 +88,20 @@ uv run orchestrator … retrospective    # failure patterns + retry learnings (o
 
 In practice the **interactive** lane is driven by a supervisor following
 `run_targets/supervisor_skill.md` (single task) or `scheduler_skill.md` (a batch), which
-dispatch the actual work via the Workflow shim. Standing up a **new project** = writing
-one adapter; `run_targets/adapter_bootstrap_skill.md` + `orchestrator-scaffold` generate
-the skeleton.
+dispatch the actual work via the Workflow shim.
+
+Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
+--detect <repo>` reads the repo's stack and prints a draft `profile.toml`;
+`run_targets/adapter_bootstrap_skill.md` walks the detect → confirm → generate → verify
+flow (and is re-callable to tune from run artifacts). The scaffold turns the profile into a
+project-config adapter **and** seeds a stack-appropriate starter kit (agents, skills, hooks,
+schemas from `templates/project-default/`) into the project's `.claude/`. The engine is
+never touched.
 
 ## Developing
 
 ```bash
-uv run pytest        # 146 cases
+uv run pytest        # 171 cases
 uv run ruff check .
 ```
 
