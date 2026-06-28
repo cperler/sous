@@ -33,6 +33,14 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
   retrospective's failure patterns; `read_stage_logs` numeric sort; `cost-report.md` off the
   status() poll path. Re-deferred: capacity-aware downgrade, stronger (schema/independent)
   test-validate.
+- **2026-06-27/28 — bootstrap arc.** Building interview-driven, stack-aware project bootstrapping.
+  **Phase 1a** (`384388a`): canonical stage schemas + `schema_for` (closed the codex-validation
+  gap). **Phase 1b** (`206c214`): the comprehensive `templates/project-default/` starter kit.
+  **Phase 2**: `orchestrator-scaffold` now consumes a `profile.toml` (stack → commands + roster
+  + kit selection), generates the adapter as a regenerated view of the profile, seeds the
+  stack-appropriate `.claude/` kit into the project (`--into`), and is idempotent/additive on
+  re-run (hand-overrides preserved). **Phase 3** (next): the interview/tune skill that composes
+  the profile (detect → ask → scaffold → verify; re-callable with run-data proposals).
 
 ## Active
 

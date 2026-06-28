@@ -50,16 +50,11 @@ def test_kit_schemas_match_canonical() -> None:
 
 
 def test_default_roster_is_backed_by_kit_agents() -> None:
-    # Every agent the scaffold's default roster references exists in the kit, and every
-    # role it maps is declared by that agent in the manifest.
-    from orchestrator.scaffold import _CONFIG  # the generated-adapter template string
+    # Every agent the scaffold's no-stack default roster references exists in the kit, and
+    # every role it maps is declared by that agent in the manifest.
+    from orchestrator.scaffold import _DEFAULT_ROSTER
 
     agents = _manifest()["agents"]
-    role_to_agent = {
-        "implement": "generic-implementer", "test": "test-validator",
-        "review": "code-reviewer", "review:spec": "spec-reviewer",
-        "docstring": "docstring-writer",
-    }
-    for role, agent in role_to_agent.items():
-        assert f'"{agent}"' in _CONFIG, f"scaffold default roster lost {agent}"
-        assert agent in agents and role in agents[agent]["roles"], f"{agent} can't serve {role}"
+    for role, agent in _DEFAULT_ROSTER.items():
+        assert agent in agents, f"default roster references unknown kit agent {agent}"
+        assert role in agents[agent]["roles"], f"{agent} can't serve {role}"
