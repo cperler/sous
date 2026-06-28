@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 
 from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
 from .classifier import SelfHostClassifier
 from .task_source import LocalFileTaskSource
@@ -59,6 +60,9 @@ class SelfHostConfig:
 
     def agent_for(self, stage: Stage, role: str | None = None) -> str | None:
         return _ROSTER.get(role) if role else None
+
+    def schema_for(self, ref: str) -> dict | None:
+        return resolve_stage_schema(ref)
 
 
 def get_config() -> SelfHostConfig:

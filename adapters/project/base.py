@@ -64,3 +64,12 @@ class ProjectConfig(Protocol):
         no phantom ``phpdoc-writer``).
         """
         ...
+
+    def schema_for(self, ref: str) -> dict | None:
+        """JSON Schema for a stage's structured output (drives codex full-validation).
+
+        Optional — duck-typed via ``getattr`` by the CLI. Delegate to
+        ``orchestrator.schemas.stage_schemas.resolve_stage_schema`` to inherit the
+        engine's canonical stage contracts (with an optional project-local override).
+        """
+        ...

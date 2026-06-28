@@ -10,6 +10,7 @@ from __future__ import annotations
 import os
 
 from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
 from .classifier import HeysooClassifier
 from .task_source import GitHubIssuesSource
@@ -72,6 +73,10 @@ class HeysooConfig:
         if role and role in _ROSTER:
             return _ROSTER[role]
         return None
+
+    def schema_for(self, ref: str) -> dict | None:
+        # Inherit the engine's canonical stage-output contracts (gives codex full-validation).
+        return resolve_stage_schema(ref)
 
 
 def get_config() -> HeysooConfig:

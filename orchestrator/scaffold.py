@@ -40,9 +40,14 @@ from __future__ import annotations
 import os
 
 from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
 from .classifier import {cls}Classifier
 from .task_source import LocalTaskSource
+
+# Seeded stage-output schemas (codex full-validation). Override a stage by dropping a
+# <ref>.json here; otherwise the engine's canonical contract is used.
+_SCHEMA_DIR = ".claude/schemas"
 
 _NOOP = ["true"]
 
@@ -92,6 +97,9 @@ class {cls}:
 
     def agent_for(self, stage: Stage, role: str | None = None) -> str | None:
         return _ROSTER.get(role) if role else None
+
+    def schema_for(self, ref: str) -> dict | None:
+        return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
 
 def get_config() -> {cls}:

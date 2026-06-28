@@ -1,0 +1,17 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "scope",
+  "description": "Stage output contract: feasibility decision plus a minimal task plan.",
+  "type": "object",
+  "required": ["feasible", "plan"],
+  "properties": {
+    "feasible": {"type": "boolean"},
+    "blocked_reason": {"type": ["string", "null"], "description": "why the task is blocked, if not feasible"},
+    "plan": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "ordered subtasks for the implement stage"
+    }
+  },
+  "additionalProperties": true
+}
