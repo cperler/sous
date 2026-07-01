@@ -43,6 +43,13 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
   (`orchestrator-scaffold --detect` → draft profile from manifests/lockfiles) + the rewritten
   `adapter_bootstrap_skill.md` interview/tune flow (detect → confirm → scaffold → verify;
   re-callable to tune from `retrospective.md` / `cost-report.md`). **Bootstrap arc complete.**
+- **2026-07-01 — direction/roadmap.** Added a **"Roadmap — functional & self-improvement ideas"**
+  section (below Active) capturing forward-looking capability ideas toward the spec→software goal:
+  closing the self-improvement loops (informed by a 3-agent review of the reference heysoo system's
+  self-improvement scaffolding — follow-up task creation, reflection capture, dogfooding, meta-
+  authoring, learnings KB), the spec→task front door, faster/cheaper levers, under-used AI-tooling
+  leverage, codex/provider parity, and two build-now DX items (terminal monitor, ARCHITECTURE doc).
+  A Fable design review is queued to prune/prioritize/extend it.
 
 ## Active
 
@@ -60,6 +67,80 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
 | Stronger test-validate — independent-reviewer half | code-review 2026-06-24 (test gate) | **Schema half now built** (`384388a`): the canonical `test.json` requires `tests_meaningful`, so the **codex** lane rejects an omission as SCHEMA_VIOLATION. Interactive/headless lanes stay fail-OPEN self-report, and self-affirmation is inherently weak (a model writing vacuous tests just says `true`). The strong form = a **separate reviewer dispatch** judging test meaningfulness. | **KEEP (the reviewer half).** Pairs with the deferred independent review lens. | When test-meaningfulness matters enough to spend a separate reviewer pass / bundle with the review-lens work |
 | **Infra-failure classification + reset loop** | log-audit 2026-06-24 (test loop) | Old runs distinguished "test runner broke" (exit code ≠ parsed failures) from real failures, counted consecutive infra failures, and ran `infra_reset` after N. We have the `infra_reset()` command but no wiring; a broken runner reads as a normal test failure. | **NEW (substance, medium).** Prevents false-fail death spirals. The classifier interface can express it. | When a real run hits flaky infra / false-fail spirals |
 | Review-loop convergence auto-approval (net-new-issue detection) | log-audit 2026-06-24 (review loop) | Old runs iterated review and auto-approved once remaining issues were all net-new (prior fixed). | **NEW — bundle with the known-thinned iterative review/quality loop.** Only meaningful once that loop is restored; the convergence math is the valuable half. | If/when the iterative review+simplify loop is restored |
+
+## Roadmap — functional & self-improvement ideas (surfaced 2026-07-01)
+
+Forward-looking capability ideas toward the goal — *automation for building software from a
+spec + requirements, faster and cheaper*. These are **candidate ideas**, not yet-dispositioned
+deferred-scope rows: promote one into "Active" (with a concrete plan) when it's picked up. Each
+cites its origin. A pending Fable design review is expected to prune/prioritize/extend this list.
+
+### A. Close the self-improvement loops (from the 2026-07-01 reference review)
+The reference heysoo system had far more self-improvement scaffolding than the rebuild — but most
+was **open-loop** (generated → dumped to PR comments → evaporated) or **human-invoked**. The
+opportunity is to *port it AND close the loops it left open*.
+- **Follow-up task creation** — add `TaskSource.create_task(spec)` + a `follow_ups` byproduct
+  channel on stage outputs; the reviewer's non-blocking `issues` + discovered work → filed as new
+  (labeled, back-linked, human-approved) issues. Ports the one real closed backlog loop we dropped
+  (`implement-orchestrator.sh:2060`, `batch-orchestrator.sh:743`). **Strongest build candidate; contained.**
+- **Reflection capture, loop closed** — bring back the completion-stage reflections
+  `innovation_brainstorm` (product ideas, the #505 lineage) and `orchestration_retrospective` /
+  `pipeline_notes` (harness improvements) (`implement-orchestrator.sh:2067–2074`), but *file* them
+  as tracked issues / `DEFERRED` rows instead of PR-comment prose (the reference never closed this).
+- **Dogfood the harness on itself** — route `process_notes` / the retrospective back to *this*
+  template's own tracker (the `selfhost` adapter already exists to run it). No reference precedent —
+  the reference had no self-run loop.
+- **Meta-authoring layer, reconsidered** — the reference's `writing-skills` / `writing-agents` /
+  `cc-orchestration-writer` (an opus agent that edits the orchestrator, carrying a known-pitfalls
+  memory) were the self-improvement *tooling*; we retired them as "9 non-wired skills." Re-evaluate
+  now that self-improvement is a goal.
+- **Cross-run / cross-task learnings knowledge base** — a persistent project knowledge store
+  (research, gotchas, conventions) injected into later tasks so cost drops over a project's life.
+  Genuine build-fresh — neither system had it (reference learnings were per-run only).
+
+### B. Spec → software front door (the missing upstream)
+- **Spec/requirements → task-graph decomposition** — read a PRD/spec and *emit* the dependency DAG
+  the scheduler runs (the "stage above intake"). The reference had no decomposition emitter either.
+- **Acceptance / spec-conformance gate** — generate acceptance tests from the spec; a final
+  "does the delivered whole meet the requirements" gate above per-task review.
+- **A-priori cost/time estimation + budget** — estimate per-task cost from the plan, approve a
+  budget, enforce it (mirror the Workflow tool's `budget` concept). "Cheaper" needs *before*-run
+  estimation, not just the after-the-fact ledger.
+
+### C. Faster / cheaper levers
+- **Cost-optimizing routing policy** — the routing *mechanism* exists (`:codex` tag, model table);
+  add a *policy* that routes cheap/mechanical stages to cheaper models/codex by difficulty.
+- **Parallel worktree execution** — see the Active "Port-registry parallel-worktree concurrency"
+  row; the real throughput lever for "faster."
+
+### D. Under-used AI-tooling leverage
+- **Workflows *inside* stages** — the review stage could *be* a find→verify multi-agent workflow
+  (like `/code-review`); implement could use a judge-panel. We use the Workflow tool only as a
+  dispatch shim, not for in-stage quality — the biggest unpulled quality lever.
+- **Reasoning-effort per stage** — route by *thinking effort* (hard stages high, cheap stages low),
+  not just by model.
+- **Vision for UI tasks** — screenshot the running app and vision-check rendering (the repo already
+  has `heysoo-*.png`).
+- **Custom slash commands** (`/orchestrate`, `/orch-status`, `/orch-monitor`) as ergonomic entry points.
+- **MCP servers** to replace shelling `gh`/`git` (structured, richer).
+- **Prompt-cache-aware prompt structuring** — the session-reuse thesis depends on a stable prefix
+  we're not deliberately engineering; structure WorkItem prompts to maximize cache hits.
+
+### E. Codex / provider parity (from the 2026-06-28 codex discussion)
+- **Provider-aware model table** — `model_table` is claude-only and `model_for_role` isn't
+  provider-aware, so a codex-routed stage gets a *claude* model id (passed to `codex exec -m` and
+  priced from the claude table). Add codex models + prices + provider-aware selection. **Correctness.**
+- **Codex-native persona surface** — codex won't read `.claude/agents`/`--agent`/hooks; emit an
+  `AGENTS.md` and/or fold the persona into the WorkItem prompt for codex-routed stages, so the kit's
+  personas reach codex too.
+
+### F. DX / observability (build-now candidates — no top model needed)
+- **Terminal live monitor** (`orchestrator monitor <run>`) — tail `events.jsonl` + render the
+  per-task stage tree + cost + lane audit live. Low effort, reuses `render.py` + the durable
+  artifacts. (The Active "Monitor dashboard" row is the cross-session/web version.)
+- **`ARCHITECTURE.md` + Mermaid diagrams + a reading guide** — component map, task-lifecycle
+  sequence, lane matrix, 15→6 collapse map, and a hot-path trace with `file:line` pointers.
+  Comprehension aid; explicitly *not* a top-model task.
 
 ## Retired
 
