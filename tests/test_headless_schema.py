@@ -55,6 +55,20 @@ def test_transport_omits_json_schema_without_a_provider(monkeypatch) -> None:
     claude_cli_transport()(_work())  # no schema provider
 
     assert "--json-schema" not in calls[0]
+    assert "--append-system-prompt" not in calls[0]
+
+
+def test_transport_appends_json_only_directive_with_schema(monkeypatch) -> None:
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls))
+
+    claude_cli_transport(lambda ref: '{"type":"object"}')(_work())
+
+    # --json-schema is best-effort on `claude -p`, so a system-prompt directive forces
+    # the JSON object as the final output (so an agentic stage doesn't end in prose).
+    assert "--append-system-prompt" in calls[0]
+    directive = calls[0][calls[0].index("--append-system-prompt") + 1]
+    assert "ONLY a single" in directive and "JSON object" in directive
 
 
 def test_transport_omits_json_schema_when_provider_returns_none(monkeypatch) -> None:

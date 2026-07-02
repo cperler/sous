@@ -67,6 +67,19 @@ _SESSION_LOST_MARKERS = (
 )
 
 
+# Appended to every headless `claude -p` call that carries a schema. `--json-schema` is
+# best-effort (the CLI only guarantees session_id/stop_reason/envelope, not
+# structured_output); this makes the JSON object the required final output so an agentic
+# stage doesn't finish in prose. Composes with _json_object_from_text + _validate_shape.
+_JSON_ONLY_POSTAMBLE = (
+    "When your work for this stage is complete, your FINAL message must be ONLY a single "
+    "JSON object that satisfies the required JSON schema — using the exact required "
+    "property names, with no prose, no explanation, and no markdown code fences before or "
+    "after it. Do the stage's actual work first (tools, edits, commands as needed), then "
+    "emit that JSON object as the last thing you output."
+)
+
+
 def _session_lost(stderr: str | None) -> bool:
     text = (stderr or "").lower()
     return bool(text) and any(m in text for m in _SESSION_LOST_MARKERS)
@@ -279,7 +292,12 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
         if work.agent:
             argv += ["--agent", work.agent]
         if schema_json_for and (schema := schema_json_for(work.schema_ref)):
-            argv += ["--json-schema", schema]
+            # `--json-schema` is BEST-EFFORT on `claude -p`, not a hard constraint: after
+            # multi-turn agentic work the model often ends `stop_reason=end_turn` with a
+            # PROSE summary and no `structured_output` (the headless #25 failure). Force
+            # the contract with a system-prompt directive — the same lever the reference
+            # bash system applied on its codex path (which also lacked --json-schema).
+            argv += ["--json-schema", schema, "--append-system-prompt", _JSON_ONLY_POSTAMBLE]
         if session_ref:
             argv += ["--resume", session_ref]
         invocation = (f"claude -p --model {work.model}"
