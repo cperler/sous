@@ -91,6 +91,11 @@ class WorkItem(BaseModel):
     agent: str | None = None  # persona the runner dispatches (from the project roster)
     lane_policy: LanePolicy
     timeout_s: int | None = None
+    # Working directory the runner executes in — the task's worktree (folded from
+    # intake's output). None => the runner's process CWD. Dispatch/environment metadata
+    # (like timeout_s), NOT part of content_hash: it is derived from the same durable
+    # state the prompt is, so it never changes a dispatch's identity.
+    cwd: str | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -109,6 +114,7 @@ class WorkItem(BaseModel):
         agent: str | None = None,
         attempt: int = 0,
         timeout_s: int | None = None,
+        cwd: str | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -132,6 +138,7 @@ class WorkItem(BaseModel):
             model=model,
             lane_policy=lane_policy,
             timeout_s=timeout_s,
+            cwd=cwd,
             created_at=created_at,
         )
 

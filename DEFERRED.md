@@ -113,6 +113,27 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
       map is injective (unit-tested); the fold is tolerant + idempotent + replay-safe. The dedicated
       `task.pr_number`/`pr_url` lift is kept (other consumers read it). Tests in
       `tests/test_context_plane.py`. (Scope's `plan` now reaches the task — was dropped on the floor.)
+    - **#6 Cache-friendly context block in `render_prompt` (built).** Prompt assembled as ordered
+      sections, stable parts FIRST for prompt-cache reuse: (1) project commands [project-wide
+      stable], (2) task spec title/body [per-task stable across its 6 stages], (3) folded
+      `task.context` [grows per stage], (4) the stage instruction + learnings [per-stage/attempt].
+      Context rendered in fixed canonical (pipeline) order → replay-stable. Stage templates reduced
+      to pure instructions (title/body/learnings now supplied by the sections). `Engine._project_commands()`
+      folds install/test/typecheck via the generic `ProjectConfig` Protocol (**the previously-decorative
+      command surface is now consumed** — see #4's "left intact"); context/commands passed as plain
+      dicts so `stages.py` stays project-agnostic. Acceptance checks (in `tests/test_context_plane.py`):
+      implement's prompt contains scope's plan; review's contains pr_url; stable parts precede context.
+    - **#7 `WorkItem.cwd` / worktree (built).** New `WorkItem.cwd` (dispatch/environment metadata,
+      NOT part of `content_hash` — same treatment as `timeout_s`). `next_work` sets it from the folded
+      `worktree` (None on intake, which creates the worktree); both transports pass `cwd=work.cwd` to
+      `subprocess.run`, so the headless lane no longer depends on process CWD. Acceptance checks: a
+      WorkItem's cwd is the folded worktree (`tests/test_context_plane.py`); both transports run in the
+      stated cwd (`tests/test_timeout.py`).
+    - **Phase B complete.** The task context plane (data plane) is in: stage outputs flow downstream,
+      project knowledge reaches the prompt, and headless dispatch is cwd-addressed. **Out-of-scope /
+      reserved for the design pass** (untouched, no ground changed): Stage-enum→per-task-pipeline
+      migration; headless session continuity / `session_ref`; stage-commit checkpoint protocol; the
+      decomposition front door / acceptance gate / eval-replay bench / cost-routing policy.
 
 ## Active
 

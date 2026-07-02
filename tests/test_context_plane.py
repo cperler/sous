@@ -111,6 +111,19 @@ def test_implement_prompt_contains_scope_plan(tmp_path, project) -> None:
     assert "Context from earlier stages" in prompt
 
 
+def test_workitem_cwd_is_the_folded_worktree(tmp_path, project) -> None:
+    # review Phase B #7: a WorkItem runs in the task's worktree, not process CWD
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    intake = eng.next_work("r1", "t1")
+    assert intake.stage is Stage.INTAKE
+    assert intake.cwd is None  # intake creates the worktree; nothing folded yet
+    eng.record("r1", make_result(intake))  # folds worktree=/wt/42 into context
+    scope = eng.next_work("r1", "t1")
+    assert scope.cwd == "/wt/42"  # every later stage runs in the worktree
+
+
 def test_review_prompt_contains_pr_url(tmp_path, project) -> None:
     # review Phase B acceptance check: review's prompt is given task.pr_url
     eng = _engine(tmp_path, project)

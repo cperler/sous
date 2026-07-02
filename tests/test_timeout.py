@@ -31,11 +31,11 @@ def _engine(tmp_path, project, **kw) -> Engine:
     return Engine(store, ledger, project, **kw)
 
 
-def _wi(*, stage=Stage.IMPLEMENT, policy=POLICY_HEADLESS, timeout_s=1) -> WorkItem:
+def _wi(*, stage=Stage.IMPLEMENT, policy=POLICY_HEADLESS, timeout_s=1, cwd=None) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=stage, prompt="p",
         schema_ref="implement", model="claude-opus-4-8", lane_policy=policy,
-        created_at="2026-06-22T00:00:00Z", timeout_s=timeout_s,
+        created_at="2026-06-22T00:00:00Z", timeout_s=timeout_s, cwd=cwd,
     )
 
 
@@ -86,6 +86,41 @@ def test_codex_transport_passes_timeout_and_classifies(monkeypatch) -> None:
     assert raw.exit_code == 124
     sr = CodexRunner(transport=lambda w: raw).dispatch(_wi(policy=POLICY_CODEX, timeout_s=9))
     assert sr.status is ResultStatus.TIMEOUT
+
+
+# --- the headless lane runs in the WorkItem's stated cwd, not process CWD ---
+def test_claude_transport_runs_in_workitem_cwd(monkeypatch) -> None:
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+
+        class P:
+            returncode = 0
+            stdout = '{"structured_output": {"committed": true}}'
+            stderr = ""
+        return P()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    claude_cli_transport()(_wi(cwd="/wt/42"))
+    assert seen["cwd"] == "/wt/42"  # the headless lane no longer depends on process CWD
+
+
+def test_codex_transport_runs_in_workitem_cwd(monkeypatch) -> None:
+    seen: dict = {}
+
+    def fake_run(argv, **kwargs):
+        seen["cwd"] = kwargs.get("cwd")
+
+        class P:
+            returncode = 0
+            stdout = ""
+            stderr = ""
+        return P()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    codex_cli_transport()(_wi(policy=POLICY_CODEX, cwd="/wt/99"))
+    assert seen["cwd"] == "/wt/99"
 
 
 # --- a transport that genuinely sleeps past the ceiling does NOT hang -----

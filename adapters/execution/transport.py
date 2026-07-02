@@ -125,7 +125,8 @@ def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = N
             argv += ["--json-schema", sp]
         invocation = f"claude -p --model {work.model}" + (f" --agent {work.agent}" if work.agent else "")
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True, timeout=work.timeout_s)  # noqa: S603
+            proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
+                                  timeout=work.timeout_s, cwd=work.cwd)
         except FileNotFoundError as exc:  # pragma: no cover - env dependent
             return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
         except subprocess.TimeoutExpired:
@@ -164,7 +165,7 @@ def codex_cli_transport() -> Transport:
             invocation = f"codex exec --json (model {work.model})"
             try:
                 proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
-                                      timeout=work.timeout_s)
+                                      timeout=work.timeout_s, cwd=work.cwd)
             except FileNotFoundError as exc:  # pragma: no cover - env dependent
                 return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
             except subprocess.TimeoutExpired:
