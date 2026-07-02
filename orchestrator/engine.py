@@ -197,7 +197,13 @@ class Engine:
             attempt = 0
         learnings = "\n".join(task.learnings)
         prompt = render_prompt(
-            stage, task_id=task_id, title=task.title, body=task.body, learnings=learnings
+            stage,
+            task_id=task_id,
+            title=task.title,
+            body=task.body,
+            learnings=learnings,
+            context=task.context,
+            project_commands=self._project_commands(),
         )
         agent = self.project.agent_for(stage, spec.agent_role)
         work = WorkItem.create(
@@ -533,6 +539,26 @@ class Engine:
         }
 
     # --- helpers --------------------------------------------------------------
+    def _project_commands(self) -> dict[str, str]:
+        """The project's stable shell commands, folded into the prompt's cache-stable
+        prefix (was decorative — declared on ProjectConfig, consumed by nothing). Only
+        the generic Protocol methods are called, so the engine stays project-agnostic.
+        Each maps a label to a joined command string; a command that raises/returns
+        empty is simply omitted (tolerant)."""
+        out: dict[str, str] = {}
+        for label, getter in (
+            ("install", self.project.install_cmd),
+            ("test (unit)", self.project.test_unit_cmd),
+            ("typecheck", self.project.typecheck_cmd),
+        ):
+            try:
+                argv = getter()
+            except Exception:  # noqa: BLE001 - a project command surface must never block dispatch
+                continue
+            if argv:
+                out[label] = " ".join(argv)
+        return out
+
     def _set_ref_state(self, run_id: str, task_id: str, state: TaskState) -> None:
         def mut(run: Run) -> None:
             for ref in run.task_refs:

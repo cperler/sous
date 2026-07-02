@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .model_table import Role
-from .schemas.enums import Stage
+from .schemas.enums import STAGE_ORDER, Stage
 
 
 @dataclass(frozen=True)
@@ -20,7 +20,7 @@ class StageSpec:
     model_role: str  # resolved to a model id by the model_table
     schema_ref: str  # output-schema key the runner enforces
     agent_role: str | None  # sub-role for ProjectConfig.agent_for()
-    template: str  # prompt template; {placeholders} filled at render time
+    template: str  # the stage instruction (goal + return spec); render_prompt frames it
     # Wall-clock ceiling (seconds) the engine threads into the WorkItem so a hung
     # CLI fails as a classifiable TIMEOUT instead of hanging the scheduler forever.
     # Sized by the stage's expected work: cheap shell < reasoning < implement/test.
@@ -37,7 +37,6 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role=None,
         timeout_s=300,  # cheap shell: worktree prep + baseline
         template=(
-            "INTAKE for task {task_id} ({title}).\n"
             "Prepare an isolated worktree/branch for this task and capture a test "
             "baseline using the project's test commands. Do not implement anything.\n"
             "Return: branch, worktree, baseline_captured."
@@ -50,9 +49,8 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="scope",
         timeout_s=600,  # deep reasoning, no file edits
         template=(
-            "SCOPE for task {task_id} ({title}).\n{body}\n\n"
             "Understand the change, decide feasibility, and produce a minimal task "
-            "plan. If genuinely blocked, say so.\n{learnings}"
+            "plan. If genuinely blocked, say so.\n"
             "Return: feasible, blocked_reason, plan (list of subtasks)."
         ),
     ),
@@ -63,10 +61,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="implement",
         timeout_s=1800,  # the heavy stage: multi-file edits + commits
         template=(
-            "IMPLEMENT for task {task_id} ({title}).\n"
-            "Implement the planned change and commit it. If no scope plan is present "
-            "(lite/micro), implement the task spec directly as a single change.\n"
-            "{learnings}"
+            "Implement the change and commit it. Follow the scope plan in the context "
+            "above if present; if none (lite/micro), implement the task spec directly "
+            "as a single change.\n"
             "Return: files_changed, summary, committed."
         ),
     ),
@@ -77,12 +74,11 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="test",
         timeout_s=1200,  # test/fix iterate-until-green loop
         template=(
-            "TEST for task {task_id} ({title}).\n"
             "Run the project's tests for the changed files, fix regressions you "
             "introduced (not inherited failures), and re-run until green or no "
             "progress. Then VERIFY the tests are meaningful: they must exercise THIS "
             "change and would fail if it regressed — not vacuous, tautological, or "
-            "always-green.\n{learnings}"
+            "always-green.\n"
             "Return: passed, failures (list of failing test ids), tests_meaningful "
             "(bool — only true if the tests genuinely cover the change), "
             "validation_notes (what the tests assert / any gaps)."
@@ -95,7 +91,6 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
         timeout_s=600,  # docstrings + open a PR
         template=(
-            "DELIVER for task {task_id} ({title}).\n"
             "Add/refresh docstrings for changed source, then open a pull request for "
             "the task branch.\n"
             "Return: pr_number, pr_url."
@@ -108,22 +103,79 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="review",
         timeout_s=600,  # read the PR + judge
         template=(
-            "REVIEW for task {task_id} ({title}).\n"
-            "Review the PR against the task goal and code quality. Approve only if it "
-            "achieves the goal without regressions.\n{learnings}"
+            "Review the PR (see pr_url in the context above) against the task goal and "
+            "code quality. Approve only if it achieves the goal without regressions.\n"
             "Return: approved, issues (list)."
         ),
     ),
 }
 
 
-def render_prompt(stage: Stage, *, task_id: str, title: str, body: str, learnings: str = "") -> str:
-    """Fill a stage template. ``learnings`` is the appended prior-attempt context."""
+def _render_value(v: object) -> str:
+    """One folded context value → a compact one-line-ish string for the prompt."""
+    if isinstance(v, list):
+        return "; ".join(str(x) for x in v) if v else "(none)"
+    return str(v)
+
+
+def _render_context(context: dict) -> str:
+    """Render the folded task context in FIXED canonical (pipeline) order so the block is
+    a pure function of the values — byte-identical on replay, cache-stable across a run."""
+    # Imported here (not module-scope) to keep the stage-metadata module free of an
+    # import-time dependency on the state machine; the map is the single fold source.
+    from .state_machine import CONTEXT_KEYS
+
+    lines = [
+        f"- {key}: {_render_value(context[key])}"
+        for stage in STAGE_ORDER
+        for key in CONTEXT_KEYS[stage]
+        if key in context
+    ]
+    return "\n".join(lines)
+
+
+def render_prompt(
+    stage: Stage,
+    *,
+    task_id: str,
+    title: str,
+    body: str,
+    learnings: str = "",
+    context: dict | None = None,
+    project_commands: dict[str, str] | None = None,
+) -> str:
+    """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
+    reuse (2026-07-01 context-plane design note §4):
+
+      1. project commands  — stable project-wide (identical for every task & stage)
+      2. task spec (title/body) — stable per-task (identical across the task's 6 stages)
+      3. folded task context — per-task, grows as upstream stages complete
+      4. the stage instruction (+ prior-attempt learnings) — per-stage / per-attempt
+
+    Sections 1–2 form the byte-identical prefix a downstream stage can reuse from cache;
+    the volatile per-stage content trails it. ``context``/``project_commands`` are plain
+    dicts so this stays project-agnostic (the engine supplies them).
+    """
     spec = STAGE_SPECS[stage]
-    learn_block = f"Prior attempts (learn from these):\n{learnings}\n\n" if learnings else ""
-    return spec.template.format(
-        task_id=task_id,
-        title=title or "(no title)",
-        body=(body or "").strip(),
-        learnings=learn_block,
-    )
+    parts: list[str] = []
+
+    if project_commands:
+        cmds = "\n".join(f"- {name}: {cmd}" for name, cmd in project_commands.items())
+        parts.append(f"## Project commands\n{cmds}")
+
+    task_block = f"## Task {task_id}: {title or '(no title)'}"
+    if (body or "").strip():
+        task_block += f"\n\n{body.strip()}"
+    parts.append(task_block)
+
+    if context:
+        rendered = _render_context(context)
+        if rendered:
+            parts.append(f"## Context from earlier stages\n{rendered}")
+
+    instruction = f"## {stage.value.upper()}\n{spec.template}"
+    if learnings:
+        instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
+    parts.append(instruction)
+
+    return "\n\n".join(parts)

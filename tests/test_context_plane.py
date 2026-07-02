@@ -92,6 +92,48 @@ def test_context_ceiling_drops_lowest_priority_stages_first() -> None:
     assert "issues" not in task.context  # review dropped first (lowest priority)
 
 
+def _prompt_at(eng: Engine, stage: Stage, run="r1", task="t1") -> str:
+    """Drive the task until `stage` is dispatched; return that WorkItem's prompt."""
+    while (w := eng.next_work(run, task)) is not None:
+        if w.stage is stage:
+            return w.prompt
+        eng.record(run, make_result(w))
+    raise AssertionError(f"stage {stage} never dispatched")
+
+
+def test_implement_prompt_contains_scope_plan(tmp_path, project) -> None:
+    # review Phase B acceptance check: scope's plan reaches implement's prompt
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    prompt = _prompt_at(eng, Stage.IMPLEMENT)
+    assert "subtask-1" in prompt  # the plan scope produced (_default_output SCOPE)
+    assert "Context from earlier stages" in prompt
+
+
+def test_review_prompt_contains_pr_url(tmp_path, project) -> None:
+    # review Phase B acceptance check: review's prompt is given task.pr_url
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    prompt = _prompt_at(eng, Stage.REVIEW)
+    assert "/1234" in prompt  # deliver's pr_url, folded into context
+
+
+def test_prompt_orders_stable_parts_before_per_task_context(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    prompt = _prompt_at(eng, Stage.IMPLEMENT)
+    # stable project commands + task spec precede the growing per-task context block
+    i_cmds = prompt.index("## Project commands")
+    i_task = prompt.index("## Task t1")
+    i_ctx = prompt.index("## Context from earlier stages")
+    assert i_cmds < i_task < i_ctx
+    # the decorative-no-more ProjectConfig commands are actually in the prompt now
+    assert "install" in prompt and "typecheck" in prompt
+
+
 # --- helpers ---------------------------------------------------------------
 def make_result_stub(stage: Stage, output: dict):
     from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
