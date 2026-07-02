@@ -17,6 +17,9 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 
+from jsonschema import Draft202012Validator
+from jsonschema import ValidationError as _JSONSchemaError
+
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
 
@@ -72,21 +75,56 @@ def _session_lost(stderr: str | None) -> bool:
 def _json_object_from_text(text: str) -> dict | None:
     """Recover a JSON object a model printed as text (in the envelope's ``result``) when
     it answered the ``--json-schema`` prompt with prose instead of the structured-output
-    tool — commonly a ```json fenced block. Returns the object, or None if the text isn't
-    a single JSON object (genuine prose stays a SCHEMA_VIOLATION)."""
-    s = text.strip()
-    if s.startswith("```"):  # strip a ```json / ``` code fence
-        s = s.split("\n", 1)[-1] if "\n" in s else s[3:]
-        if s.rstrip().endswith("```"):
-            s = s.rstrip()[:-3]
-    s = s.strip()
-    if not s.startswith("{"):
+    tool. Extracts the first balanced ``{...}`` object, so it survives the common shapes a
+    model actually emits — a ```json fenced block, a "Here is the result:" preamble, or a
+    trailing "Let me know if…" sentence. Returns the object, or None if the text has no
+    parseable JSON object (genuine prose stays a SCHEMA_VIOLATION). Shape is validated
+    separately against the stage schema — this only finds the object, it doesn't vouch for it."""
+    start = text.find("{")
+    if start == -1:
         return None
+    depth = 0
+    in_str = False
+    esc = False
+    for i in range(start, len(text)):
+        c = text[i]
+        if in_str:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                in_str = False
+            continue
+        if c == '"':
+            in_str = True
+        elif c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:  # matched the first object's close brace
+                try:
+                    obj = json.loads(text[start:i + 1])
+                except json.JSONDecodeError:
+                    return None
+                return obj if isinstance(obj, dict) else None
+    return None
+
+
+def _validate_shape(obj: dict, schema_json: str) -> dict | None:
+    """Return ``obj`` iff it satisfies the stage's JSON Schema, else None. Guards the
+    recovery/tool paths where the CLI didn't (or can't) enforce shape, so a wrong-shape
+    object becomes a SCHEMA_VIOLATION instead of a false SUCCESS. A malformed schema is not
+    the model's fault — pass the object through rather than failing the dispatch on it."""
     try:
-        obj = json.loads(s)
-    except json.JSONDecodeError:
+        validator = Draft202012Validator(json.loads(schema_json))
+    except Exception:  # noqa: BLE001 - a malformed schema must not veto real work
+        return obj
+    try:
+        validator.validate(obj)
+    except _JSONSchemaError:
         return None
-    return obj if isinstance(obj, dict) else None
+    return obj
 
 
 def to_stage_result(
@@ -275,6 +313,12 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
             # text (often fenced ```json) lands it in `result`. Recover that rather than
             # discarding a schema-shaped answer as a SCHEMA_VIOLATION.
             structured = _json_object_from_text(structured)
+        # Shape-gate: the CLI enforces --json-schema ONLY on the tool path, so a recovered
+        # (or tool-path) object must still satisfy the stage schema — else a valid-JSON-but-
+        # wrong-shape answer would record as SUCCESS with a missing required field. Failing
+        # validation drops to None → SCHEMA_VIOLATION (the engine retries).
+        if structured is not None and schema_json_for and (sj := schema_json_for(work.schema_ref)):
+            structured = _validate_shape(structured, sj)
         session_id = data.get("session_id")
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
                          exit_code=0, invocation=invocation,

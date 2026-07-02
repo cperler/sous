@@ -193,6 +193,22 @@ def test_render_completion_note_content() -> None:
     assert "other → (filing failed)" in note
 
 
+def test_completion_note_costs_read_na_on_the_interactive_lane() -> None:
+    from orchestrator.schemas.enums import ExecutionMode
+
+    task = Task(task_id="#11", run_id="r1", created_at="t0", updated_at="t0", title="X")
+    rec = task.stages[Stage.IMPLEMENT]
+    rec.status = StageStatus.COMPLETED
+    rec.model = "claude-opus-4-8"
+    rec.lane = ExecutionMode.INTERACTIVE
+    rec.cost_usd = 0.0  # interactive can't meter in-session
+
+    note = render_completion_note(task, [])
+
+    assert "n/a" in note  # not a misleading "$0.0000"
+    assert "$0.0000" not in note
+
+
 def test_render_completion_note_denied_verdict() -> None:
     task = Task(task_id="#10", run_id="r1", created_at="t0", updated_at="t0")
     task.stages[Stage.REVIEW].output = {"approved": False, "issues": ["broken"]}

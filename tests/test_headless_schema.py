@@ -7,7 +7,11 @@ import json
 import subprocess
 
 from adapters.execution.runners import _schema_json_provider, build_registry
-from adapters.execution.transport import claude_cli_transport
+from adapters.execution.transport import (
+    _json_object_from_text,
+    _validate_shape,
+    claude_cli_transport,
+)
 from orchestrator.schemas.enums import ExecutionMode, Provider, Stage
 from orchestrator.schemas.work import LanePolicy, WorkItem
 
@@ -137,6 +141,63 @@ def test_transport_leaves_genuine_prose_unstructured(monkeypatch) -> None:
     raw = claude_cli_transport()(_work())
 
     assert raw.structured_output is None  # prose stays a schema_violation upstream
+
+
+# --- _json_object_from_text: the realistic prose-wrapped shapes a model emits -----------
+
+
+def test_json_object_recovery_handles_the_common_shapes() -> None:
+    obj = {"approved": True, "issues": []}
+    cases = {
+        "bare": '{"approved": true, "issues": []}',
+        "fenced": '```json\n{"approved": true, "issues": []}\n```',
+        "preamble+fence": 'Here is the result:\n```json\n{"approved": true, "issues": []}\n```',
+        "trailing prose": '{"approved": true, "issues": []}. Let me know if you need changes.',
+        "tagged fence no newline": '```json {"approved": true, "issues": []} ```',
+    }
+    for label, text in cases.items():
+        assert _json_object_from_text(text) == obj, f"failed to recover: {label}"
+
+    # backticks INSIDE a string value must not confuse the brace scanner
+    assert _json_object_from_text('{"detail": "```"}') == {"detail": "```"}
+    # conservative: genuine prose and a bare array recover nothing (object-shaped only)
+    assert _json_object_from_text("Looks good, approving.") is None
+    assert _json_object_from_text("[1, 2, 3]") is None
+    assert _json_object_from_text("{ not json }") is None
+
+
+# --- _validate_shape: recovered/tool objects must satisfy the stage schema --------------
+
+
+def test_validate_shape_rejects_wrong_shape_but_passes_valid() -> None:
+    schema = '{"type":"object","required":["approved","issues"]}'
+    assert _validate_shape({"approved": True, "issues": []}, schema) == {"approved": True, "issues": []}
+    assert _validate_shape({"foo": 1}, schema) is None  # missing required keys -> rejected
+    # a malformed schema must not veto real work
+    assert _validate_shape({"foo": 1}, "not a schema") == {"foo": 1}
+
+
+def test_transport_shape_gates_a_wrong_shape_tool_answer(monkeypatch) -> None:
+    calls: list = []
+    # structured_output present but missing the required review keys.
+    envelope = {"structured_output": {"foo": 1}}
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls, payload=envelope))
+    provider = lambda ref: '{"type":"object","required":["approved","issues"]}'  # noqa: E731
+
+    raw = claude_cli_transport(provider)(_work("review"))
+
+    assert raw.structured_output is None  # wrong shape -> SCHEMA_VIOLATION, not false SUCCESS
+
+
+def test_transport_recovers_and_shape_accepts_prose_wrapped_answer(monkeypatch) -> None:
+    calls: list = []
+    envelope = {"result": 'Sure:\n```json\n{"approved": true, "issues": []}\n```'}
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls, payload=envelope))
+    provider = lambda ref: '{"type":"object","required":["approved","issues"]}'  # noqa: E731
+
+    raw = claude_cli_transport(provider)(_work("review"))
+
+    assert raw.structured_output == {"approved": True, "issues": []}
 
 
 def test_build_registry_injected_transport_beats_schema_provider() -> None:

@@ -10,8 +10,17 @@ from __future__ import annotations
 
 import json
 
-from .schemas.enums import STAGE_ORDER
-from .schemas.status import Task
+from .schemas.enums import STAGE_ORDER, ExecutionMode
+from .schemas.status import StageRecord, Task
+
+
+def _cost_cell(rec: StageRecord) -> str:
+    """Cost column for a stage row. The interactive lane can't meter per-stage cost
+    in-session, so it records 0.0 — render that as ``n/a`` rather than ``$0.0000``, which
+    reads as 'this stage was free'. Metered lanes (headless/codex) show the real figure."""
+    if rec.lane is ExecutionMode.INTERACTIVE:
+        return "n/a"
+    return f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
 
 
 def render_cost_summary(run_id: str, summary: dict) -> str:
@@ -192,9 +201,8 @@ def render_task_index(task: Task) -> str:
     ]
     for seq, stage in enumerate(STAGE_ORDER, start=1):
         rec = task.stages[stage]
-        cost = f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
         model = f"`{rec.model}`" if rec.model else "—"
-        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {cost} |")
+        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {_cost_cell(rec)} |")
     lines.append("")
     return "\n".join(lines)
 
@@ -222,9 +230,8 @@ def render_completion_note(task: Task, followups: list[dict] | None = None) -> s
     ]
     for seq, stage in enumerate(STAGE_ORDER, start=1):
         rec = task.stages[stage]
-        cost = f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
         model = f"`{rec.model}`" if rec.model else "—"
-        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {cost} |")
+        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {_cost_cell(rec)} |")
 
     blocking = [i for i in (review.get("issues") or []) if str(i).strip()]
     if blocking:
