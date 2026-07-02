@@ -92,6 +92,33 @@ def test_context_ceiling_drops_lowest_priority_stages_first() -> None:
     assert "issues" not in task.context  # review dropped first (lowest priority)
 
 
+def test_context_ceiling_evicts_largest_stage_not_reverse_order() -> None:
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    # A fat test.failures list sized to sit JUST UNDER the ceiling on its own: 33 elements
+    # of len 490 plus one of len 30 (every element < _MAX_ITEM_STR and count < _MAX_LIST, so
+    # nothing is truncated). Deterministic byte-count ≈ 16350 < 16384.
+    failures = ["f" * 489 + str(i % 10) for i in range(33)] + ["g" * 30]
+    _absorb_outputs(task, make_result_stub(Stage.TEST, {"failures": failures}))
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # test fold alone fits
+    # deliver adds a TINY contribution (~65 bytes) that tips the whole context over the
+    # ceiling. Size-aware eviction must shed the fat test.failures, not the small deliver
+    # keys. The pre-fix reverse-pipeline order evicted DELIVER first (it precedes TEST in
+    # reversed(STAGE_ORDER)), starving the near-ceiling test.failures — the bug this guards.
+    _absorb_outputs(
+        task,
+        make_result_stub(
+            Stage.DELIVER,
+            {"pr_number": 1234, "pr_url": "https://github.com/o/r/pull/1234"},
+        ),
+    )
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    assert "failures" not in task.context  # the FAT contribution is evicted first
+    assert task.context["pr_number"] == 1234  # the small deliver keys SURVIVE
+    assert task.context["pr_url"].endswith("/1234")
+
+
 def _prompt_at(eng: Engine, stage: Stage, run="r1", task="t1") -> str:
     """Drive the task until `stage` is dispatched; return that WorkItem's prompt."""
     while (w := eng.next_work(run, task)) is not None:

@@ -147,15 +147,29 @@ def _context_bytes(context: dict) -> int:
 
 def _enforce_context_ceiling(task: Task) -> None:
     """Keep task.context under the whole-context ceiling by dropping ENTIRE stage
-    contributions in fixed reverse-pipeline order (review first, intake last) — the
-    downstream stages need the earliest stages' context most. Deterministic."""
+    contributions, heaviest-first: each pass evicts the single present stage whose
+    folded keys weigh the most bytes, so a fat contribution is shed before a tiny one
+    (a near-ceiling ``test.failures`` is no longer starved by evicting ``deliver``'s
+    small ``pr_url`` first). Ties break reverse-pipeline (review first, intake last) —
+    downstream stages need the earliest stages' context most. Deterministic: only json
+    byte-lengths and the fixed enum order decide, never context insertion order."""
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
-    for stage in reversed(STAGE_ORDER):
-        for key in CONTEXT_KEYS[stage]:
-            task.context.pop(key, None)
-        if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
+    while _context_bytes(task.context) > _MAX_CONTEXT_BYTES:
+        candidates = [
+            s for s in reversed(STAGE_ORDER) if any(k in task.context for k in CONTEXT_KEYS[s])
+        ]
+        if not candidates:
             return
+
+        def _weight(stage: Stage) -> int:
+            return _context_bytes(
+                {k: task.context[k] for k in CONTEXT_KEYS[stage] if k in task.context}
+            )
+
+        victim = max(candidates, key=_weight)
+        for key in CONTEXT_KEYS[victim]:
+            task.context.pop(key, None)
 
 
 def _absorb_outputs(task: Task, result: StageResult) -> None:
