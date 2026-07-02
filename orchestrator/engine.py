@@ -156,6 +156,10 @@ class Engine:
         for ref in run.task_refs:
             if states[ref.task_id] in TERMINAL_TASK_STATES:
                 continue
+            # Held at a human gate: non-terminal (keeps the run open) but never
+            # dispatched until Engine.approve() releases it (design pass §4).
+            if states[ref.task_id] is TaskState.BLOCKED_ON_HUMAN:
+                continue
             if dag.unmet_deps(ref.task_id, states):
                 continue
             # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
@@ -478,6 +482,55 @@ class Engine:
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
         task.state = TaskState.RETRYING
         return "stage_failed_will_retry"
+
+    # --- human approval gate (design pass §4) ----------------------------------
+    def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
+        """Park a task at the human gate. Refuses while a dispatch is outstanding
+        (record the in-flight result first — a held task must be quiescent)."""
+
+        def _hold(t: Task) -> None:
+            if t.state in TERMINAL_TASK_STATES:
+                raise ContractError(f"task {task_id} is terminal ({t.state.value}); cannot hold")
+            if t.pending_work_item_id is not None:
+                raise ContractError(
+                    f"task {task_id} has an outstanding dispatch {t.pending_work_item_id}; "
+                    f"record its result before holding"
+                )
+            t.state = TaskState.BLOCKED_ON_HUMAN
+
+        task = self.store.update_task(run_id, task_id, _hold)
+        self._set_ref_state(run_id, task_id, TaskState.BLOCKED_ON_HUMAN)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "held_for_approval", "run_id": run_id,
+             "task_id": task_id, "what": what},
+        )
+        return task
+
+    def approve(self, run_id: str, task_id: str, *, approved_by: str, what: str = "") -> Task:
+        """Release a held task. The durable ``approval-<run>-<task>.json`` artifact IS
+        the gate record (who/when/what) — prose norms stay documentation."""
+
+        def _release(t: Task) -> None:
+            if t.state is not TaskState.BLOCKED_ON_HUMAN:
+                raise ContractError(
+                    f"task {task_id} is not held for approval (state {t.state.value})"
+                )
+            t.state = TaskState.PENDING
+
+        task = self.store.update_task(run_id, task_id, _release)
+        self.store.write_approval(
+            run_id, task_id,
+            {"approved_by": approved_by, "at": _now(), "what": what, "run_id": run_id,
+             "task_id": task_id},
+        )
+        self._set_ref_state(run_id, task_id, TaskState.PENDING)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "approved", "run_id": run_id, "task_id": task_id,
+             "approved_by": approved_by, "what": what},
+        )
+        return task
 
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:

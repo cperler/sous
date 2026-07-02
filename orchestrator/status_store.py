@@ -265,6 +265,18 @@ class StatusStore:
         self._atomic_write(path, text)
         return path
 
+    def write_approval(self, run_id: str, task_id: str, payload: dict) -> Path:
+        """Durable human-approval artifact (design pass §4): who approved what, when."""
+        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        path = self.root / f"approval-{run_id}-{safe}.json"
+        self._atomic_write(path, json.dumps(payload, indent=2, default=str))
+        return path
+
+    def load_approval(self, run_id: str, task_id: str) -> dict | None:
+        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        path = self.root / f"approval-{run_id}-{safe}.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
     def write_run_artifact(self, name: str, text: str) -> Path:
         """Write a run-level text artifact (e.g. cost-summary.md) under the root."""
         path = self.root / name

@@ -86,6 +86,13 @@ def main(argv: list[str] | None = None) -> int:
     rh = sub.add_parser("run-headless", help="drive the whole run in-process (headless mode)")
     rh.add_argument("--util", type=float, default=0.0)
     rh.add_argument("--max-concurrent", type=int, default=3)
+    hd = sub.add_parser("hold", help="park a task at the human approval gate")
+    hd.add_argument("--task", required=True)
+    hd.add_argument("--reason", required=True, help="what needs human sign-off")
+    ap = sub.add_parser("approve", help="release a held task (writes the approval artifact)")
+    ap.add_argument("--task", required=True)
+    ap.add_argument("--by", required=True, help="who is approving")
+    ap.add_argument("--note", default="", help="what is being approved")
     sub.add_parser("resume")
     sub.add_parser("status")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
@@ -127,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
 
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
         _emit(sched.run(args.run, registry_runner(eng.registry), util_pct=args.util))
+    elif args.cmd == "hold":
+        task = eng.hold_for_approval(args.run, args.task, args.reason)
+        _emit({"held": task.task_id, "state": task.state.value, "reason": args.reason})
+    elif args.cmd == "approve":
+        task = eng.approve(args.run, args.task, approved_by=args.by, what=args.note)
+        _emit({"approved": task.task_id, "state": task.state.value, "by": args.by})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":

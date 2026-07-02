@@ -66,9 +66,14 @@ class TaskState(StrEnum):
     RETRYING = "retrying"
     COMPLETED = "completed"
     FAILED = "failed"
+    # Held at a human gate (design pass §4): NON-terminal, not dispatchable, does not
+    # cascade. Exit is Engine.approve(), which writes a durable approval artifact —
+    # the HARD-CHECKPOINT norm as a mechanism instead of prose.
+    BLOCKED_ON_HUMAN = "blocked_on_human"
 
 
 # Terminal task states — the DAG/state machine treats these as "done".
+# BLOCKED_ON_HUMAN is deliberately NOT terminal: a held task keeps its run open.
 TERMINAL_TASK_STATES: frozenset[TaskState] = frozenset(
     {TaskState.COMPLETED, TaskState.FAILED, TaskState.CASCADE_BLOCKED}
 )
