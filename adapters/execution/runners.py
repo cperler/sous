@@ -9,6 +9,8 @@ dispatches in-process cells (headless/codex) — exactly the headless/codex mode
 
 from __future__ import annotations
 
+import json
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 
 from orchestrator.schemas.enums import ExecutionMode, Provider
@@ -17,17 +19,42 @@ from orchestrator.schemas.work import StageResult, WorkItem
 from .base import SUPPORTED, CapabilityDescriptor, Registry
 from .codex import CodexRunner, SchemaProvider
 from .headless_claude import HeadlessClaudeRunner
-from .transport import Transport
+from .transport import Transport, checkpointing_transport, claude_cli_transport
+
+
+def _schema_json_provider(schema_for: SchemaProvider) -> Callable[[str], str | None]:
+    """Adapt a project's ``schema_for(ref) -> dict`` into the inline-JSON callable
+    ``claude_cli_transport`` needs for ``--json-schema`` (the CLI takes the schema JSON
+    itself, not a path). Serialized once per ref and cached. Without this the headless lane
+    never sends a schema, so ``claude -p`` answers in prose and every stage is a
+    SCHEMA_VIOLATION (the codex lane already gets its schema provider; this is its
+    headless×claude twin)."""
+    cache: dict[str, str | None] = {}
+
+    def json_for(ref: str) -> str | None:
+        if ref not in cache:
+            schema = schema_for(ref) if schema_for else None
+            cache[ref] = json.dumps(schema) if schema is not None else None
+        return cache[ref]
+
+    return json_for
 
 
 def build_registry(
     *,
     headless_transport: Transport | None = None,
+    headless_schema_provider: SchemaProvider | None = None,
     codex_transport: Transport | None = None,
     codex_schema_provider: SchemaProvider | None = None,
     include_interactive: bool = True,
 ) -> Registry:
-    """Registry covering interactive×claude (external) + headless×claude + any×codex."""
+    """Registry covering interactive×claude (external) + headless×claude + any×codex.
+
+    ``headless_schema_provider`` wires the project's stage schemas into the real
+    headless×claude transport (``--json-schema``) so structured output is actually
+    enforced; it is ignored when an explicit ``headless_transport`` is injected (tests
+    wrap their own). The schema-wired transport keeps the checkpoint/reset protocol.
+    """
     reg = Registry()
     if include_interactive:
         reg.register_external(
@@ -38,6 +65,10 @@ def build_registry(
                 schema_enforced=True,
                 status=SUPPORTED,
             )
+        )
+    if headless_transport is None and headless_schema_provider is not None:
+        headless_transport = checkpointing_transport(
+            claude_cli_transport(_schema_json_provider(headless_schema_provider))
         )
     reg.register_runner(HeadlessClaudeRunner(headless_transport))
     reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))

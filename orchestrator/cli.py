@@ -38,9 +38,14 @@ def _engine(args: argparse.Namespace) -> Engine:
         mode = ExecutionMode.HEADLESS  # this command drives in-process; force the lane
     provider = Provider(args.provider) if getattr(args, "provider", None) else None
     interactive = mode is ExecutionMode.INTERACTIVE and provider is not Provider.CODEX
-    # Codex full-validation needs the project's schemas (optional hook); wire it through.
+    # Codex full-validation AND the headless×claude --json-schema both need the project's
+    # stage schemas (optional hook); wire the same provider into both lanes.
     schema_provider = getattr(project, "schema_for", None)
-    registry = build_registry(include_interactive=interactive, codex_schema_provider=schema_provider)
+    registry = build_registry(
+        include_interactive=interactive,
+        headless_schema_provider=schema_provider,
+        codex_schema_provider=schema_provider,
+    )
     router = Router(execution_mode=mode, orchestrator_provider=provider)
     return Engine(store, ledger, project, router=router, registry=registry)
 

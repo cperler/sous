@@ -201,8 +201,12 @@ def checkpointing_transport(inner: Transport) -> Transport:
     return run
 
 
-def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = None) -> Transport:
+def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = None) -> Transport:
     """Real headless×claude transport: shells ``claude -p ... --output-format json``.
+
+    ``schema_json_for`` returns the stage's JSON Schema **inline** (the CLI's
+    ``--json-schema`` takes the schema JSON itself, not a file path) so the reply is
+    forced into the stage contract and comes back on the envelope's ``structured_output``.
 
     Session continuity (design pass §2): a WorkItem carrying ``session_ref`` resumes
     that conversation (``--resume``) so later stages of a task are nearly all
@@ -216,8 +220,8 @@ def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = N
                 "--dangerously-skip-permissions", "--output-format", "json"]
         if work.agent:
             argv += ["--agent", work.agent]
-        if schema_path_for and (sp := schema_path_for(work.schema_ref)):
-            argv += ["--json-schema", sp]
+        if schema_json_for and (schema := schema_json_for(work.schema_ref)):
+            argv += ["--json-schema", schema]
         if session_ref:
             argv += ["--resume", session_ref]
         invocation = (f"claude -p --model {work.model}"

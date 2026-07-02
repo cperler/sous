@@ -24,9 +24,13 @@ _SELF_REPO = "cperler/orchestration-template"
 
 _NOOP = ["true"]  # this project has no e2e / shell / infra layer
 
+# Stage sub-role -> agent name. These resolve to the starter-kit personas seeded into
+# this repo's own ``.claude/agents/`` (bootstrapped from templates/project-default), so
+# both lanes can name them: the interactive lane as a subagent type, the headless lane as
+# ``claude -p --agent <name>``.
 _ROSTER: dict[str, str] = {
-    "implement": "python-implementer",
-    "test": "python-implementer",
+    "implement": "python-backend-developer",
+    "test": "test-validator",
     "review": "code-reviewer",
     "docstring": "docstring-writer",
 }

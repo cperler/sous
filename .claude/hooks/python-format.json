@@ -1,0 +1,16 @@
+{
+  "_comment": "EXAMPLE Claude Code hook: format edited Python files with ruff. Merge into the project's .claude/settings.json under \"hooks\". Adjust the event name / matcher / env var to your Claude Code version before relying on it.",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "f=\"$CLAUDE_FILE_PATH\"; case \"$f\" in *.py) uv run ruff format \"$f\" >/dev/null 2>&1 || true;; esac"
+          }
+        ]
+      }
+    ]
+  }
+}
