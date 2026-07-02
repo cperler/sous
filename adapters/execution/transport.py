@@ -31,6 +31,9 @@ class RawResult:
     invocation: str = ""
     # Provider session the call used/created (design pass §2); None if unsupported.
     session_ref: str | None = None
+    # {"tag", "sha"} stamped by the checkpoint wrapper after a successful
+    # git-affecting stage (design pass §3); None otherwise.
+    checkpoint: dict | None = None
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -94,6 +97,7 @@ def to_stage_result(
             execution_mode=mode, provider=provider, invocation=raw.invocation or provider.value
         ),
         session_ref=raw.session_ref,
+        checkpoint=raw.checkpoint,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
     )
@@ -128,6 +132,73 @@ def _codex_usage(events_stdout: str) -> TokenUsage:
         if isinstance(u, dict):
             usage = _usage_from({"usage": u})
     return usage
+
+
+def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True,  # noqa: S603, S607
+                          text=True, timeout=60)
+
+
+def _reset_worktree(cwd: str | None, ref: str) -> str | None:
+    """Hard-reset a task worktree to a checkpoint ref before dispatch (design pass §3).
+    Returns an error string (fails the dispatch) or None. DESTRUCTIVE — guarded:
+
+    - refuses without an explicit cwd (never resets the process CWD), and
+    - refuses unless ``<cwd>/.git`` is a FILE, i.e. a linked ``git worktree`` — in the
+      main checkout ``.git`` is a directory, and wiping a checkout the human may be
+      working in is exactly the accident this guard exists to prevent.
+    """
+    if not cwd:
+        return "checkpoint reset requires an explicit worktree cwd"
+    if not Path(cwd, ".git").is_file():
+        return f"refusing checkpoint reset: {cwd} is not a linked git worktree"
+    for args in (("reset", "--hard", ref), ("clean", "-fd")):
+        proc = _git(cwd, *args)
+        if proc.returncode != 0:
+            # Do NOT run the stage over unknown/dirty state — fail the dispatch.
+            return f"checkpoint reset failed (git {' '.join(args)}): {proc.stderr.strip()[:300]}"
+    return None
+
+
+def _tag_head(cwd: str, tag: str) -> dict | None:
+    """Tag HEAD (``-f``: a crash between tag and record re-runs the stage and
+    overwrites the same attempt's tag). Returns {"tag", "sha"} or None — fail-OPEN:
+    a missing checkpoint only means no reset anchor later, never a failed stage."""
+    try:
+        if _git(cwd, "tag", "-f", tag).returncode != 0:
+            return None
+        head = _git(cwd, "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - defensive
+        return None
+    return {"tag": tag, "sha": head.stdout.strip()} if head.returncode == 0 else None
+
+
+def checkpointing_transport(inner: Transport) -> Transport:
+    """Wrap a transport with the stage-commit checkpoint protocol (design pass §3).
+
+    All git I/O lives HERE — models are unreliable at bookkeeping and the engine must
+    stay pure (it only names tags / picks reset anchors, as WorkItem fields). Before
+    dispatch: reset the worktree to ``reset_to`` if set. After a successful raw result
+    of a checkpoint stage: tag HEAD as ``checkpoint_tag`` and stamp {tag, sha} into
+    the RawResult. Intake has no cwd yet, so the tag lands in the worktree its own
+    output names.
+    """
+
+    def run(work: WorkItem) -> RawResult:
+        if work.reset_to:
+            err = _reset_worktree(work.cwd, work.reset_to)
+            if err:
+                return RawResult(None, exit_code=1, error=err,
+                                 invocation=f"checkpoint reset {work.reset_to}")
+        raw = inner(work)
+        if work.checkpoint_tag and raw.exit_code == 0 and not raw.error:
+            out = raw.structured_output if isinstance(raw.structured_output, dict) else {}
+            tag_dir = work.cwd or out.get("worktree")
+            if isinstance(tag_dir, str) and tag_dir:
+                raw.checkpoint = _tag_head(tag_dir, work.checkpoint_tag)
+        return raw
+
+    return run
 
 
 def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = None) -> Transport:

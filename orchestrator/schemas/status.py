@@ -105,6 +105,11 @@ class Task(BaseModel):
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing
     # metadata only: correctness never depends on it.
     session_ref: str | None = None
+    # Last successful stage checkpoint {"tag", "sha"} (design pass §3): the reset
+    # anchor for a retry/crash-resume of a git-affecting stage. Absorbed from
+    # StageResult.checkpoint on SUCCESS only, so a failed/vetoed attempt's commits
+    # never become an anchor.
+    last_checkpoint: dict | None = None
 
     @model_validator(mode="before")
     @classmethod

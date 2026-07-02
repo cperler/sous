@@ -17,7 +17,14 @@ from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .base import EXPLICIT_EMPTY, SUPPORTED, CapabilityDescriptor
-from .transport import RawResult, Transport, codex_cli_transport, is_rate_limited, to_stage_result
+from .transport import (
+    RawResult,
+    Transport,
+    checkpointing_transport,
+    codex_cli_transport,
+    is_rate_limited,
+    to_stage_result,
+)
 
 # schema_ref -> JSON Schema dict (or None if unknown -> can't full-validate).
 SchemaProvider = Callable[[str], dict | None]
@@ -27,7 +34,9 @@ class CodexRunner:
     def __init__(
         self, transport: Transport | None = None, schema_provider: SchemaProvider | None = None
     ) -> None:
-        self._transport = transport or codex_cli_transport()
+        # The real transport gets the checkpoint protocol (design pass §3); an
+        # injected transport is the caller's choice (tests wrap explicitly).
+        self._transport = transport or checkpointing_transport(codex_cli_transport())
         self._schema_provider = schema_provider
 
     def capabilities(self) -> list[CapabilityDescriptor]:

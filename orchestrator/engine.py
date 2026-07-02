@@ -9,6 +9,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import UTC, datetime
 
@@ -49,6 +50,13 @@ from .status_store import StatusStore
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _ref_safe(s: str) -> str:
+    """Make an id safe inside a git ref component (tags: design pass §3). Conservative:
+    anything outside [word . -] becomes '-', which also rules out the refname-forbidden
+    sequences ('..', '@{', '~', '^', ':', '?', '*', '[', space)."""
+    return re.sub(r"[^\w.\-]", "-", s) or "x"
 
 
 class Engine:
@@ -212,6 +220,19 @@ class Engine:
             attempt = rec.attempt + 1
         else:
             attempt = 0
+        # Checkpoint protocol (design pass §3): the engine only NAMES the tag and picks
+        # the reset anchor — the runner-side wrapper does the git I/O. Tags include the
+        # run id (open Q3: yes — bench replays will recur task ids across runs).
+        checkpoint_tag = reset_to = None
+        if spec.checkpoint:
+            checkpoint_tag = (
+                f"task/{_ref_safe(run_id)}/{_ref_safe(task_id)}/{stage.value}/{attempt}"
+            )
+            # Reset only a retry (FAILED) or crash-resume (RUNNING) — a first attempt
+            # starts from a clean tree by construction. Anchor = last SUCCESSFUL
+            # checkpoint, so the failed attempt's debris (tracked or not) is discarded.
+            if rec.status in (StageStatus.FAILED, StageStatus.RUNNING) and task.last_checkpoint:
+                reset_to = task.last_checkpoint.get("tag")
         learnings = "\n".join(task.learnings)
         prompt = render_prompt(
             stage,
@@ -244,6 +265,8 @@ class Engine:
             # resume passes whatever ref survives — a dead session is the transport's
             # fallback-to-fresh, never a correctness problem.
             session_ref=task.session_ref,
+            checkpoint_tag=checkpoint_tag,
+            reset_to=reset_to,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -379,6 +402,10 @@ class Engine:
                 # self-contained and a dead session cold-starts in the transport).
                 if effective.session_ref:
                     task.session_ref = effective.session_ref
+                # Checkpoint anchor (design pass §3): SUCCESS only — a failed or
+                # gate-vetoed attempt's commits must never become a reset target.
+                if effective.checkpoint:
+                    task.last_checkpoint = effective.checkpoint
                 if is_done(task):
                     task.state = TaskState.COMPLETED
                     outcome = "task_completed"
@@ -403,6 +430,8 @@ class Engine:
             "model": result.model,
             "lane_used": result.lane_used.model_dump(),
             "cost_usd": cost,
+            "session_ref": result.session_ref,
+            "checkpoint": result.checkpoint,
             "structured_output": result.structured_output,
             "raw_output": result.raw_output,
             "error": effective.error,

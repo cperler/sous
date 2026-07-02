@@ -102,6 +102,17 @@ class WorkItem(BaseModel):
     # as timeout_s/cwd. A transport that cannot resume (codex today) ignores it; a lost
     # session falls back to a fresh one inside the same dispatch.
     session_ref: str | None = None
+    # Checkpoint protocol (design pass §3) — both engine-derived bookkeeping, excluded
+    # from content_hash like timeout_s/cwd/session_ref:
+    #   checkpoint_tag: the tag the runner-side wrapper creates at HEAD after a
+    #     successful git-affecting stage (`git tag -f` — a crash between tag and record
+    #     re-runs the stage and overwrites it; git state never short-circuits the
+    #     state machine).
+    #   reset_to: the last-good checkpoint tag; the wrapper hard-resets the worktree to
+    #     it BEFORE dispatch (retry/crash-resume only), so attempts never inherit a
+    #     failed attempt's debris.
+    checkpoint_tag: str | None = None
+    reset_to: str | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -122,6 +133,8 @@ class WorkItem(BaseModel):
         timeout_s: int | None = None,
         cwd: str | None = None,
         session_ref: str | None = None,
+        checkpoint_tag: str | None = None,
+        reset_to: str | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -147,6 +160,8 @@ class WorkItem(BaseModel):
             timeout_s=timeout_s,
             cwd=cwd,
             session_ref=session_ref,
+            checkpoint_tag=checkpoint_tag,
+            reset_to=reset_to,
             created_at=created_at,
         )
 
@@ -172,6 +187,11 @@ class StageResult(BaseModel):
     # the engine on SUCCESS and threaded into the task's next WorkItem. None on
     # providers/lanes without session support.
     session_ref: str | None = None
+    # {"tag": ..., "sha": ...} stamped by the runner-side checkpoint wrapper after a
+    # successful git-affecting stage (design pass §3); absorbed into
+    # task.last_checkpoint. None when the stage doesn't checkpoint or tagging failed
+    # (fail-open: a missing checkpoint only means no reset anchor later).
+    checkpoint: dict | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

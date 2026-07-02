@@ -25,6 +25,10 @@ class StageSpec:
     # CLI fails as a classifiable TIMEOUT instead of hanging the scheduler forever.
     # Sized by the stage's expected work: cheap shell < reasoning < implement/test.
     timeout_s: int = 900
+    # Git-affecting stage (design pass §3): success ends in a tagged commit and a
+    # retry/crash-resume resets the worktree to the last-good tag. Vocabulary
+    # metadata — the transport wrapper does the git I/O, the engine only names tags.
+    checkpoint: bool = False
 
 
 # The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
@@ -36,6 +40,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="intake",
         agent_role=None,
         timeout_s=300,  # cheap shell: worktree prep + baseline
+        checkpoint=True,  # the baseline anchor: implement's first retry resets here
         template=(
             "Prepare an isolated worktree/branch for this task and capture a test "
             "baseline using the project's test commands. Do not implement anything.\n"
@@ -60,6 +65,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="implement",
         agent_role="implement",
         timeout_s=1800,  # the heavy stage: multi-file edits + commits
+        checkpoint=True,
         template=(
             "Implement the change and commit it. Follow the scope plan in the context "
             "above if present; if none (lite/micro), implement the task spec directly "
@@ -73,6 +79,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="test",
         agent_role="test",
         timeout_s=1200,  # test/fix iterate-until-green loop
+        checkpoint=True,
         template=(
             "Run the project's tests for the changed files, fix regressions you "
             "introduced (not inherited failures), and re-run until green or no "
@@ -90,6 +97,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="deliver",
         agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
         timeout_s=600,  # docstrings + open a PR
+        checkpoint=True,
         template=(
             "Add/refresh docstrings for changed source, then open a pull request for "
             "the task branch.\n"

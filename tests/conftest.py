@@ -90,12 +90,14 @@ def make_result(
     mode: ExecutionMode = ExecutionMode.INTERACTIVE,
     provider: Provider = Provider.CLAUDE,
     session_ref: str | None = None,
+    checkpoint: dict | None = None,
 ) -> StageResult:
     """Simulate a runner's StageResult answering a WorkItem."""
     if structured_output is None and status is ResultStatus.SUCCESS:
         structured_output = _default_output(work.stage)
     return StageResult(
         session_ref=session_ref,
+        checkpoint=checkpoint,
         work_item_id=work.id,
         content_hash=work.content_hash,
         run_id=work.run_id,
