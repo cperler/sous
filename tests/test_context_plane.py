@@ -17,6 +17,7 @@ from orchestrator.state_machine import (
     CONTEXT_KEYS,
     _absorb_outputs,
     _context_bytes,
+    _enforce_context_ceiling,
 )
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
@@ -143,6 +144,55 @@ def test_context_ceiling_evicts_the_fat_key_but_keeps_its_small_siblings() -> No
     assert "failures" not in task.context  # the FAT key is evicted
     assert task.context["tests_meaningful"] is True  # small siblings SURVIVE
     assert task.context["validation_notes"] == "asserts the changed behavior"
+
+
+def test_context_ceiling_tie_break_evicts_latest_pipeline_stage_first() -> None:
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    # Two folds engineered to weigh EXACTLY the same: SCOPE.plan (early pipeline) and
+    # REVIEW.issues (latest pipeline). The 2-byte gap between the "plan"/"issues" key names
+    # is offset by making one plan element 2 chars longer, so `_weight` cannot choose by
+    # bytes — only the reverse-pipeline tie-break (max over reversed(STAGE_ORDER)) decides,
+    # and the docstring promises it evicts the latest-pipeline stage's key first.
+    plan = ["z" * 498 for _ in range(19)] + ["z" * 500]
+    issues = ["z" * 498 for _ in range(20)]
+    assert _context_bytes({"plan": plan}) == _context_bytes({"issues": issues})  # true tie
+    _absorb_outputs(task, make_result_stub(Stage.SCOPE, {"plan": plan}))  # ~10KB, fits alone
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES
+    _absorb_outputs(task, make_result_stub(Stage.REVIEW, {"issues": issues}))  # tips ceiling
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    assert "issues" not in task.context  # REVIEW (latest pipeline) evicted on the tie
+    assert task.context["plan"] == plan  # the equal-weight EARLIER stage's key survives
+
+
+def test_context_ceiling_evicts_across_multiple_passes() -> None:
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    # Three fat keys of distinct weight plus a tiny survivor, seeded together so a single
+    # ceiling sweep must run >1 pass: evicting only the heaviest key leaves the context
+    # still over the ceiling. The while-loop must keep going, evicting largest-first, until
+    # it fits — dropping the two heaviest and keeping the third (lighter) fat key.
+    failures = ["z" * 480 for _ in range(33)]  # TEST, ~16KB (heaviest)
+    issues = ["z" * 480 for _ in range(30)]  # REVIEW, ~14.5KB (second)
+    files_changed = ["m" * 480 for _ in range(24)]  # IMPLEMENT, ~11.5KB (survives)
+    task.context = {
+        "branch": "b",  # INTAKE, tiny — always survives
+        "files_changed": files_changed,
+        "issues": issues,
+        "failures": failures,
+    }
+    assert _context_bytes(task.context) > _MAX_CONTEXT_BYTES  # over ceiling by ~2.5x
+    _enforce_context_ceiling(task)
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    # >1 pass: the two heaviest keys are gone (one eviction would not have sufficed —
+    # dropping `failures` alone still leaves ~26KB > ceiling), largest-first.
+    assert "failures" not in task.context
+    assert "issues" not in task.context
+    # the lighter fat key and the tiny early-stage key both survive the multi-pass sweep.
+    assert task.context["files_changed"] == files_changed
+    assert task.context["branch"] == "b"
 
 
 def _prompt_at(eng: Engine, stage: Stage, run="r1", task="t1") -> str:
