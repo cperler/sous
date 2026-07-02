@@ -8,8 +8,6 @@ so they are trivially testable and the engine just writes their output.
 
 from __future__ import annotations
 
-import json
-
 from .schemas.enums import STAGE_ORDER, ExecutionMode
 from .schemas.status import StageRecord, Task
 
@@ -162,8 +160,45 @@ def render_retrospective(retro: dict) -> str:
     return "\n".join(lines)
 
 
+def _md_scalar(v: object) -> str:
+    if isinstance(v, bool):
+        return "yes" if v else "no"
+    if v is None or v == [] or v == {}:
+        return "—"
+    return str(v)
+
+
+def _render_struct(obj: object, depth: int = 0) -> list[str]:
+    """A stage's structured output as readable markdown bullets — not a JSON dump.
+
+    The machine-exact copy lives in the sibling ``NN-<stage>.json``; this is the human
+    view, so keys become bold labels and lists/nested dicts become indented bullets."""
+    pad = "  " * depth
+    out: list[str] = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)) and v:
+                out.append(f"{pad}- **{k}:**")
+                out += _render_struct(v, depth + 1)
+            else:
+                out.append(f"{pad}- **{k}:** {_md_scalar(v)}")
+    elif isinstance(obj, list):
+        for item in obj:
+            if isinstance(item, (dict, list)) and item:
+                out += _render_struct(item, depth)
+            else:
+                out.append(f"{pad}- {_md_scalar(item)}")
+    else:
+        out.append(f"{pad}- {_md_scalar(obj)}")
+    return out
+
+
 def render_stage(payload: dict) -> str:
-    """Render one stage's durable record (the write_stage_log payload) to Markdown."""
+    """Render one stage's durable record (the write_stage_log payload) to Markdown.
+
+    The Markdown is the *human* view (readable header + result bullets + any narrative);
+    the full, machine-exact record is the sibling ``NN-<stage>.json``. No JSON is embedded
+    here on purpose."""
     lane = payload.get("lane_used") or {}
     lane_str = f"{lane.get('execution_mode', '?')}:{lane.get('provider', '?')}"
     cost = payload.get("cost_usd")
@@ -180,10 +215,9 @@ def render_stage(payload: dict) -> str:
     if payload.get("error"):
         lines += ["", f"**Error:** {payload['error']}"]
     if payload.get("structured_output") is not None:
-        lines += ["", "## Structured output", "", "```json",
-                  json.dumps(payload["structured_output"], indent=2), "```"]
+        lines += ["", "## Result", "", *_render_struct(payload["structured_output"])]
     if payload.get("raw_output"):
-        lines += ["", "## Output (raw)", "", str(payload["raw_output"])]
+        lines += ["", "## Commentary", "", str(payload["raw_output"])]
     lines.append("")
     return "\n".join(lines)
 

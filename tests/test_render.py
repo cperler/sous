@@ -26,16 +26,20 @@ def test_render_cost_summary_markdown() -> None:
     assert "$1.5000" in md and "claude-opus-4-8" in md and "| Model |" in md
 
 
-def test_render_stage_includes_structured_output() -> None:
+def test_render_stage_renders_structured_output_as_readable_markdown() -> None:
     payload = {
         "stage": "scope", "task_id": "#9", "attempt": 0, "status": "success", "outcome": "stage_completed",
         "model": "claude-opus-4-8", "lane_used": {"execution_mode": "interactive", "provider": "claude"},
-        "cost_usd": 0.66, "structured_output": {"feasible": True, "plan": ["x"]},
-        "raw_output": None, "error": None, "completed_at": "t",
+        "cost_usd": 0.66, "structured_output": {"feasible": True, "plan": ["hoist it"]},
+        "raw_output": "did the thing", "error": None, "completed_at": "t",
     }
     md = render_stage(payload)
     assert "# scope — #9" in md and "interactive:claude" in md and "$0.6600" in md
-    assert '"feasible": true' in md  # the structured output (the embedded substance)
+    # structured output is readable bullets, NOT an embedded JSON blob
+    assert "```json" not in md and '"feasible"' not in md
+    assert "- **feasible:** yes" in md
+    assert "- **plan:**" in md and "  - hoist it" in md
+    assert "## Commentary" in md and "did the thing" in md
 
 
 def test_render_task_index_lists_six_stages() -> None:
