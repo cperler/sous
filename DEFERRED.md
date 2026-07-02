@@ -72,6 +72,19 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
     current pins to verify on a provider price change (same as claude rows). Tests in
     `tests/test_model_table.py`. Roadmap E1 retired below; cross-provider fallthrough stays the
     open Active row.
+  - **#3 Reconcile `Engine.ready` / `Scheduler.dispatchable` (built).** They implemented different
+    eligibility semantics (PENDING/BLOCKED-only + capacity-capped, lease-ignoring vs.
+    non-terminal + deps-met + unleased). Picked the semantics the scheduler needs and made it the
+    single source of truth: moved the canonical predicate into `Engine.dispatchable` (non-terminal,
+    deps COMPLETED, no lease; deliberately NOT capacity-capped — the cap is an orthogonal
+    `dispatch_limit` decision in `Scheduler.tick`). `Scheduler.dispatchable` now delegates.
+    **Deleted** `Engine.ready` and the redundant CLI `ready` subcommand (superseded by
+    `dispatchable`, which run targets already use; the single-task supervisor uses `next`).
+    `dag.ready_tasks` is kept (a tested pure-DAG helper, unrelated to the divergence). Boundary
+    tests in `tests/test_dispatchable.py` (a RETRYING task is dispatchable — old `ready` excluded it;
+    a leased task is not — old `ready` included it). **CLI-surface note:** `docs/orchestration-spec/
+    target.md` lists `orchestrator ready` in the intended surface; it is superseded by `dispatchable`
+    (spec text left as-is — the spec describes intent/the reference system, not our CLI).
 
 ## Active
 

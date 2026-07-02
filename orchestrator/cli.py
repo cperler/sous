@@ -76,8 +76,6 @@ def main(argv: list[str] | None = None) -> int:
     n.add_argument("--task", required=True)
     n.add_argument("--util", type=float, default=0.0)
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
-    r = sub.add_parser("ready")
-    r.add_argument("--util", type=float, default=0.0)
     d = sub.add_parser("dispatchable")
     d.add_argument("--util", type=float, default=0.0)
     d.add_argument("--max-concurrent", type=int, default=3)
@@ -104,8 +102,6 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "record":
         result = StageResult.model_validate_json(Path(args.result).read_text())
         _emit(eng.record(args.run, result))
-    elif args.cmd == "ready":
-        _emit({"ready": eng.ready(args.run, util_pct=args.util)})
     elif args.cmd == "dispatchable":
         from .scheduler import Scheduler
 

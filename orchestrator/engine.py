@@ -122,14 +122,36 @@ class Engine:
         self.store.save_task(task)
         return task
 
-    # --- ready (DAG + capacity) ----------------------------------------------
-    def ready(self, run_id: str, *, util_pct: float = 0.0) -> list[str]:
+    # --- dispatchable (DAG + lease) ------------------------------------------
+    def dispatchable(self, run_id: str) -> list[str]:
+        """The canonical dispatch-eligibility set: every non-terminal task whose deps
+        are all COMPLETED and which holds no outstanding dispatch lease.
+
+        This is the ONE eligibility predicate (the scheduler delegates here). It is
+        deliberately NOT capacity-limited — the capacity cap (``dispatch_limit``) is a
+        separate, orthogonal decision applied by the caller (Scheduler.tick), so the
+        eligibility set and the throttle don't get tangled.
+
+        Semantics chosen over the old ``ready()`` (PENDING/BLOCKED-only, lease-ignoring),
+        which was wrong for the scheduler: it excluded RETRYING tasks (a retry must be
+        re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
+        """
         run = self.store.load_run(run_id)
         states = {ref.task_id: ref.state for ref in run.task_refs}
         dag = Dag(run.dependency_graph)
-        candidates = dag.ready_tasks(states)
-        limit = self.capacity.dispatch_limit(util_pct, self.concurrency_ceiling)
-        return candidates[:limit]
+        out: list[str] = []
+        for ref in run.task_refs:
+            if states[ref.task_id] in TERMINAL_TASK_STATES:
+                continue
+            if dag.unmet_deps(ref.task_id, states):
+                continue
+            # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
+            # re-dispatchable on the normal path — it needs explicit resume, never a
+            # silent re-pick that would overwrite the outstanding WorkItem.
+            if self.store.load_task(run_id, ref.task_id).pending_work_item_id is not None:
+                continue
+            out.append(ref.task_id)
+        return out
 
     # --- dispatch / record ----------------------------------------------------
     def next_work(

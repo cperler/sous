@@ -18,10 +18,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 
-from .dag import Dag
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
-from .schemas.enums import TERMINAL_TASK_STATES
 from .schemas.work import StageResult, WorkItem
 
 Runner = Callable[[list[WorkItem]], list[StageResult]]
@@ -33,23 +31,13 @@ class Scheduler:
         self.max_concurrent = max_concurrent
 
     def dispatchable(self, run_id: str) -> list[str]:
-        """Non-terminal tasks whose every dependency is COMPLETED (DAG-ready)."""
-        run = self.engine.store.load_run(run_id)
-        states = {ref.task_id: ref.state for ref in run.task_refs}
-        dag = Dag(run.dependency_graph)
-        out: list[str] = []
-        for ref in run.task_refs:
-            if states[ref.task_id] in TERMINAL_TASK_STATES:
-                continue
-            if dag.unmet_deps(ref.task_id, states):
-                continue
-            # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
-            # re-dispatchable on the normal path — it needs explicit resume, not a
-            # silent re-pick that would overwrite the outstanding WorkItem.
-            if self.engine.store.load_task(run_id, ref.task_id).pending_work_item_id is not None:
-                continue
-            out.append(ref.task_id)
-        return out
+        """Non-terminal, dependency-satisfied, unleased tasks.
+
+        Delegates to the engine's single eligibility predicate — the scheduler stays a
+        thin loop and there is one source of truth for "what's dispatchable" (fixes the
+        prior Engine.ready / Scheduler.dispatchable divergence).
+        """
+        return self.engine.dispatchable(run_id)
 
     def tick(self, run_id: str, runner: Runner, *, util_pct: float = 0.0) -> dict:
         """Advance up to `dispatch_limit` ready tasks by one stage each."""
