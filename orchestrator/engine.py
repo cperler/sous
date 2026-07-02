@@ -188,6 +188,7 @@ class Engine:
             lane_policy=lane,
             created_at=_now(),
             attempt=attempt,
+            timeout_s=spec.timeout_s,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls

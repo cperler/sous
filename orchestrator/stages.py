@@ -21,6 +21,10 @@ class StageSpec:
     schema_ref: str  # output-schema key the runner enforces
     agent_role: str | None  # sub-role for ProjectConfig.agent_for()
     template: str  # prompt template; {placeholders} filled at render time
+    # Wall-clock ceiling (seconds) the engine threads into the WorkItem so a hung
+    # CLI fails as a classifiable TIMEOUT instead of hanging the scheduler forever.
+    # Sized by the stage's expected work: cheap shell < reasoning < implement/test.
+    timeout_s: int = 900
 
 
 # The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
@@ -31,6 +35,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.CHEAP_SHELL,
         schema_ref="intake",
         agent_role=None,
+        timeout_s=300,  # cheap shell: worktree prep + baseline
         template=(
             "INTAKE for task {task_id} ({title}).\n"
             "Prepare an isolated worktree/branch for this task and capture a test "
@@ -43,6 +48,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.DEEP_REASON,
         schema_ref="scope",
         agent_role="scope",
+        timeout_s=600,  # deep reasoning, no file edits
         template=(
             "SCOPE for task {task_id} ({title}).\n{body}\n\n"
             "Understand the change, decide feasibility, and produce a minimal task "
@@ -55,6 +61,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.DEEP_REASON,
         schema_ref="implement",
         agent_role="implement",
+        timeout_s=1800,  # the heavy stage: multi-file edits + commits
         template=(
             "IMPLEMENT for task {task_id} ({title}).\n"
             "Implement the planned change and commit it. If no scope plan is present "
@@ -68,6 +75,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.REVIEW,
         schema_ref="test",
         agent_role="test",
+        timeout_s=1200,  # test/fix iterate-until-green loop
         template=(
             "TEST for task {task_id} ({title}).\n"
             "Run the project's tests for the changed files, fix regressions you "
@@ -85,6 +93,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.REVIEW,
         schema_ref="deliver",
         agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
+        timeout_s=600,  # docstrings + open a PR
         template=(
             "DELIVER for task {task_id} ({title}).\n"
             "Add/refresh docstrings for changed source, then open a pull request for "
@@ -97,6 +106,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.REVIEW,
         schema_ref="review",
         agent_role="review",
+        timeout_s=600,  # read the PR + judge
         template=(
             "REVIEW for task {task_id} ({title}).\n"
             "Review the PR against the task goal and code quality. Approve only if it "

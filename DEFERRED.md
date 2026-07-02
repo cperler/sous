@@ -51,6 +51,18 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
   leverage, codex/provider parity, and two build-now DX items (terminal monitor, ARCHITECTURE doc).
   A Fable design review is queued to prune/prioritize/extend it.
 
+- **2026-07-01 — Fable design-review execution (Phase A mechanical fixes).** Executing the
+  well-specified findings from `docs/reviews/2026-07-01-fable.md`.
+  - **#1 Timeout wiring (built).** Added `StageSpec.timeout_s` per-stage defaults (intake 300 /
+    scope 600 / implement 1800 / test 1200 / deliver 600 / review 600) and threaded them through
+    `next_work` into `WorkItem.timeout_s`. **Discrepancy vs review:** the review says "both real
+    transports run `subprocess.run(timeout=None)`" and that `WorkItem` lacks the field — but the
+    field and both transports' `timeout=work.timeout_s` + `TimeoutExpired`→exit-124→`ResultStatus.TIMEOUT`
+    handling were *already* present; the only real gap was that `next_work` never populated
+    `timeout_s` (so it defaulted to None → `timeout=None`). Fixed the real gap. Regression tests in
+    `tests/test_timeout.py` (transport passes the ceiling to `subprocess.run`; a real sleeping
+    subprocess yields a TIMEOUT result not a hang; the engine treats TIMEOUT as a retryable failure).
+
 ## Active
 
 | Item | Source (as-built §) | Why deferred | Status (2026-06-23 gate) | Trigger to revisit |
