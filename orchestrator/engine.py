@@ -239,6 +239,11 @@ class Engine:
             # Run in the task's worktree (folded from intake) so the headless lane stops
             # depending on process CWD. None on intake itself (it creates the worktree).
             cwd=task.context.get("worktree"),
+            # Chain the task's provider session (design pass §2). None on the first
+            # stage and after a failure (warm retry is deliberately off); a crash-
+            # resume passes whatever ref survives — a dead session is the transport's
+            # fallback-to-fresh, never a correctness problem.
+            session_ref=task.session_ref,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -368,6 +373,12 @@ class Engine:
             apply_result(task, effective, now=_now(), cost_usd=cost)
             if effective.status is ResultStatus.SUCCESS:
                 task.error_signatures = []  # streak resets on a clean stage
+                # Session chaining (design pass §2): reuse across SUCCESSFUL stage
+                # transitions only. A runner that reports no ref leaves the prior one
+                # in place (resuming a slightly-stale session is safe: prompts are
+                # self-contained and a dead session cold-starts in the transport).
+                if effective.session_ref:
+                    task.session_ref = effective.session_ref
                 if is_done(task):
                     task.state = TaskState.COMPLETED
                     outcome = "task_completed"
@@ -375,6 +386,9 @@ class Engine:
                     task.state = TaskState.RUNNING
                     outcome = "stage_completed"
             else:
+                # Warm retry is deliberately OFF: a failed attempt's session is as
+                # likely poisoned as useful; learnings carry the distilled failure.
+                task.session_ref = None
                 outcome = self._handle_failure(task, effective)
 
         # Durable per-stage log (JSON contract) + human-readable Markdown alongside.

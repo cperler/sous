@@ -29,6 +29,8 @@ class RawResult:
     exit_code: int = 0
     error: str | None = None
     invocation: str = ""
+    # Provider session the call used/created (design pass §2); None if unsupported.
+    session_ref: str | None = None
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -48,6 +50,20 @@ def is_rate_limited(raw: RawResult) -> bool:
     """True if a RawResult's error looks like a transient rate-limit / overload."""
     text = (raw.error or "").lower()
     return bool(text) and any(m in text for m in _RATE_LIMIT_MARKERS)
+
+
+# Errors meaning "the session to resume no longer exists" (expired/gc'd/unknown) — and
+# ONLY that. A lost session falls back to a fresh one inside the same dispatch (design
+# pass §2: a session ref is routing metadata; correctness never depends on continuity).
+# Any other resume error fails the dispatch normally.
+_SESSION_LOST_MARKERS = (
+    "no conversation found", "session not found", "unknown session", "invalid session",
+)
+
+
+def _session_lost(stderr: str | None) -> bool:
+    text = (stderr or "").lower()
+    return bool(text) and any(m in text for m in _SESSION_LOST_MARKERS)
 
 
 def to_stage_result(
@@ -77,6 +93,7 @@ def to_stage_result(
         lane_used=LaneUsed(
             execution_mode=mode, provider=provider, invocation=raw.invocation or provider.value
         ),
+        session_ref=raw.session_ref,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
     )
@@ -114,16 +131,27 @@ def _codex_usage(events_stdout: str) -> TokenUsage:
 
 
 def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = None) -> Transport:
-    """Real headless×claude transport: shells ``claude -p ... --output-format json``."""
+    """Real headless×claude transport: shells ``claude -p ... --output-format json``.
 
-    def run(work: WorkItem) -> RawResult:
+    Session continuity (design pass §2): a WorkItem carrying ``session_ref`` resumes
+    that conversation (``--resume``) so later stages of a task are nearly all
+    cache-read; the JSON payload's ``session_id`` is reported back so the engine can
+    chain the next stage. A lost/expired session cold-starts a fresh one inside the
+    same dispatch — prompts are self-contained, so continuity is never load-bearing.
+    """
+
+    def _call(work: WorkItem, session_ref: str | None) -> RawResult:
         argv = ["claude", "-p", work.prompt, "--model", work.model,
                 "--dangerously-skip-permissions", "--output-format", "json"]
         if work.agent:
             argv += ["--agent", work.agent]
         if schema_path_for and (sp := schema_path_for(work.schema_ref)):
             argv += ["--json-schema", sp]
-        invocation = f"claude -p --model {work.model}" + (f" --agent {work.agent}" if work.agent else "")
+        if session_ref:
+            argv += ["--resume", session_ref]
+        invocation = (f"claude -p --model {work.model}"
+                      + (f" --agent {work.agent}" if work.agent else "")
+                      + (f" --resume {session_ref}" if session_ref else ""))
         try:
             proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
                                   timeout=work.timeout_s, cwd=work.cwd)
@@ -148,8 +176,18 @@ def claude_cli_transport(schema_path_for: Callable[[str], str | None] | None = N
         structured = data["structured_output"] if "structured_output" in data else data.get("result")
         if isinstance(structured, str):
             structured = None  # prose, not structured
+        session_id = data.get("session_id")
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
-                         exit_code=0, invocation=invocation)
+                         exit_code=0, invocation=invocation,
+                         session_ref=session_id if isinstance(session_id, str) else None)
+
+    def run(work: WorkItem) -> RawResult:
+        raw = _call(work, work.session_ref)
+        # Fallback-to-fresh on a dead session ONLY (one retry, same dispatch). Any
+        # other resume failure returns as-is and fails the dispatch normally.
+        if work.session_ref and raw.exit_code != 0 and _session_lost(raw.error):
+            raw = _call(work, None)
+        return raw
 
     return run
 

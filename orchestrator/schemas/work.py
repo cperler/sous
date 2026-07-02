@@ -96,6 +96,12 @@ class WorkItem(BaseModel):
     # (like timeout_s), NOT part of content_hash: it is derived from the same durable
     # state the prompt is, so it never changes a dispatch's identity.
     cwd: str | None = None
+    # Provider session to resume (design pass §2). ROUTING METADATA, not content: the
+    # rendered prompt MUST stay fully self-contained — continuity may only make a stage
+    # cheaper or richer, never correct. Excluded from content_hash for the same reason
+    # as timeout_s/cwd. A transport that cannot resume (codex today) ignores it; a lost
+    # session falls back to a fresh one inside the same dispatch.
+    session_ref: str | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -115,6 +121,7 @@ class WorkItem(BaseModel):
         attempt: int = 0,
         timeout_s: int | None = None,
         cwd: str | None = None,
+        session_ref: str | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -139,6 +146,7 @@ class WorkItem(BaseModel):
             lane_policy=lane_policy,
             timeout_s=timeout_s,
             cwd=cwd,
+            session_ref=session_ref,
             created_at=created_at,
         )
 
@@ -160,6 +168,10 @@ class StageResult(BaseModel):
     structured_output: dict | None = None
     raw_output: str | None = None
     lane_used: LaneUsed
+    # The provider session the runner used or created (design pass §2) — absorbed by
+    # the engine on SUCCESS and threaded into the task's next WorkItem. None on
+    # providers/lanes without session support.
+    session_ref: str | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

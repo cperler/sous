@@ -100,6 +100,11 @@ class Task(BaseModel):
     # Set when a rate-limited dispatch re-queues the current stage on a cheaper model;
     # consumed by the next next_work() for this stage (graceful fallback).
     pending_fallback_model: str | None = None
+    # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
+    # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
+    # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing
+    # metadata only: correctness never depends on it.
+    session_ref: str | None = None
 
     @model_validator(mode="before")
     @classmethod
