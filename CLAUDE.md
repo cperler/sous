@@ -25,7 +25,8 @@ issues. Ongoing work is incremental — pick from `DEFERRED.md` or fix-forward.
   `adapters/execution/`. Don't add project-specific logic to `orchestrator/`.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
-  `main`; the `phase-3a-engine` branch is kept fast-forwarded to `main` (no git remote).
+  `main`; the `phase-3a-engine` branch is kept fast-forwarded to `main`. Remote:
+  `github.com/cperler/orchestration-template` (private; push `main` after committing).
 
 ## Live runs against the product repo (HARD CHECKPOINT)
 A live run writes to the real product repo (heysoo) and opens a PR. **The human picks the
