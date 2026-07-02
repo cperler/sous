@@ -54,7 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root", help="status/ledger directory for the run (not needed for validate)")
     p.add_argument("--run", help="run id (not needed for validate)")
-    p.add_argument("--project", required=True,
+    p.add_argument("--project",
                    help="project-config module (e.g. adapters.project.heysoo) or a "
                         "project-owned adapter dir (e.g. ../my-project/.orchestration)")
     p.add_argument("--mode", default="interactive", choices=["interactive", "headless"],
@@ -91,8 +91,39 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
+    gc = sub.add_parser("gc", help="list/prune long-lived git checkpoint tags (no run/project needed)")
+    gc.add_argument("--repo", default=".", help="git repo/worktree to scan for checkpoint tags")
+    gc.add_argument("--keep-latest", type=int, default=0,
+                    help="keep the N newest matching tags; the rest are prune candidates")
+    gc.add_argument("--prune", action="store_true",
+                    help="actually delete the candidate tags (default is a dry-run preview)")
+    # SUPPRESS: only override the global --run when explicitly given here, so
+    # `--run R gc` (global position) is not clobbered by a subparser default.
+    gc.add_argument("--run", default=argparse.SUPPRESS,
+                    help="scope to one run's checkpoint tags (may also precede the subcommand)")
 
     args = p.parse_args(argv)
+
+    if args.cmd == "gc":
+        # Checkpoint tags (task/<run>/<task>/<stage>/<attempt>) outlive their run; list
+        # them newest-first, hold back --keep-latest N, and delete the rest under --prune.
+        from adapters.execution.transport import _git
+
+        from .engine import _ref_safe
+
+        scope = f"task/{_ref_safe(args.run)}/*" if args.run else "task/*"
+        listing = _git(args.repo, "tag", "-l", "--sort=-creatordate", scope)
+        tags = [t for t in listing.stdout.splitlines() if t.strip()]
+        kept = tags[:args.keep_latest] if args.keep_latest else []
+        doomed = tags[args.keep_latest:] if args.keep_latest else tags
+        deleted = []
+        if args.prune:
+            for tag in doomed:
+                if _git(args.repo, "tag", "-d", tag).returncode == 0:
+                    deleted.append(tag)
+        _emit({"repo": args.repo, "scope": scope, "kept": kept, "candidates": doomed,
+               "deleted": deleted, "dry_run": not args.prune})
+        return 0
 
     if args.cmd == "validate":
         # Loading an external dir already enforces CONTRACT_VERSION + the full surface;
@@ -103,8 +134,8 @@ def main(argv: list[str] | None = None) -> int:
                "missing": missing, "contract_version": ADAPTER_CONTRACT_VERSION})
         return 1 if missing else 0
 
-    if not args.root or not args.run:
-        p.error(f"--root and --run are required for {args.cmd}")
+    if not args.root or not args.run or not args.project:
+        p.error(f"--root, --run and --project are required for {args.cmd}")
     eng = _engine(args)
 
     if args.cmd == "init-run":
