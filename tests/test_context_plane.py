@@ -119,6 +119,32 @@ def test_context_ceiling_evicts_largest_stage_not_reverse_order() -> None:
     assert task.context["pr_url"].endswith("/1234")
 
 
+def test_context_ceiling_evicts_the_fat_key_but_keeps_its_small_siblings() -> None:
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    # A single fat test.failures list that alone tips the ceiling, folded ALONGSIDE its
+    # small same-stage siblings (tests_meaningful, validation_notes). Per-KEY eviction must
+    # shed only the fat `failures` key; whole-stage eviction would have dropped the whole
+    # TEST contribution, needlessly losing the two small siblings.
+    failures = ["f" * 489 + str(i % 10) for i in range(34)]  # ~16.8KB > ceiling on its own
+    _absorb_outputs(
+        task,
+        make_result_stub(
+            Stage.TEST,
+            {
+                "failures": failures,
+                "tests_meaningful": True,
+                "validation_notes": "asserts the changed behavior",
+            },
+        ),
+    )
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    assert "failures" not in task.context  # the FAT key is evicted
+    assert task.context["tests_meaningful"] is True  # small siblings SURVIVE
+    assert task.context["validation_notes"] == "asserts the changed behavior"
+
+
 def _prompt_at(eng: Engine, stage: Stage, run="r1", task="t1") -> str:
     """Drive the task until `stage` is dispatched; return that WorkItem's prompt."""
     while (w := eng.next_work(run, task)) is not None:
