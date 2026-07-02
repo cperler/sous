@@ -158,7 +158,7 @@ def _enforce_context_ceiling(task: Task) -> None:
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
     while _context_bytes(task.context) > _MAX_CONTEXT_BYTES:
-        # (stage, key) pairs present in context, ordered so max() breaks weight-ties by
+        # context keys present, ordered so max() breaks weight-ties by
         # evicting the latest-pipeline stage's key first, then the first key in its tuple.
         candidates = [
             key
