@@ -207,12 +207,15 @@ def render_task_index(task: Task) -> str:
     return "\n".join(lines)
 
 
-def render_completion_note(task: Task, followups: list[dict] | None = None) -> str:
+def render_completion_note(
+    task: Task, followups: list[dict] | None = None, improvement_ref: str | None = None
+) -> str:
     """Render a run's completion evidence as Markdown — the note the engine publishes
     back to the task source (PR/issue comment) so the pipeline's reasoning outlives the
     run logs. Derived purely from the task's recorded stages + the follow-ups the engine
     filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
-    None if filing failed)."""
+    None if filing failed). ``improvement_ref`` is the URL of the enhancement issue the
+    engine filed from the review's improvement idea (None if unfiled)."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -245,6 +248,24 @@ def render_completion_note(task: Task, followups: list[dict] | None = None) -> s
             suffix = f" → {ref}" if ref else " → (filing failed)"
             lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
 
-    lines += ["", "_Produced by the orchestration harness — nothing dropped: "
-              "non-blocking findings are tracked as follow-up issues._", ""]
+    # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
+    # process lesson, so a completed run improves the project/process, not just ships a fix.
+    improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
+    if improvement and str(improvement.get("title", "")).strip():
+        head = f"💡 **Improvement idea:** {improvement['title']}" + (
+            f" → {improvement_ref}" if improvement_ref else "")
+        lines += ["", "### Self-improvement", head]
+        if str(improvement.get("detail", "")).strip():
+            lines.append(improvement["detail"].strip())
+    retro = review.get("retrospective") if isinstance(review.get("retrospective"), dict) else None
+    if retro and str(retro.get("title", "")).strip():
+        if not (improvement and str(improvement.get("title", "")).strip()):
+            lines += ["", "### Self-improvement"]
+        lines += ["", f"🔍 **Process retrospective:** {retro['title']}"]
+        if str(retro.get("detail", "")).strip():
+            lines.append(retro["detail"].strip())
+
+    lines += ["", "_Produced by the orchestration harness — nothing dropped: non-blocking "
+              "findings are tracked as follow-up issues; the improvement idea is filed as an "
+              "enhancement._", ""]
     return "\n".join(lines)

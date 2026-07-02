@@ -123,8 +123,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "follow-on ideas) that should be tracked but must not hold up this PR — the "
             "engine files each as a deferred-scope follow-up issue at finalize, so "
             "nothing you notice is silently dropped.\n"
+            "Finally — the self-improvement loop — step back from THIS PR and propose: "
+            "(a) improvement — the single highest-value forward-looking enhancement this "
+            "task suggests for the PROJECT/roadmap (filed as an enhancement issue), and "
+            "(b) retrospective — one lesson this task teaches about the ORCHESTRATION "
+            "PROCESS itself (prompts, stages, tooling, lanes). Omit either if nothing "
+            "genuine stands out — do not pad.\n"
             "Return: approved, issues (blocking; empty when approved), non_blocking "
-            "(list of {title, detail}; empty if none)."
+            "(list of {title, detail}; empty if none), improvement ({title, detail} or "
+            "omitted), retrospective ({title, detail} or omitted)."
         ),
     ),
 }

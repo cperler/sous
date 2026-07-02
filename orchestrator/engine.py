@@ -699,12 +699,15 @@ class Engine:
         # duck-typed task-source hooks (absent on a v1 adapter -> graceful no-op) and must
         # never crash run finalize — a flaky `gh` cannot un-complete a merged task.
         followups = self._file_review_followups(run_id, task, ts)
-        self._publish_completion_note(run_id, task, ts, followups)
+        # Self-improvement loop: file the review's forward-looking improvement idea as an
+        # enhancement issue (so a completed run improves the roadmap, not just ships a fix).
+        improvement_ref = self._file_review_improvement(run_id, task, ts)
+        self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
-             "followups_filed": len(followups)},
+             "followups_filed": len(followups), "improvement_filed": improvement_ref is not None},
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
@@ -749,15 +752,51 @@ class Engine:
             filed.append({"title": title, "ref": ref})
         return filed
 
+    def _file_review_improvement(self, run_id: str, task: Task, task_source: object) -> str | None:
+        """File the review's single forward-looking improvement idea as an ``enhancement``
+        issue (the self-improvement loop — heysoo's Innovation Brainstorm). Returns the
+        issue ref, or None when the adapter lacks ``file_followup`` or the review had none."""
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return None
+        review = task.stages.get(Stage.REVIEW)
+        improvement = (review.output or {}).get("improvement") if review else None
+        if not isinstance(improvement, dict):
+            return None
+        title = (improvement.get("title") or "").strip()
+        if not title:
+            return None
+        body = (
+            f"{(improvement.get('detail') or '').strip()}\n\n"
+            f"_Filed automatically from the {task.task_id} review "
+            f"({task.pr_url or 'PR'}) — the run's own improvement idea (self-improvement loop)._"
+        )
+        try:
+            ref = file_followup(title=title, body=body, labels=["enhancement"])
+        except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "improvement_failed", "run_id": run_id,
+                 "task_id": task.task_id, "title": title, "error": str(exc)},
+            )
+            return None
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "improvement_filed", "run_id": run_id,
+             "task_id": task.task_id, "title": title, "ref": ref},
+        )
+        return ref
+
     def _publish_completion_note(
-        self, run_id: str, task: Task, task_source: object, followups: list[dict]
+        self, run_id: str, task: Task, task_source: object, followups: list[dict],
+        improvement_ref: str | None = None,
     ) -> None:
         """Publish the run's completion evidence via the adapter's ``publish_note`` hook
         (a no-op when absent). Failure is logged, never fatal to finalize."""
         publish_note = getattr(task_source, "publish_note", None)
         if not callable(publish_note):
             return
-        body = render_completion_note(task, followups)
+        body = render_completion_note(task, followups, improvement_ref)
         try:
             publish_note(task.task_id, body, pr_url=task.pr_url)
         except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source

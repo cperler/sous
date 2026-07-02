@@ -23,6 +23,26 @@
         },
         "additionalProperties": true
       }
+    },
+    "improvement": {
+      "type": "object",
+      "description": "self-improvement loop: the single highest-value forward-looking improvement this task suggests for the PROJECT/roadmap (not a fix for this PR). The engine files it as an enhancement issue at finalize. Omit if none stands out.",
+      "required": ["title"],
+      "properties": {
+        "title": {"type": "string", "description": "one-line enhancement title"},
+        "detail": {"type": "string", "description": "what/why — the enhancement issue body"}
+      },
+      "additionalProperties": true
+    },
+    "retrospective": {
+      "type": "object",
+      "description": "self-improvement loop: one lesson this task teaches about the ORCHESTRATION PROCESS (prompts/stages/tooling/lanes), not the code. Rendered in the completion note. Omit if none.",
+      "required": ["title"],
+      "properties": {
+        "title": {"type": "string", "description": "one-line process lesson"},
+        "detail": {"type": "string", "description": "what we learned / what to change"}
+      },
+      "additionalProperties": true
     }
   },
   "additionalProperties": true

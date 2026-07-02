@@ -93,6 +93,40 @@ def test_finalize_files_followups_and_publishes_note(tmp_path, project) -> None:
     assert completed["followups_filed"] == 2
 
 
+_REVIEW_WITH_SELF_IMPROVEMENT = {
+    "approved": True,
+    "issues": [],
+    "improvement": {"title": "Add a schema-validate-retry loop to the transport",
+                    "detail": "Retire the postamble band-aid with a real retry."},
+    "retrospective": {"title": "Terse stage prompts under-elicit structured output",
+                      "detail": "Tune prompts against real run transcripts."},
+}
+
+
+def test_finalize_files_improvement_and_renders_self_improvement(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output=_REVIEW_WITH_SELF_IMPROVEMENT)
+
+    ts = project.task_source
+    # the improvement idea is filed as an ENHANCEMENT issue (not deferred-scope)
+    enh = [f for f in ts.followups if f["labels"] == ["enhancement"]]
+    assert len(enh) == 1
+    assert enh[0]["title"] == "Add a schema-validate-retry loop to the transport"
+
+    note = ts.notes[0]["body"]
+    assert "### Self-improvement" in note
+    assert "Improvement idea" in note and enh[0]["ref"] in note  # links the filed issue
+    assert "Process retrospective" in note and "under-elicit structured output" in note
+
+    events = _events(tmp_path)
+    assert any(e["type"] == "improvement_filed" for e in events)
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is True
+
+
 def test_finalize_no_findings_files_nothing_but_still_notes(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
@@ -216,6 +250,26 @@ def test_render_completion_note_denied_verdict() -> None:
     assert "❌ changes requested" in note
 
 
+def test_render_note_self_improvement_sections() -> None:
+    task = Task(task_id="#9", run_id="r1", created_at="t0", updated_at="t0")
+    task.stages[Stage.REVIEW].output = {
+        "approved": True, "issues": [],
+        "improvement": {"title": "Cost-aware routing", "detail": "route by budget"},
+        "retrospective": {"title": "Batch lane untested", "detail": "run a batch"},
+    }
+    note = render_completion_note(task, [], improvement_ref="https://x/issues/50")
+    assert "💡 **Improvement idea:** Cost-aware routing" in note
+    assert "https://x/issues/50" in note  # links the filed enhancement
+    assert "🔍 **Process retrospective:** Batch lane untested" in note
+
+    # retrospective still renders when there's no improvement
+    task.stages[Stage.REVIEW].output = {
+        "approved": True, "issues": [], "retrospective": {"title": "Lesson only", "detail": "d"}}
+    note2 = render_completion_note(task, [])
+    assert "### Self-improvement" in note2 and "Lesson only" in note2
+    assert "Improvement idea" not in note2
+
+
 # --- adapter hooks -----------------------------------------------------------------
 
 
@@ -270,3 +324,13 @@ def test_review_schema_accepts_non_blocking() -> None:
         validator.validate({
             "approved": True, "issues": [], "non_blocking": [{"detail": "no title"}],
         })
+
+    # self-improvement loop fields are optional objects with a required title
+    assert "improvement" in schema["properties"] and "retrospective" in schema["properties"]
+    validator.validate({
+        "approved": True, "issues": [],
+        "improvement": {"title": "idea", "detail": "why"},
+        "retrospective": {"title": "lesson", "detail": "what"},
+    })
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({"approved": True, "issues": [], "improvement": {"detail": "no title"}})

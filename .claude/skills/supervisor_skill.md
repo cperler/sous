@@ -49,12 +49,17 @@ You never call a model directly and you never run `claude -p`.
 
 ## Evidence-out (automatic at `task_completed`)
 When the task completes, the engine publishes the run's evidence through the project
-adapter — no supervisor action needed: it files each **non-blocking** review finding
-(`review.non_blocking[*]`) as a `deferred-scope` follow-up issue, then posts a
-completion note (stage table + PR + verdict + follow-ups filed) to the PR/issue. These
-run through optional `file_followup` / `publish_note` task-source hooks; an adapter that
-omits them is a silent no-op. So a reviewer's nits are never dropped — they land as
-tracked issues, satisfying the "nothing silently dropped" scope-ledger norm.
+adapter — no supervisor action needed:
+- files each **non-blocking** review finding (`review.non_blocking[*]`) as a
+  `deferred-scope` follow-up issue (a reviewer's nits are never dropped);
+- **self-improvement loop:** files the review's `improvement` idea as an `enhancement`
+  issue and renders both it and the `retrospective` (process lesson) into the note — so a
+  completed run also grows the roadmap, not just ships a fix;
+- posts a completion note (stage table + PR + verdict + follow-ups + self-improvement)
+  to the PR/issue.
+
+These run through optional `file_followup` / `publish_note` task-source hooks; an adapter
+that omits them is a silent no-op — satisfying the "nothing silently dropped" norm.
 
 ## Resumability
 Because the shim only returns results **on Workflow completion**, a session death
