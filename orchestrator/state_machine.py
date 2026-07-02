@@ -146,30 +146,33 @@ def _context_bytes(context: dict) -> int:
 
 
 def _enforce_context_ceiling(task: Task) -> None:
-    """Keep task.context under the whole-context ceiling by dropping ENTIRE stage
-    contributions, heaviest-first: each pass evicts the single present stage whose
-    folded keys weigh the most bytes, so a fat contribution is shed before a tiny one
-    (a near-ceiling ``test.failures`` is no longer starved by evicting ``deliver``'s
-    small ``pr_url`` first). Ties break reverse-pipeline (review first, intake last) —
-    downstream stages need the earliest stages' context most. Deterministic: only json
-    byte-lengths and the fixed enum order decide, never context insertion order."""
+    """Keep task.context under the whole-context ceiling by a per-KEY size-weighted
+    sweep, heaviest-first: each pass evicts the single folded key that weighs the most
+    bytes, so a fat key is shed while its small stage-siblings survive (dropping a
+    near-ceiling ``test.failures`` no longer takes ``tests_meaningful`` /
+    ``validation_notes`` down with it — whole-stage eviction was needlessly coarse).
+    Ties break reverse-pipeline (review's keys first, intake's last) then the fixed key
+    order within each stage's ``CONTEXT_KEYS`` — downstream stages need the earliest
+    stages' context most. Deterministic: only json byte-lengths and the fixed enum/tuple
+    order decide, never context insertion order."""
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
     while _context_bytes(task.context) > _MAX_CONTEXT_BYTES:
+        # (stage, key) pairs present in context, ordered so max() breaks weight-ties by
+        # evicting the latest-pipeline stage's key first, then the first key in its tuple.
         candidates = [
-            s for s in reversed(STAGE_ORDER) if any(k in task.context for k in CONTEXT_KEYS[s])
+            key
+            for stage in reversed(STAGE_ORDER)
+            for key in CONTEXT_KEYS[stage]
+            if key in task.context
         ]
         if not candidates:
             return
 
-        def _weight(stage: Stage) -> int:
-            return _context_bytes(
-                {k: task.context[k] for k in CONTEXT_KEYS[stage] if k in task.context}
-            )
+        def _weight(key: str) -> int:
+            return _context_bytes({key: task.context[key]})
 
-        victim = max(candidates, key=_weight)
-        for key in CONTEXT_KEYS[victim]:
-            task.context.pop(key, None)
+        task.context.pop(max(candidates, key=_weight), None)
 
 
 def _absorb_outputs(task: Task, result: StageResult) -> None:
