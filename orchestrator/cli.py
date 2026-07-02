@@ -8,27 +8,19 @@ on stdout so a Bash/skill supervisor can drive it. It never calls a model.
 from __future__ import annotations
 
 import argparse
-import importlib
 import json
 import sys
 from pathlib import Path
 
 from adapters.execution.runners import build_registry
-from adapters.project.base import ProjectConfig
+from adapters.project.base import ADAPTER_CONTRACT_VERSION
 
 from .cost_ledger import CostLedger
 from .engine import Engine
+from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
 from .schemas.work import StageResult
-
-
-def _load_project(module_path: str) -> ProjectConfig:
-    mod = importlib.import_module(module_path)
-    factory = getattr(mod, "get_config", None)
-    if factory is None:
-        raise SystemExit(f"project module {module_path!r} has no get_config()")
-    return factory()
 
 
 def _engine(args: argparse.Namespace) -> Engine:
@@ -38,7 +30,7 @@ def _engine(args: argparse.Namespace) -> Engine:
     root.mkdir(parents=True, exist_ok=True)
     store = StatusStore(root)
     ledger = CostLedger(root / "stage-costs.jsonl")
-    project = _load_project(args.project)
+    project = load_project(args.project)
 
     # Config-only execution mode (interactive×claude default; headless = in-process).
     mode = ExecutionMode(getattr(args, "mode", "interactive"))
@@ -60,10 +52,11 @@ def _emit(obj) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchestrator")
-    p.add_argument("--root", required=True, help="status/ledger directory for the run")
-    p.add_argument("--run", required=True, help="run id")
+    p.add_argument("--root", help="status/ledger directory for the run (not needed for validate)")
+    p.add_argument("--run", help="run id (not needed for validate)")
     p.add_argument("--project", required=True,
-                   help="project-config module (e.g. adapters.project.heysoo)")
+                   help="project-config module (e.g. adapters.project.heysoo) or a "
+                        "project-owned adapter dir (e.g. ../my-project/.orchestration)")
     p.add_argument("--mode", default="interactive", choices=["interactive", "headless"],
                    help="execution mode (config-only lane selection)")
     p.add_argument("--provider", default=None, choices=["claude", "codex"],
@@ -97,8 +90,21 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("status")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
+    sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
 
     args = p.parse_args(argv)
+
+    if args.cmd == "validate":
+        # Loading an external dir already enforces CONTRACT_VERSION + the full surface;
+        # validate_config additionally reports on module-path adapters.
+        config = load_project(args.project)
+        missing = validate_config(config)
+        _emit({"project": getattr(config, "name", None), "valid": not missing,
+               "missing": missing, "contract_version": ADAPTER_CONTRACT_VERSION})
+        return 1 if missing else 0
+
+    if not args.root or not args.run:
+        p.error(f"--root and --run are required for {args.cmd}")
     eng = _engine(args)
 
     if args.cmd == "init-run":

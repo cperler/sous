@@ -12,7 +12,9 @@ into a project-config adapter + a seeded `.claude/` starter kit. You detect and 
 project concern seems to need an engine change, it belongs in the adapter.
 
 Constants: `PROJECT` = the adapter/package name; `REPO` = the target project's root dir;
-`DEST` = where the adapter package goes (default `adapters/project`).
+`ADAPTER` = where the adapter package lives — **default `$REPO/.orchestration`** (the
+adapter is owned by the project's repo and loaded by path; pass `--dest` only to place it
+in this repo under `adapters/project/` instead, e.g. for a reference adapter).
 
 ---
 
@@ -42,12 +44,14 @@ Write the confirmed profile to a file, e.g. `/tmp/<PROJECT>-profile.toml`.
 ### 3. Generate
 ```
 uv run orchestrator-scaffold --name "$PROJECT" --profile /tmp/<PROJECT>-profile.toml \
-    --dest "$DEST" --into "$REPO"
+    --into "$REPO"
 ```
-This writes the adapter (`$DEST/<PROJECT>/`: `profile.toml`, generated `config.py`,
-write-once `classifier.py` / `task_source.py`) and **seeds the stack's kit** into
-`$REPO/.claude/` (agents, skills, example hooks). `config.py` is a regenerated VIEW of
-`profile.toml` — hand-edits go in the profile (or re-run), never in `config.py`.
+This writes the adapter into the **project's own repo** (`$REPO/.orchestration/`:
+`profile.toml`, generated `config.py`, write-once `classifier.py` / `task_source.py`)
+and **seeds the stack's kit** into `$REPO/.claude/` (agents, skills, example hooks).
+`config.py` is a regenerated VIEW of `profile.toml` — hand-edits go in the profile (or
+re-run), never in `config.py`. The generated `__init__.py` carries `CONTRACT_VERSION`;
+the engine checks it at load and refuses a stale adapter loudly.
 
 ### 4. Finish what the profile can't infer (Keep / Modify / Replace / Delete)
 - **`classifier.py`** (Replace) — map THIS project's test output to unit/e2e/shell failures
@@ -59,11 +63,11 @@ write-once `classifier.py` / `task_source.py`) and **seeds the stack's kit** int
   the project's `.claude/settings.json` and adjust to its Claude Code version.
 
 ### 5. Verify
-- Imports + satisfies the contract:
-  `uv run python -c "import adapters.project.<PROJECT> as a; from adapters.project.base import ProjectConfig; assert isinstance(a.get_config(), ProjectConfig)"`
+- Satisfies the contract (version + full ProjectConfig surface, no run needed):
+  `uv run orchestrator --project "$REPO/.orchestration" validate`
 - A stage resolves (and the roster/agent names resolve in `$REPO/.claude/agents/`): run the
   interactive supervisor loop (`run_targets/supervisor_skill.md`) or
-  `--project adapters.project.<PROJECT> run-headless` on a throwaway task, and confirm
+  `--project "$REPO/.orchestration" run-headless` on a throwaway task, and confirm
   `status` shows `lane_audit.clean == true`.
 
 ---
@@ -74,7 +78,7 @@ The scaffold is idempotent and additive, so re-running is safe. Use this after s
 runs, or when the stack grows.
 
 ### 1. Read the current state + the evidence
-- The persisted `$DEST/<PROJECT>/profile.toml` (what's configured now).
+- The persisted `$REPO/.orchestration/profile.toml` (what's configured now).
 - Run artifacts from a run's root dir, if present:
   - `retrospective.md` — recurring failure patterns (which stage/signature keeps failing).
   - `cost-report.md` — per-stage cost + the session-reuse win (which stages are cheap).
@@ -92,7 +96,7 @@ runs, or when the stack grows.
 Write only the *delta* into a profile file (e.g. just the new language, or the swapped
 roster entry) and re-run:
 ```
-uv run orchestrator-scaffold --name "$PROJECT" --profile /tmp/<PROJECT>-delta.toml --dest "$DEST" --into "$REPO"
+uv run orchestrator-scaffold --name "$PROJECT" --profile /tmp/<PROJECT>-delta.toml --into "$REPO"
 ```
 The scaffold unions languages, re-derives defaults for new ones, and re-applies hand-
 overrides — `classifier.py` / `task_source.py` are never clobbered, and only newly-selected
@@ -102,5 +106,5 @@ kit assets are seeded.
 
 ## Invariant
 If you find yourself editing anything under `orchestrator/`, stop — a project concern leaked
-into the engine. The fix is almost always in the adapter (`$DEST/<PROJECT>/`) or the
+into the engine. The fix is almost always in the adapter (`$REPO/.orchestration/`) or the
 profile.

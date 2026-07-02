@@ -18,6 +18,8 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from adapters.project.base import ADAPTER_CONTRACT_VERSION
+
 KIT_DIR = Path(__file__).resolve().parent.parent / "templates" / "project-default"
 
 # Command method <-> profile key. Order is the order they appear in the generated config.
@@ -56,6 +58,9 @@ class Profile:
     roster: dict[str, str] = field(default_factory=dict)
     layers: dict[str, bool] = field(default_factory=dict)
     seed: dict[str, list[str]] = field(default_factory=dict)
+    # The adapter-contract version the generated files target (checked at load for
+    # project-owned adapters). (Re)generation always writes the engine's current one.
+    contract_version: int = ADAPTER_CONTRACT_VERSION
 
 
 def load_kit_manifest() -> dict:
@@ -258,6 +263,7 @@ def profile_to_toml(profile: Profile) -> str:
         f"name = {_toml_str(profile.name)}",
         f"languages = {_toml_value(profile.languages)}",
         f"task_source = {_toml_str(profile.task_source)}",
+        f"contract_version = {profile.contract_version}",
     ]
     for section, data in (
         ("commands", profile.commands), ("roster", profile.roster),
@@ -284,6 +290,7 @@ def read_profile(path: Path) -> Profile:
         roster=dict(raw.get("roster", {})),
         layers=dict(raw.get("layers", {})),
         seed={k: list(v) for k, v in raw.get("seed", {}).items()},
+        contract_version=int(proj.get("contract_version", ADAPTER_CONTRACT_VERSION)),
     )
 
 
@@ -308,6 +315,10 @@ _INIT = '''"""{name} project-config adapter (generated skeleton)."""
 from __future__ import annotations
 
 from .config import {cls}, get_config
+
+# The ProjectConfig contract this adapter was generated against (checked at load
+# when the adapter lives outside the engine repo). Regenerating updates it.
+CONTRACT_VERSION = {contract}
 
 __all__ = ["{cls}", "get_config"]
 '''
@@ -476,7 +487,12 @@ def seed_kit(assets: dict[str, list[str]], into: Path) -> list[str]:
 
 
 def scaffold_adapter(
-    name: str, dest_dir: str | Path, *, profile: Profile | None = None, into: str | Path | None = None
+    name: str,
+    dest_dir: str | Path | None = None,
+    *,
+    profile: Profile | None = None,
+    into: str | Path | None = None,
+    package_dir: str | Path | None = None,
 ) -> Path:
     """Generate (or additively update) a project adapter at ``<dest_dir>/<name>/``.
 
@@ -484,9 +500,14 @@ def scaffold_adapter(
     - If a ``profile.toml`` already exists, the incoming profile is merged additively and
       config.py + profile.toml regenerated; classifier.py / task_source.py are left alone.
     - ``into`` seeds the stack's kit assets into that project root's ``.claude/``.
+    - ``package_dir`` writes the package files directly into that dir instead of
+      ``<dest_dir>/<name>/`` — the project-owned layout (``<repo>/.orchestration/``),
+      loadable by path via ``orchestrator --project <package_dir>``.
     """
+    if package_dir is None and dest_dir is None:
+        raise ValueError("scaffold_adapter needs dest_dir or package_dir")
     manifest = load_kit_manifest()
-    pkg = Path(dest_dir) / name.replace("-", "_")
+    pkg = Path(package_dir) if package_dir is not None else Path(dest_dir) / name.replace("-", "_")
     pkg.mkdir(parents=True, exist_ok=True)
     cls = _class_name(name)
 
@@ -499,7 +520,9 @@ def scaffold_adapter(
 
     # Generated-from-profile (always (re)written).
     write_profile(incoming, profile_path)
-    (pkg / "__init__.py").write_text(_INIT.format(name=name, cls=cls))
+    (pkg / "__init__.py").write_text(
+        _INIT.format(name=name, cls=cls, contract=ADAPTER_CONTRACT_VERSION)
+    )
     (pkg / "config.py").write_text(render_config(name, incoming))
     # Hand-editable (written once; never clobber on re-run).
     for fname, template in (("classifier.py", _CLASSIFIER), ("task_source.py", _TASK_SOURCE)):
@@ -517,7 +540,9 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI s
     p = argparse.ArgumentParser(prog="orchestrator-scaffold",
                                 description="Generate a project-config adapter from a profile.")
     p.add_argument("--name", help="adapter/project name (defaults to the --detect repo's dir name)")
-    p.add_argument("--dest", default="adapters/project", help="destination dir for the package")
+    p.add_argument("--dest", default=None,
+                   help="destination dir for the package (default: <into>/.orchestration when "
+                        "--into is given — the adapter lives with the project; else adapters/project)")
     p.add_argument("--profile", help="path to a profile.toml (the interview writes this)")
     p.add_argument("--languages", help="comma-separated stack to synthesize a profile from (e.g. python,typescript)")
     p.add_argument("--into", help="target project root to seed .claude/ assets into")
@@ -541,11 +566,18 @@ def main(argv: list[str] | None = None) -> int:  # pragma: no cover - thin CLI s
     else:
         prof = None
 
-    path = scaffold_adapter(args.name, args.dest, profile=prof, into=args.into)
+    if args.dest is None and args.into:
+        # Project-owned layout: the adapter lives in the project's repo, loaded by path.
+        path = scaffold_adapter(args.name, profile=prof, into=args.into,
+                                package_dir=Path(args.into) / ".orchestration")
+    else:
+        path = scaffold_adapter(args.name, args.dest or "adapters/project",
+                                profile=prof, into=args.into)
     print(f"scaffolded adapter: {path}")
     if args.into:
         print(f"seeded starter kit into: {Path(args.into) / '.claude'}")
     print("Next: review profile.toml + fill classifier.py / task_source.py for this project.")
+    print(f"Check it: uv run orchestrator --project {path} validate")
     return 0
 
 

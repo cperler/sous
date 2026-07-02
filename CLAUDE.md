@@ -10,18 +10,19 @@ implementation plan, and the as-built/target spec.
 mode + codex → dogfood/generalize) plus two engine-hardening passes, a workflow
 code-review pass, and the 2026-07-01 review→execute cycle (context plane, per-task
 pipelines schema v2, session continuity, checkpoints, approval gate — see
-`docs/reviews/`). 231 pytest cases green, ruff clean; live-proven on real heysoo
+`docs/reviews/`). 241 pytest cases green, ruff clean; live-proven on real heysoo
 issues. Ongoing work is incremental — pick from `DEFERRED.md` or fix-forward.
 
 ## Working norms
-- **Tests + lint, every change:** `uv run pytest` (231 cases) and `uv run ruff check .`
+- **Tests + lint, every change:** `uv run pytest` (241 cases) and `uv run ruff check .`
   must stay green. Add a regression test with each fix.
 - **`DEFERRED.md` is the scope ledger.** Nothing is silently dropped: anything cut,
   thinned, or found-missing gets a row, re-dispositioned at each gate (promote / keep /
   retire-with-reason). Update it when you build or defer something.
 - **The engine never calls a model and stays project-agnostic.** New projects plug in via
-  `adapters/project/<name>/`; new execution lanes via `adapters/execution/`. Don't add
-  project-specific logic to `orchestrator/`.
+  a project-owned `<repo>/.orchestration/` adapter (loaded by path, contract-checked) or
+  `adapters/project/<name>/` for in-repo reference adapters; new execution lanes via
+  `adapters/execution/`. Don't add project-specific logic to `orchestrator/`.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
   `main`; the `phase-3a-engine` branch is kept fast-forwarded to `main` (no git remote).

@@ -153,6 +153,20 @@ included in checkpoint tag names (bench replays recur task ids).
   `checkpointing_transport` (tag-on-success, guarded reset-before-retry/resume); supersedes the
   committed-work/timeout-recovery Active row (retired below).
 
+- **2026-07-01 — project-owned external adapters (the two-folder layout).** A new project's
+  adapter now lives in the *project's* repo (`<repo>/.orchestration/`), not this one — the
+  engine loads it by path (`--project <repo>/.orchestration` → `orchestrator/project_loader.py`,
+  which imports the dir as a standalone package inside the engine's process, so the project
+  repo needs no Python packaging). Skew guardrails: `ADAPTER_CONTRACT_VERSION`
+  (`adapters/project/base.py`) vs. the generated `__init__.py`'s `CONTRACT_VERSION` — mismatch
+  or absence fails loudly at load; external configs are duck-checked against the full
+  `ProjectConfig` surface; new `orchestrator --project <dir> validate` subcommand (no
+  `--root`/`--run` needed). `orchestrator-scaffold --into <repo>` now defaults the package to
+  `<repo>/.orchestration/` (explicit `--dest` keeps the in-repo layout); `profile.toml` records
+  `contract_version`. heysoo/selfhost stay in-repo as reference adapters (suite-locked).
+  Bootstrap skill + README updated; tests in `tests/test_external_adapter.py` (241 total).
+  New Active row: engine-as-installable-package.
+
 ## Active
 
 | Item | Source (as-built §) | Why deferred | Status (2026-06-23 gate) | Trigger to revisit |
@@ -172,6 +186,7 @@ included in checkpoint tag names (bench replays recur task ids).
 | Stronger test-validate — independent-reviewer half | code-review 2026-06-24 (test gate) | **Schema half now built** (`384388a`): the canonical `test.json` requires `tests_meaningful`, so the **codex** lane rejects an omission as SCHEMA_VIOLATION. Interactive/headless lanes stay fail-OPEN self-report, and self-affirmation is inherently weak (a model writing vacuous tests just says `true`). The strong form = a **separate reviewer dispatch** judging test meaningfulness. | **KEEP (the reviewer half).** Pairs with the deferred independent review lens. | When test-meaningfulness matters enough to spend a separate reviewer pass / bundle with the review-lens work |
 | **Infra-failure classification + reset loop** | log-audit 2026-06-24 (test loop) | Old runs distinguished "test runner broke" (exit code ≠ parsed failures) from real failures, counted consecutive infra failures, and ran `infra_reset` after N. We have the `infra_reset()` command but no wiring; a broken runner reads as a normal test failure. | **KEEP (substance, medium).** Prevents false-fail death spirals. The `FailureClassifier` Protocol (kept, adapter-implemented) can express it. The engine-side `compute_regressions` mechanism was **removed** in the Fable #4 wire-or-delete pass (no caller); it returns when this loop is actually built — this row is its written wire-when/how record. | When a real run hits flaky infra / false-fail spirals |
 | Review-loop convergence auto-approval (net-new-issue detection) | log-audit 2026-06-24 (review loop) | Old runs iterated review and auto-approved once remaining issues were all net-new (prior fixed). | **NEW — bundle with the known-thinned iterative review/quality loop.** Only meaningful once that loop is restored; the convergence math is the valuable half. | If/when the iterative review+simplify loop is restored |
+| Engine as installable package (adapters via pip / entry points) | external-adapter build 2026-07-01 | The two-folder layout + path-loading covers multi-project use without release/version-pinning overhead; packaging before the `ProjectConfig` surface stabilizes would freeze the contract prematurely and slow the improve-the-engine loop. `CONTRACT_VERSION` + `validate` are the interim skew guardrails. | **NEW.** | When 2–3 external projects run against the engine and the adapter contract has stayed stable across them |
 
 ## Roadmap — functional & self-improvement ideas (surfaced 2026-07-01)
 

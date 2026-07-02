@@ -8,7 +8,7 @@ It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 `.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
 
 **Status: built and live-proven.** Phases 1–5 complete plus two engine-hardening passes
-and a workflow code-review pass. 171 pytest cases green, ruff clean. Driven real GitHub
+and a workflow code-review pass. 241 pytest cases green, ruff clean. Driven real GitHub
 issues to merged/draft PRs on the reference project (heysoo PRs #556–#560) with clean
 lane-attribution audits. Remaining/known-thinned scope is tracked in `DEFERRED.md`.
 
@@ -59,7 +59,8 @@ orchestrator/            the deterministic engine (never calls a model) + CLI
   schemas/               versioned status + work-item/result schemas
 adapters/
   execution/             interactive shim, headless_claude, codex, registry, transport
-  project/{base,heysoo,selfhost}/   the reference adapter + a self-host adapter
+  project/{base,heysoo,selfhost}/   the contract + reference adapters (a NEW project's
+                         adapter lives in the project's OWN repo — see below)
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
 tests/                   pytest suite (171)
 docs/                    design doc, plan, and the as-built/target spec (see below)
@@ -98,15 +99,27 @@ project-config adapter **and** seeds a stack-appropriate starter kit (agents, sk
 schemas from `templates/project-default/`) into the project's `.claude/`. The engine is
 never touched.
 
+The adapter is **owned by the project's repo**, not this one (the two-folder layout):
+`orchestrator-scaffold --into <repo>` writes it to `<repo>/.orchestration/` (profile.toml
++ generated config.py + hand-tunable classifier.py / task_source.py), and the engine loads
+it by path — `--project <repo>/.orchestration`. The adapter runs inside the engine's
+process, so the project repo needs no Python packaging. Because an external adapter isn't
+updated in lockstep with the engine, its generated `__init__.py` declares the
+`CONTRACT_VERSION` it targets (`adapters/project/base.py`); the loader refuses a mismatch
+loudly, and `orchestrator --project <dir> validate` duck-checks the full ProjectConfig
+surface without needing a run. The in-repo `adapters/project/{heysoo,selfhost}` remain the
+reference implementations, kept in lockstep by this repo's test suite.
+
 ## Developing
 
 ```bash
-uv run pytest        # 171 cases
+uv run pytest        # 241 cases
 uv run ruff check .
 ```
 
-The engine stays project-agnostic: new projects plug in via `adapters/project/`, never by
-editing the engine. Anything cut from MVP scope is logged in `DEFERRED.md` (and
+The engine stays project-agnostic: new projects plug in via a project-owned
+`.orchestration/` adapter (or `adapters/project/` for in-repo reference adapters), never
+by editing the engine. Anything cut from MVP scope is logged in `DEFERRED.md` (and
 re-dispositioned at each gate) — nothing is silently dropped.
 
 ## Docs

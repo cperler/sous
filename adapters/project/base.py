@@ -14,6 +14,12 @@ from pydantic import BaseModel, Field
 from orchestrator.failure_classifier import FailureClassifier
 from orchestrator.schemas.enums import Stage
 
+# The version of the ProjectConfig contract below. An adapter owned by an external
+# project repo declares the version it was generated against (module-level
+# ``CONTRACT_VERSION`` in its ``__init__.py``); the loader refuses a mismatch loudly
+# instead of failing mid-run. Bump on any incompatible change to this surface.
+ADAPTER_CONTRACT_VERSION = 1
+
 
 class TaskSpec(BaseModel):
     """A task resolved from a task source (e.g. a GitHub issue)."""
