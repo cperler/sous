@@ -38,9 +38,7 @@ class CapabilityDescriptor(BaseModel):
     execution_mode: ExecutionMode
     provider: Provider
     in_process: bool  # False = served externally (the interactive Workflow shim)
-    supports_streaming: bool = False
     schema_enforced: bool = False
-    cost_metered: bool = True
     status: CellStatus = SUPPORTED
 
     @property
@@ -120,9 +118,7 @@ def default_registry() -> Registry:
             execution_mode=ExecutionMode.INTERACTIVE,
             provider=Provider.CLAUDE,
             in_process=False,
-            supports_streaming=True,
             schema_enforced=True,
-            cost_metered=True,
             status=SUPPORTED,
         )
     )

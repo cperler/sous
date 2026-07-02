@@ -85,6 +85,22 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
     a leased task is not — old `ready` included it). **CLI-surface note:** `docs/orchestration-spec/
     target.md` lists `orchestrator ready` in the intended surface; it is superseded by `dispatchable`
     (spec text left as-is — the spec describes intent/the reference system, not our CLI).
+  - **#4 Wire-or-delete pass on decorative surfaces (deletions).**
+    - **Deleted `compute_regressions`** (the engine-side regression-diff mechanism in
+      `failure_classifier.py`): no caller, untested, part of the unwired infra-reset loop. The
+      `FailureClassifier` **Protocol is kept** — the "Infra-failure classification + reset loop"
+      Active row names when/how it will be wired (per the review's condition) and the heysoo/selfhost
+      adapters + scaffold generator implement it. Module docstring updated to say the engine does not
+      yet invoke it and that `compute_regressions` returns when the loop is built.
+    - **Deleted `CapabilityDescriptor.supports_streaming` and `cost_metered`** (base.py) and every
+      assignment (default_registry, build_registry, headless/codex runners): read by nothing.
+    - **Discovered while there:** `CapabilityDescriptor.schema_enforced` is *also* read by nothing
+      today. **Kept (keep-with-reason):** unlike the two deleted flags it encodes a real, imminent
+      cell distinction (codex/headless enforce a JSON schema; the external interactive shim does
+      not) that the lane audit / validation reporting is the natural near-term reader for. Revisit if
+      no reader materializes.
+    - **Left intact:** the `ProjectConfig` command surface (`install_cmd`/`test_unit_cmd`/
+      `typecheck_cmd`/…) — consumed by Phase B (render_prompt's project-command context block).
 
 ## Active
 
@@ -100,7 +116,7 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
 | **Timeout/crash recovery via committed-work detection** | log-audit 2026-06-24 (resume) | Old runs checked git for committed work on a timed-out stage and reclassified `timed_out → completed`; we blindly re-dispatch on resume (risk: redo/duplicate already-committed work). Heysoo #548 is a live bug in their version. | **NEW (substance).** Correctness + wasted-work gap on the resume path; somewhat adapter-coupled (needs git inspection). | When resume robustness matters / a real run hits a stage timeout |
 | Capacity-aware model downgrade (degrade instead of stall) | code-review 2026-06-24 (capacity/engine) | A first attempt (a downgrade inside `next_work`) was **reverted**: it was unreachable through the scheduler (`dispatch_limit→0` at the same ≥90 gate) and bypassed backpressure on the direct path. Doing it right needs the capacity policy to admit a *reduced* number of cheap-model dispatches at ≥gate instead of returning 0. | **RE-DEFERRED.** Real capacity-policy redesign, not a silent per-dispatch override. The rate-limit fallback (retired below) covers the reactive case. | When high-util runs must keep progressing on cheaper models (needs dispatch_limit to express a cheap-dispatch band) |
 | Stronger test-validate — independent-reviewer half | code-review 2026-06-24 (test gate) | **Schema half now built** (`384388a`): the canonical `test.json` requires `tests_meaningful`, so the **codex** lane rejects an omission as SCHEMA_VIOLATION. Interactive/headless lanes stay fail-OPEN self-report, and self-affirmation is inherently weak (a model writing vacuous tests just says `true`). The strong form = a **separate reviewer dispatch** judging test meaningfulness. | **KEEP (the reviewer half).** Pairs with the deferred independent review lens. | When test-meaningfulness matters enough to spend a separate reviewer pass / bundle with the review-lens work |
-| **Infra-failure classification + reset loop** | log-audit 2026-06-24 (test loop) | Old runs distinguished "test runner broke" (exit code ≠ parsed failures) from real failures, counted consecutive infra failures, and ran `infra_reset` after N. We have the `infra_reset()` command but no wiring; a broken runner reads as a normal test failure. | **NEW (substance, medium).** Prevents false-fail death spirals. The classifier interface can express it. | When a real run hits flaky infra / false-fail spirals |
+| **Infra-failure classification + reset loop** | log-audit 2026-06-24 (test loop) | Old runs distinguished "test runner broke" (exit code ≠ parsed failures) from real failures, counted consecutive infra failures, and ran `infra_reset` after N. We have the `infra_reset()` command but no wiring; a broken runner reads as a normal test failure. | **KEEP (substance, medium).** Prevents false-fail death spirals. The `FailureClassifier` Protocol (kept, adapter-implemented) can express it. The engine-side `compute_regressions` mechanism was **removed** in the Fable #4 wire-or-delete pass (no caller); it returns when this loop is actually built — this row is its written wire-when/how record. | When a real run hits flaky infra / false-fail spirals |
 | Review-loop convergence auto-approval (net-new-issue detection) | log-audit 2026-06-24 (review loop) | Old runs iterated review and auto-approved once remaining issues were all net-new (prior fixed). | **NEW — bundle with the known-thinned iterative review/quality loop.** Only meaningful once that loop is restored; the convergence math is the valuable half. | If/when the iterative review+simplify loop is restored |
 
 ## Roadmap — functional & self-improvement ideas (surfaced 2026-07-01)

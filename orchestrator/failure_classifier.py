@@ -1,9 +1,14 @@
 """Failure-classifier interface (target.md §3 / §5, build-fresh D5).
 
-The engine owns the *mechanism* (collect failures, diff regressions vs a baseline).
-The *taxonomy* — how a line of test output maps to a unit/e2e/shell failure, and
-how a changed source file maps to its impacted tests — is project-config (the
-concrete regexes live in the Hey Soo! adapter, not here).
+The *taxonomy* — how a line of test output maps to a unit/e2e/shell failure, and how a
+changed source file maps to its impacted tests — is project-config (the concrete regexes
+live in the Hey Soo! adapter, not here). This Protocol is the pluggable seam.
+
+The engine does NOT yet invoke this — the infra-failure classification + reset loop it
+exists for is unwired (see the "Infra-failure classification + reset loop" DEFERRED row,
+which names when/how it will be wired). The engine-side regression-diff mechanism that
+was here (``compute_regressions``) had no caller and was removed with that row; it
+returns when the loop is actually built.
 """
 
 from __future__ import annotations
@@ -34,17 +39,3 @@ class FailureClassifier(Protocol):
     def impacted_tests(self, changed_files: list[str]) -> list[str]:
         """Map changed source files to the tests that should run (change->test-set)."""
         ...
-
-
-def compute_regressions(
-    current: list[Failure], baseline: list[Failure]
-) -> list[Failure]:
-    """Engine mechanism: failures present now but not in the baseline.
-
-    Identity is the ``test`` field. Inherited (baseline) failures are excluded so
-    a stage is judged only on regressions it introduced (ports the as-built
-    regression-aware pass; the taxonomy that produced ``Failure.kind`` is adapter-owned).
-    """
-
-    baseline_tests = {f.test for f in baseline}
-    return [f for f in current if f.test not in baseline_tests]

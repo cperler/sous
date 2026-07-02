@@ -35,7 +35,6 @@ def build_registry(
                 execution_mode=ExecutionMode.INTERACTIVE,
                 provider=Provider.CLAUDE,
                 in_process=False,
-                supports_streaming=True,
                 schema_enforced=True,
                 status=SUPPORTED,
             )

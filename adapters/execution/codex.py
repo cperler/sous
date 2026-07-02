@@ -37,7 +37,6 @@ class CodexRunner:
                 provider=Provider.CODEX,
                 in_process=True,
                 schema_enforced=True,
-                cost_metered=True,
                 status=SUPPORTED,
             ),
             # codex never runs in-session — declare the empty cell honestly.

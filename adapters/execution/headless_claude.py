@@ -26,9 +26,7 @@ class HeadlessClaudeRunner:
                 execution_mode=ExecutionMode.HEADLESS,
                 provider=Provider.CLAUDE,
                 in_process=True,
-                supports_streaming=False,
                 schema_enforced=True,  # via --json-schema
-                cost_metered=True,
                 status=SUPPORTED,
             )
         ]
