@@ -71,7 +71,11 @@ def main(argv: list[str] | None = None) -> int:
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("init-run").add_argument("--lane", default="full")
-    sub.add_parser("add-task").add_argument("--task", required=True)
+    at = sub.add_parser("add-task")
+    at.add_argument("--task", required=True)
+    at.add_argument("--pipeline", default=None,
+                    help="comma-separated stage list (e.g. 'intake,implement,review'); "
+                         "default: the run lane's preset")
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
     n.add_argument("--util", type=float, default=0.0)
@@ -94,8 +98,15 @@ def main(argv: list[str] | None = None) -> int:
         run = eng.create_run(args.run, ExecutionLane(args.lane))
         _emit({"created_run": run.run_id, "lane": run.lane.value})
     elif args.cmd == "add-task":
-        task = eng.add_task(args.run, args.task)
-        _emit({"added_task": task.task_id, "title": task.title})
+        from .schemas.enums import Stage
+
+        pipeline = (
+            [Stage(s.strip()) for s in args.pipeline.split(",") if s.strip()]
+            if args.pipeline else None
+        )
+        task = eng.add_task(args.run, args.task, pipeline=pipeline)
+        _emit({"added_task": task.task_id, "title": task.title,
+               "pipeline": [s.value for s in task.pipeline]})
     elif args.cmd == "next":
         work = eng.next_work(args.run, args.task, util_pct=args.util)
         _emit(None if work is None else json.loads(work.model_dump_json()))

@@ -9,11 +9,15 @@ from __future__ import annotations
 
 from enum import StrEnum
 
-SCHEMA_VERSION = "1"
+# v2: Task carries its own `pipeline` (ordered stage list); v1 docs derive it from
+# execution_lane on load (2026-07-01 design pass §1).
+SCHEMA_VERSION = "2"
 
 
 class Stage(StrEnum):
-    """The collapsed 6-stage pipeline (target.md §6.1)."""
+    """The stage VOCABULARY (target.md §6.1): the dispatchable stage kinds, each with a
+    StageSpec. The execution *sequence* is per-task (``Task.pipeline``) — this enum is
+    not a sequence, and new node types extend the vocabulary additively."""
 
     INTAKE = "intake"
     SCOPE = "scope"
@@ -23,7 +27,9 @@ class Stage(StrEnum):
     REVIEW = "review"
 
 
-# Canonical execution order. The state machine advances through this list.
+# The default FULL pipeline (and the canonical *display* order for stage records).
+# Its ONLY sequencing duty is defining the FULL preset below — the state machine walks
+# task.pipeline, never this constant.
 STAGE_ORDER: tuple[Stage, ...] = (
     Stage.INTAKE,
     Stage.SCOPE,
@@ -94,7 +100,8 @@ class ExecutionLane(StrEnum):
     MICRO = "micro"
 
 
-# Which stages run per lane (mode machinery, target.md §6.1).
+# Lane PRESETS: named pipelines (ported from full/lite/micro). A lane is resolved to a
+# concrete task.pipeline at add_task; the engine sequences on the pipeline, not the lane.
 LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
     ExecutionLane.FULL: STAGE_ORDER,
     ExecutionLane.LITE: (Stage.INTAKE, Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER, Stage.REVIEW),

@@ -31,6 +31,7 @@ from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
+    LANE_STAGES,
     TERMINAL_TASK_STATES,
     ExecutionLane,
     ResultStatus,
@@ -89,7 +90,18 @@ class Engine:
         self.store.save_run(run)
         return run
 
-    def add_task(self, run_id: str, task_id: str, lane: ExecutionLane | None = None) -> Task:
+    def add_task(
+        self,
+        run_id: str,
+        task_id: str,
+        lane: ExecutionLane | None = None,
+        *,
+        pipeline: tuple[Stage, ...] | list[Stage] | None = None,
+    ) -> Task:
+        """Register a task. ``pipeline`` is the ordered stage list this task runs;
+        omitted, it resolves from the lane preset (design pass §1 — a lane is a named
+        pipeline, not the sequencing mechanism). Validation (non-empty, duplicate-free)
+        is the Task model's."""
         spec = self.project.task_source.resolve(task_id)
         run = self.store.load_run(run_id)
         # Register the task ref + dependency edge as a locked read-modify-write so a
@@ -117,6 +129,7 @@ class Engine:
             issue_number=spec.issue_number,
             depends_on=spec.depends_on,
             execution_lane=lane or run.lane,
+            pipeline=tuple(pipeline) if pipeline else LANE_STAGES[lane or run.lane],
             max_attempts=self.max_attempts,
         )
         self.store.save_task(task)

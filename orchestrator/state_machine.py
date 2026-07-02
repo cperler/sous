@@ -1,8 +1,9 @@
-"""Per-task state machine over the 6 collapsed stages (target.md §3 / §6.1).
+"""Per-task state machine over the task's own pipeline (target.md §3 / §6.1).
 
-Pure logic over a ``Task``: which stage runs next (honoring the execution lane's
-skip-set), how to apply a ``StageResult``, and where to resume after a crash. The
-``started_at``-always-present schema makes the crash marker unambiguous.
+Pure logic over a ``Task``: which stage runs next (walking ``task.pipeline`` — the
+stage enum is a vocabulary, not a sequence; 2026-07-01 design pass §1), how to apply
+a ``StageResult``, and where to resume after a crash. The ``started_at``-always-present
+schema makes the crash marker unambiguous.
 """
 
 from __future__ import annotations
@@ -10,7 +11,6 @@ from __future__ import annotations
 import json
 
 from .schemas.enums import (
-    LANE_STAGES,
     STAGE_ORDER,
     ExecutionMode,
     Provider,
@@ -22,21 +22,21 @@ from .schemas.status import ResumeCursor, StageRecord, Task
 from .schemas.work import StageResult
 
 
-def plan_lane(task: Task) -> None:
-    """Mark every stage not in the task's lane as ``skipped`` (idempotent)."""
-    active = set(LANE_STAGES[task.execution_lane])
+def plan_pipeline(task: Task) -> None:
+    """Mark every vocabulary stage not in the task's pipeline as ``skipped`` (idempotent)."""
+    active = set(task.pipeline)
     for stage, rec in task.stages.items():
         if stage not in active and rec.status is StageStatus.PENDING:
             rec.status = StageStatus.SKIPPED
 
 
 def _active_sequence(task: Task) -> tuple[Stage, ...]:
-    return LANE_STAGES[task.execution_lane]
+    return tuple(task.pipeline)
 
 
 def next_stage(task: Task) -> Stage | None:
-    """First in-lane stage whose status is not completed/skipped, else None."""
-    plan_lane(task)
+    """First in-pipeline stage whose status is not completed/skipped, else None."""
+    plan_pipeline(task)
     for stage in _active_sequence(task):
         if task.stages[stage].status in (StageStatus.COMPLETED, StageStatus.SKIPPED):
             continue
@@ -183,7 +183,7 @@ def resume_point(task: Task) -> Stage | None:
     A stage left ``running`` (started_at set, completed_at null) is a crash marker —
     re-run it. Otherwise resume at the first non-completed/skipped stage.
     """
-    plan_lane(task)
+    plan_pipeline(task)
     for stage in _active_sequence(task):
         rec = task.stages[stage]
         if rec.status is StageStatus.RUNNING and rec.started_at and not rec.completed_at:

@@ -119,7 +119,11 @@ class StatusStore:
 
         if "schema_version" not in raw:
             raw = {**raw, "schema_version": SCHEMA_VERSION}
-        # Future migration steps keyed on schema_version go here.
+        # v1 -> v2: task docs gained `pipeline`. The derivation itself lives on the Task
+        # model's before-validator (lane preset), so here we only stamp the version —
+        # a doc read through this migration validates as v2-shaped.
+        if raw.get("schema_version") == "1":
+            raw = {**raw, "schema_version": SCHEMA_VERSION}
         return raw
 
     def _read_json(self, path: Path) -> dict:

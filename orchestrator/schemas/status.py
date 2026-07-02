@@ -9,11 +9,11 @@ cost is traceable to the exact stage+model (closes D6 at the schema level).
 
 from __future__ import annotations
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import (
+    LANE_STAGES,
     SCHEMA_VERSION,
-    STAGE_ORDER,
     TERMINAL_TASK_STATES,
     ExecutionLane,
     ExecutionMode,
@@ -49,7 +49,9 @@ class ResumeCursor(BaseModel):
 
 
 def _new_stage_map() -> dict[Stage, StageRecord]:
-    return {s: StageRecord() for s in STAGE_ORDER}
+    # Keyed by the FULL vocabulary (not the task's pipeline): off-pipeline stages sit at
+    # SKIPPED, keeping the doc shape uniform across tasks (2026-07-01 design pass §1).
+    return {s: StageRecord() for s in Stage}
 
 
 class Task(BaseModel):
@@ -71,7 +73,13 @@ class Task(BaseModel):
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
+    # Provenance: the lane preset this task was added under. Sequencing reads
+    # ``pipeline``, never this field (kept for rendering/audit — design pass §1 Q1).
     execution_lane: ExecutionLane = ExecutionLane.FULL
+    # The ordered stage list THIS task runs (schema v2). Set once at add_task and
+    # immutable in spirit thereafter (mutating it mid-run would invalidate the resume
+    # cursor's meaning). v1 docs without it derive it from execution_lane on load.
+    pipeline: tuple[Stage, ...] = ()
     pr_number: int | None = None
     pr_url: str | None = None
     # Engine-owned task context plane: well-known fields folded out of each stage's
@@ -92,6 +100,25 @@ class Task(BaseModel):
     # Set when a rate-limited dispatch re-queues the current stage on a cheaper model;
     # consumed by the next next_work() for this stage (graceful fallback).
     pending_fallback_model: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _derive_pipeline(cls, data: object) -> object:
+        """v1→v2 migration + construction default: a task without an explicit pipeline
+        gets its lane preset. Lives on the model (not the store) so every load path —
+        store, tests, hand-built docs — derives identically."""
+        if isinstance(data, dict) and not data.get("pipeline"):
+            lane = data.get("execution_lane") or ExecutionLane.FULL
+            data["pipeline"] = LANE_STAGES[ExecutionLane(lane)]
+        return data
+
+    @model_validator(mode="after")
+    def _validate_pipeline(self) -> Task:
+        if not self.pipeline:
+            raise ValueError("task pipeline must be non-empty")
+        if len(set(self.pipeline)) != len(self.pipeline):
+            raise ValueError(f"task pipeline has duplicate stages: {self.pipeline}")
+        return self
 
     @property
     def is_terminal(self) -> bool:
