@@ -24,8 +24,22 @@ export const meta = {
 
 phase('Dispatch')
 
-const items = args.workItems || []
-const ceiling = Math.max(1, Math.min(args.dispatchLimit || 1, items.length || 1))
+// The Workflow runtime may hand `args` to the script as a JSON *string* rather than a
+// parsed object; normalize so the shim reads work items either way (else it silently
+// dispatches nothing and returns []).
+const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
+
+const items = A.workItems || []
+const ceiling = Math.max(1, Math.min(A.dispatchLimit || 1, items.length || 1))
+
+// agent()'s schema validator rejects a top-level `$schema`/`$id` — it tries to resolve
+// the meta-schema URI as a $ref and fails ("no schema with key or ref ..."). The engine's
+// canonical stage schemas all carry `$schema`, so strip meta-keys before dispatch.
+function sanitizeSchema(s) {
+  if (!s || typeof s !== 'object') return s
+  const { $schema, $id, ...rest } = s
+  return rest
+}
 
 // Schema-enforced structured output per stage. agent({schema}) makes the model
 // return JSON matching the stage's output contract; a null/empty result -> the
@@ -55,7 +69,7 @@ function toStageResult(wi, agentResult) {
       cache_write: usage.cache_creation_input_tokens || 0,
     },
     cost_usd: null, // the engine prices authoritatively from its single model table
-    completed_at: args.now, // the supervisor injects an ISO timestamp (sandbox has no clock)
+    completed_at: A.now, // the supervisor injects an ISO timestamp (sandbox has no clock)
   }
 }
 
@@ -65,7 +79,7 @@ const thunks = items.map((wi) => async () => {
     const res = await agent(wi.prompt, {
       model: wi.model,
       agentType: wi.agent || undefined, // persona from the project roster
-      schema: args.schemas ? args.schemas[wi.schema_ref] : undefined,
+      schema: A.schemas ? sanitizeSchema(A.schemas[wi.schema_ref]) : undefined,
       label: `${wi.stage}:${wi.task_id}`,
     })
     // With a schema, agent() returns the validated object itself (the structured
