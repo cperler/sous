@@ -105,6 +105,8 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     if args.cmd == "gc":
+        # Checkpoint tags (task/<run>/<task>/<stage>/<attempt>) outlive their run; list
+        # them newest-first, hold back --keep-latest N, and delete the rest under --prune.
         from adapters.execution.transport import _git
 
         from .engine import _ref_safe
