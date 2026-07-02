@@ -189,11 +189,13 @@ the terminal-set exclusion, and the artifact shape need to land with the schema 
 
 ---
 
-## Open questions for Craig (blocking none of the above starts)
+## Open questions — RESOLVED 2026-07-01 (Craig delegated; Fable decided at build time)
 
-1. §1: keep `execution_lane` on the Task doc indefinitely (provenance), or deprecate
-   once callers pass pipelines? (Doc assumes: keep.)
-2. §2: warm-retry (reuse session after failure) is OFF by default — agree, or want it
-   flag-gated from day one?
-3. §3: tag namespace — include run_id or not? (Doc leans yes if tasks can recur across
-   runs, e.g. bench replays.)
+1. §1 `execution_lane`: **kept** as provenance on the Task doc; sequencing reads only
+   `pipeline`.
+2. §2 warm retry: **OFF**, no flag — fresh session after any failure. Revisit only with
+   eval-bench evidence (DEFERRED row).
+3. §3 tag namespace: **run_id included** — `task/<run>/<task>/<stage>/<attempt>`,
+   ids sanitized git-ref-safe.
+
+**Built 2026-07-01:** §1 `dd47001`, §4 `8667f01`, §2 `6b16b0e`, §3 `c4303d2` (231 tests).
