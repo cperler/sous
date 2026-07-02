@@ -38,6 +38,22 @@ def test_selfhost_satisfies_protocol_and_differs_from_heysoo() -> None:
     assert cfg.typecheck_cmd() == ["uv", "run", "ruff", "check", "."]
 
 
+def test_selfhost_defaults_to_own_github_issue_log(monkeypatch) -> None:
+    from adapters.project.github_issues import GitHubIssuesSource
+
+    monkeypatch.delenv("SELFHOST_TASKS", raising=False)
+    cfg = selfhost_config()
+    assert isinstance(cfg.task_source, GitHubIssuesSource)
+    assert cfg.task_source.repo == "cperler/orchestration-template"
+
+
+def test_selfhost_env_selects_local_file_mode(tmp_path, monkeypatch) -> None:
+    tasks = _tasks_file(tmp_path, {"T1": {"title": "t"}})
+    monkeypatch.setenv("SELFHOST_TASKS", tasks)
+    cfg = selfhost_config()
+    assert cfg.task_source.resolve("T1").title == "t"
+
+
 def test_selfhost_classifier_taxonomy() -> None:
     cfg = selfhost_config()
     fails = cfg.classifier.classify("FAILED tests/test_x.py::test_y\nsrc/a.py:1:1: E501 line too long\n")

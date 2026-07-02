@@ -5,9 +5,9 @@ changed source file maps to its impacted tests — is project-config (the concre
 live in the Hey Soo! adapter, not here). This Protocol is the pluggable seam.
 
 The engine does NOT yet invoke this — the infra-failure classification + reset loop it
-exists for is unwired (see the "Infra-failure classification + reset loop" DEFERRED row,
+exists for is unwired (tracked as issue #14, "Infra-failure classification + reset loop",
 which names when/how it will be wired). The engine-side regression-diff mechanism that
-was here (``compute_regressions``) had no caller and was removed with that row; it
+was here (``compute_regressions``) had no caller and was removed with that item; it
 returns when the loop is actually built.
 """
 

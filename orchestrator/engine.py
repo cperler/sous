@@ -490,7 +490,7 @@ class Engine:
         Fail-OPEN on a MISSING field: nothing enforces this soft field on the interactive/
         headless lanes (no JSON schema), so a model that simply omits it must not dead-end
         otherwise-green work — only an explicit ``false`` is a veto. (A stronger, schema-
-        or independent-reviewer-enforced version is tracked in DEFERRED.)"""
+        or independent-reviewer-enforced version is tracked as issue #13.)"""
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}

@@ -3,17 +3,24 @@
 A pure Python/uv/pytest/ruff library: no frontend build, no lambda, no E2E/bats.
 Demonstrates Phase 5 generality — the engine drives this with ZERO changes; only
 this adapter differs from the Hey Soo! one (different commands, taxonomy, task source).
+
+Tasks default to THIS repo's GitHub issues (the harness's own issue log is directly
+orchestratable — the dogfood loop); set ``SELFHOST_TASKS`` to a JSON file for the
+local/offline mode instead.
 """
 
 from __future__ import annotations
 
 import os
 
+from adapters.project.github_issues import GitHubIssuesSource
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
 from .classifier import SelfHostClassifier
 from .task_source import LocalFileTaskSource
+
+_SELF_REPO = "cperler/orchestration-template"
 
 _NOOP = ["true"]  # this project has no e2e / shell / infra layer
 
@@ -28,9 +35,11 @@ _ROSTER: dict[str, str] = {
 class SelfHostConfig:
     name = "orchestration-template"
 
-    def __init__(self, tasks_path: str = "tasks.json") -> None:
+    def __init__(self, tasks_path: str | None = None, repo: str = _SELF_REPO) -> None:
         self._classifier = SelfHostClassifier()
-        self._task_source = LocalFileTaskSource(tasks_path)
+        self._task_source = (
+            LocalFileTaskSource(tasks_path) if tasks_path else GitHubIssuesSource(repo)
+        )
 
     def install_cmd(self) -> list[str]:
         return ["uv", "sync"]
@@ -55,7 +64,7 @@ class SelfHostConfig:
         return self._classifier
 
     @property
-    def task_source(self) -> LocalFileTaskSource:
+    def task_source(self) -> LocalFileTaskSource | GitHubIssuesSource:
         return self._task_source
 
     def agent_for(self, stage: Stage, role: str | None = None) -> str | None:
@@ -66,4 +75,7 @@ class SelfHostConfig:
 
 
 def get_config() -> SelfHostConfig:
-    return SelfHostConfig(tasks_path=os.environ.get("SELFHOST_TASKS", "tasks.json"))
+    return SelfHostConfig(
+        tasks_path=os.environ.get("SELFHOST_TASKS"),
+        repo=os.environ.get("SELFHOST_REPO", _SELF_REPO),
+    )

@@ -10,15 +10,18 @@ implementation plan, and the as-built/target spec.
 mode + codex → dogfood/generalize) plus two engine-hardening passes, a workflow
 code-review pass, and the 2026-07-01 review→execute cycle (context plane, per-task
 pipelines schema v2, session continuity, checkpoints, approval gate — see
-`docs/reviews/`). 241 pytest cases green, ruff clean; live-proven on real heysoo
-issues. Ongoing work is incremental — pick from `DEFERRED.md` or fix-forward.
+`docs/reviews/`). 243 pytest cases green, ruff clean; live-proven on real heysoo
+issues. Ongoing work is incremental — pick from the issue tracker or fix-forward.
 
 ## Working norms
-- **Tests + lint, every change:** `uv run pytest` (241 cases) and `uv run ruff check .`
+- **Tests + lint, every change:** `uv run pytest` (243 cases) and `uv run ruff check .`
   must stay green. Add a regression test with each fix.
-- **`DEFERRED.md` is the scope ledger.** Nothing is silently dropped: anything cut,
-  thinned, or found-missing gets a row, re-dispositioned at each gate (promote / keep /
-  retire-with-reason). Update it when you build or defer something.
+- **GitHub issues are the scope ledger** (`gh issue list -R cperler/orchestration-template`).
+  Nothing is silently dropped: anything cut, thinned, or found-missing gets an issue labeled
+  `deferred-scope` (with source / why / trigger-to-revisit), re-dispositioned at each gate
+  (promote / keep-with-comment / close-with-reason). File or close issues as you build or
+  defer. `DEFERRED.md` documents the discipline; the pre-2026-07-01 ledger is frozen at
+  `docs/deferred-history.md`.
 - **The engine never calls a model and stays project-agnostic.** New projects plug in via
   a project-owned `<repo>/.orchestration/` adapter (loaded by path, contract-checked) or
   `adapters/project/<name>/` for in-repo reference adapters; new execution lanes via
