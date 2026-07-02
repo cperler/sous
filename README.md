@@ -70,27 +70,90 @@ DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub iss
 
 ## Running it
 
-The engine is a CLI the supervisor drives. Common commands (see `orchestrator/cli.py`):
+Two things vary independently: **how you launch** (from a plain terminal, or from inside
+a Claude session) and **which lane the work runs on** (`execution_mode × provider`). The
+engine is the same CLI in every case (`orchestrator/cli.py`); what differs is who dispatches
+the model calls. Set these once so the examples stay short:
 
 ```bash
-# interactive×claude lane (supervisor loop): init → add task → next/record per stage
-uv run orchestrator --root runs/issue-42 --run issue-42 --project adapters.project.heysoo init-run --lane full
-uv run orchestrator --root runs/issue-42 --run issue-42 --project adapters.project.heysoo add-task --task "#42"
-uv run orchestrator --root runs/issue-42 --run issue-42 --project adapters.project.heysoo next --task "#42" --util 0
-uv run orchestrator --root runs/issue-42 --run issue-42 --project adapters.project.heysoo record --result result.json
-
-# headless lane (engine drives the runners in-process)
-uv run orchestrator --root runs/r --run r --project <pkg> run-headless --mode headless
-
-# observability
-uv run orchestrator … status          # progress + cost summary + lane audit
-uv run orchestrator … cost-report      # per-stage/-task breakdown + session-reuse win
-uv run orchestrator … retrospective    # failure patterns + retry learnings (on a failed run)
+ROOT=runs/issue-42; RUN=issue-42; PROJECT=adapters.project.heysoo
+ORCH="uv run orchestrator --root $ROOT --run $RUN --project $PROJECT"
 ```
 
-In practice the **interactive** lane is driven by a supervisor following
-`run_targets/supervisor_skill.md` (single task) or `scheduler_skill.md` (a batch), which
-dispatch the actual work via the Workflow shim.
+`--lane full|lite|micro` picks the pipeline depth (how many stages); `--util N` is the
+current 5h utilization %, which the engine turns into the capacity-bounded dispatch limit.
+
+### 1. From a terminal — headless, in-process (self-contained)
+
+`run-headless` drives the **whole** run in one process, shelling out to `claude -p` (and
+`codex exec`) per stage. No Claude session required — just the `claude` CLI on your PATH.
+This is the mode for cron / CI / a background terminal.
+
+```bash
+$ORCH init-run --lane full
+$ORCH add-task --task "#42"
+$ORCH run-headless --mode headless --util 0
+$ORCH status
+```
+
+### 2. From within a Claude session — interactive (subscription)
+
+Invoke a supervisor **slash command** and Claude drives the run in-session. This runs the
+same engine CLI but dispatches each stage via the in-session Workflow shim (`agent()`
+calls), so the work bills to your Claude subscription instead of the API. This lane is
+*only* launchable from inside a session — the interactive dispatch needs the in-session
+shim, which a plain terminal doesn't have.
+
+- **single task** → `/orchestrate-task-interactive`
+- **batch** → `/orchestrate-batch-interactive`
+
+These are real, registered skills — they live at `.claude/skills/<name>/SKILL.md` (the
+layout Claude Code discovers), sourced from `run_targets/supervisor_skill.md` /
+`scheduler_skill.md`. The skill runs the loop: `init-run` → `add-task` → `next` → dispatch
+via `run_targets/workflow_shim.js` → `record`, repeating until the task is terminal. It
+never calls a model directly or drives `next`/`record` by hand out of order — the engine
+sequences the state; the supervisor just follows it. (The same engine commands exist
+standalone — `$ORCH next --task "#42" --util 0`, then `$ORCH record --result result.json`
+— if you want to step a run manually from a terminal.)
+
+> **Bootstrapped projects get these slash commands too.** `orchestrator-scaffold` seeds the
+> supervisor skills into the new project's `.claude/skills/<name>/SKILL.md` (keyed by each
+> skill's frontmatter `name:`), so `/orchestrate-task-interactive` and
+> `/orchestrate-batch-interactive` are invocable in that repo out of the box.
+
+### 3. Headless via `claude -p` / `codex exec` (what mode 1 uses underneath)
+
+Mode 1's transport is literally `claude -p <prompt> --model <model> --output-format json`
+(see `adapters/execution/transport.py`), with a `codex exec` sibling for the codex
+provider. You don't invoke these by hand — `run-headless` builds and runs one per stage —
+but that's the actual model call, and it's why mode 1 needs no interactive session. Pick
+the provider on the same command:
+
+```bash
+$ORCH run-headless --mode headless --provider claude   # every stage via claude -p
+$ORCH run-headless --mode headless --provider codex     # file-patching stages via codex exec
+```
+
+### 4. Pointing at different models
+
+The engine assigns a model **per stage by role** — it's never a CLI flag. Two knobs:
+
+- **Provider axis** — `--provider claude|codex` (whole run) or a per-task `:codex` tag
+  (routes only the file-patching stages, `IMPLEMENT`/`TEST`, to codex). Codex is always
+  headless; `codex×interactive` is an intentional empty cell.
+- **Which Claude model per role** — `orchestrator/model_table.py` is the single source of
+  truth: roles resolve to ids (`DEEP_REASON → claude-opus-4-8`, `REVIEW →
+  claude-sonnet-4-6`, `CHEAP_SHELL → claude-haiku-4-5`). A model bump is a one-line edit
+  there and every lane (the Workflow shim *and* `claude -p`) picks it up automatically. The
+  rate-limit fallback chain (opus → sonnet → haiku) lives in the same table.
+
+### Observability (any mode)
+
+```bash
+$ORCH status          # progress + cost summary + lane-attribution audit
+$ORCH cost-report     # per-stage / per-task breakdown + the session-reuse win
+$ORCH retrospective   # failure patterns + what the retries learned (on a failed run)
+```
 
 Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
 --detect <repo>` reads the repo's stack and prints a draft `profile.toml`;

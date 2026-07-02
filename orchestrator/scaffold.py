@@ -464,6 +464,25 @@ def get_config() -> {cls}:
 # Seeding + orchestration
 # ---------------------------------------------------------------------------------------
 
+def _skill_slug(src: Path) -> str:
+    """The invocable skill name for a kit skill file = its frontmatter ``name:``.
+
+    Claude Code discovers skills at ``.claude/skills/<name>/SKILL.md`` (a directory per
+    skill), so the seed destination is keyed by the frontmatter name, not the source file
+    stem. Falls back to the file stem if the frontmatter has no ``name:``."""
+    in_frontmatter = False
+    for line in src.read_text().splitlines():
+        stripped = line.strip()
+        if stripped == "---":
+            if in_frontmatter:
+                break  # end of the frontmatter block; no name found
+            in_frontmatter = True
+            continue
+        if in_frontmatter and stripped.startswith("name:"):
+            return stripped.split(":", 1)[1].strip()
+    return src.stem
+
+
 def seed_kit(assets: dict[str, list[str]], into: Path) -> list[str]:
     """Copy the selected kit assets into ``<into>/.claude/`` (agents, skills, hooks)."""
     claude = Path(into) / ".claude"
@@ -474,10 +493,13 @@ def seed_kit(assets: dict[str, list[str]], into: Path) -> list[str]:
         shutil.copyfile(KIT_DIR / "agents" / f"{agent}.md", dst)
         seeded.append(f"agents/{agent}.md")
     for skill in assets.get("skills", []):
-        dst = claude / "skills" / f"{skill}.md"
+        # Seed as .claude/skills/<name>/SKILL.md so the project gets a real, invocable
+        # `/<name>` slash command (not a flat, undiscovered .md file).
+        src = KIT_DIR / "skills" / f"{skill}.md"
+        dst = claude / "skills" / _skill_slug(src) / "SKILL.md"
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(KIT_DIR / "skills" / f"{skill}.md", dst)
-        seeded.append(f"skills/{skill}.md")
+        shutil.copyfile(src, dst)
+        seeded.append(f"skills/{dst.parent.name}/SKILL.md")
     for hook in assets.get("hooks", []):
         dst = claude / "hooks" / f"{hook}.json"
         dst.parent.mkdir(parents=True, exist_ok=True)

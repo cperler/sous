@@ -88,7 +88,13 @@ def test_seeds_kit_into_project_root(tmp_path) -> None:
     claude = proj / ".claude"
     assert (claude / "agents" / "python-backend-developer.md").exists()
     assert (claude / "agents" / "code-reviewer.md").exists()       # generic too
-    assert (claude / "skills" / "supervisor_skill.md").exists()
+    # Skills seed as .claude/skills/<name>/SKILL.md (invocable slash commands), keyed by
+    # the frontmatter name — NOT a flat, undiscovered .md file.
+    skill = claude / "skills" / "orchestrate-task-interactive" / "SKILL.md"
+    assert skill.exists()
+    assert "name: orchestrate-task-interactive" in skill.read_text()
+    assert (claude / "skills" / "orchestrate-batch-interactive" / "SKILL.md").exists()
+    assert not (claude / "skills" / "supervisor_skill.md").exists()  # no flat mirror
     assert (claude / "hooks" / "python-format.json").exists()
     assert not (claude / "agents" / "typescript-frontend-developer.md").exists()  # not in stack
 

@@ -12,6 +12,7 @@ from pathlib import Path
 
 from jsonschema import Draft202012Validator
 
+from orchestrator.scaffold import _skill_slug
 from orchestrator.schemas.stage_schemas import load_stage_schema
 
 KIT = Path(__file__).resolve().parent.parent / "templates" / "project-default"
@@ -38,7 +39,13 @@ def test_manifest_hooks_and_skills_resolve() -> None:
         assert p.exists(), f"missing hooks/{hook}.json"
         json.loads(p.read_text())  # valid JSON
     for skill in m["skills"]["always"]:
-        assert (KIT / "skills" / f"{skill}.md").exists(), f"missing skills/{skill}.md"
+        src = KIT / "skills" / f"{skill}.md"
+        assert src.exists(), f"missing skills/{skill}.md"
+        # Every kit skill must carry a frontmatter name — that name becomes the
+        # .claude/skills/<name>/SKILL.md dir the bootstrap seeds (the invocable slash
+        # command), so a missing/blank name would seed an undiscoverable skill.
+        slug = _skill_slug(src)
+        assert slug and slug != src.stem, f"{skill}.md has no frontmatter name:"
 
 
 def test_kit_schemas_match_canonical() -> None:
