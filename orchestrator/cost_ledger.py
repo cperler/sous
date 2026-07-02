@@ -33,6 +33,10 @@ class CostLedger:
         ``result.cost_usd`` is deliberately ignored.
         """
         usage = result.token_usage
+        # Tolerant pricing: an unknown model id (e.g. a new provider model not yet in the
+        # table) must NOT raise — every call still gets exactly one row. An unpriced call
+        # is flagged (priced=False) and costed at 0.0, the same tolerance analysis() has.
+        cost, priced = self.model_table.try_cost_usd(result.model, usage)
         row = {
             "ts": result.completed_at,
             "run_id": result.run_id,
@@ -46,7 +50,8 @@ class CostLedger:
             "output_tokens": usage.output,
             "cache_read_tokens": usage.cache_read,
             "cache_write_tokens": usage.cache_write,
-            "cost_usd": self.model_table.cost_usd(result.model, usage),
+            "cost_usd": cost,
+            "priced": priced,
             "status": result.status.value,
             "work_item_id": result.work_item_id,
         }

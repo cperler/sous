@@ -62,6 +62,16 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
     `timeout_s` (so it defaulted to None → `timeout=None`). Fixed the real gap. Regression tests in
     `tests/test_timeout.py` (transport passes the ceiling to `subprocess.run`; a real sleeping
     subprocess yields a TIMEOUT result not a hang; the engine treats TIMEOUT as a retryable failure).
+  - **#2 Provider-aware model table (built; roadmap E1 → retired).** `_MODELS` now spans both
+    providers; `_ROLE_TO_MODEL` is keyed by `Provider` and `model_for_role(role, provider)` resolves
+    a codex-routed stage to a codex id (`gpt-5-codex`/`gpt-5`/`gpt-5-mini`) instead of a claude id
+    shelled to `codex exec -m`. `next_work` passes `lane.provider`. `ledger.record` is now tolerant
+    of an unknown model id via `ModelTable.try_cost_usd` (logs a warning, prices 0.0, flags the row
+    `priced=False`) — matching `analysis()`; no more `KeyError`. Fallback chains are per-provider
+    (`_MODEL_CHAINS`); `fallback_after` stays within a provider's chain. Codex/OpenAI prices are
+    current pins to verify on a provider price change (same as claude rows). Tests in
+    `tests/test_model_table.py`. Roadmap E1 retired below; cross-provider fallthrough stays the
+    open Active row.
 
 ## Active
 
@@ -139,9 +149,7 @@ opportunity is to *port it AND close the loops it left open*.
   we're not deliberately engineering; structure WorkItem prompts to maximize cache hits.
 
 ### E. Codex / provider parity (from the 2026-06-28 codex discussion)
-- **Provider-aware model table** — `model_table` is claude-only and `model_for_role` isn't
-  provider-aware, so a codex-routed stage gets a *claude* model id (passed to `codex exec -m` and
-  priced from the claude table). Add codex models + prices + provider-aware selection. **Correctness.**
+- ~~**Provider-aware model table**~~ — **BUILT 2026-07-01 (Fable #2), retired below.**
 - **Codex-native persona surface** — codex won't read `.claude/agents`/`--agent`/hooks; emit an
   `AGENTS.md` and/or fold the persona into the WorkItem prompt for codex-routed stages, so the kit's
   personas reach codex too.
@@ -162,4 +170,5 @@ opportunity is to *port it AND close the loops it left open*.
 | Codex routing hardening (per-task tag tuning, `CODEX_ELIGIBLE_STAGES`, conformance beyond the §4 full-validation fix) | execution adapter / ADR-062 | 2026-06-23 | **Built in Phase 4 + the review-fix wiring.** `routing.py` carries `codex_eligible_stages` (default `{implement, test}`) and the per-task `:codex` `provider_tag`; `codex.py` enforces full JSON-Schema validation (`jsonschema` Draft202012Validator), wired through `build_registry(codex_schema_provider=…)` from the project's `schema_for`. Any further conformance tuning is a normal change, not deferred scope. |
 | Non-wired skill disposition (9: brainstorming, executing-plans, investigating-codebase, review-ui, systematic-debugging, using-git-worktrees, write-docblocks, writing-agents, writing-skills) | fragment 12 / config-agents-skills | 2026-06-23 | **Decided.** Only the pipeline-wired run targets were ported (`supervisor_skill`, `scheduler_skill`, `adapter_bootstrap_skill`). The 9 methodology/product-specific skills were dropped from the harness; they remain available as project-config drop-ins for an adapter that wants them, so nothing is lost. |
 | Rich per-stage cost reports + session-reuse-win measurement | cost ledger (OC:2704) | 2026-06-23 | **Built.** `CostLedger.analysis()` (per-stage/-task breakdown + the cache-read-savings-net-of-write-premium session-reuse win vs. an uncached counterfactual), `render_cost_report()` → `cost-report.md` written on `status()`/finalize, and the `cost-report` CLI subcommand. Validates the collapsed-stage cost thesis from the data every ledger row already carries. |
+| Provider-aware model table (roadmap E1) | codex discussion 2026-06-28 / Fable review §Bet(c) | 2026-07-01 | **Built (Fable #2).** `_MODELS` spans claude+codex; `_ROLE_TO_MODEL` keyed by `Provider`; `model_for_role(role, provider)` routes a codex stage to a codex id (not a claude id shelled to `codex exec -m`); `next_work` passes `lane.provider`; per-provider fallback chains (`_MODEL_CHAINS`); `ledger.record` tolerant of unknown ids (`try_cost_usd` → 0.0 + `priced=False`, no `KeyError`). Codex prices are pins to verify. **Cross-provider (codex→claude) fallthrough remains the open Active row.** |
 | Retrospective auto-generation (`emit_failure_retrospective` + `detect_failure_patterns`) | 2b (OC:814/870) | 2026-06-23 | **Built.** `orchestrator/retrospective.py` (`detect_failure_patterns` recomputes the circuit-breaker error signature over the per-stage logs → within-task-plateau / cross-task grouping; `build_retrospective` assembles the per-failed-task trail + cascade map), `render_retrospective()` → `retrospective.md` auto-written at finalize only when the run failed, and the `retrospective` CLI subcommand. |

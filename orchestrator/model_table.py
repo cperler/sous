@@ -8,9 +8,14 @@ system). Cost is computed here so the cost ledger has a single source of truth.
 
 from __future__ import annotations
 
+import logging
+
 from pydantic import BaseModel, ConfigDict
 
+from .schemas.enums import Provider
 from .schemas.work import TokenUsage
+
+_log = logging.getLogger(__name__)
 
 
 class ModelInfo(BaseModel):
@@ -32,28 +37,54 @@ class Role:
     CHEAP_SHELL = "cheap_shell"  # setup/intake
 
 
-# Current model pins (single source). Update here on a model bump.
+# Current model pins (single source). Update here on a model bump. Keyed by id and
+# spanning BOTH providers, so a codex-routed stage is priced from the codex prices
+# rather than a claude row (roadmap E1). Codex/OpenAI prices are current pins — verify
+# on a provider price change the same as the claude rows.
 _MODELS: dict[str, ModelInfo] = {
+    # claude
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
+    # codex (OpenAI) — the ids passed to `codex exec -m`.
+    "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0),
 }
 
-_ROLE_TO_MODEL: dict[str, str] = {
-    Role.DEEP_REASON: "claude-opus-4-8",
-    Role.REVIEW: "claude-sonnet-4-6",
-    Role.CHEAP_SHELL: "claude-haiku-4-5",
+# Role -> model id, keyed by provider so `model_for_role` is provider-aware: a
+# codex-routed stage resolves to a codex id, not a claude one shelled to `codex exec -m`.
+_ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
+    Provider.CLAUDE: {
+        Role.DEEP_REASON: "claude-opus-4-8",
+        Role.REVIEW: "claude-sonnet-4-6",
+        Role.CHEAP_SHELL: "claude-haiku-4-5",
+    },
+    Provider.CODEX: {
+        Role.DEEP_REASON: "gpt-5-codex",
+        Role.REVIEW: "gpt-5",
+        Role.CHEAP_SHELL: "gpt-5-mini",
+    },
 }
 
-# Rate-limit fallback chain (ports MODEL_CHAIN: opus -> sonnet -> haiku).
-MODEL_CHAIN: tuple[str, ...] = ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5")
+# Rate-limit fallback chain, per provider (ports MODEL_CHAIN: opus -> sonnet -> haiku).
+# Cross-provider fallthrough (codex -> claude) is a separate, deferred change; within a
+# provider a rate-limited model degrades down its own chain.
+_MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
+    Provider.CLAUDE: ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    Provider.CODEX: ("gpt-5-codex", "gpt-5", "gpt-5-mini"),
+}
+
+# Back-compat alias: the claude chain (the default lane). fallback_after searches all
+# chains, so callers need not know the provider.
+MODEL_CHAIN: tuple[str, ...] = _MODEL_CHAINS[Provider.CLAUDE]
 
 
 class ModelTable:
     """Immutable view over the model/pricing config."""
 
-    def model_for_role(self, role: str) -> str:
-        return _ROLE_TO_MODEL[role]
+    def model_for_role(self, role: str, provider: Provider = Provider.CLAUDE) -> str:
+        return _ROLE_TO_MODEL[provider][role]
 
     def info(self, model_id: str) -> ModelInfo:
         if model_id not in _MODELS:
@@ -71,13 +102,27 @@ class ModelTable:
         ) / 1_000_000
         return round(cost, 6)
 
-    def fallback_after(self, model_id: str) -> str | None:
-        """Next cheaper model in the chain, or None if at the end."""
+    def try_cost_usd(self, model_id: str, usage: TokenUsage) -> tuple[float, bool]:
+        """Tolerant pricing: (cost, priced). An unknown model id logs a warning and
+        prices at 0.0 with ``priced=False`` instead of raising — the ledger must still
+        record the call (mirrors ``analysis()``'s tolerance). The row's ``priced`` flag
+        surfaces the gap; the call is never silently dropped."""
         try:
-            idx = MODEL_CHAIN.index(model_id)
-        except ValueError:
-            return None
-        return MODEL_CHAIN[idx + 1] if idx + 1 < len(MODEL_CHAIN) else None
+            return self.cost_usd(model_id, usage), True
+        except KeyError:
+            _log.warning("unpriced model id %r — recording call at 0.0 cost", model_id)
+            return 0.0, False
+
+    def fallback_after(self, model_id: str) -> str | None:
+        """Next cheaper model in the same provider's chain, or None if at the end /
+        not in any chain."""
+        for chain in _MODEL_CHAINS.values():
+            try:
+                idx = chain.index(model_id)
+            except ValueError:
+                continue
+            return chain[idx + 1] if idx + 1 < len(chain) else None
+        return None
 
 
 DEFAULT_MODEL_TABLE = ModelTable()

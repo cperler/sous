@@ -160,7 +160,9 @@ class Engine:
         # Graceful model fallback: a queued fallback model (set when a prior dispatch of
         # this stage was rate-limited) overrides the role default so the retry runs on a
         # cheaper model. Consumed in the commit below.
-        model = task.pending_fallback_model or self.models.model_for_role(spec.model_role)
+        model = task.pending_fallback_model or self.models.model_for_role(
+            spec.model_role, lane.provider
+        )
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump

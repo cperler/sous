@@ -260,13 +260,13 @@ def test_analysis_unpriced_model_excluded_from_counterfactual(tmp_path: Path) ->
     cost) but is excluded from the cache counterfactual and named in unpriced_models."""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     rows = [
-        {"stage": "implement", "task_id": "t", "model": "gpt-5-codex", "cost_usd": 2.0,
+        {"stage": "implement", "task_id": "t", "model": "some-future-model", "cost_usd": 2.0,
          "input_tokens": 100, "output_tokens": 50, "cache_read_tokens": 999, "cache_write_tokens": 0},
     ]
     a = ledger.analysis(rows=rows)
     assert a["total_cost_usd"] == 2.0  # spend still counted
     assert a["session_reuse"]["cache_read_savings_usd"] == 0.0  # not priced
-    assert a["session_reuse"]["unpriced_models"] == ["gpt-5-codex"]
+    assert a["session_reuse"]["unpriced_models"] == ["some-future-model"]
 
 
 def test_analysis_empty_is_zeroed(tmp_path: Path) -> None:
