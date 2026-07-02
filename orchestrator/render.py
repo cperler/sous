@@ -197,3 +197,47 @@ def render_task_index(task: Task) -> str:
         lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {cost} |")
     lines.append("")
     return "\n".join(lines)
+
+
+def render_completion_note(task: Task, followups: list[dict] | None = None) -> str:
+    """Render a run's completion evidence as Markdown — the note the engine publishes
+    back to the task source (PR/issue comment) so the pipeline's reasoning outlives the
+    run logs. Derived purely from the task's recorded stages + the follow-ups the engine
+    filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
+    None if filing failed)."""
+    from .schemas.enums import Stage  # local: avoid widening the module import surface
+
+    review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
+    approved = review.get("approved")
+    verdict = "✅ approved" if approved else ("❌ changes requested" if approved is False else "—")
+    lines = [
+        f"## Orchestration run complete — {task.task_id}",
+        "",
+        f"- **Task:** {task.title or '(no title)'}",
+        f"- **PR:** {task.pr_url or '(none)'}",
+        f"- **Review:** {verdict}",
+        "",
+        "| # | Stage | Status | Model | Cost |",
+        "|---:|---|---|---|---:|",
+    ]
+    for seq, stage in enumerate(STAGE_ORDER, start=1):
+        rec = task.stages[stage]
+        cost = f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
+        model = f"`{rec.model}`" if rec.model else "—"
+        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {cost} |")
+
+    blocking = [i for i in (review.get("issues") or []) if str(i).strip()]
+    if blocking:
+        lines += ["", "### Outstanding review issues"]
+        lines += [f"- {i}" for i in blocking]
+
+    if followups:
+        lines += ["", "### Follow-ups filed (non-blocking findings)"]
+        for f in followups:
+            ref = f.get("ref")
+            suffix = f" → {ref}" if ref else " → (filing failed)"
+            lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
+
+    lines += ["", "_Produced by the orchestration harness — nothing dropped: "
+              "non-blocking findings are tracked as follow-up issues._", ""]
+    return "\n".join(lines)

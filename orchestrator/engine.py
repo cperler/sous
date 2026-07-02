@@ -22,6 +22,7 @@ from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
 from .render import (
+    render_completion_note,
     render_cost_report,
     render_cost_summary,
     render_retrospective,
@@ -680,13 +681,81 @@ class Engine:
         self.store.update_run(run_id, mut)
 
     def _on_task_completed(self, run_id: str, task: Task) -> None:
+        ts = self.project.task_source
         if task.pr_url:
             self.project.task_source.mark_complete(task.task_id, task.pr_url)
+        # Evidence-out (matches the work-in seam): file follow-ups from the review's
+        # non-blocking findings, then publish a completion note. Both go through OPTIONAL
+        # duck-typed task-source hooks (absent on a v1 adapter -> graceful no-op) and must
+        # never crash run finalize — a flaky `gh` cannot un-complete a merged task.
+        followups = self._file_review_followups(run_id, task, ts)
+        self._publish_completion_note(run_id, task, ts, followups)
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
-             "task_id": task.task_id, "pr_url": task.pr_url},
+             "task_id": task.task_id, "pr_url": task.pr_url,
+             "followups_filed": len(followups)},
         )
+
+    def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
+        """File each non-blocking review finding as a deferred-scope follow-up issue, so
+        nothing the reviewer noticed is silently dropped (the project's scope-ledger norm).
+        Returns ``[{"title", "ref"}]``; a no-op when the adapter lacks ``file_followup`` or
+        the review reported none."""
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return []
+        review = task.stages.get(Stage.REVIEW)
+        findings = (review.output or {}).get("non_blocking") if review else None
+        if not findings:
+            return []
+        filed: list[dict] = []
+        for finding in findings:
+            if not isinstance(finding, dict):
+                continue
+            title = (finding.get("title") or "").strip()
+            if not title:
+                continue
+            body = (
+                f"{(finding.get('detail') or '').strip()}\n\n"
+                f"_Filed automatically from the {task.task_id} review "
+                f"({task.pr_url or 'PR'}) as a non-blocking follow-up._"
+            )
+            try:
+                ref = file_followup(title=title, body=body, labels=["deferred-scope"])
+            except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "followup_failed", "run_id": run_id,
+                     "task_id": task.task_id, "title": title, "error": str(exc)},
+                )
+                filed.append({"title": title, "ref": None})
+                continue
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "followup_filed", "run_id": run_id,
+                 "task_id": task.task_id, "title": title, "ref": ref},
+            )
+            filed.append({"title": title, "ref": ref})
+        return filed
+
+    def _publish_completion_note(
+        self, run_id: str, task: Task, task_source: object, followups: list[dict]
+    ) -> None:
+        """Publish the run's completion evidence via the adapter's ``publish_note`` hook
+        (a no-op when absent). Failure is logged, never fatal to finalize."""
+        publish_note = getattr(task_source, "publish_note", None)
+        if not callable(publish_note):
+            return
+        body = render_completion_note(task, followups)
+        try:
+            publish_note(task.task_id, body, pr_url=task.pr_url)
+        except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_note_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
 
     def _cascade_from(self, run_id: str, failed_task_id: str) -> None:
         """Transitively cascade-block every dependent of a failed task (fix D14)."""

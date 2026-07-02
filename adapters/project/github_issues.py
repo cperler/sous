@@ -52,3 +52,28 @@ class GitHubIssuesSource:
         num = _issue_number(task_id)
         body = f"Implemented via {pr_url}" if pr_url else "Implemented."
         self._run(["gh", "issue", "comment", num, "--repo", self.repo, "--body", body])
+
+    # --- optional evidence-out hooks (duck-typed by the engine; not part of the v1
+    # TaskSource contract, so an older external adapter without them still runs) ------
+
+    def publish_note(self, task_id: str, body: str, *, pr_url: str | None = None) -> None:
+        """Post a run's completion evidence. Prefers the PR thread when a ``pr_url`` is
+        known (a full URL locates the repo+PR by itself, so no ``--repo``); otherwise
+        comments on the issue."""
+        if pr_url:
+            self._run(["gh", "pr", "comment", pr_url, "--body", body])
+        else:
+            self._run(
+                ["gh", "issue", "comment", _issue_number(task_id), "--repo", self.repo,
+                 "--body", body]
+            )
+
+    def file_followup(
+        self, title: str, body: str, labels: list[str] | None = None
+    ) -> str | None:
+        """Open a follow-up issue (e.g. a review's non-blocking finding) and return the
+        new issue URL (`gh issue create` prints it on stdout)."""
+        argv = ["gh", "issue", "create", "--repo", self.repo, "--title", title, "--body", body]
+        for label in labels or []:
+            argv += ["--label", label]
+        return self._run(argv).strip() or None

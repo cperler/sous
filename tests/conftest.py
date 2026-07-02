@@ -24,6 +24,8 @@ class FakeTaskSource:
     def __init__(self) -> None:
         self.completed: list[tuple[str, str | None]] = []
         self.deps: dict[str, list[str]] = {}  # task_id -> depends_on (test-configurable)
+        self.notes: list[dict] = []  # publish_note calls
+        self.followups: list[dict] = []  # file_followup calls
 
     def resolve(self, task_id: str) -> TaskSpec:
         return TaskSpec(
@@ -36,6 +38,15 @@ class FakeTaskSource:
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         self.completed.append((task_id, pr_url))
+
+    # Optional evidence-out hooks (duck-typed by the engine at finalize).
+    def publish_note(self, task_id: str, body: str, *, pr_url: str | None = None) -> None:
+        self.notes.append({"task_id": task_id, "body": body, "pr_url": pr_url})
+
+    def file_followup(self, title: str, body: str, labels: list[str] | None = None) -> str:
+        ref = f"https://example.test/issues/{len(self.followups) + 1}"
+        self.followups.append({"title": title, "body": body, "labels": labels, "ref": ref})
+        return ref
 
 
 class FakeProject:

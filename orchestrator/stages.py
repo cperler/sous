@@ -112,8 +112,14 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         timeout_s=600,  # read the PR + judge
         template=(
             "Review the PR (see pr_url in the context above) against the task goal and "
-            "code quality. Approve only if it achieves the goal without regressions.\n"
-            "Return: approved, issues (list)."
+            "code quality. Assess the goal criterion-by-criterion and check for "
+            "regressions; approve only if it achieves the goal without regressions. "
+            "Separately, record any NON-BLOCKING findings (nits, edge cases, polish, "
+            "follow-on ideas) that should be tracked but must not hold up this PR — the "
+            "engine files each as a deferred-scope follow-up issue at finalize, so "
+            "nothing you notice is silently dropped.\n"
+            "Return: approved, issues (blocking; empty when approved), non_blocking "
+            "(list of {title, detail}; empty if none)."
         ),
     ),
 }

@@ -41,6 +41,15 @@ class TaskSource(Protocol):
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None: ...
 
+    # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
+    # them only via ``getattr`` at task finalize, so an older external adapter that omits
+    # them keeps running unchanged; that's why adding them needs no CONTRACT_VERSION bump):
+    #   publish_note(task_id, body, *, pr_url=None) -> None
+    #       publish a run's completion evidence (a PR/issue comment, a log line, …).
+    #   file_followup(title, body, labels=None) -> str | None
+    #       open a follow-up (e.g. a review's non-blocking finding); return its ref/URL.
+    # The shared GitHubIssuesSource and LocalFileTaskSource implement both.
+
 
 @runtime_checkable
 class ProjectConfig(Protocol):

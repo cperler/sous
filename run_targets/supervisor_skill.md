@@ -38,6 +38,20 @@ You never call a model directly and you never run `claude -p`.
    - `stage_completed` / `stage_failed_will_retry` → loop again (the engine re-emits
      the same stage with appended learnings on a retry).
 
+   Preserve the agent's narrative: pass its full prose back as the `StageResult`'s
+   `raw_output` (the shim does this from `agentResult.raw`), not just the structured
+   fields — the per-stage log keeps it as the durable "why", and the review stage's
+   narrative is the human-readable audit of the approve/deny decision.
+
+## Evidence-out (automatic at `task_completed`)
+When the task completes, the engine publishes the run's evidence through the project
+adapter — no supervisor action needed: it files each **non-blocking** review finding
+(`review.non_blocking[*]`) as a `deferred-scope` follow-up issue, then posts a
+completion note (stage table + PR + verdict + follow-ups filed) to the PR/issue. These
+run through optional `file_followup` / `publish_note` task-source hooks; an adapter that
+omits them is a silent no-op. So a reviewer's nits are never dropped — they land as
+tracked issues, satisfying the "nothing silently dropped" scope-ledger norm.
+
 ## Resumability
 Because the shim only returns results **on Workflow completion**, a session death
 mid-dispatch loses only the in-flight **batch** — re-run from `… next`/`… resume`

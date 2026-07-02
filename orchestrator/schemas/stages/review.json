@@ -9,7 +9,20 @@
     "issues": {
       "type": "array",
       "items": {"type": "string"},
-      "description": "outstanding issues (empty when approved)"
+      "description": "blocking issues (empty when approved)"
+    },
+    "non_blocking": {
+      "type": "array",
+      "description": "findings that do NOT block approval but should be tracked as follow-ups; the engine files each as a deferred-scope issue at finalize (empty if none)",
+      "items": {
+        "type": "object",
+        "required": ["title"],
+        "properties": {
+          "title": {"type": "string", "description": "one-line issue title"},
+          "detail": {"type": "string", "description": "what/why/where — the follow-up issue body"}
+        },
+        "additionalProperties": true
+      }
     }
   },
   "additionalProperties": true
