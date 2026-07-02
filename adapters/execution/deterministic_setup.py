@@ -66,7 +66,10 @@ class DeterministicSetupRunner:
                 )
             else:
                 out, checkpoint = self._git_setup(work)
-        except _SetupError as exc:
+        except Exception as exc:  # noqa: BLE001 - every dispatch MUST yield a StageResult,
+            # never an escaped exception (a _git timeout / stale index.lock, or a raising
+            # project setup_task, would otherwise leave the dispatch lease held with no CLI
+            # path to clear it). Mirror claude_cli_transport's convert-to-FAILURE contract.
             raw = RawResult(None, exit_code=1, error=str(exc), invocation="engine:setup")
             return to_stage_result(work, raw, ResultStatus.FAILURE,
                                    mode=ExecutionMode.ENGINE, provider=Provider.NONE)
@@ -115,7 +118,14 @@ class DeterministicSetupRunner:
         worktree.parent.mkdir(parents=True, exist_ok=True)
         add = _git(str(repo_root), "worktree", "add", str(worktree), "-b", branch, self._base_ref)
         if add.returncode != 0:
-            # Stale branch from a prior failed run: delete it and retry once.
+            # The branch likely already exists (prior run). Try to REUSE it (attach a
+            # worktree to the existing branch) before anything destructive — never
+            # `branch -D` first, which would discard unmerged commits on that branch.
+            reuse = _git(str(repo_root), "worktree", "add", str(worktree), branch)
+            if reuse.returncode == 0:
+                return
+            # Last resort: the branch is checked out elsewhere / genuinely stale. Delete
+            # and recreate from base (matches the reference run_setup_stage retry).
             _git(str(repo_root), "branch", "-D", branch)
             add = _git(str(repo_root), "worktree", "add", str(worktree), "-b", branch, self._base_ref)
         if add.returncode != 0:

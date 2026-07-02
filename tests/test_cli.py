@@ -50,3 +50,18 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     assert set(report["by_stage"]) == {"intake", "scope", "implement", "test", "deliver", "review"}
     assert "net_win_usd" in report["session_reuse"]
     assert (tmp_path / "cost-report.md").exists()  # written at run finalize
+
+
+def test_cli_next_terminates_when_deterministic_setup_fails(tmp_path, capsys) -> None:
+    # Regression: the `next` drain runs the deterministic intake in-process. If that stage
+    # persistently fails, `next` must terminate (task -> FAILED, returns null), NOT loop
+    # forever re-dispatching the failed stage.
+    base = ["--root", str(tmp_path), "--run", "r", "--project", "tests.failsetup"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    _run(capsys, *base, "add-task", "--task", "#7")
+
+    work = _run(capsys, *base, "next", "--task", "#7")  # drains intake; must not hang
+
+    assert work is None  # terminated instead of re-dispatching a failed task forever
+    status = _run(capsys, *base, "status")
+    assert status["tasks"]["#7"]["state"] == "failed"

@@ -74,6 +74,24 @@ def test_non_git_dir_fails_cleanly(tmp_path, monkeypatch) -> None:
     assert "git" in (res.error or "").lower()
 
 
+def test_dispatch_yields_failure_when_setup_task_raises(tmp_path, monkeypatch) -> None:
+    # Every dispatch MUST yield a StageResult — a raising setup_task (or a _git timeout)
+    # must become FAILURE, never an escaped exception that leaves the lease held.
+    monkeypatch.chdir(tmp_path)
+
+    class P:
+        def install_cmd(self) -> list[str]:
+            return ["true"]
+
+        def setup_task(self, task_id: str) -> dict:
+            raise RuntimeError("boom")
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.FAILURE
+    assert "boom" in (res.error or "")
+
+
 def test_project_setup_task_override_skips_git(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)  # NOT a git repo — the override must not touch git
 

@@ -127,6 +127,25 @@ def test_finalize_files_improvement_and_renders_self_improvement(tmp_path, proje
     assert completed["improvement_filed"] is True
 
 
+def test_finalize_survives_a_non_string_improvement_field(tmp_path, project) -> None:
+    # The interactive lane doesn't schema-validate structured_output, so a model may emit
+    # a non-string field. Evidence-out must NOT crash record()/finalize.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    outcomes = _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "improvement": {"title": "coerce me", "detail": ["a", "list", "not", "a", "string"]},
+    })
+
+    assert outcomes[-1]["outcome"] == "task_completed"  # record() did not crash
+    events = _events(tmp_path)
+    assert any(e["type"] == "task_completed" for e in events)  # finalize event still fired
+    assert not any(e["type"] == "evidence_out_failed" for e in events)  # coerced, not crashed
+    assert len(project.task_source.notes) == 1  # the note still published
+
+
 def test_finalize_no_findings_files_nothing_but_still_notes(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)

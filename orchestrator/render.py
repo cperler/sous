@@ -256,14 +256,14 @@ def render_completion_note(
             f" → {improvement_ref}" if improvement_ref else "")
         lines += ["", "### Self-improvement", head]
         if str(improvement.get("detail", "")).strip():
-            lines.append(improvement["detail"].strip())
+            lines.append(str(improvement["detail"]).strip())
     retro = review.get("retrospective") if isinstance(review.get("retrospective"), dict) else None
     if retro and str(retro.get("title", "")).strip():
         if not (improvement and str(improvement.get("title", "")).strip()):
             lines += ["", "### Self-improvement"]
         lines += ["", f"🔍 **Process retrospective:** {retro['title']}"]
         if str(retro.get("detail", "")).strip():
-            lines.append(retro["detail"].strip())
+            lines.append(str(retro["detail"]).strip())
 
     lines += ["", "_Produced by the orchestration harness — nothing dropped: non-blocking "
               "findings are tracked as follow-up issues; the improvement idea is filed as an "

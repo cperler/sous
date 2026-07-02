@@ -191,6 +191,12 @@ class Engine:
         if self.capacity.at_capacity(util_pct):
             raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
         task = self.store.load_task(run_id, task_id)
+        # A terminal task has no more work — never re-emit its (failed/completed) stage.
+        # Without this, a caller that loops on next_work (the CLI `next` drain) would
+        # re-dispatch a FAILED task forever; the scheduler is safe because `dispatchable`
+        # filters terminal states, but next_work must be self-safe for direct callers.
+        if task.state in TERMINAL_TASK_STATES:
+            return None
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
         # so recovery is the explicit resume=True path — never a silent re-dispatch that
@@ -691,18 +697,27 @@ class Engine:
         self.store.update_run(run_id, mut)
 
     def _on_task_completed(self, run_id: str, task: Task) -> None:
-        ts = self.project.task_source
-        if task.pr_url:
-            self.project.task_source.mark_complete(task.task_id, task.pr_url)
-        # Evidence-out (matches the work-in seam): file follow-ups from the review's
-        # non-blocking findings, then publish a completion note. Both go through OPTIONAL
-        # duck-typed task-source hooks (absent on a v1 adapter -> graceful no-op) and must
-        # never crash run finalize — a flaky `gh` cannot un-complete a merged task.
-        followups = self._file_review_followups(run_id, task, ts)
-        # Self-improvement loop: file the review's forward-looking improvement idea as an
-        # enhancement issue (so a completed run improves the roadmap, not just ships a fix).
-        improvement_ref = self._file_review_improvement(run_id, task, ts)
-        self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
+        # Evidence-out (matches the work-in seam): mark_complete + file follow-ups from the
+        # review's non-blocking findings + the improvement idea, then publish a completion
+        # note. ALL of it is best-effort and wrapped: a flaky `gh`, a malformed review
+        # payload (e.g. a non-string field on the un-validated interactive lane), or a
+        # render error must NEVER escape record() and skip the task_completed event /
+        # finalize — the task is already COMPLETED and the result can't be replayed.
+        followups: list[dict] = []
+        improvement_ref: str | None = None
+        try:
+            ts = self.project.task_source
+            if task.pr_url:
+                ts.mark_complete(task.task_id, task.pr_url)
+            followups = self._file_review_followups(run_id, task, ts)
+            improvement_ref = self._file_review_improvement(run_id, task, ts)
+            self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
+        except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "evidence_out_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
@@ -726,11 +741,11 @@ class Engine:
         for finding in findings:
             if not isinstance(finding, dict):
                 continue
-            title = (finding.get("title") or "").strip()
+            title = str(finding.get("title") or "").strip()  # coerce: a model may emit non-strings
             if not title:
                 continue
             body = (
-                f"{(finding.get('detail') or '').strip()}\n\n"
+                f"{str(finding.get('detail') or '').strip()}\n\n"
                 f"_Filed automatically from the {task.task_id} review "
                 f"({task.pr_url or 'PR'}) as a non-blocking follow-up._"
             )
@@ -763,11 +778,11 @@ class Engine:
         improvement = (review.output or {}).get("improvement") if review else None
         if not isinstance(improvement, dict):
             return None
-        title = (improvement.get("title") or "").strip()
+        title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
             return None
         body = (
-            f"{(improvement.get('detail') or '').strip()}\n\n"
+            f"{str(improvement.get('detail') or '').strip()}\n\n"
             f"_Filed automatically from the {task.task_id} review "
             f"({task.pr_url or 'PR'}) — the run's own improvement idea (self-improvement loop)._"
         )
