@@ -69,6 +69,26 @@ def _session_lost(stderr: str | None) -> bool:
     return bool(text) and any(m in text for m in _SESSION_LOST_MARKERS)
 
 
+def _json_object_from_text(text: str) -> dict | None:
+    """Recover a JSON object a model printed as text (in the envelope's ``result``) when
+    it answered the ``--json-schema`` prompt with prose instead of the structured-output
+    tool — commonly a ```json fenced block. Returns the object, or None if the text isn't
+    a single JSON object (genuine prose stays a SCHEMA_VIOLATION)."""
+    s = text.strip()
+    if s.startswith("```"):  # strip a ```json / ``` code fence
+        s = s.split("\n", 1)[-1] if "\n" in s else s[3:]
+        if s.rstrip().endswith("```"):
+            s = s.rstrip()[:-3]
+    s = s.strip()
+    if not s.startswith("{"):
+        return None
+    try:
+        obj = json.loads(s)
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def to_stage_result(
     work: WorkItem,
     raw: RawResult,
@@ -250,7 +270,11 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
         # must not fall through to the prose `result`.
         structured = data["structured_output"] if "structured_output" in data else data.get("result")
         if isinstance(structured, str):
-            structured = None  # prose, not structured
+            # --json-schema only populates `structured_output` when the model answers via
+            # the structured-output tool; a model that instead prints the JSON object as
+            # text (often fenced ```json) lands it in `result`. Recover that rather than
+            # discarding a schema-shaped answer as a SCHEMA_VIOLATION.
+            structured = _json_object_from_text(structured)
         session_id = data.get("session_id")
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
                          exit_code=0, invocation=invocation,

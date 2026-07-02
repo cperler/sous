@@ -104,6 +104,41 @@ def test_build_registry_wires_headless_schema_into_the_transport(monkeypatch) ->
     assert result.structured_output == {"ok": True}
 
 
+# --- result-as-JSON fallback (model answered in prose, not the structured tool) ------
+
+
+def test_transport_recovers_fenced_json_from_result(monkeypatch) -> None:
+    calls: list = []
+    # No structured_output key; the JSON object is fenced text in `result`.
+    envelope = {"result": '```json\n{"approved": true, "issues": []}\n```',
+                "session_id": "s1"}
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls, payload=envelope))
+
+    raw = claude_cli_transport(lambda ref: '{"type":"object"}')(_work("review"))
+
+    assert raw.structured_output == {"approved": True, "issues": []}
+
+
+def test_transport_recovers_bare_json_object_from_result(monkeypatch) -> None:
+    calls: list = []
+    envelope = {"result": '{"ok": true}'}
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls, payload=envelope))
+
+    raw = claude_cli_transport()(_work())
+
+    assert raw.structured_output == {"ok": True}
+
+
+def test_transport_leaves_genuine_prose_unstructured(monkeypatch) -> None:
+    calls: list = []
+    envelope = {"result": "I reviewed the PR and it looks good to me."}
+    monkeypatch.setattr(subprocess, "run", _stub_json_run(calls, payload=envelope))
+
+    raw = claude_cli_transport()(_work())
+
+    assert raw.structured_output is None  # prose stays a schema_violation upstream
+
+
 def test_build_registry_injected_transport_beats_schema_provider() -> None:
     # An explicitly injected transport wins (tests wrap their own); the provider is ignored.
     sentinel_calls: list = []
