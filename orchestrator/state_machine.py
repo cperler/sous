@@ -157,6 +157,10 @@ def _enforce_context_ceiling(task: Task) -> None:
     order decide, never context insertion order."""
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
+
+    def _weight(key: str) -> int:
+        return _context_bytes({key: task.context[key]})
+
     while _context_bytes(task.context) > _MAX_CONTEXT_BYTES:
         # context keys present, ordered so max() breaks weight-ties by
         # evicting the latest-pipeline stage's key first, then the first key in its tuple.
@@ -168,9 +172,6 @@ def _enforce_context_ceiling(task: Task) -> None:
         ]
         if not candidates:
             return
-
-        def _weight(key: str) -> int:
-            return _context_bytes({key: task.context[key]})
 
         task.context.pop(max(candidates, key=_weight), None)
 
