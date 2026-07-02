@@ -16,6 +16,7 @@ from orchestrator.routing import Router
 from orchestrator.schemas.enums import ExecutionLane, ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
 from orchestrator.status_store import StatusStore
+from tests.conftest import make_result
 
 
 def test_model_for_role_is_provider_aware() -> None:
@@ -90,8 +91,11 @@ def test_next_work_routes_codex_stage_to_codex_model(tmp_path: Path, project) ->
     )
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
-    work = eng.next_work("r1", "t1")  # intake stage -> cheap_shell role
+    intake = eng.next_work("r1", "t1")  # deterministic ENGINE lane — not a model call
+    assert intake.lane_policy.execution_mode is ExecutionMode.ENGINE
+    eng.record("r1", make_result(intake))
+    work = eng.next_work("r1", "t1")  # scope -> first model stage, routed to codex
     assert work.lane_policy.provider is Provider.CODEX
     # the WorkItem model is a codex id (not a claude id shelled to `codex exec -m`)
-    assert work.model == "gpt-5-mini"
+    assert work.model == "gpt-5-codex"
     assert not work.model.startswith("claude")

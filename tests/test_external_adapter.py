@@ -114,6 +114,15 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
     tasks.write_text(json.dumps({"T1": {"title": "wire the thing", "body": "do it"}}))
     monkeypatch.setenv("MY_PROJECT_TASKS", str(tasks))
 
+    # The deterministic intake runner creates a real worktree off HEAD of the CWD repo —
+    # make the project dir an isolated git repo and run there, so nothing touches this repo.
+    import subprocess
+
+    for argv in (["git", "init", "-q"], ["git", "add", "-A"],
+                 ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]):
+        subprocess.run(argv, cwd=proj, check=True)
+    monkeypatch.chdir(proj)
+
     base = ["--root", str(tmp_path / "run-root"), "--run", "r1", "--project", str(pkg)]
 
     def run(*argv):
@@ -132,7 +141,8 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
         result_file = tmp_path / "result.json"
         result_file.write_text(make_result(wi).model_dump_json())
         recorded.append(run("record", "--result", str(result_file))["stage"])
-    assert recorded == ["intake", "scope", "implement", "test", "deliver", "review"]
+    # intake is drained deterministically by `next`, so the supervisor records 5 model stages.
+    assert recorded == ["scope", "implement", "test", "deliver", "review"]
 
     status = run("status")
     assert status["tasks"]["T1"]["state"] == "completed"

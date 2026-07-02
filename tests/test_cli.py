@@ -22,7 +22,8 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     _run(capsys, *base, "init-run", "--lane", "full")
     _run(capsys, *base, "add-task", "--task", "#42")
 
-    # supervisor loop: next -> (shim would run agent) -> record
+    # supervisor loop: next -> (shim would run agent) -> record. `next` drains the
+    # deterministic intake stage in-process, so the supervisor only sees model stages.
     stages_recorded = []
     for _ in range(10):  # safety bound
         work = _run(capsys, *base, "next", "--task", "#42")
@@ -37,7 +38,7 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
         stages_recorded.append(outcome["stage"])
         assert outcome["lane_attributed"] is True
 
-    assert stages_recorded == ["intake", "scope", "implement", "test", "deliver", "review"]
+    assert stages_recorded == ["scope", "implement", "test", "deliver", "review"]
 
     status = _run(capsys, *base, "status")
     assert status["tasks"]["#42"]["state"] == "completed"

@@ -23,6 +23,10 @@ You never call a model directly and you never run `claude -p`.
 ## The loop (repeat until the task is terminal)
 1. **next**: `WORK=$(… next --task "$TASK" --util "$UTIL")`.
    - If `WORK` is `null`, the task is done — stop.
+   - **Deterministic stages are already done for you.** `next` runs any leading
+     deterministic stage (e.g. `intake` — worktree/branch/baseline) in-process on the
+     `engine:none` lane and returns the first *model* WorkItem. You never create a
+     worktree by hand or dispatch intake to a model (heysoo #227).
    - `UTIL` is the current 5h utilization %; the engine turns it into the binding
      dispatch limit. **Do not exceed the engine's limit** even though the Workflow
      cap could allow more — the engine's number is the policy, the Workflow cap is a

@@ -11,7 +11,9 @@ from enum import StrEnum
 
 # v2: Task carries its own `pipeline` (ordered stage list); v1 docs derive it from
 # execution_lane on load (2026-07-01 design pass §1).
-SCHEMA_VERSION = "2"
+# v3: deterministic stages (e.g. intake) run on the non-model ENGINE lane
+# (ExecutionMode.ENGINE × Provider.NONE); additive — pre-v3 docs never name it.
+SCHEMA_VERSION = "3"
 
 
 class Stage(StrEnum):
@@ -43,11 +45,13 @@ STAGE_ORDER: tuple[Stage, ...] = (
 class ExecutionMode(StrEnum):
     INTERACTIVE = "interactive"
     HEADLESS = "headless"
+    ENGINE = "engine"  # deterministic, in-process, no model call (e.g. intake setup)
 
 
 class Provider(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"
+    NONE = "none"  # no model provider — the ENGINE lane's deterministic runner
 
 
 class StageStatus(StrEnum):

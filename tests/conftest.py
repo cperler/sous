@@ -85,6 +85,12 @@ class FakeProject:
     def agent_for(self, stage: Stage, role: str | None = None):
         return {"implement": "impl-agent", "review": "code-reviewer", "docstring": "docstring-agent"}.get(role)
 
+    def setup_task(self, task_id: str) -> dict:
+        # No-git fake for the deterministic ENGINE-lane intake runner: tests must never
+        # create real worktrees. Returns the intake contract with a synthetic worktree.
+        safe = task_id.lstrip("#")
+        return {"branch": f"task/{safe}", "worktree": f"/wt/{safe}", "baseline_captured": True}
+
 
 @pytest.fixture
 def project() -> FakeProject:
@@ -98,12 +104,16 @@ def make_result(
     structured_output: dict | None = None,
     error: str | None = None,
     tokens: TokenUsage | None = None,
-    mode: ExecutionMode = ExecutionMode.INTERACTIVE,
-    provider: Provider = Provider.CLAUDE,
+    mode: ExecutionMode | None = None,
+    provider: Provider | None = None,
     session_ref: str | None = None,
     checkpoint: dict | None = None,
 ) -> StageResult:
-    """Simulate a runner's StageResult answering a WorkItem."""
+    """Simulate a runner's StageResult answering a WorkItem. The lane defaults to the
+    WorkItem's own policy (so a deterministic engine-lane stage records as engine:none),
+    honoring an explicit mode/provider override when a test needs one."""
+    mode = mode if mode is not None else work.lane_policy.execution_mode
+    provider = provider if provider is not None else work.lane_policy.provider
     if structured_output is None and status is ResultStatus.SUCCESS:
         structured_output = _default_output(work.stage)
     return StageResult(

@@ -20,7 +20,7 @@ from .capacity import DEFAULT_CAPACITY, CapacityPolicy
 from .cost_ledger import CostLedger
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
-from .model_table import DEFAULT_MODEL_TABLE, ModelTable
+from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
 from .render import (
     render_completion_note,
     render_cost_report,
@@ -36,6 +36,8 @@ from .schemas.enums import (
     LANE_STAGES,
     TERMINAL_TASK_STATES,
     ExecutionLane,
+    ExecutionMode,
+    Provider,
     ResultStatus,
     RunState,
     Stage,
@@ -43,7 +45,7 @@ from .schemas.enums import (
     TaskState,
 )
 from .schemas.status import Run, Task, TaskRef
-from .schemas.work import StageResult, WorkItem
+from .schemas.work import LanePolicy, StageResult, WorkItem
 from .stages import STAGE_SPECS, render_prompt
 from .state_machine import apply_result, begin_stage, is_done, next_stage, resume_point
 from .status_store import StatusStore
@@ -204,13 +206,21 @@ class Engine:
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
-        lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
-        # Graceful model fallback: a queued fallback model (set when a prior dispatch of
-        # this stage was rate-limited) overrides the role default so the retry runs on a
-        # cheaper model. Consumed in the commit below.
-        model = task.pending_fallback_model or self.models.model_for_role(
-            spec.model_role, lane.provider
-        )
+        if spec.deterministic:
+            # No model: route to the in-process ENGINE lane (a shell runner does the work).
+            # heysoo #227 — don't ask an LLM to run `git worktree add`.
+            lane = LanePolicy(
+                execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False
+            )
+            model = ENGINE_MODEL
+        else:
+            lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
+            # Graceful model fallback: a queued fallback model (set when a prior dispatch of
+            # this stage was rate-limited) overrides the role default so the retry runs on a
+            # cheaper model. Consumed in the commit below.
+            model = task.pending_fallback_model or self.models.model_for_role(
+                spec.model_role, lane.provider
+            )
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump

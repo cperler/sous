@@ -130,4 +130,16 @@ def default_registry() -> Registry:
             status=EXPLICIT_EMPTY,
         )
     )
+    # The deterministic ENGINE lane (intake setup): register the descriptor so it is
+    # SANCTIONED for the lane audit even here (the in-process DeterministicSetupRunner is
+    # attached in build_registry, which has the project; importing it here would cycle).
+    reg.register_external(
+        CapabilityDescriptor(
+            execution_mode=ExecutionMode.ENGINE,
+            provider=Provider.NONE,
+            in_process=True,
+            schema_enforced=True,
+            status=SUPPORTED,
+        )
+    )
     return reg

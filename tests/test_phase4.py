@@ -114,7 +114,11 @@ def test_registry_runner_rejects_external_interactive() -> None:
 
 # --- headless run target (config-only mode flip) --------------------------
 def _headless_engine(tmp_path) -> tuple[Engine, Registry]:
-    reg = build_registry(headless_transport=fake_headless_transport, include_interactive=False)
+    reg = build_registry(
+        headless_transport=fake_headless_transport,
+        setup_project=FakeProject(),  # wires the deterministic ENGINE-lane intake runner
+        include_interactive=False,
+    )
     eng = Engine(
         StatusStore(tmp_path),
         CostLedger(tmp_path / "stage-costs.jsonl"),
@@ -134,7 +138,8 @@ def test_headless_run_target_completes_in_process(tmp_path) -> None:
     assert status["tasks"]["t1"]["state"] == "completed"
     audit = status["lane_audit"]
     assert audit["clean"] is True
-    assert audit["by_lane"] == {"headless:claude": 6}  # whole run on the headless lane
+    # intake runs on the deterministic ENGINE lane; the five model stages are headless:claude.
+    assert audit["by_lane"] == {"engine:none": 1, "headless:claude": 5}
     assert "headless:claude" in audit["sanctioned_lanes"]
 
 

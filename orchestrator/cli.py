@@ -45,6 +45,7 @@ def _engine(args: argparse.Namespace) -> Engine:
         include_interactive=interactive,
         headless_schema_provider=schema_provider,
         codex_schema_provider=schema_provider,
+        setup_project=project,  # wires the deterministic ENGINE-lane intake runner
     )
     router = Router(execution_mode=mode, orchestrator_provider=provider)
     return Engine(store, ledger, project, router=router, registry=registry)
@@ -157,7 +158,17 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline]})
     elif args.cmd == "next":
+        # Deterministic stages (e.g. intake setup) run in-process on the ENGINE lane —
+        # drain them here so the interactive supervisor only ever sees model WorkItems
+        # (never hand-creates a worktree). The headless scheduler dispatches them itself
+        # via the registry, so this drain is the interactive lane's equivalent.
+        from .stages import STAGE_SPECS
+
         work = eng.next_work(args.run, args.task, util_pct=args.util)
+        while work is not None and STAGE_SPECS[work.stage].deterministic:
+            result = eng.registry.resolve(work.lane_policy).dispatch(work)
+            eng.record(args.run, result)
+            work = eng.next_work(args.run, args.task, util_pct=args.util)
         _emit(None if work is None else json.loads(work.model_dump_json()))
     elif args.cmd == "record":
         result = StageResult.model_validate_json(Path(args.result).read_text())

@@ -29,6 +29,10 @@ class ModelInfo(BaseModel):
     cache_write_mult: float = 1.25  # cache writes bill at 125% of input
 
 
+# The sentinel model id for a deterministic (non-model) ENGINE-lane stage.
+ENGINE_MODEL = "engine"
+
+
 class Role:
     """Stage role -> model. The engine asks for a role; the table resolves the id."""
 
@@ -50,6 +54,9 @@ _MODELS: dict[str, ModelInfo] = {
     "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0),
+    # sentinel for the deterministic ENGINE lane: no model call, always $0. Present so
+    # its ledger row prices cleanly (priced=True, cost 0) rather than warning as unpriced.
+    ENGINE_MODEL: ModelInfo(id="engine", input_per_mtok=0.0, output_per_mtok=0.0),
 }
 
 # Role -> model id, keyed by provider so `model_for_role` is provider-aware: a

@@ -55,7 +55,8 @@ def test_every_call_is_cost_attributed_clean(tmp_path, project) -> None:
     assert audit["total_calls"] == 6  # one ledger row per stage — no bypass
     assert audit["clean"] is True
     assert audit["unattributed"] == 0 and audit["off_lane"] == 0
-    assert audit["by_lane"] == {"interactive:claude": 6}
+    # intake is the deterministic ENGINE lane; the five model stages are interactive:claude.
+    assert audit["by_lane"] == {"engine:none": 1, "interactive:claude": 5}
 
 
 def test_lite_lane_skips_scope(tmp_path, project) -> None:

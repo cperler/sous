@@ -29,6 +29,10 @@ class StageSpec:
     # retry/crash-resume resets the worktree to the last-good tag. Vocabulary
     # metadata — the transport wrapper does the git I/O, the engine only names tags.
     checkpoint: bool = False
+    # Deterministic stage: produced by an in-process shell/engine runner on the
+    # non-model ENGINE lane — NEVER a model call (heysoo #227: don't ask an LLM to run
+    # `git worktree add`). Routes to (ExecutionMode.ENGINE, Provider.NONE); $0.
+    deterministic: bool = False
 
 
 # The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
@@ -41,6 +45,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role=None,
         timeout_s=300,  # cheap shell: worktree prep + baseline
         checkpoint=True,  # the baseline anchor: implement's first retry resets here
+        deterministic=True,  # run by the engine's shell runner, not a model (heysoo #227)
         template=(
             "Prepare an isolated worktree/branch for this task and capture a test "
             "baseline using the project's test commands. Do not implement anything.\n"

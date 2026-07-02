@@ -46,14 +46,21 @@ def build_registry(
     headless_schema_provider: SchemaProvider | None = None,
     codex_transport: Transport | None = None,
     codex_schema_provider: SchemaProvider | None = None,
+    setup_project: object | None = None,
     include_interactive: bool = True,
 ) -> Registry:
-    """Registry covering interactive×claude (external) + headless×claude + any×codex.
+    """Registry covering interactive×claude (external) + headless×claude + any×codex +
+    the deterministic ENGINE lane.
 
     ``headless_schema_provider`` wires the project's stage schemas into the real
     headless×claude transport (``--json-schema``) so structured output is actually
     enforced; it is ignored when an explicit ``headless_transport`` is injected (tests
     wrap their own). The schema-wired transport keeps the checkpoint/reset protocol.
+
+    ``setup_project`` (the ProjectConfig) wires the in-process DeterministicSetupRunner
+    for the ENGINE lane (intake worktree/baseline, no model call). When omitted the
+    ENGINE cell is still registered as a sanctioned descriptor (for the lane audit) but
+    has no runner — real deterministic dispatch needs the project.
     """
     reg = Registry()
     if include_interactive:
@@ -72,6 +79,20 @@ def build_registry(
         )
     reg.register_runner(HeadlessClaudeRunner(headless_transport))
     reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))
+    if setup_project is not None:
+        from .deterministic_setup import DeterministicSetupRunner
+
+        reg.register_runner(DeterministicSetupRunner(setup_project))
+    else:
+        reg.register_external(
+            CapabilityDescriptor(
+                execution_mode=ExecutionMode.ENGINE,
+                provider=Provider.NONE,
+                in_process=True,
+                schema_enforced=True,
+                status=SUPPORTED,
+            )
+        )
     return reg
 
 

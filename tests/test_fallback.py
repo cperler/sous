@@ -113,10 +113,18 @@ def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
 
 
 def test_rate_limit_at_floor_becomes_failure(tmp_path, project) -> None:
-    """Rate-limited on the cheapest model (nothing to fall back to) -> normal failure."""
+    """Rate-limited on the cheapest model (nothing to fall back to) -> normal failure.
+    intake is deterministic (no model), so reach the floor by degrading a model stage
+    down the chain opus -> sonnet -> haiku."""
     eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9)
-    w = _advance_to(eng, Stage.INTAKE)  # intake uses the floor model (haiku)
-    assert w.model == "claude-haiku-4-5"
+    w = _advance_to(eng, Stage.SCOPE)  # first model stage, on opus
+    assert w.model == "claude-opus-4-8"
+    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+    w = eng.next_work("r1", "t1")
+    assert w.model == "claude-sonnet-4-6"
+    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+    w = eng.next_work("r1", "t1")
+    assert w.model == "claude-haiku-4-5"  # the floor
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_failed_will_retry"  # degraded to a real failure
     task = eng.store.load_task("r1", "t1")
