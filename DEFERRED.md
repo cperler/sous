@@ -101,6 +101,18 @@ next phase, keep deferred, or retire (move to "Retired" with a written reason; n
       no reader materializes.
     - **Left intact:** the `ProjectConfig` command surface (`install_cmd`/`test_unit_cmd`/
       `typecheck_cmd`/…) — consumed by Phase B (render_prompt's project-command context block).
+  - **Phase B — task context plane.** Design note: `docs/reviews/2026-07-01-context-plane-design.md`
+    (bounding decisions; approved before step 5).
+    - **#5 Generalized `_absorb_outputs` → `task.context` (built).** New persisted, engine-owned
+      `Task.context` dict. `_absorb_outputs` folds each stage's whitelisted, generic stage-contract
+      keys (`CONTEXT_KEYS` in `state_machine.py`: intake `branch`/`worktree`; scope `plan`/
+      `blocked_reason`; implement `files_changed`/`summary`; test `failures`/`tests_meaningful`/
+      `validation_notes`; deliver `pr_number`/`pr_url`; review `issues`) — never whole blobs, so no
+      project-specific keys leak. Bounded (strings 2000 / list items 500 / lists 40 / whole-context
+      16 KB ceiling dropping entire stage contributions in fixed reverse-pipeline order). The key
+      map is injective (unit-tested); the fold is tolerant + idempotent + replay-safe. The dedicated
+      `task.pr_number`/`pr_url` lift is kept (other consumers read it). Tests in
+      `tests/test_context_plane.py`. (Scope's `plan` now reaches the task — was dropped on the floor.)
 
 ## Active
 

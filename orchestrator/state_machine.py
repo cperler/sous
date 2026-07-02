@@ -7,8 +7,11 @@ skip-set), how to apply a ``StageResult``, and where to resume after a crash. Th
 
 from __future__ import annotations
 
+import json
+
 from .schemas.enums import (
     LANE_STAGES,
+    STAGE_ORDER,
     ExecutionMode,
     Provider,
     ResultStatus,
@@ -98,14 +101,80 @@ def apply_result(
     task.updated_at = now
 
 
+# Engine-owned context-fold whitelist (2026-07-01 context-plane design note). Per stage,
+# the generic stage-contract keys folded into task.context for downstream prompts. Only
+# these keys (present in the canonical schemas/stages/*.json) are folded — never whole
+# blobs — so nothing project-specific leaks into the engine's context. The map is
+# INJECTIVE across stages (no two stages write the same context key); enforced by test.
+CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
+    Stage.INTAKE: ("branch", "worktree"),
+    Stage.SCOPE: ("plan", "blocked_reason"),
+    Stage.IMPLEMENT: ("files_changed", "summary"),
+    Stage.TEST: ("failures", "tests_meaningful", "validation_notes"),
+    Stage.DELIVER: ("pr_number", "pr_url"),
+    Stage.REVIEW: ("issues",),
+}
+
+# Bounds so the context (fed into every later prompt) stays bounded regardless of what a
+# model returns. Deterministic (no wall-clock/random) → replay reproduces the same fold.
+_MAX_STR = 2000  # a single string value
+_MAX_ITEM_STR = 500  # a string element inside a list value
+_MAX_LIST = 40  # elements kept from a list value
+_MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
+
+
+def _cap_item(x: object) -> object:
+    if isinstance(x, str) and len(x) > _MAX_ITEM_STR:
+        return x[:_MAX_ITEM_STR] + " … [truncated]"
+    return x
+
+
+def _cap_value(v: object) -> object:
+    """Bound one folded value (string/list); scalars pass through unchanged."""
+    if isinstance(v, str):
+        return v[:_MAX_STR] + " … [truncated]" if len(v) > _MAX_STR else v
+    if isinstance(v, list):
+        capped = [_cap_item(x) for x in v[:_MAX_LIST]]
+        if len(v) > _MAX_LIST:
+            capped.append(f"… ({len(v) - _MAX_LIST} more)")
+        return capped
+    return v  # bool / int / float / None
+
+
+def _context_bytes(context: dict) -> int:
+    return len(json.dumps(context, default=str, ensure_ascii=False).encode("utf-8"))
+
+
+def _enforce_context_ceiling(task: Task) -> None:
+    """Keep task.context under the whole-context ceiling by dropping ENTIRE stage
+    contributions in fixed reverse-pipeline order (review first, intake last) — the
+    downstream stages need the earliest stages' context most. Deterministic."""
+    if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
+        return
+    for stage in reversed(STAGE_ORDER):
+        for key in CONTEXT_KEYS[stage]:
+            task.context.pop(key, None)
+        if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
+            return
+
+
 def _absorb_outputs(task: Task, result: StageResult) -> None:
-    """Lift well-known fields out of a stage's structured output onto the task."""
+    """Fold a stage's well-known structured-output fields into task.pr_* and the
+    engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
+    missing whitelisted key is skipped) and idempotent (a stage succeeds once; re-folding
+    the same result yields the same values)."""
     out = result.structured_output or {}
+    # Dedicated pr_* fields stay: other consumers read them (_on_task_completed, status()).
     if result.stage is Stage.DELIVER:
         if "pr_number" in out:
             task.pr_number = out.get("pr_number")
         if "pr_url" in out:
             task.pr_url = out.get("pr_url")
+    # Generalized fold: every whitelisted key present in the result, bounded.
+    for key in CONTEXT_KEYS.get(result.stage, ()):
+        if key in out:
+            task.context[key] = _cap_value(out[key])
+    _enforce_context_ceiling(task)
 
 
 def resume_point(task: Task) -> Stage | None:

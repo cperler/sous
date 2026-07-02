@@ -74,6 +74,11 @@ class Task(BaseModel):
     execution_lane: ExecutionLane = ExecutionLane.FULL
     pr_number: int | None = None
     pr_url: str | None = None
+    # Engine-owned task context plane: well-known fields folded out of each stage's
+    # structured_output (bounded + injective per the 2026-07-01 context-plane design
+    # note) and threaded into downstream prompts. Derived only from durable StageResults,
+    # so it is reconstructible on replay — correctness never depends on it.
+    context: dict = Field(default_factory=dict)
     current_stage: Stage | None = None
     stage_counter: int = 0  # monotonic count of recorded stage executions (log sequence)
     stages: dict[Stage, StageRecord] = Field(default_factory=_new_stage_map)
