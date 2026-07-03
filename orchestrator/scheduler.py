@@ -28,9 +28,16 @@ Runner = Callable[[list[WorkItem]], list[StageResult]]
 
 
 class Scheduler:
-    def __init__(self, engine: Engine, *, max_concurrent: int = 3) -> None:
+    def __init__(
+        self, engine: Engine, *, max_concurrent: int = 3, batch_failure_threshold: int = 3
+    ) -> None:
         self.engine = engine
         self.max_concurrent = max_concurrent
+        # Batch-wide circuit breaker (#58, ports batch-orchestrator.sh:784-811): after
+        # this many CONSECUTIVE task failures (no completion in between) the run is
+        # PAUSED — a systemic cause (broken env, bad base branch) must not burn every
+        # task's full retry budget. 0 disables.
+        self.batch_failure_threshold = batch_failure_threshold
 
     def dispatchable(self, run_id: str) -> list[str]:
         """Non-terminal, dependency-satisfied, unleased tasks.
@@ -57,7 +64,8 @@ class Scheduler:
                 work.append(w)
 
         if not work:
-            return {"dispatched": 0, "recorded": 0, "ready": len(ready), "limit": limit}
+            return {"dispatched": 0, "recorded": 0, "ready": len(ready), "limit": limit,
+                    "outcomes": []}
 
         results = runner(work)
         by_id = {r.work_item_id: r for r in results}
@@ -67,9 +75,9 @@ class Scheduler:
         missing = [w.id for w in work if w.id not in by_id]
         if missing:
             raise ContractError(f"runner returned no StageResult for work item(s): {missing}")
-        for w in work:
-            self.engine.record(run_id, by_id[w.id])
-        return {"dispatched": len(work), "recorded": len(work), "ready": len(ready), "limit": limit}
+        outcomes = [self.engine.record(run_id, by_id[w.id])["outcome"] for w in work]
+        return {"dispatched": len(work), "recorded": len(work), "ready": len(ready),
+                "limit": limit, "outcomes": outcomes}
 
     def run(
         self,
@@ -90,8 +98,16 @@ class Scheduler:
         continue. Without one (the default), the caller owns retrying later — the
         pre-existing behavior. Returns the final engine status. Resumable: call again
         on the same run to continue after a kill.
+
+        Batch-wide circuit breaker (#58): ``batch_failure_threshold`` consecutive task
+        failures (no completion in between) PAUSE the run and stop dispatching — a
+        systemic cause fails fast instead of burning every task's retry budget. A
+        paused run refuses to schedule until ``orchestrator unpause``.
         """
+        consecutive_failures = 0
         for _ in range(max_ticks):
+            if self.engine.store.load_run(run_id).state.value == "paused":
+                break  # human-gated: unpause first
             if not self.dispatchable(run_id):
                 # Nothing dispatchable — but a rate-limit cooldown is a wait, not an end.
                 wait = self._cooldown_wait(run_id)
@@ -101,6 +117,19 @@ class Scheduler:
                 break
             util = util_provider() if util_provider is not None else util_pct
             res = self.tick(run_id, runner, util_pct=util)
+            for outcome in res.get("outcomes", []):
+                if outcome.startswith("task_failed"):
+                    consecutive_failures += 1
+                elif outcome == "task_completed":
+                    consecutive_failures = 0  # real progress resets the streak
+            if self.batch_failure_threshold and consecutive_failures >= self.batch_failure_threshold:
+                self.engine.pause_run(
+                    run_id,
+                    f"batch circuit breaker: {consecutive_failures} consecutive task "
+                    f"failures — check for a systemic cause (env, base branch), then "
+                    f"`orchestrator unpause`",
+                )
+                break
             if res["dispatched"] == 0:
                 # Capacity-throttled tick (limit 0). Wait out the window if we can.
                 if sleeper is not None:

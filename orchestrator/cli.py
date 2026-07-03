@@ -102,6 +102,8 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task", required=True)
     ap.add_argument("--by", required=True, help="who is approving")
     ap.add_argument("--note", default="", help="what is being approved")
+    sub.add_parser("unpause", help="release a PAUSED run (e.g. after the batch circuit "
+                                   "breaker tripped and the systemic cause is fixed)")
     sub.add_parser("resume")
     sub.add_parser("status")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
@@ -242,6 +244,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "approve":
         task = eng.approve(args.run, args.task, approved_by=args.by, what=args.note)
         _emit({"approved": task.task_id, "state": task.state.value, "by": args.by})
+    elif args.cmd == "unpause":
+        run = eng.unpause_run(args.run)
+        _emit({"unpaused": run.run_id, "state": run.state.value})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":

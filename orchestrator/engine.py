@@ -949,6 +949,27 @@ class Engine:
         )
         return task
 
+    # --- run pause (batch-wide circuit breaker, #58) ----------------------------
+    def pause_run(self, run_id: str, reason: str) -> None:
+        """Pause a run (no further scheduler dispatch until unpaused). Used by the
+        batch-wide circuit breaker on systemic failure; also human-callable."""
+        self.store.update_run(run_id, lambda r: setattr(r, "state", RunState.PAUSED))
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "run_paused", "run_id": run_id, "reason": reason},
+        )
+
+    def unpause_run(self, run_id: str) -> Run:
+        """Release a paused run back to RUNNING (the human fixed the systemic cause)."""
+        run = self.store.load_run(run_id)
+        if run.state is not RunState.PAUSED:
+            raise ContractError(f"run {run_id} is not paused (state {run.state.value})")
+        self.store.update_run(run_id, lambda r: setattr(r, "state", RunState.RUNNING))
+        self.store.append_event(
+            run_id, {"ts": _now(), "type": "run_unpaused", "run_id": run_id}
+        )
+        return self.store.load_run(run_id)
+
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
         run = self.store.load_run(run_id)
