@@ -1084,10 +1084,19 @@ class Engine:
         return self.store.load_run(run_id)
 
     def reject(self, run_id: str, task_id: str, *, rejected_by: str, reason: str) -> Task:
-        """Confirm-and-close a held task the human agrees is infeasible. The symmetric
-        counterpart to ``approve``: instead of overriding the gate and proceeding, it
-        transitions the task to the terminal FAILED state so the run can actually close.
-        The durable ``rejection-<run>-<task>.json`` artifact IS the gate record."""
+        """Confirm-and-close a held task the human agrees is infeasible.
+
+        The symmetric counterpart to ``approve``: instead of overriding the gate and
+        proceeding, it transitions the task to the terminal FAILED state so the run can
+        actually close.  The durable ``rejection-<run>-<task>.json`` artifact IS the gate
+        record (who/when/why).
+
+        As an out-of-band transition (like ``approve``/``hold_for_approval``) this method
+        performs the same post-transition run-level effects that ``record()`` would: it
+        cascade-blocks any dependents of the now-FAILED task and calls
+        ``_maybe_finalize_run`` so the run reaches a terminal state instead of staying open.
+
+        Raises ``ContractError`` if the task is not currently ``BLOCKED_ON_HUMAN``."""
 
         def _reject(t: Task) -> None:
             if t.state is not TaskState.BLOCKED_ON_HUMAN:
