@@ -38,6 +38,7 @@ from .schemas.enums import (
     TERMINAL_TASK_STATES,
     ExecutionLane,
     ExecutionMode,
+    FailureKind,
     Provider,
     ResultStatus,
     RunState,
@@ -657,10 +658,24 @@ class Engine:
         if result.structured_output:
             failures = result.structured_output.get("failures")
         sig = error_signature(result.stage, failures=failures, error=result.error)
-        task.error_signatures.append(sig)
-        task.learnings.append(
-            f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"
-        )
+        # Best-effort taxonomy over a TEST failure via the project's classifier (its
+        # first production caller — the reset LOOP stays #14). An infra-classed failure
+        # is an environment problem, not a code problem: it must not stack the breaker's
+        # identical-code-failure streak (the old system didn't burn fix iterations on
+        # infra either), though max_attempts still bounds it.
+        classified = self._classify_failure(result)
+        infra_only = bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
+        if not infra_only:
+            task.error_signatures.append(sig)
+        task.learnings.append(self._failure_learning(result, failures, classified, infra_only))
+        if classified:
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "failure_classified", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "kinds": sorted({f.kind.value for f in classified}),
+                 "infra_only": infra_only},
+            )
 
         # Reuse the tested CircuitBreaker over the persisted signature streak.
         breaker = CircuitBreaker(self.breaker_threshold)
@@ -675,6 +690,60 @@ class Engine:
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
         task.state = TaskState.RETRYING
         return "stage_failed_will_retry"
+
+    def _classify_failure(self, result: StageResult) -> list:
+        """Run the project's failure classifier over a failed TEST result's output
+        (raw output + error + the structured failing-test ids). Best-effort and
+        engine-agnostic: no classifier / no text / a raising classifier all yield []."""
+        if result.stage is not Stage.TEST:
+            return []
+        classifier = getattr(self.project, "classifier", None)
+        if classifier is None:
+            return []
+        parts = [result.raw_output or "", result.error or ""]
+        out = result.structured_output or {}
+        if isinstance(out.get("failures"), list):
+            parts.append("\n".join(str(f) for f in out["failures"]))
+        text = "\n".join(p for p in parts if p).strip()
+        if not text:
+            return []
+        try:
+            return list(classifier.classify(text))
+        except Exception:  # noqa: BLE001 - classification must never break failure handling
+            return []
+
+    @staticmethod
+    def _failure_learning(
+        result: StageResult, failures: object, classified: list, infra_only: bool
+    ) -> str:
+        """One failed attempt's learning entry. Richer than a bare error string (the old
+        system carried the stage trail + a log tail): the failing-test ids (kind-tagged
+        when classified) and a bounded tail of the runner's output, so the retry starts
+        from the failure's substance instead of re-discovering it."""
+        lines = [f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"]
+        kind_by_test = {f.test: f.kind.value for f in classified}
+        if isinstance(failures, list) and failures:
+            shown = [str(f)[:200] for f in failures[:10]]
+            tagged = [f"{t} [{kind_by_test[t]}]" if t in kind_by_test else t for t in shown]
+            more = f" (+{len(failures) - 10} more)" if len(failures) > 10 else ""
+            lines.append(f"  failing: {'; '.join(tagged)}{more}")
+        elif classified:
+            lines.append(
+                "  classified: "
+                + "; ".join(f"{f.test} [{f.kind.value}]" for f in classified[:10])
+            )
+        if infra_only:
+            lines.append(
+                "  NOTE: classified as an INFRASTRUCTURE failure (env/ports/browser), "
+                "not a code failure — consider resetting the test environment before "
+                "re-diagnosing the change itself."
+            )
+        tail = (result.raw_output or "").strip()
+        if tail:
+            clipped = tail[-500:]
+            prefix = "…" if len(tail) > 500 else ""
+            lines.append(f"  output tail: {prefix}{clipped}")
+        return "\n".join(lines)
 
     # --- human approval gate (design pass §4) ----------------------------------
     def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
