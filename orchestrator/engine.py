@@ -10,6 +10,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 from __future__ import annotations
 
 import re
+import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
 
@@ -102,6 +103,7 @@ class Engine:
         max_review_cycles: int = 2,
         max_rate_limit_waits: int = 4,
         rate_limit_cooldown_s: int = 900,
+        max_infra_resets: int = 2,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -125,6 +127,10 @@ class Engine:
         # attempt; bounded so a permanently-limited account still fails out.
         self.max_rate_limit_waits = max_rate_limit_waits
         self.rate_limit_cooldown_s = rate_limit_cooldown_s
+        # Infra-failure reset loop (#14): how many times an infra-classified TEST
+        # failure may reset the environment and re-run the SAME attempt before it
+        # degrades to a normal failure (the old MAX_CONSECUTIVE_INFRA_FAILURES halt).
+        self.max_infra_resets = max_infra_resets
 
     # --- run/task setup -------------------------------------------------------
     def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
@@ -499,6 +505,7 @@ class Engine:
             if effective.status is ResultStatus.SUCCESS:
                 task.error_signatures = []  # streak resets on a clean stage
                 task.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
+                task.infra_resets = 0  # ... and the infra-reset budget (#14)
                 # Session chaining (design pass §2): reuse across SUCCESSFUL stage
                 # transitions only. A runner that reports no ref leaves the prior one
                 # in place (resuming a slightly-stale session is safe: prompts are
@@ -734,11 +741,11 @@ class Engine:
         if result.structured_output:
             failures = result.structured_output.get("failures")
         sig = error_signature(result.stage, failures=failures, error=result.error)
-        # Best-effort taxonomy over a TEST failure via the project's classifier (its
-        # first production caller — the reset LOOP stays #14). An infra-classed failure
-        # is an environment problem, not a code problem: it must not stack the breaker's
-        # identical-code-failure streak (the old system didn't burn fix iterations on
-        # infra either), though max_attempts still bounds it.
+        # Best-effort taxonomy over a TEST failure via the project's classifier. An
+        # infra-classed failure is an environment problem, not a code problem: it must
+        # not stack the breaker's identical-code-failure streak, and (the #14 loop,
+        # below) it earns an environment reset + a free re-run of the SAME attempt
+        # instead of burning the retry budget on a broken runner.
         classified = self._classify_failure(result)
         infra_only = bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
         if not infra_only:
@@ -756,6 +763,33 @@ class Engine:
                  "infra_only": infra_only},
             )
 
+        # Infra-failure reset loop (#14, ports OC:3835-3860): reset the environment via
+        # the project's infra_reset command, then re-run the SAME attempt (RUNNING marker
+        # keeps the attempt number — a broken runner must not consume the code-fix
+        # budget). Bounded by max_infra_resets; past the budget it falls through to the
+        # normal failure path (the old persistent_infra_failure halt).
+        if infra_only and task.infra_resets < self.max_infra_resets:
+            reset_note = self._run_infra_reset(task)
+            task.infra_resets += 1
+            rec = task.stages[result.stage]
+            rec.status = StageStatus.RUNNING
+            rec.completed_at = None
+            rec.error = None
+            task.state = TaskState.RETRYING
+            task.learnings.append(
+                f"{result.stage.value} (attempt {result.attempt}): infrastructure "
+                f"failure — environment reset ({reset_note}), re-running the same "
+                f"attempt ({task.infra_resets}/{self.max_infra_resets} resets used)"
+            )
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "infra_reset", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "reset_result": reset_note, "resets_used": task.infra_resets,
+                 "resets_budget": self.max_infra_resets},
+            )
+            return "stage_infra_reset_retry"
+
         # Reuse the tested CircuitBreaker over the persisted signature streak.
         breaker = CircuitBreaker(self.breaker_threshold)
         for s in task.error_signatures:
@@ -769,6 +803,26 @@ class Engine:
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
         task.state = TaskState.RETRYING
         return "stage_failed_will_retry"
+
+    def _run_infra_reset(self, task: Task) -> str:
+        """Shell the project's ``infra_reset`` command in the task's worktree
+        (best-effort, bounded). A deterministic project command, not a model call —
+        the same class of work the ENGINE lane's setup runner does."""
+        getter = getattr(self.project, "infra_reset", None)
+        try:
+            argv = getter() if callable(getter) else None
+        except Exception:  # noqa: BLE001 - a project command surface must never break failure handling
+            argv = None
+        if not argv or argv == ["true"]:  # the no-op sentinel
+            return "skipped (no infra_reset command)"
+        cwd = task.context.get("worktree")
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=cwd or None, capture_output=True, text=True, timeout=300
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return f"error ({type(exc).__name__})"
+        return "ok" if proc.returncode == 0 else f"rc={proc.returncode}"
 
     def _classify_failure(self, result: StageResult) -> list:
         """Run the project's failure classifier over a failed TEST result's output

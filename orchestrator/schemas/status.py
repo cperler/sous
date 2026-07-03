@@ -110,6 +110,9 @@ class Task(BaseModel):
     # rate_limit_waits vs the engine's max_rate_limit_waits.
     not_before: str | None = None
     rate_limit_waits: int = 0
+    # Infra-failure reset loop (#14): how many environment resets this task has spent
+    # re-running an infra-classified failure's attempt (vs the engine's max_infra_resets).
+    infra_resets: int = 0
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing

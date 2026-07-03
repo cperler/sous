@@ -64,7 +64,10 @@ def test_learning_carries_failures_and_output_tail(tmp_path, project) -> None:
     assert "AssertionError: expected 3 got 2" in nxt.prompt
 
 
-def test_infra_failure_skips_breaker_streak_and_is_evented(tmp_path) -> None:
+def test_infra_failure_resets_env_and_reruns_same_attempt(tmp_path) -> None:
+    """The #14 loop: an infra-classified TEST failure runs the project's infra_reset
+    and re-runs the SAME attempt — a broken runner never consumes the code-fix budget
+    or stacks the breaker streak."""
     project = FakeProject()
     project._classifier = _InfraClassifier()
     eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=2)
@@ -72,20 +75,39 @@ def test_infra_failure_skips_breaker_streak_and_is_evented(tmp_path) -> None:
     out = eng.record("r1", make_result(
         w, status=ResultStatus.FAILURE, error="ECONNREFUSED 127.0.0.1:5173",
     ))
-    assert out["outcome"] == "stage_failed_will_retry"
+    assert out["outcome"] == "stage_infra_reset_retry"
     task = eng.store.load_task("r1", "t1")
     assert task.error_signatures == []  # infra doesn't stack the code-failure streak
-    assert "INFRASTRUCTURE failure" in task.learnings[-1]
-    # a second identical infra flake still retries (breaker_threshold=2 would have
-    # tripped on two identical code failures)
+    assert task.infra_resets == 1
+    assert "environment reset (ok)" in task.learnings[-1]  # FakeProject's echo ran
+    # the SAME attempt re-dispatches (RUNNING marker, not a burned retry)
+    w2 = eng.next_work("r1", "t1")
+    assert w2.stage is Stage.TEST and w2.attempt == w.attempt
+    events = [e for e in eng.store.read_events("r1") if e["type"] == "infra_reset"]
+    assert len(events) == 1 and events[0]["resets_used"] == 1
+    # a clean stage refreshes the reset budget
+    eng.record("r1", make_result(w2))
+    assert eng.store.load_task("r1", "t1").infra_resets == 0
+
+
+def test_infra_reset_budget_exhaustion_degrades_to_normal_failure(tmp_path) -> None:
+    project = FakeProject()
+    project._classifier = _InfraClassifier()
+    eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9, max_infra_resets=1)
+    w = _advance_to_test(eng)
+    out = eng.record("r1", make_result(
+        w, status=ResultStatus.FAILURE, error="ECONNREFUSED",
+    ))
+    assert out["outcome"] == "stage_infra_reset_retry"  # reset #1
     w2 = eng.next_work("r1", "t1")
     out2 = eng.record("r1", make_result(
-        w2, status=ResultStatus.FAILURE, error="ECONNREFUSED 127.0.0.1:5173",
+        w2, status=ResultStatus.FAILURE, error="ECONNREFUSED",
     ))
+    # budget spent: the persistent infra failure now takes the normal failure path
     assert out2["outcome"] == "stage_failed_will_retry"
-    events = [e for e in eng.store.read_events("r1") if e["type"] == "failure_classified"]
-    assert len(events) == 2
-    assert events[0]["kinds"] == ["infra"] and events[0]["infra_only"] is True
+    task = eng.store.load_task("r1", "t1")
+    assert task.error_signatures == []  # still never stacks the code-failure streak
+    assert "INFRASTRUCTURE failure" in task.learnings[-1]
 
 
 def test_raising_classifier_never_breaks_failure_handling(tmp_path) -> None:
