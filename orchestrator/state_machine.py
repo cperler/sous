@@ -107,7 +107,7 @@ def apply_result(
 # blobs — so nothing project-specific leaks into the engine's context. The map is
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
-    Stage.INTAKE: ("branch", "worktree"),
+    Stage.INTAKE: ("branch", "worktree", "baseline_failures"),
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.TEST: ("failures", "tests_meaningful", "validation_notes"),

@@ -7,7 +7,12 @@
   "properties": {
     "branch": {"type": "string"},
     "worktree": {"type": "string"},
-    "baseline_captured": {"type": "boolean"},
+    "baseline_captured": {"type": "boolean", "description": "true only if the unit-test command actually ran at base (never fabricated)"},
+    "baseline_failures": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "test ids already failing at base — inherited, not regressions; the TEST stage and the engine's regression split exclude them"
+    },
     "baseline": {"type": "string", "description": "optional human note about the captured baseline"}
   },
   "additionalProperties": true

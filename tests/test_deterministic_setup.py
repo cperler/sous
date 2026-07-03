@@ -14,10 +14,14 @@ _ENGINE = LanePolicy(execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE
 
 
 class _Proj:
-    """A project WITHOUT setup_task -> exercises the built-in git logic. Noop install."""
+    """A project WITHOUT setup_task -> exercises the built-in git logic. Noop install,
+    fast real unit-test command (so the baseline is genuinely captured)."""
 
     def install_cmd(self) -> list[str]:
         return ["true"]
+
+    def test_unit_cmd(self, files=None) -> list[str]:
+        return ["sh", "-c", "exit 0"]
 
 
 def _wi(task: str = "#7") -> WorkItem:
@@ -46,6 +50,7 @@ def test_real_git_setup_creates_worktree_and_tags(tmp_path, monkeypatch) -> None
         ExecutionMode.ENGINE, Provider.NONE)
     out = res.structured_output
     assert out["branch"] == "task/7" and out["baseline_captured"] is True
+    assert out["baseline_failures"] == [] and "green at base" in out["baseline"]
     wt = Path(out["worktree"])
     assert wt.exists() and (wt / ".git").exists()  # a real linked worktree
     branches = subprocess.run(["git", "branch"], cwd=tmp_path, capture_output=True, text=True).stdout
@@ -90,6 +95,61 @@ def test_dispatch_yields_failure_when_setup_task_raises(tmp_path, monkeypatch) -
 
     assert res.status is ResultStatus.FAILURE
     assert "boom" in (res.error or "")
+
+
+def test_baseline_not_fabricated_without_test_command(tmp_path, monkeypatch) -> None:
+    """The old stub reported baseline_captured=True without running anything. Honest
+    now: no unit-test command (or the ["true"] no-op sentinel) => captured False."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    class P:
+        def install_cmd(self) -> list[str]:
+            return ["true"]
+
+        def test_unit_cmd(self, files=None) -> list[str]:
+            return ["true"]  # the no-op sentinel: nothing actually runs
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.SUCCESS  # setup itself is fine
+    out = res.structured_output
+    assert out["baseline_captured"] is False
+    assert "no unit-test command" in out["baseline"]
+
+
+def test_red_baseline_records_classified_failures(tmp_path, monkeypatch) -> None:
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    class _Classifier:
+        def classify(self, test_output):
+            from orchestrator.failure_classifier import Failure
+
+            return [
+                Failure(test=line.split(" ", 1)[1], kind="unit")
+                for line in test_output.splitlines()
+                if line.startswith("FAILED ")
+            ]
+
+        def impacted_tests(self, changed_files):
+            return []
+
+    class P:
+        classifier = _Classifier()
+
+        def install_cmd(self) -> list[str]:
+            return ["true"]
+
+        def test_unit_cmd(self, files=None) -> list[str]:
+            return ["sh", "-c", "echo 'FAILED tests/test_x.py::t1'; exit 1"]
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    out = res.structured_output
+    assert out["baseline_captured"] is True  # the suite RAN — red is still a baseline
+    assert out["baseline_failures"] == ["tests/test_x.py::t1"]
+    assert "RED at base" in out["baseline"] and "1 known-failing" in out["baseline"]
 
 
 def test_project_setup_task_override_skips_git(tmp_path, monkeypatch) -> None:

@@ -43,7 +43,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         model_role=Role.CHEAP_SHELL,
         schema_ref="intake",
         agent_role=None,
-        timeout_s=300,  # cheap shell: worktree prep + baseline
+        timeout_s=1800,  # worktree prep + a REAL baseline test run (bounded at 900s itself)
         checkpoint=True,  # the baseline anchor: implement's first retry resets here
         deterministic=True,  # run by the engine's shell runner, not a model (heysoo #227)
         template=(
@@ -87,8 +87,10 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         checkpoint=True,
         template=(
             "Run the project's tests for the changed files, fix regressions you "
-            "introduced (not inherited failures), and re-run until green or no "
-            "progress. Then VERIFY the tests are meaningful: they must exercise THIS "
+            "introduced, and re-run until green or no progress. Tests listed under "
+            "baseline_failures in the context above were ALREADY failing at base — "
+            "inherited, not yours: do not fix them and do not count them against this "
+            "change. Then VERIFY the tests are meaningful: they must exercise THIS "
             "change and would fail if it regressed — not vacuous, tautological, or "
             "always-green.\n"
             "Return: passed, failures (list of failing test ids), tests_meaningful "

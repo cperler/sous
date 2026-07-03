@@ -99,6 +99,34 @@ def test_raising_classifier_never_breaks_failure_handling(tmp_path) -> None:
     assert task.error_signatures  # normal (non-infra) signature path taken
 
 
+def test_baseline_split_separates_inherited_from_regressions(tmp_path, project) -> None:
+    """The deterministic regression-vs-inherited diff (ADR-035 parity): a TEST failure's
+    learning names which failures were already red at base and which are real."""
+    eng = _engine(tmp_path, project, breaker_threshold=9)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = eng.next_work("r1", "t1")
+    assert w.stage is Stage.INTAKE
+    eng.record("r1", make_result(w, structured_output={
+        "branch": "task/1", "worktree": "/wt/1", "baseline_captured": True,
+        "baseline_failures": ["tests/test_old.py::flaky"],
+    }))
+    for _ in range(2):  # scope, implement
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    wt = eng.next_work("r1", "t1")
+    assert wt.stage is Stage.TEST
+    # the TEST prompt itself carries the inherited list via the context plane
+    assert "tests/test_old.py::flaky" in wt.prompt
+
+    eng.record("r1", make_result(
+        wt, status=ResultStatus.FAILURE, error="2 failed",
+        structured_output={"failures": ["tests/test_old.py::flaky", "tests/test_new.py::broke"]},
+    ))
+    learning = eng.store.load_task("r1", "t1").learnings[-1]
+    assert "inherited from base" in learning and "tests/test_old.py::flaky" in learning
+    assert "true regressions to fix: tests/test_new.py::broke" in learning
+
+
 def test_non_test_stage_failure_is_not_classified(tmp_path, project) -> None:
     eng = _engine(tmp_path, project, breaker_threshold=9)
     eng.create_run("r1")

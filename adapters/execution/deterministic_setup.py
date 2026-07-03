@@ -96,13 +96,65 @@ class DeterministicSetupRunner:
         head = _git(str(worktree), "rev-parse", "HEAD")
         base_sha = head.stdout.strip()[:12] if head.returncode == 0 else "?"
 
+        # ACTUALLY capture the test baseline (ADR-035 parity): run the project's unit
+        # tests at base and record the pre-existing failures, so the TEST stage can
+        # separate regressions-you-introduced from inherited red — deterministically,
+        # not by model judgment. baseline_captured is honest: True only when the test
+        # command really ran to completion here.
+        baseline = self._capture_baseline(worktree)
         out = {
             "branch": branch,
             "worktree": str(worktree),
-            "baseline_captured": True,
-            "baseline": f"isolated worktree off {base_sha}; install: {install_note}",
+            "baseline_captured": baseline["captured"],
+            "baseline_failures": baseline["failures"],
+            "baseline": (
+                f"isolated worktree off {base_sha}; install: {install_note}; "
+                f"tests: {baseline['note']}"
+            ),
         }
         return out, checkpoint
+
+    def _capture_baseline(self, worktree: Path) -> dict:
+        """Run ``test_unit_cmd`` at base and classify the failures (via the project's
+        classifier when present). Never fatal: a missing/no-op command, a timeout, or an
+        unrunnable suite yields ``captured: False`` with the reason in the note — an
+        HONEST miss, never a fabricated baseline."""
+        getter = getattr(self._project, "test_unit_cmd", None)
+        try:
+            argv = getter() if callable(getter) else None
+        except Exception:  # noqa: BLE001 - a project command surface must never fail setup
+            argv = None
+        if not argv or argv == ["true"]:  # the no-op sentinel
+            return {"captured": False, "failures": [], "note": "n/a (no unit-test command)"}
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=worktree, capture_output=True, text=True, timeout=900
+            )
+        except subprocess.TimeoutExpired:
+            return {"captured": False, "failures": [], "note": "baseline run timed out (900s)"}
+        except (OSError, subprocess.SubprocessError) as exc:
+            return {"captured": False, "failures": [],
+                    "note": f"baseline run error ({type(exc).__name__})"}
+        if proc.returncode == 0:
+            return {"captured": True, "failures": [], "note": "green at base"}
+        failures = self._classify_baseline(f"{proc.stdout}\n{proc.stderr}")
+        note = (
+            f"RED at base (rc={proc.returncode}): {len(failures)} known-failing test(s)"
+            if failures
+            else f"RED at base (rc={proc.returncode}); failures unparsed — "
+                 f"regression diff unavailable"
+        )
+        return {"captured": True, "failures": failures[:40], "note": note}
+
+    def _classify_baseline(self, test_output: str) -> list[str]:
+        """Failing-test ids from raw output via the project classifier (best-effort)."""
+        classifier = getattr(self._project, "classifier", None)
+        if classifier is None:
+            return []
+        try:
+            return [f.test for f in classifier.classify(test_output) if f.test != "<infra>"]
+        except Exception:  # noqa: BLE001 - classification must never fail setup
+            return []
 
     def _ensure_worktree(self, repo_root: Path, worktree: Path, branch: str) -> None:
         """Create the worktree+branch, or reuse an existing one (retry idempotency).

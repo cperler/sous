@@ -667,7 +667,10 @@ class Engine:
         infra_only = bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
         if not infra_only:
             task.error_signatures.append(sig)
-        task.learnings.append(self._failure_learning(result, failures, classified, infra_only))
+        baseline = task.context.get("baseline_failures")
+        task.learnings.append(
+            self._failure_learning(result, failures, classified, infra_only, baseline)
+        )
         if classified:
             self.store.append_event(
                 task.run_id,
@@ -714,7 +717,11 @@ class Engine:
 
     @staticmethod
     def _failure_learning(
-        result: StageResult, failures: object, classified: list, infra_only: bool
+        result: StageResult,
+        failures: object,
+        classified: list,
+        infra_only: bool,
+        baseline: object = None,
     ) -> str:
         """One failed attempt's learning entry. Richer than a bare error string (the old
         system carried the stage trail + a log tail): the failing-test ids (kind-tagged
@@ -727,6 +734,21 @@ class Engine:
             tagged = [f"{t} [{kind_by_test[t]}]" if t in kind_by_test else t for t in shown]
             more = f" (+{len(failures) - 10} more)" if len(failures) > 10 else ""
             lines.append(f"  failing: {'; '.join(tagged)}{more}")
+            # Deterministic regression-vs-inherited split against the intake baseline
+            # (ADR-035 parity): the retry must chase regressions, never inherited red.
+            if result.stage is Stage.TEST and isinstance(baseline, list) and baseline:
+                base_set = {str(b) for b in baseline}
+                inherited = [str(f) for f in failures if str(f) in base_set]
+                regressions = [str(f) for f in failures if str(f) not in base_set]
+                if inherited:
+                    lines.append(
+                        f"  inherited from base (already failing before this change — "
+                        f"do NOT fix): {'; '.join(inherited[:10])}"
+                    )
+                    lines.append(
+                        f"  true regressions to fix: "
+                        f"{'; '.join(regressions[:10]) if regressions else '(none — all failures are inherited)'}"
+                    )
         elif classified:
             lines.append(
                 "  classified: "
