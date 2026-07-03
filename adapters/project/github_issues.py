@@ -28,23 +28,34 @@ def _issue_number(task_id: str) -> str:
 class GitHubIssuesSource:
     """Task source backed by GitHub issues via the ``gh`` CLI."""
 
-    def __init__(self, repo: str, *, runner: Runner = _gh) -> None:
+    def __init__(self, repo: str, *, runner: Runner = _gh, allow_closed: bool = False) -> None:
         self.repo = repo
         self._run = runner
+        self._allow_closed = allow_closed
 
     def resolve(self, task_id: str) -> TaskSpec:
         num = _issue_number(task_id)
         raw = self._run(
-            ["gh", "issue", "view", num, "--repo", self.repo, "--json", "number,title,body,labels"]
+            ["gh", "issue", "view", num, "--repo", self.repo,
+             "--json", "number,title,body,labels,state"]
         )
         data = json.loads(raw)
+        # Already-closed early exit (ports implement-orchestrator.sh:519): a batch over
+        # a stale issue list must not burn a full pipeline and open a PR against a
+        # closed issue. Loud refusal, opt-out via allow_closed for deliberate re-runs.
+        state = str(data.get("state", "")).upper()
+        if state == "CLOSED" and not self._allow_closed:
+            raise ValueError(
+                f"issue #{num} in {self.repo} is CLOSED — refusing to run "
+                f"(pass allow_closed=True to the task source to override)"
+            )
         labels = [lbl["name"] for lbl in data.get("labels", [])]
         return TaskSpec(
             task_id=task_id,
             title=data.get("title", ""),
             body=data.get("body") or "",
             issue_number=data.get("number"),
-            depends_on=[],  # dependency analysis is the 3b scheduler's job
+            depends_on=[],  # no analysis step yet; add-task --depends-on supplies edges
             labels=labels,
         )
 

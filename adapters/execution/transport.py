@@ -357,10 +357,23 @@ def codex_cli_transport() -> Transport:
     """Real codex transport: ``codex exec --json --output-last-message``."""
 
     def run(work: WorkItem) -> RawResult:
+        # A linked worktree's real .git lives in the main checkout — the codex sandbox
+        # must be granted that dir too or commits from the worktree fail (the reference
+        # system's --add-dir <git-common-dir>). Best-effort: no cwd / not a repo / any
+        # git hiccup just means no extra grant.
+        add_dir: list[str] = []
+        if work.cwd:
+            try:
+                gcd = _git(work.cwd, "rev-parse", "--git-common-dir")
+                common = gcd.stdout.strip()
+                if gcd.returncode == 0 and common:
+                    add_dir = ["--add-dir", str((Path(work.cwd) / common).resolve())]
+            except Exception:  # noqa: BLE001 - the grant is an optimization, never a failure
+                add_dir = []
         with tempfile.TemporaryDirectory() as td:
             last = Path(td) / "last.json"
             argv = ["codex", "exec", "-m", work.model, "--full-auto", "--skip-git-repo-check",
-                    "--json", "--output-last-message", str(last), work.prompt]
+                    *add_dir, "--json", "--output-last-message", str(last), work.prompt]
             invocation = f"codex exec --json (model {work.model})"
             try:
                 proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603

@@ -139,12 +139,19 @@ class Engine:
         lane: ExecutionLane | None = None,
         *,
         pipeline: tuple[Stage, ...] | list[Stage] | None = None,
+        depends_on: list[str] | None = None,
+        provider_tag: str | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
-        pipeline, not the sequencing mechanism). Validation (non-empty, duplicate-free)
-        is the Task model's."""
+        pipeline, not the sequencing mechanism). ``depends_on``/``provider_tag``
+        override the task source's values — the supervisor's way to supply DAG edges
+        and per-task provider routing when the source has no analysis step (the old
+        ``82:codex`` tag / ralph dependency analysis, human-supplied). Validation
+        (non-empty, duplicate-free) is the Task model's."""
         spec = self.project.task_source.resolve(task_id)
+        deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
+        tag = provider_tag if provider_tag is not None else spec.provider_tag
         run = self.store.load_run(run_id)
         # Register the task ref + dependency edge as a locked read-modify-write so a
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
@@ -156,7 +163,7 @@ class Engine:
             r.task_refs.append(
                 TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json")
             )
-            r.dependency_graph[task_id] = list(spec.depends_on)
+            r.dependency_graph[task_id] = list(deps)
 
         self.store.update_run(run_id, _register)
         task = Task(
@@ -167,9 +174,9 @@ class Engine:
             state=TaskState.PENDING,
             title=spec.title,
             body=spec.body,
-            provider_tag=spec.provider_tag,
+            provider_tag=tag,
             issue_number=spec.issue_number,
-            depends_on=spec.depends_on,
+            depends_on=deps,
             execution_lane=lane or run.lane,
             pipeline=tuple(pipeline) if pipeline else LANE_STAGES[lane or run.lane],
             max_attempts=self.max_attempts,
@@ -964,13 +971,20 @@ class Engine:
         for label, getter in (
             ("install", self.project.install_cmd),
             ("test (unit)", self.project.test_unit_cmd),
+            # e2e/shell were declared on the adapter but invisible to prompts — the
+            # model could never learn the project HAS an e2e suite. Optional (getattr):
+            # a minimal adapter without them still works.
+            ("test (e2e)", getattr(self.project, "test_e2e_cmd", None)),
+            ("test (shell)", getattr(self.project, "test_shell_cmd", None)),
             ("typecheck", self.project.typecheck_cmd),
         ):
+            if getter is None:
+                continue
             try:
                 argv = getter()
             except Exception:  # noqa: BLE001 - a project command surface must never block dispatch
                 continue
-            if argv:
+            if argv and argv != ["true"]:  # skip the no-op sentinel, not just empty
                 out[label] = " ".join(argv)
         return out
 

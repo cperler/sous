@@ -75,6 +75,11 @@ def main(argv: list[str] | None = None) -> int:
     at.add_argument("--pipeline", default=None,
                     help="comma-separated stage list (e.g. 'intake,implement,review'); "
                          "default: the run lane's preset")
+    at.add_argument("--depends-on", default=None,
+                    help="comma-separated task ids this task depends on (DAG edges for "
+                         "the batch scheduler; overrides the task source)")
+    at.add_argument("--provider-tag", default=None, choices=["claude", "codex"],
+                    help="per-task provider routing tag (the old '82:codex' tag)")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -179,9 +184,15 @@ def main(argv: list[str] | None = None) -> int:
             [Stage(s.strip()) for s in args.pipeline.split(",") if s.strip()]
             if args.pipeline else None
         )
-        task = eng.add_task(args.run, args.task, pipeline=pipeline)
+        deps = (
+            [d.strip() for d in args.depends_on.split(",") if d.strip()]
+            if args.depends_on else None
+        )
+        task = eng.add_task(args.run, args.task, pipeline=pipeline,
+                            depends_on=deps, provider_tag=args.provider_tag)
         _emit({"added_task": task.task_id, "title": task.title,
-               "pipeline": [s.value for s in task.pipeline]})
+               "pipeline": [s.value for s in task.pipeline],
+               "depends_on": task.depends_on, "provider_tag": task.provider_tag})
     elif args.cmd == "next":
         # Deterministic stages (e.g. intake setup) run in-process on the ENGINE lane —
         # drain them here so the interactive supervisor only ever sees model WorkItems

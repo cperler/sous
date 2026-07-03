@@ -58,7 +58,12 @@ class HeysooConfig:
         return ["npx", "tsc", "--noEmit"]
 
     def infra_reset(self) -> list[str]:
-        return ["bash", ".claude/scripts/reset-infra.sh"]
+        # reset-infra.sh is a SOURCED function library under lib/ (not an executable
+        # script — the old pointer at .claude/scripts/reset-infra.sh named a file that
+        # doesn't exist); invoke its entry function with the worktree as the target.
+        return ["bash", "-c",
+                'source .claude/scripts/lib/reset-infra.sh && '
+                'reset_test_infrastructure "$PWD" orchestrator-reset']
 
     # --- pluggable behavior ---------------------------------------------------
     @property
