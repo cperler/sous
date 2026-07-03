@@ -97,6 +97,10 @@ class Task(BaseModel):
     # re-opens implement→…→review increments this; at the engine's max_review_cycles
     # the task parks BLOCKED_ON_HUMAN instead of looping forever.
     review_cycles: int = 0
+    # Fingerprints (file:description, normalized) of the LAST rejection's blocking
+    # issues — the convergence key (#15): a re-review whose issues are a subset of
+    # these (no net-new findings, none critical) has converged and auto-approves.
+    last_review_rejection: list[str] = Field(default_factory=list)
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None

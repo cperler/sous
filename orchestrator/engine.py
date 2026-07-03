@@ -528,7 +528,7 @@ class Engine:
                 # must never fall through to task_completed (the old system's strongest
                 # quality loop — restored as a bounded fix cycle; issue #15 keeps the
                 # convergence-auto-approval refinement).
-                review_verdict = self._review_verdict(effective)
+                review_verdict = self._review_verdict(effective, task)
                 if scope_blocked_reason is not None:
                     task.state = TaskState.BLOCKED_ON_HUMAN
                     outcome = "scope_not_feasible_held"
@@ -683,10 +683,27 @@ class Engine:
             return "scope reported the task is not feasible (feasible=false)"
         return None
 
-    def _review_verdict(self, result: StageResult) -> dict | None:
+    @staticmethod
+    def _issue_fingerprint(issue: object) -> str:
+        """Stable convergence key for one blocking issue (#15, ports the as-built
+        ``file:description`` fingerprint, OC:993-999): normalized so cosmetic rewording
+        of the same finding still matches."""
+        if isinstance(issue, dict):
+            base = f"{str(issue.get('file') or '').strip()}:{str(issue.get('description') or '').strip()}"
+        else:
+            base = str(issue)
+        return re.sub(r"\s+", " ", base).casefold()[:160]
+
+    def _review_verdict(self, result: StageResult, task: Task) -> dict | None:
         """Interpret a completed REVIEW stage's verdict; None when there is nothing to act
         on (not the review stage, or approved / field omitted — fail-OPEN like the other
         soft gates: only an explicit ``approved=false`` triggers).
+
+        Convergence auto-approval (#15, ports OC:985-1022): a re-review AFTER a fix
+        cycle whose blocking issues are a SUBSET of the previous rejection's (no
+        net-new findings) has converged — the loop is no longer finding new problems,
+        so it auto-approves rather than parking. Guarded: never with a critical-severity
+        issue, never over a vacuous-tests verdict, never on the first rejection.
 
         Restores the old severity gate (as-built ``orchestrator-common.sh:965``): when every
         blocking issue is a structured object explicitly marked ``severity=suggestion``,
@@ -721,8 +738,25 @@ class Engine:
                 for i in issues
             )
         )
-        kind = "auto_approved" if suggestions_only else "rejected"
-        return {"kind": kind, "issues_text": issues_text}
+        fingerprints = [self._issue_fingerprint(i) for i in issues]
+        has_critical = any(
+            isinstance(i, dict) and str(i.get("severity", "")).lower() == "critical"
+            for i in issues
+        )
+        converged = (
+            not tests_vacuous
+            and not has_critical
+            and task.review_cycles > 0  # only a re-review after a fix can converge
+            and bool(fingerprints)
+            and set(fingerprints) <= set(task.last_review_rejection)
+        )
+        if suggestions_only:
+            kind = "auto_approved"
+        elif converged:
+            kind = "converged_auto_approved"
+        else:
+            kind = "rejected"
+        return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints}
 
     def _apply_review_rejection(self, task: Task, verdict: dict) -> str:
         """Dispose of a rejected review: a bounded fix cycle (re-open implement→…→review
@@ -733,6 +767,9 @@ class Engine:
         task.learnings.append(
             f"review rejected (cycle {task.review_cycles + 1}) — blocking issues: {summary}"
         )
+        # The convergence key (#15): the NEXT re-review compares its issues against
+        # this rejection's fingerprints — a subset (no net-new findings) auto-approves.
+        task.last_review_rejection = list(verdict.get("fingerprints") or [])
         # Fix work must not inherit the reviewer's session (same rationale as warm-retry
         # OFF: a rejecting session's context is as likely poisoned as useful).
         task.session_ref = None

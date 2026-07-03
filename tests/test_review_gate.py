@@ -158,6 +158,78 @@ def test_vacuous_tests_never_auto_approve_as_suggestions(tmp_path, project) -> N
     assert out["outcome"] == "review_rejected_fix_cycle"  # not auto-approved
 
 
+def _reject_then_fix(eng, issues):
+    """Reject the first review with `issues`, then drive the fix cycle back to review."""
+    w = _advance_to_review(eng)
+    eng.record("r1", make_result(w, structured_output={"approved": False, "issues": issues}))
+    for _ in range(3):  # implement, test, deliver again
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    w2 = eng.next_work("r1", "t1")
+    assert w2.stage is Stage.REVIEW
+    return w2
+
+
+def test_converged_re_review_auto_approves(tmp_path, project) -> None:
+    """#15: a re-review whose issues are a subset of the previous rejection's (no
+    net-new findings, none critical) has converged — auto-approve, don't park."""
+    eng = _engine(tmp_path, project, max_review_cycles=1)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    issues = [
+        {"severity": "important", "file": "a.py", "description": "naming could be tighter"},
+        {"severity": "important", "file": "b.py", "description": "duplicated helper"},
+    ]
+    w2 = _reject_then_fix(eng, issues)
+    # the re-review repeats ONE of the same issues (reworded whitespace) — a subset
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": False,
+        "issues": [{"severity": "important", "file": "a.py",
+                    "description": "naming  could be tighter"}],
+    }))
+    assert out["outcome"] == "task_completed"  # converged, not parked
+    events = [e for e in eng.store.read_events("r1") if e["type"] == "review_verdict"]
+    assert events[-1]["kind"] == "converged_auto_approved"
+
+
+def test_net_new_issue_blocks_convergence(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_review_cycles=1)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w2 = _reject_then_fix(eng, [{"severity": "important", "file": "a.py",
+                                 "description": "naming"}])
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": False,
+        "issues": [{"severity": "important", "file": "c.py",
+                    "description": "brand new problem the fix introduced"}],
+    }))
+    assert out["outcome"] == "review_rejected_held"  # net-new finding: cycles spent -> park
+
+
+def test_critical_issue_never_converges(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_review_cycles=1)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    crit = [{"severity": "critical", "file": "a.py", "description": "data loss"}]
+    w2 = _reject_then_fix(eng, crit)
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": False, "issues": crit,  # identical, but critical
+    }))
+    assert out["outcome"] == "review_rejected_held"  # a critical repeat parks, never ships
+
+
+def test_first_rejection_never_converges(tmp_path, project) -> None:
+    """Subset-of-nothing must not auto-approve the FIRST rejection."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": False,
+        "issues": [{"severity": "important", "file": "a.py", "description": "x"}],
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+
+
 def test_missing_approved_field_fails_open(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
