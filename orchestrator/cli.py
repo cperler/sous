@@ -104,6 +104,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--note", default="", help="what is being approved")
     sub.add_parser("unpause", help="release a PAUSED run (e.g. after the batch circuit "
                                    "breaker tripped and the systemic cause is fixed)")
+    rj = sub.add_parser("reject", help="confirm-and-close a held infeasible task (writes the rejection artifact)")
+    rj.add_argument("--task", required=True)
+    rj.add_argument("--by", required=True, help="who is rejecting")
+    rj.add_argument("--reason", required=True, help="why the task is infeasible")
     sub.add_parser("resume")
     sub.add_parser("status")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
@@ -247,6 +251,9 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "unpause":
         run = eng.unpause_run(args.run)
         _emit({"unpaused": run.run_id, "state": run.state.value})
+    elif args.cmd == "reject":
+        task = eng.reject(args.run, args.task, rejected_by=args.by, reason=args.reason)
+        _emit({"rejected": task.task_id, "state": task.state.value, "by": args.by})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
