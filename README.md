@@ -8,7 +8,7 @@ It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 `.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
 
 **Status: built and live-proven.** Phases 1–5 complete plus two engine-hardening passes
-and a workflow code-review pass. 243 pytest cases green, ruff clean. Driven real GitHub
+and a workflow code-review pass. 294 pytest cases green, ruff clean. Driven real GitHub
 issues to merged/draft PRs on the reference project (heysoo PRs #556–#560) with clean
 lane-attribution audits. Remaining/known-thinned scope is tracked as GitHub issues
 (label `deferred-scope`); see `DEFERRED.md` for the discipline.
@@ -63,7 +63,7 @@ adapters/
   project/{base,heysoo,selfhost}/   the contract + reference adapters (a NEW project's
                          adapter lives in the project's OWN repo — see below)
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
-tests/                   pytest suite (243)
+tests/                   pytest suite (294)
 docs/                    design doc, plan, and the as-built/target spec (see below)
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
@@ -177,7 +177,7 @@ reference implementations, kept in lockstep by this repo's test suite.
 ## Developing
 
 ```bash
-uv run pytest        # 243 cases
+uv run pytest        # 294 cases
 uv run ruff check .
 ```
 

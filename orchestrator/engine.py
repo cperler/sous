@@ -1083,6 +1083,38 @@ class Engine:
         )
         return self.store.load_run(run_id)
 
+    def reject(self, run_id: str, task_id: str, *, rejected_by: str, reason: str) -> Task:
+        """Confirm-and-close a held task the human agrees is infeasible. The symmetric
+        counterpart to ``approve``: instead of overriding the gate and proceeding, it
+        transitions the task to the terminal FAILED state so the run can actually close.
+        The durable ``rejection-<run>-<task>.json`` artifact IS the gate record."""
+
+        def _reject(t: Task) -> None:
+            if t.state is not TaskState.BLOCKED_ON_HUMAN:
+                raise ContractError(
+                    f"task {task_id} is not held for approval (state {t.state.value})"
+                )
+            t.state = TaskState.FAILED
+
+        task = self.store.update_task(run_id, task_id, _reject)
+        self.store.write_rejection(
+            run_id, task_id,
+            {"rejected_by": rejected_by, "at": _now(), "reason": reason, "run_id": run_id,
+             "task_id": task_id},
+        )
+        self._set_ref_state(run_id, task_id, TaskState.FAILED)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "rejected", "run_id": run_id, "task_id": task_id,
+             "rejected_by": rejected_by, "reason": reason},
+        )
+        # Out-of-band transition (like approve/hold, not via record()), so it must perform
+        # record()'s post-transition run-level effects itself: cascade-block dependents of
+        # the now-FAILED task and finalize the run so it closes instead of staying open.
+        self._cascade_from(run_id, task_id)
+        self._maybe_finalize_run(run_id)
+        return task
+
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
         run = self.store.load_run(run_id)

@@ -296,6 +296,19 @@ class StatusStore:
         path = self.root / f"approval-{run_id}-{safe}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
+    def write_rejection(self, run_id: str, task_id: str, payload: dict) -> Path:
+        """Durable human-rejection artifact (issue #49): who rejected what, when, why —
+        the terminal confirm-and-close counterpart to write_approval."""
+        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        path = self.root / f"rejection-{run_id}-{safe}.json"
+        self._atomic_write(path, json.dumps(payload, indent=2, default=str))
+        return path
+
+    def load_rejection(self, run_id: str, task_id: str) -> dict | None:
+        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        path = self.root / f"rejection-{run_id}-{safe}.json"
+        return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
+
     def write_run_artifact(self, name: str, text: str) -> Path:
         """Write a run-level text artifact (e.g. cost-summary.md) under the root."""
         path = self.root / name
