@@ -13,6 +13,7 @@ import re
 import subprocess
 import uuid
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
@@ -816,9 +817,11 @@ class Engine:
         if not argv or argv == ["true"]:  # the no-op sentinel
             return "skipped (no infra_reset command)"
         cwd = task.context.get("worktree")
+        if not (cwd and Path(cwd).is_dir()):  # a recorded-but-gone worktree must not
+            cwd = None  # turn the reset itself into a FileNotFoundError
         try:
             proc = subprocess.run(  # noqa: S603
-                argv, cwd=cwd or None, capture_output=True, text=True, timeout=300
+                argv, cwd=cwd, capture_output=True, text=True, timeout=300
             )
         except (OSError, subprocess.SubprocessError) as exc:
             return f"error ({type(exc).__name__})"
