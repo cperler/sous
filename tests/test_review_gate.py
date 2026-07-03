@@ -123,6 +123,41 @@ def test_suggestion_only_rejection_auto_approves(tmp_path, project) -> None:
     assert verdicts and verdicts[-1]["kind"] == "auto_approved"
 
 
+def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, project) -> None:
+    """The independent test-validate half (#13): the reviewer (a different agent from
+    the test writer) reporting tests_meaningful=false rejects an otherwise-approved
+    review and drives the fix cycle."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": False,
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    task = eng.store.load_task("r1", "t1")
+    assert "independent test-validate" in task.learnings[-1]
+    # fail-open unchanged: omitting the field on an approved review completes
+    for _ in range(3):
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    w2 = eng.next_work("r1", "t1")
+    out2 = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
+    assert out2["outcome"] == "task_completed"
+
+
+def test_vacuous_tests_never_auto_approve_as_suggestions(tmp_path, project) -> None:
+    """tests_meaningful=false must not slip through the suggestion-only severity gate."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": False, "tests_meaningful": False,
+        "issues": [{"severity": "suggestion", "description": "nit"}],
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"  # not auto-approved
+
+
 def test_missing_approved_field_fails_open(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")

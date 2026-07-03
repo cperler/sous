@@ -691,18 +691,35 @@ class Engine:
         Restores the old severity gate (as-built ``orchestrator-common.sh:965``): when every
         blocking issue is a structured object explicitly marked ``severity=suggestion``,
         the rejection auto-approves (kind="auto_approved") instead of cycling — suggestions
-        must not hold up an otherwise-approved PR."""
+        must not hold up an otherwise-approved PR.
+
+        Also the independent test-validate half (#13): the reviewer — a different agent
+        from the one that wrote/ran the tests — reports ``tests_meaningful``; an explicit
+        ``false`` REJECTS even an approved review (vacuous-green tests are exactly what
+        the self-graded TEST gate can't catch about itself). Fail-open when omitted."""
         if result.stage is not Stage.REVIEW:
             return None
         out = result.structured_output or {}
-        if out.get("approved") is not False:  # explicit self-report only
+        approved_false = out.get("approved") is False  # explicit self-report only
+        tests_vacuous = out.get("tests_meaningful") is False  # independent verdict
+        if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")
         issues = raw if isinstance(raw, list) else []
         issues_text = [format_review_issue(i)[:300] for i in issues[:10]]
-        suggestions_only = bool(issues) and all(
-            isinstance(i, dict) and str(i.get("severity", "")).lower() == "suggestion"
-            for i in issues
+        if tests_vacuous:
+            issues_text.append(
+                "independent test-validate (#13): the reviewer judged the tests do not "
+                "meaningfully exercise this change — add/adjust assertions so they "
+                "would fail if the change regressed"
+            )
+        suggestions_only = (
+            not tests_vacuous
+            and bool(issues)
+            and all(
+                isinstance(i, dict) and str(i.get("severity", "")).lower() == "suggestion"
+                for i in issues
+            )
         )
         kind = "auto_approved" if suggestions_only else "rejected"
         return {"kind": kind, "issues_text": issues_text}

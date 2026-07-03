@@ -6,6 +6,10 @@
   "required": ["approved", "issues"],
   "properties": {
     "approved": {"type": "boolean"},
+    "tests_meaningful": {
+      "type": "boolean",
+      "description": "independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false rejects the review even when approved — the reviewer is a different agent from the one that wrote the tests, which is the point"
+    },
     "issues": {
       "type": "array",
       "items": {
