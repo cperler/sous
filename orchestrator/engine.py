@@ -630,6 +630,10 @@ class Engine:
         # cost-report.md (the richer per-stage/-task + session-reuse breakdown) is NOT
         # written here: status() is the cheap poll path and analysis() re-scans the whole
         # ledger. It is produced at run finalize and on demand via the `cost-report` CLI.
+        # A poll of an already-terminal run just recreated a cost-artifact lock; sweep it
+        # (safe only because the run is terminal — a mid-run poll leaves live locks alone).
+        if run.state in (RunState.COMPLETED, RunState.FAILED):
+            self.store.sweep_locks()
         return {
             "run_id": run_id,
             "run_state": run.state.value,
@@ -874,3 +878,6 @@ class Engine:
                 run_id,
                 {"ts": _now(), "type": "retrospective_emitted", "run_id": run_id},
             )
+        # Every task is terminal → no more writers → sweep the now-idle lock sentinels
+        # (done LAST, after the final artifact writes that recreate their own locks).
+        self.store.sweep_locks()

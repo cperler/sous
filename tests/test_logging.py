@@ -35,6 +35,30 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
     assert types.index("stage_dispatched") < types.index("stage_recorded")
 
 
+def test_finalize_sweeps_lock_sentinels_but_keeps_audit_trail(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+
+    # Mid-run: a live run leaves flock sentinels next to the files being written.
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    assert list(tmp_path.rglob("*.lock")), "expected lock sentinels while the run is active"
+
+    # Drive to completion → finalize sweeps them.
+    while (w := eng.next_work("r1", "t1")) is not None:
+        eng.record("r1", make_result(w))
+    assert eng.status("r1")["run_state"] == "completed"
+    assert not list(tmp_path.rglob("*.lock")), "finalize should sweep lock sentinels"
+
+    # A poll of the finished run recreates a cost-artifact lock, then sweeps it too.
+    eng.status("r1")
+    assert not list(tmp_path.rglob("*.lock"))
+
+    # The durable audit trail is never swept.
+    assert (tmp_path / "events.jsonl").exists()
+    assert (tmp_path / "stage-costs.jsonl").exists()
+
+
 def test_per_stage_log_tree(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")

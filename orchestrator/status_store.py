@@ -111,6 +111,25 @@ class StatusStore:
                 with contextlib.suppress(OSError):
                     os.rmdir(lock_dir)
 
+    def sweep_locks(self) -> int:
+        """Delete the ``.lock``/``.lockdir`` sentinels under the run dir; return the count.
+
+        These are ``flock``/mkdir sentinels needed only while writers are active. They
+        can't be unlinked on release (delete-then-recreate races two writers onto
+        different inodes → no mutual exclusion), so they linger. Sweeping is safe ONLY
+        when the run is terminal — no writers remain — which is the only place the engine
+        calls this."""
+        removed = 0
+        for lock in self.root.rglob("*.lock"):
+            with contextlib.suppress(OSError):
+                lock.unlink()
+                removed += 1
+        for lockdir in self.root.rglob("*.lockdir"):
+            with contextlib.suppress(OSError):
+                lockdir.rmdir()
+                removed += 1
+        return removed
+
     # ---- versioning -----------------------------------------------------
 
     @staticmethod
