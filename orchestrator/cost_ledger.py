@@ -26,17 +26,26 @@ class CostLedger:
         self.path = Path(path)
         self.model_table = model_table
 
-    def record(self, result: StageResult) -> dict:
+    def record(self, result: StageResult, *, duration_s: float | None = None) -> dict:
         """Append exactly one JSONL row for this invocation and return it.
 
         Cost is recomputed from ``model_table`` (authoritative) — the runner's
-        ``result.cost_usd`` is deliberately ignored.
+        ``result.cost_usd`` is deliberately ignored. ``duration_s`` is the engine-
+        measured wall time of the dispatch (dispatch->record).
         """
         usage = result.token_usage
         # Tolerant pricing: an unknown model id (e.g. a new provider model not yet in the
         # table) must NOT raise — every call still gets exactly one row. An unpriced call
         # is flagged (priced=False) and costed at 0.0, the same tolerance analysis() has.
         cost, priced = self.model_table.try_cost_usd(result.model, usage)
+        # HONESTY flag: the interactive lane cannot meter per-call usage in-session, so
+        # its zero-token rows are UNMETERED (cost unknown), not free. Metered lanes and
+        # the deterministic engine lane (genuinely $0) stay metered=True. Renderers use
+        # this to say "n/a / unmetered" instead of a confident $0.0000.
+        tokens_seen = usage.input + usage.output + usage.cache_read + usage.cache_write
+        metered = not (
+            result.lane_used.execution_mode.value == "interactive" and tokens_seen == 0
+        )
         row = {
             "ts": result.completed_at,
             "run_id": result.run_id,
@@ -52,6 +61,8 @@ class CostLedger:
             "cache_write_tokens": usage.cache_write,
             "cost_usd": cost,
             "priced": priced,
+            "metered": metered,
+            "duration_s": round(duration_s, 3) if duration_s is not None else None,
             "status": result.status.value,
             "work_item_id": result.work_item_id,
         }
@@ -75,10 +86,15 @@ class CostLedger:
         by_model: dict[str, dict] = {}
         total_cost = 0.0
         total_invocations = 0
+        unmetered_calls = 0
+        total_wall_s = 0.0
         for row in (self.rows() if rows is None else rows):
             total_invocations += 1
             cost = row.get("cost_usd") or 0.0
             total_cost += cost
+            if row.get("metered") is False:
+                unmetered_calls += 1
+            total_wall_s += row.get("duration_s") or 0.0
             bucket = by_model.setdefault(
                 row.get("model", "unknown"),
                 {
@@ -95,6 +111,8 @@ class CostLedger:
         return {
             "total_cost_usd": round(total_cost, 6),
             "total_invocations": total_invocations,
+            "unmetered_calls": unmetered_calls,
+            "total_wall_s": round(total_wall_s, 1),
             "by_model": by_model,
         }
 

@@ -26,11 +26,29 @@ def render_cost_summary(run_id: str, summary: dict) -> str:
     # Defensive: a present-but-None value or a partial by_model bucket must not crash
     # the render (it runs at run finalization).
     total_cost = summary.get("total_cost_usd") or 0.0
+    unmetered = summary.get("unmetered_calls") or 0
+    invocations = summary.get("total_invocations") or 0
+    # HONESTY: unmetered interactive calls have UNKNOWN cost — a bare $0.0000 total
+    # would read as "this run was free". Say what is metered and what isn't.
+    if unmetered and unmetered == invocations:
+        cost_line = (f"- Total cost: **n/a — all {unmetered} call(s) ran on the "
+                     f"interactive lane, which cannot meter per-call usage** (billed "
+                     f"to the session's subscription, not $0)")
+    elif unmetered:
+        cost_line = (f"- Total cost: **${total_cost:.4f}** (metered lanes only — "
+                     f"⚠️ {unmetered} interactive call(s) are unmetered and NOT included)")
+    else:
+        cost_line = f"- Total cost: **${total_cost:.4f}**"
     lines = [
         f"# Cost summary — {run_id}",
         "",
-        f"- Invocations: **{summary.get('total_invocations') or 0}**",
-        f"- Total cost: **${total_cost:.4f}**",
+        f"- Invocations: **{invocations}**",
+        cost_line,
+    ]
+    wall_s = summary.get("total_wall_s") or 0.0
+    if wall_s:
+        lines.append(f"- Wall time (in model calls): **{wall_s / 60.0:.1f} min**")
+    lines += [
         "",
         "| Model | Invocations | Input tok | Output tok | Cost (USD) |",
         "|---|---:|---:|---:|---:|",

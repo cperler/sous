@@ -414,8 +414,19 @@ class Engine:
             )
 
         # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
-        # and the engine share one model table; compute once, in the ledger).
-        cost = self.ledger.record(result)["cost_usd"]
+        # and the engine share one model table; compute once, in the ledger). Wall time
+        # is engine-measured (dispatch begin_stage -> now) so reports can show duration.
+        duration_s: float | None = None
+        if dispatched.started_at:
+            try:
+                duration_s = max(
+                    0.0,
+                    (datetime.now(UTC) - datetime.fromisoformat(dispatched.started_at))
+                    .total_seconds(),
+                )
+            except ValueError:
+                duration_s = None
+        cost = self.ledger.record(result, duration_s=duration_s)["cost_usd"]
 
         # Attributed/clean iff the lane actually used is a sanctioned (registered) cell.
         lane_clean = (
@@ -899,17 +910,34 @@ class Engine:
         stage_logs = {t.task_id: self.store.read_stage_logs(t.task_id) for t in tasks}
         return build_retrospective(run, tasks, events, stage_logs)
 
-    def status(self, run_id: str) -> dict:
+    def status(self, run_id: str, *, stale_after_s: int = 1800) -> dict:
         run = self.store.load_run(run_id)
         progress = run.progress()
+        now = datetime.now(UTC)
         tasks = {}
         for ref in run.task_refs:
             task = self.store.load_task(run_id, ref.task_id)
+            # Liveness: how long since this task last moved. A non-terminal task that
+            # hasn't updated past the threshold is flagged STALE — the caller's cheap
+            # stall signal (the old monitor's dead-process/no-progress checks had no
+            # counterpart; nothing said a run was dead until a human went digging).
+            age_s: float | None = None
+            try:
+                age_s = max(0.0, (now - datetime.fromisoformat(task.updated_at)).total_seconds())
+            except (ValueError, TypeError):
+                age_s = None
             tasks[ref.task_id] = {
                 "state": task.state.value,
                 "current_stage": task.current_stage.value if task.current_stage else None,
                 "stages": {s.value: r.status.value for s, r in task.stages.items()},
                 "pr_url": task.pr_url,
+                "seconds_since_update": round(age_s, 1) if age_s is not None else None,
+                "stale": bool(
+                    age_s is not None
+                    and age_s > stale_after_s
+                    and task.state not in TERMINAL_TASK_STATES
+                    and task.state is not TaskState.BLOCKED_ON_HUMAN
+                ),
             }
         # One ledger read shared by the summary, the audit, and the cost-summary.md
         # refresh (status() used to read the ledger twice).
