@@ -1,0 +1,17 @@
+{
+  "_comment": "SAFETY hook: block deploy-shaped Bash commands (exit 2 = deny the tool call). Ports the reference system's deploy guard, generalized: add your project's own deploy entry points to the pattern. The bootstrap merges this into the project's .claude/settings.json.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys,re; d=json.load(sys.stdin); c=d.get('tool_input',{}).get('command',''); sys.exit(2 if re.search(r'deploy_to_production|terraform\\\\s+apply|cdk\\\\s+deploy', c) else 0)\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

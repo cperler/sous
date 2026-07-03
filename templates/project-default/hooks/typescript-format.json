@@ -1,5 +1,5 @@
 {
-  "_comment": "EXAMPLE Claude Code hook: format edited TS/JS files with prettier. Merge into the project's .claude/settings.json under \"hooks\". Adjust the event name / matcher / env var to your Claude Code version before relying on it.",
+  "_comment": "Format edited TS/JS files with prettier. The bootstrap merges this into the project's .claude/settings.json under 'hooks'. Reads the hook's stdin JSON (tool_input.file_path) — the proven interface, not a $CLAUDE_FILE_PATH env var.",
   "hooks": {
     "PostToolUse": [
       {
@@ -7,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "f=\"$CLAUDE_FILE_PATH\"; case \"$f\" in *.ts|*.tsx|*.js|*.jsx) pnpm exec prettier --write \"$f\" >/dev/null 2>&1 || true;; esac"
+            "command": "jq -r '.tool_input.file_path // empty' | { read f; if [ -n \"$f\" ]; then case \"$f\" in *.ts|*.tsx|*.js|*.jsx) cd \"${CLAUDE_PROJECT_DIR:-.}\" && npx prettier --write \"$f\" >/dev/null 2>&1 || true;; esac; fi; }",
+            "timeout": 30
           }
         ]
       }

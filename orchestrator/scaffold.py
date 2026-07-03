@@ -13,6 +13,7 @@ separate run-target skill; this is the deterministic layer it drives.
 
 from __future__ import annotations
 
+import json
 import shutil
 import tomllib
 from dataclasses import dataclass, field
@@ -75,8 +76,11 @@ def select_kit_assets(profile: Profile, manifest: dict) -> dict[str, list[str]]:
         a for a, spec in manifest["agents"].items()
         if not spec.get("tags") or langs.intersection(spec["tags"])
     ]
+    # Hooks mirror agents: untagged = always (the safety guards must reach every
+    # project, not just tagged stacks); tagged = per-language.
     hooks = [
-        h for h, spec in manifest["hooks"].items() if langs.intersection(spec.get("tags", []))
+        h for h, spec in manifest["hooks"].items()
+        if not spec.get("tags") or langs.intersection(spec["tags"])
     ]
     skills = list(manifest.get("skills", {}).get("always", []))
     return {"agents": sorted(agents), "hooks": sorted(hooks), "skills": skills}
@@ -500,12 +504,49 @@ def seed_kit(assets: dict[str, list[str]], into: Path) -> list[str]:
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(src, dst)
         seeded.append(f"skills/{dst.parent.name}/SKILL.md")
+    hook_files: list[Path] = []
     for hook in assets.get("hooks", []):
         dst = claude / "hooks" / f"{hook}.json"
         dst.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(KIT_DIR / "hooks" / f"{hook}.json", dst)
         seeded.append(f"hooks/{hook}.json")
+        hook_files.append(dst)
+    # A hook fragment on disk is inert — it only fires once it lives in the project's
+    # .claude/settings.json. Merge the seeded fragments in (idempotent, additive), so
+    # the safety guards and format hooks are LIVE from the first scaffold, not an
+    # example the user has to hand-wire.
+    if hook_files and _merge_hook_settings(claude, hook_files):
+        seeded.append("settings.json (hooks merged)")
     return seeded
+
+
+def _merge_hook_settings(claude: Path, hook_files: list[Path]) -> bool:
+    """Merge hook fragments ({"hooks": {event: [entries]}}) into ``.claude/settings.json``.
+    Additive and idempotent: an entry already present (exact match) is never duplicated;
+    other settings keys are preserved. Returns True when the file changed."""
+    settings_path = claude / "settings.json"
+    settings: dict = {}
+    if settings_path.exists():
+        try:
+            settings = json.loads(settings_path.read_text(encoding="utf-8"))
+        except ValueError:
+            return False  # never clobber a hand-edited-but-broken settings file
+    hooks = settings.setdefault("hooks", {})
+    changed = not settings_path.exists()
+    for hf in hook_files:
+        try:
+            fragment = json.loads(hf.read_text(encoding="utf-8")).get("hooks", {})
+        except ValueError:
+            continue
+        for event, entries in fragment.items():
+            bucket = hooks.setdefault(event, [])
+            for entry in entries:
+                if entry not in bucket:
+                    bucket.append(entry)
+                    changed = True
+    if changed:
+        settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
+    return changed
 
 
 def scaffold_adapter(

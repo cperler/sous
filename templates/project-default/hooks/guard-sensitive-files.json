@@ -1,0 +1,17 @@
+{
+  "_comment": "SAFETY hook: block model edits to env/credential/git-internal files (exit 2 = deny the tool call). Ports the reference system's PreToolUse guard — the bootstrap merges this into the project's .claude/settings.json, so autonomous runs against a real repo carry the guard from day one. Reads the hook's stdin JSON (the proven interface).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 -c \"import json,sys; d=json.load(sys.stdin); p=d.get('tool_input',{}).get('file_path',''); sys.exit(2 if any(x in p for x in ('.env','.git/','credentials','.pem','id_rsa')) else 0)\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}

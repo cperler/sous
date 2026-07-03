@@ -35,7 +35,14 @@ tags = ["python"]
 roles = ["implement:frontend"]
 tags = ["typescript"]
 
-# ── Hooks: example .claude hooks, stack-tagged (optional, off unless selected) ──
+# ── Hooks: .claude hooks the bootstrap merges into the project's settings.json.
+#    Empty tags = always seeded (the safety guards); language tags = per-stack. ──
+[hooks.guard-sensitive-files]
+tags = []                       # SAFETY: always on — block edits to env/credential/.git files
+description = "Deny model edits to .env/credentials/.git-internal files (exit 2)."
+[hooks.guard-deploy]
+tags = []                       # SAFETY: always on — block deploy-shaped Bash commands
+description = "Deny deploy-shaped Bash commands (deploy_to_production, terraform apply, cdk deploy)."
 [hooks.python-format]
 tags = ["python"]
 description = "Run ruff format on edited Python files."

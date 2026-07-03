@@ -54,13 +54,15 @@ def test_profile_selects_stack_agents_and_commands() -> None:
     # seed picks generic + both stacks' agents/hooks
     assert "python-backend-developer" in p.seed["agents"]
     assert "typescript-frontend-developer" in p.seed["agents"]
-    assert set(p.seed["hooks"]) == {"python-format", "typescript-format"}
+    assert set(p.seed["hooks"]) == {"python-format", "typescript-format",
+                                "guard-deploy", "guard-sensitive-files"}  # guards always ride
 
 
 def test_no_language_profile_is_generic() -> None:
     p = profile_from_languages("svc", [], MANIFEST)
     assert p.roster["implement"] == "generic-implementer"
-    assert p.seed["hooks"] == [] and p.commands == {}
+    assert p.seed["hooks"] == ["guard-deploy", "guard-sensitive-files"]  # safety is stack-agnostic
+    assert p.commands == {}
 
 
 # --- generated adapter reflects the profile ----------------------------------
