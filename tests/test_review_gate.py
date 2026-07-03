@@ -1,0 +1,166 @@
+"""The review gate: a completed REVIEW that reports approved=false must never
+fall through to task_completed. While fix cycles remain, the engine re-opens
+implement→…→review with the blocking issues as learnings (the old system's
+quality/fix loop, restored bounded); at max_review_cycles it parks the task
+BLOCKED_ON_HUMAN with REVIEW re-opened so approve() leads to a re-review.
+Suggestion-only rejections auto-approve (the old severity gate)."""
+
+from __future__ import annotations
+
+from orchestrator.cost_ledger import CostLedger
+from orchestrator.engine import Engine
+from orchestrator.render import format_review_issue
+from orchestrator.schemas.enums import ResultStatus, Stage, StageStatus, TaskState
+from orchestrator.status_store import StatusStore
+from tests.conftest import make_result
+
+
+def _engine(tmp_path, project, **kw) -> Engine:
+    return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"), project, **kw)
+
+
+def _advance_to_review(eng, run="r1", task="t1"):
+    """Drive intake→…→deliver green; return the REVIEW WorkItem."""
+    for _ in range(5):  # intake, scope, implement, test, deliver
+        eng.record(run, make_result(eng.next_work(run, task)))
+    w = eng.next_work(run, task)
+    assert w.stage is Stage.REVIEW
+    return w
+
+
+REJECTION = {
+    "approved": False,
+    "issues": [
+        {"severity": "critical", "file": "a.py", "line": 12,
+         "description": "breaks the invariant", "suggested_fix": "guard the None case"},
+        "second issue as a plain string",
+    ],
+}
+
+
+def test_rejection_triggers_fix_cycle(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output=REJECTION))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert out["task_state"] == "retrying"
+    assert out["next_stage"] == "implement"  # pipeline re-opened from implement
+
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1
+    for stage in (Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER, Stage.REVIEW):
+        assert task.stages[stage].status is StageStatus.PENDING
+    # earlier stages keep their completion
+    assert task.stages[Stage.INTAKE].status is StageStatus.COMPLETED
+    assert task.stages[Stage.SCOPE].status is StageStatus.COMPLETED
+    # the reviewer's session must not leak into the fix work
+    assert task.session_ref is None
+
+    # the fix implement's prompt carries the blocking issues as learnings
+    nxt = eng.next_work("r1", "t1")
+    assert nxt.stage is Stage.IMPLEMENT
+    assert "review rejected" in nxt.prompt
+    assert "breaks the invariant" in nxt.prompt
+    assert "second issue as a plain string" in nxt.prompt
+
+
+def test_fix_cycle_then_approval_completes(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    eng.record("r1", make_result(w, structured_output=REJECTION))
+    # fix cycle: implement, test, deliver run again, then review approves
+    for _ in range(3):
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    w2 = eng.next_work("r1", "t1")
+    assert w2.stage is Stage.REVIEW
+    out = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
+    assert out["outcome"] == "task_completed"
+    assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
+
+
+def test_rejection_parks_when_cycles_exhausted(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_review_cycles=0)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output=REJECTION))
+    assert out["outcome"] == "review_rejected_held"
+    assert out["task_state"] == "blocked_on_human"
+
+    task = eng.store.load_task("r1", "t1")
+    # REVIEW re-opened as FAILED: after approve() the pipeline still has a next stage
+    assert task.stages[Stage.REVIEW].status is StageStatus.FAILED
+    assert "review rejected" in (task.last_error or "")
+    # parked, not dispatchable
+    assert eng.next_work("r1", "t1") is None
+    # approve() releases to a re-review, never a zombie with no next stage
+    eng.approve("r1", "t1", approved_by="craig")
+    nxt = eng.next_work("r1", "t1")
+    assert nxt is not None and nxt.stage is Stage.REVIEW
+    # the run stayed open throughout (BLOCKED_ON_HUMAN is non-terminal)
+    assert eng.store.load_run("r1").state.value == "running"
+
+
+def test_suggestion_only_rejection_auto_approves(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": False,
+        "issues": [
+            {"severity": "suggestion", "description": "could rename the helper"},
+            {"severity": "suggestion", "description": "docstring nit"},
+        ],
+    }))
+    assert out["outcome"] == "task_completed"  # severity gate: suggestions never block
+    events = eng.store.read_events("r1")
+    verdicts = [e for e in events if e["type"] == "review_verdict"]
+    assert verdicts and verdicts[-1]["kind"] == "auto_approved"
+
+
+def test_missing_approved_field_fails_open(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={"issues": []}))
+    assert out["outcome"] == "task_completed"  # fail-open: only explicit false triggers
+
+
+def test_rejection_event_is_audited(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    eng.record("r1", make_result(w, structured_output=REJECTION))
+    events = eng.store.read_events("r1")
+    verdicts = [e for e in events if e["type"] == "review_verdict"]
+    assert len(verdicts) == 1
+    v = verdicts[0]
+    assert v["kind"] == "rejected" and v["disposition"] == "fix_cycle"
+    assert v["review_cycles"] == 1
+    assert any("breaks the invariant" in i for i in v["issues"])
+
+
+def test_rejection_still_records_cost_and_stage_log(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    out = eng.record("r1", make_result(w, status=ResultStatus.SUCCESS, structured_output=REJECTION))
+    assert out["cost_usd"] > 0  # the review model call is still priced
+
+
+def test_format_review_issue_shapes() -> None:
+    assert format_review_issue("plain text") == "plain text"
+    rich = format_review_issue({
+        "severity": "critical", "file": "a.py", "line": 12,
+        "description": "breaks it", "suggested_fix": "guard None",
+    })
+    assert rich == "critical — a.py:12 — breaks it (suggested fix: guard None)"
+    assert format_review_issue({"description": "just a description"}) == "just a description"

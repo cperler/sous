@@ -8,8 +8,28 @@
     "approved": {"type": "boolean"},
     "issues": {
       "type": "array",
-      "items": {"type": "string"},
-      "description": "blocking issues (empty when approved)"
+      "items": {
+        "anyOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "required": ["description"],
+            "properties": {
+              "severity": {
+                "type": "string",
+                "enum": ["critical", "important", "suggestion"],
+                "description": "suggestion-only rejections auto-approve (the severity gate); critical/important drive the fix cycle"
+              },
+              "file": {"type": "string"},
+              "line": {"type": "integer"},
+              "description": {"type": "string"},
+              "suggested_fix": {"type": "string"}
+            },
+            "additionalProperties": true
+          }
+        ]
+      },
+      "description": "blocking issues (empty when approved). Prefer the structured object form — severity gates disposition, file/line/suggested_fix make the fix cycle actionable"
     },
     "non_blocking": {
       "type": "array",

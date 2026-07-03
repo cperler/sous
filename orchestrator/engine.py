@@ -22,6 +22,7 @@ from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
 from .render import (
+    format_review_issue,
     render_completion_note,
     render_cost_report,
     render_cost_summary,
@@ -47,7 +48,14 @@ from .schemas.enums import (
 from .schemas.status import Run, Task, TaskRef
 from .schemas.work import LanePolicy, StageResult, WorkItem
 from .stages import STAGE_SPECS, render_prompt
-from .state_machine import apply_result, begin_stage, is_done, next_stage, resume_point
+from .state_machine import (
+    apply_result,
+    begin_stage,
+    is_done,
+    next_stage,
+    reset_for_fix_cycle,
+    resume_point,
+)
 from .status_store import StatusStore
 
 
@@ -79,6 +87,7 @@ class Engine:
         max_attempts: int = 3,
         breaker_threshold: int = 2,
         concurrency_ceiling: int = 1,
+        max_review_cycles: int = 2,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -94,6 +103,9 @@ class Engine:
         self.max_attempts = max_attempts
         self.breaker_threshold = breaker_threshold
         self.concurrency_ceiling = concurrency_ceiling
+        # Review gate: how many rejection-triggered fix cycles (re-run implement→…→review
+        # with the blocking issues as learnings) before the task parks BLOCKED_ON_HUMAN.
+        self.max_review_cycles = max_review_cycles
 
     # --- run/task setup -------------------------------------------------------
     def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
@@ -405,6 +417,7 @@ class Engine:
 
         outcome: str
         scope_blocked_reason: str | None = None
+        review_verdict: dict | None = None
         if effective.status is ResultStatus.RATE_LIMITED:
             # Transient: re-queue the stage (RUNNING marker keeps the attempt) on the
             # cheaper model; no apply_result/learnings/breaker, but cost is recorded.
@@ -437,9 +450,16 @@ class Engine:
                 # non-terminal BLOCKED_ON_HUMAN state (park-for-human) — an autonomous
                 # hard-close is deferred to its own issue. Fail-open (see helper).
                 scope_blocked_reason = self._scope_not_feasible(effective)
+                # Review gate: a completed REVIEW that explicitly reports approved=false
+                # must never fall through to task_completed (the old system's strongest
+                # quality loop — restored as a bounded fix cycle; issue #15 keeps the
+                # convergence-auto-approval refinement).
+                review_verdict = self._review_verdict(effective)
                 if scope_blocked_reason is not None:
                     task.state = TaskState.BLOCKED_ON_HUMAN
                     outcome = "scope_not_feasible_held"
+                elif review_verdict is not None and review_verdict["kind"] == "rejected":
+                    outcome = self._apply_review_rejection(task, review_verdict)
                 elif is_done(task):
                     task.state = TaskState.COMPLETED
                     outcome = "task_completed"
@@ -496,6 +516,17 @@ class Engine:
                 "task_state": task.state.value,
             },
         )
+        # Audit the review verdict alongside the generic stage record: what the reviewer
+        # rejected (or auto-approved as suggestions-only) and how the engine disposed of it.
+        if review_verdict is not None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "review_verdict", "run_id": run_id,
+                 "task_id": result.task_id, "kind": review_verdict["kind"],
+                 "disposition": review_verdict.get("disposition"),
+                 "issues": review_verdict["issues_text"],
+                 "review_cycles": task.review_cycles},
+            )
         # Audit the WHY of a feasibility park alongside the generic stage record, so the
         # event stream shows the blocked_reason that routed the task to the human gate.
         if scope_blocked_reason is not None:
@@ -566,6 +597,60 @@ class Engine:
                 return reason
             return "scope reported the task is not feasible (feasible=false)"
         return None
+
+    def _review_verdict(self, result: StageResult) -> dict | None:
+        """Interpret a completed REVIEW stage's verdict; None when there is nothing to act
+        on (not the review stage, or approved / field omitted — fail-OPEN like the other
+        soft gates: only an explicit ``approved=false`` triggers).
+
+        Restores the old severity gate (as-built ``orchestrator-common.sh:965``): when every
+        blocking issue is a structured object explicitly marked ``severity=suggestion``,
+        the rejection auto-approves (kind="auto_approved") instead of cycling — suggestions
+        must not hold up an otherwise-approved PR."""
+        if result.stage is not Stage.REVIEW:
+            return None
+        out = result.structured_output or {}
+        if out.get("approved") is not False:  # explicit self-report only
+            return None
+        raw = out.get("issues")
+        issues = raw if isinstance(raw, list) else []
+        issues_text = [format_review_issue(i)[:300] for i in issues[:10]]
+        suggestions_only = bool(issues) and all(
+            isinstance(i, dict) and str(i.get("severity", "")).lower() == "suggestion"
+            for i in issues
+        )
+        kind = "auto_approved" if suggestions_only else "rejected"
+        return {"kind": kind, "issues_text": issues_text}
+
+    def _apply_review_rejection(self, task: Task, verdict: dict) -> str:
+        """Dispose of a rejected review: a bounded fix cycle (re-open implement→…→review
+        with the blocking issues as learnings) while cycles remain, else park the task at
+        the human gate with the REVIEW record re-opened as FAILED — so an approve() leads
+        to a re-review, never a zombie task with no next stage."""
+        summary = "; ".join(verdict["issues_text"]) or "no issues listed"
+        task.learnings.append(
+            f"review rejected (cycle {task.review_cycles + 1}) — blocking issues: {summary}"
+        )
+        # Fix work must not inherit the reviewer's session (same rationale as warm-retry
+        # OFF: a rejecting session's context is as likely poisoned as useful).
+        task.session_ref = None
+        if task.review_cycles < self.max_review_cycles:
+            reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
+            if reset:
+                task.review_cycles += 1
+                task.state = TaskState.RETRYING
+                verdict["disposition"] = "fix_cycle"
+                return "review_rejected_fix_cycle"
+        # Cycles exhausted (or no implement stage in this pipeline to fix with): park.
+        # Flip the (apply_result-completed) REVIEW record to FAILED so the pipeline still
+        # has a next stage — after approve(), next_work re-dispatches REVIEW.
+        rec = task.stages[Stage.REVIEW]
+        rec.status = StageStatus.FAILED
+        rec.error = f"review rejected: {summary}"[:500]
+        task.last_error = rec.error
+        task.state = TaskState.BLOCKED_ON_HUMAN
+        verdict["disposition"] = "held"
+        return "review_rejected_held"
 
     def _handle_failure(self, task: Task, result: StageResult) -> str:
         failures = None

@@ -160,6 +160,29 @@ def render_retrospective(retro: dict) -> str:
     return "\n".join(lines)
 
 
+def format_review_issue(issue: object) -> str:
+    """One blocking review issue → a compact one-line string, for learnings and the
+    completion note. Tolerates both contract shapes: a plain string, or the structured
+    ``{severity, file, line, description, suggested_fix}`` object (any subset)."""
+    if not isinstance(issue, dict):
+        return str(issue).strip()
+    where = str(issue.get("file") or "").strip()
+    if where and issue.get("line") is not None:
+        where += f":{issue['line']}"
+    parts = [
+        p for p in (
+            str(issue.get("severity") or "").strip(),
+            where,
+            str(issue.get("description") or "").strip(),
+        ) if p
+    ]
+    text = " — ".join(parts) if parts else str(issue)
+    fix = str(issue.get("suggested_fix") or "").strip()
+    if fix:
+        text += f" (suggested fix: {fix})"
+    return text
+
+
 def _md_scalar(v: object) -> str:
     if isinstance(v, bool):
         return "yes" if v else "no"
@@ -298,7 +321,8 @@ def render_completion_note(
         model = f"`{rec.model}`" if rec.model else "—"
         lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {_cost_cell(rec)} |")
 
-    blocking = [i for i in (review.get("issues") or []) if str(i).strip()]
+    blocking = [format_review_issue(i) for i in (review.get("issues") or [])]
+    blocking = [i for i in blocking if i]
     if blocking:
         lines += ["", "### Outstanding review issues"]
         lines += [f"- {i}" for i in blocking]

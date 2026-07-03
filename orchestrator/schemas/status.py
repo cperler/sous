@@ -93,6 +93,10 @@ class Task(BaseModel):
     resume_cursor: ResumeCursor | None = None
     error_signatures: list[str] = Field(default_factory=list)
     learnings: list[str] = Field(default_factory=list)  # appended per failed attempt
+    # Count of review-rejection fix cycles taken (review gate): each rejection that
+    # re-opens implement→…→review increments this; at the engine's max_review_cycles
+    # the task parks BLOCKED_ON_HUMAN instead of looping forever.
+    review_cycles: int = 0
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None

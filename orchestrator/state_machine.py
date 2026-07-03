@@ -195,6 +195,27 @@ def _absorb_outputs(task: Task, result: StageResult) -> None:
     _enforce_context_ceiling(task)
 
 
+def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
+    """Re-open the tail of the pipeline for a review-rejection fix cycle: every
+    pipeline stage at/after ``from_stage`` gets a fresh PENDING record, so
+    ``next_stage`` returns ``from_stage`` and the fix re-runs implement→…→review.
+
+    History is not lost — every prior execution is already durable in the per-stage
+    logs (``write_stage_log``); the stage RECORD is working state, not the audit trail.
+    Returns the stages that were reset (empty when ``from_stage`` is not in the
+    pipeline — the caller must handle that as "no fix cycle possible")."""
+    if from_stage not in task.pipeline:
+        return []
+    idx = task.pipeline.index(from_stage)
+    reset = list(task.pipeline[idx:])
+    for stage in reset:
+        task.stages[stage] = StageRecord()
+    task.resume_cursor = ResumeCursor(
+        stage=from_stage, hint=f"review fix cycle: re-running from {from_stage.value}"
+    )
+    return reset
+
+
 def resume_point(task: Task) -> Stage | None:
     """Where to re-enter after a crash.
 

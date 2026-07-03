@@ -105,7 +105,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         checkpoint=True,
         template=(
             "Add/refresh docstrings for changed source, then open a pull request for "
-            "the task branch.\n"
+            "the task branch. If the context above already shows a pr_url for this "
+            "task (a review fix cycle), push the branch and reuse that PR — never "
+            "open a duplicate.\n"
             "Return: pr_number, pr_url."
         ),
     ),
@@ -129,9 +131,13 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "(b) retrospective — one lesson this task teaches about the ORCHESTRATION "
             "PROCESS itself (prompts, stages, tooling, lanes). Omit either if nothing "
             "genuine stands out — do not pad.\n"
-            "Return: approved, issues (blocking; empty when approved), non_blocking "
-            "(list of {title, detail}; empty if none), improvement ({title, detail} or "
-            "omitted), retrospective ({title, detail} or omitted)."
+            "Return: approved, issues (blocking; empty when approved — each an object "
+            "{severity: critical|important|suggestion, file, line, description, "
+            "suggested_fix}; a rejection re-runs implement→…→review with your issues as "
+            "learnings, so make them concrete and actionable; suggestion-only rejections "
+            "auto-approve), non_blocking (list of {title, detail}; empty if none), "
+            "improvement ({title, detail} or omitted), retrospective ({title, detail} or "
+            "omitted)."
         ),
     ),
 }
