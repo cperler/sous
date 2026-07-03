@@ -168,23 +168,51 @@ def _md_scalar(v: object) -> str:
     return str(v)
 
 
+# A dict's natural heading field: when present, the object renders as a titled block
+# (bold lead + its other fields nested) rather than a flat `key: value` bullet list —
+# so a list of {title, detail} findings reads as titled notes, not an undifferentiated run.
+_LEAD_KEYS = ("title", "name")
+
+
+def _lead_key(d: dict) -> str | None:
+    return next((k for k in _LEAD_KEYS if isinstance(d.get(k), str) and d[k].strip()), None)
+
+
 def _render_struct(obj: object, depth: int = 0) -> list[str]:
-    """A stage's structured output as readable markdown bullets — not a JSON dump.
+    """A stage's structured output as readable Markdown — not a JSON dump.
 
     The machine-exact copy lives in the sibling ``NN-<stage>.json``; this is the human
-    view, so keys become bold labels and lists/nested dicts become indented bullets."""
+    view. Scalars become ``**key:** value`` bullets; a dict carrying a ``title``/``name``
+    leads with that as a bold heading and renders its prose fields as continuation
+    paragraphs; object items in a list are separated by a blank line so they don't blur."""
     pad = "  " * depth
     out: list[str] = []
     if isinstance(obj, dict):
-        for k, v in obj.items():
-            if isinstance(v, (dict, list)) and v:
-                out.append(f"{pad}- **{k}:**")
-                out += _render_struct(v, depth + 1)
-            else:
-                out.append(f"{pad}- **{k}:** {_md_scalar(v)}")
+        lead = _lead_key(obj)
+        if lead is not None:
+            out.append(f"{pad}- **{obj[lead]}**")
+            for k, v in obj.items():
+                if k == lead:
+                    continue
+                if isinstance(v, str) and v.strip():
+                    out.append(f"{pad}  {v}")  # prose continuation under the heading
+                elif isinstance(v, (dict, list)) and v:
+                    out.append(f"{pad}  - **{k}:**")
+                    out += _render_struct(v, depth + 2)
+                else:
+                    out.append(f"{pad}  - **{k}:** {_md_scalar(v)}")
+        else:
+            for k, v in obj.items():
+                if isinstance(v, (dict, list)) and v:
+                    out.append(f"{pad}- **{k}:**")
+                    out += _render_struct(v, depth + 1)
+                else:
+                    out.append(f"{pad}- **{k}:** {_md_scalar(v)}")
     elif isinstance(obj, list):
-        for item in obj:
+        for i, item in enumerate(obj):
             if isinstance(item, (dict, list)) and item:
+                if i and isinstance(item, dict):
+                    out.append("")  # separate object items so titled blocks don't merge
                 out += _render_struct(item, depth)
             else:
                 out.append(f"{pad}- {_md_scalar(item)}")

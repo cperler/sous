@@ -42,6 +42,36 @@ def test_render_stage_renders_structured_output_as_readable_markdown() -> None:
     assert "## Commentary" in md and "did the thing" in md
 
 
+def test_render_stage_titled_findings_are_readable_blocks() -> None:
+    payload = {
+        "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
+        "outcome": "task_completed", "model": "claude-sonnet-4-6",
+        "lane_used": {"execution_mode": "interactive", "provider": "claude"}, "cost_usd": 0.0,
+        "structured_output": {
+            "approved": True,
+            "issues": [],
+            "non_blocking": [
+                {"title": "First finding", "detail": "why one"},
+                {"title": "Second finding", "detail": "why two"},
+            ],
+            "improvement": {"title": "Do the thing", "detail": "because reasons"},
+        },
+        "raw_output": None, "error": None, "completed_at": "t",
+    }
+    md = render_stage(payload)
+    lines = md.splitlines()
+    # A titled dict leads with its title in bold, and its prose detail is a continuation
+    # line (NOT a `- **detail:**` bullet).
+    assert "  - **First finding**" in md
+    assert "    why one" in md and "- **detail:**" not in md
+    # The two findings are separated by a blank line so they don't blur together.
+    i1 = lines.index("  - **First finding**")
+    i2 = lines.index("  - **Second finding**")
+    assert "" in lines[i1:i2], "expected a blank line between findings"
+    # The improvement object is titled too.
+    assert "  - **Do the thing**" in md and "    because reasons" in md
+
+
 def test_render_task_index_lists_six_stages() -> None:
     t = Task(task_id="#9", run_id="r1", created_at="x", updated_at="x", title="Demo")
     md = render_task_index(t)
