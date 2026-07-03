@@ -21,9 +21,10 @@ You never call a model directly and you never run `claude -p`.
 2. `… add-task --task "$TASK"` (resolves the issue via the GitHub task source).
 
 ## The loop (repeat until the task is terminal)
-1. **next**: `WORK=$(… next --task "$TASK" --util "$UTIL")`.
+1. **next**: `WORK=$(… next --task "$TASK" --util auto)`.
    - If `WORK` is `null`, the task is done — stop.
-   - `UTIL` is the current 5h utilization %; the engine turns it into the binding
+   - `--util auto` probes the account's REAL 5h utilization (see `orchestrator util`;
+     a probe miss falls back to 0.0 and says so) and the engine turns it into the binding
      dispatch limit. **Do not exceed the engine's limit** even though the Workflow
      cap could allow more — the engine's number is the policy, the Workflow cap is a
      ceiling.

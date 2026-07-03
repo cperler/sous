@@ -17,9 +17,11 @@ batch left off.
 from __future__ import annotations
 
 from collections.abc import Callable
+from datetime import UTC, datetime
 
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
+from .schemas.enums import TERMINAL_TASK_STATES
 from .schemas.work import StageResult, WorkItem
 
 Runner = Callable[[list[WorkItem]], list[StageResult]]
@@ -69,16 +71,60 @@ class Scheduler:
             self.engine.record(run_id, by_id[w.id])
         return {"dispatched": len(work), "recorded": len(work), "ready": len(ready), "limit": limit}
 
-    def run(self, run_id: str, runner: Runner, *, util_pct: float = 0.0, max_ticks: int = 10_000) -> dict:
+    def run(
+        self,
+        run_id: str,
+        runner: Runner,
+        *,
+        util_pct: float = 0.0,
+        util_provider: Callable[[], float] | None = None,
+        sleeper: Callable[[int], None] | None = None,
+        drain_wait_s: int = 300,
+        max_ticks: int = 10_000,
+    ) -> dict:
         """Loop until no task is dispatchable (all terminal or capacity-stalled).
 
-        Returns the final engine status. Resumable: call again on the same run to
-        continue after a kill — the engine's persisted state is the source of truth.
+        With a ``sleeper`` (e.g. ``time.sleep``), capacity stalls and rate-limit
+        cooldowns are WAITED OUT instead of ending the run — the old capacity_wait_loop
+        behavior: sleep, re-probe (``util_provider`` re-reads utilization each tick),
+        continue. Without one (the default), the caller owns retrying later — the
+        pre-existing behavior. Returns the final engine status. Resumable: call again
+        on the same run to continue after a kill.
         """
         for _ in range(max_ticks):
             if not self.dispatchable(run_id):
+                # Nothing dispatchable — but a rate-limit cooldown is a wait, not an end.
+                wait = self._cooldown_wait(run_id)
+                if wait is not None and sleeper is not None:
+                    sleeper(wait)
+                    continue
                 break
-            res = self.tick(run_id, runner, util_pct=util_pct)
+            util = util_provider() if util_provider is not None else util_pct
+            res = self.tick(run_id, runner, util_pct=util)
             if res["dispatched"] == 0:
-                break  # nothing advanced this tick (e.g. capacity 0) — caller retries later
+                # Capacity-throttled tick (limit 0). Wait out the window if we can.
+                if sleeper is not None:
+                    sleeper(drain_wait_s)
+                    continue
+                break  # caller retries later
         return self.engine.status(run_id)
+
+    def _cooldown_wait(self, run_id: str) -> int | None:
+        """Seconds until the SOONEST rate-limit cooldown among non-terminal tasks
+        expires (None when no task is cooling — the run is genuinely done/stalled)."""
+        run = self.engine.store.load_run(run_id)
+        now = datetime.now(UTC)
+        waits: list[int] = []
+        for ref in run.task_refs:
+            if ref.state in TERMINAL_TASK_STATES:
+                continue
+            doc = self.engine.store.load_task(run_id, ref.task_id)
+            if not doc.not_before:
+                continue
+            try:
+                until = datetime.fromisoformat(doc.not_before)
+            except ValueError:
+                continue
+            if until > now:
+                waits.append(int((until - now).total_seconds()) + 1)
+        return min(waits) if waits else None

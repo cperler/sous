@@ -104,6 +104,12 @@ class Task(BaseModel):
     # Set when a rate-limited dispatch re-queues the current stage on a cheaper model;
     # consumed by the next next_work() for this stage (graceful fallback).
     pending_fallback_model: str | None = None
+    # Rate-limit cooldown (the wait-out-the-window half of the old handle_rate_limit):
+    # a floor-of-chain rate limit parks the task until this ISO timestamp instead of
+    # burning attempts; next_work/dispatchable refuse earlier dispatch. Bounded by
+    # rate_limit_waits vs the engine's max_rate_limit_waits.
+    not_before: str | None = None
+    rate_limit_waits: int = 0
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing

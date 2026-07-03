@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import re
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
@@ -64,6 +64,17 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _in_future(iso: str | None) -> bool:
+    """Is an ISO timestamp still ahead of now? Unparsable/absent => False (never
+    let a corrupt cooldown stamp park a task forever)."""
+    if not iso:
+        return False
+    try:
+        return datetime.fromisoformat(iso) > datetime.now(UTC)
+    except ValueError:
+        return False
+
+
 def _ref_safe(s: str) -> str:
     """Make an id safe inside a git ref component (tags: design pass §3). Conservative:
     anything outside [word . -] becomes '-', which also rules out the refname-forbidden
@@ -89,6 +100,8 @@ class Engine:
         breaker_threshold: int = 2,
         concurrency_ceiling: int = 1,
         max_review_cycles: int = 2,
+        max_rate_limit_waits: int = 4,
+        rate_limit_cooldown_s: int = 900,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -107,6 +120,11 @@ class Engine:
         # Review gate: how many rejection-triggered fix cycles (re-run implement→…→review
         # with the blocking issues as learnings) before the task parks BLOCKED_ON_HUMAN.
         self.max_review_cycles = max_review_cycles
+        # Rate-limit cooldown at the fallback-chain floor: wait this long and retry the
+        # ORIGINAL model (the old wait-until-reset behavior) instead of failing the
+        # attempt; bounded so a permanently-limited account still fails out.
+        self.max_rate_limit_waits = max_rate_limit_waits
+        self.rate_limit_cooldown_s = rate_limit_cooldown_s
 
     # --- run/task setup -------------------------------------------------------
     def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
@@ -186,10 +204,15 @@ class Engine:
                 continue
             if dag.unmet_deps(ref.task_id, states):
                 continue
+            doc = self.store.load_task(run_id, ref.task_id)
             # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
             # re-dispatchable on the normal path — it needs explicit resume, never a
             # silent re-pick that would overwrite the outstanding WorkItem.
-            if self.store.load_task(run_id, ref.task_id).pending_work_item_id is not None:
+            if doc.pending_work_item_id is not None:
+                continue
+            # Parked in a rate-limit cooldown: not dispatchable until the stamp elapses
+            # (the scheduler sleeps on the soonest cooldown instead of spinning).
+            if _in_future(doc.not_before):
                 continue
             out.append(ref.task_id)
         return out
@@ -216,6 +239,11 @@ class Engine:
         # with the terminal guard above — next_work must be self-safe for direct callers.
         if task.state is TaskState.BLOCKED_ON_HUMAN:
             return None
+        # Rate-limit cooldown: the task is parked until the window resets — refuse
+        # dispatch loudly (the caller waits/sleeps), never silently. Explicit resume
+        # bypasses (a human who knows better can force it).
+        if not resume and _in_future(task.not_before):
+            raise CapacityExhausted(f"rate-limit cooldown until {task.not_before}")
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
         # so recovery is the explicit resume=True path — never a silent re-dispatch that
@@ -319,6 +347,7 @@ class Engine:
             t.pending_work_item_id = work.id
             t.pending_content_hash = work.content_hash
             t.pending_fallback_model = None  # consumed into this dispatch's model
+            t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
 
         self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
@@ -407,11 +436,22 @@ class Engine:
             self.models.fallback_after(result.model)
             if effective.status is ResultStatus.RATE_LIMITED and lane_allows_fallback else None
         )
+        # At the floor (or with fallback disabled) the rate limit can't be dodged with a
+        # cheaper model — wait it out (the old handle_rate_limit's wait-until-reset) and
+        # retry the ORIGINAL model, bounded by max_rate_limit_waits; only past that
+        # budget does it degrade to a normal failure.
+        cooldown_until: str | None = None
         if effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
-            effective = effective.model_copy(update={
-                "status": ResultStatus.FAILURE,
-                "error": "rate-limited with no cheaper fallback available (floor model or fallback disabled)",
-            })
+            if task.rate_limit_waits < self.max_rate_limit_waits:
+                cooldown_until = (
+                    datetime.now(UTC) + timedelta(seconds=self.rate_limit_cooldown_s)
+                ).isoformat()
+            else:
+                effective = effective.model_copy(update={
+                    "status": ResultStatus.FAILURE,
+                    "error": "rate-limited with no cheaper fallback available and the "
+                             f"cooldown budget exhausted ({task.rate_limit_waits} waits)",
+                })
 
         task.pending_work_item_id = None
         task.pending_content_hash = None
@@ -420,20 +460,27 @@ class Engine:
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
         if effective.status is ResultStatus.RATE_LIMITED:
-            # Transient: re-queue the stage (RUNNING marker keeps the attempt) on the
-            # cheaper model; no apply_result/learnings/breaker, but cost is recorded.
+            # Transient: re-queue the stage (RUNNING marker keeps the attempt) — either
+            # immediately on a cheaper model, or after a cooldown on the original one.
+            # No apply_result/learnings/breaker, but cost is recorded.
             rec = task.stages[result.stage]
             rec.status = StageStatus.RUNNING
             rec.completed_at = None
             rec.error = None
-            task.pending_fallback_model = fallback_model
             task.state = TaskState.RETRYING
             task.updated_at = _now()
-            outcome = "stage_rate_limited_fallback"
+            if cooldown_until is None:
+                task.pending_fallback_model = fallback_model
+                outcome = "stage_rate_limited_fallback"
+            else:
+                task.rate_limit_waits += 1
+                task.not_before = cooldown_until
+                outcome = "stage_rate_limited_cooldown"
         else:
             apply_result(task, effective, now=_now(), cost_usd=cost)
             if effective.status is ResultStatus.SUCCESS:
                 task.error_signatures = []  # streak resets on a clean stage
+                task.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
                 # Session chaining (design pass §2): reuse across SUCCESSFUL stage
                 # transitions only. A runner that reports no ref leaves the prior one
                 # in place (resuming a slightly-stale session is safe: prompts are
@@ -517,6 +564,17 @@ class Engine:
                 "task_state": task.state.value,
             },
         )
+        # Audit a cooldown park: when the task may dispatch again, and how much of the
+        # wait budget is spent — so a stalled-looking run explains itself in the events.
+        if outcome == "stage_rate_limited_cooldown":
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "rate_limit_cooldown", "run_id": run_id,
+                 "task_id": result.task_id, "stage": result.stage.value,
+                 "not_before": task.not_before,
+                 "waits_used": task.rate_limit_waits,
+                 "waits_budget": self.max_rate_limit_waits},
+            )
         # Audit the review verdict alongside the generic stage record: what the reviewer
         # rejected (or auto-approved as suggestions-only) and how the engine disposed of it.
         if review_verdict is not None:

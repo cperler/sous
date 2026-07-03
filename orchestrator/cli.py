@@ -75,16 +75,21 @@ def main(argv: list[str] | None = None) -> int:
     at.add_argument("--pipeline", default=None,
                     help="comma-separated stage list (e.g. 'intake,implement,review'); "
                          "default: the run lane's preset")
+    util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
-    n.add_argument("--util", type=float, default=0.0)
+    n.add_argument("--util", default="0", help=util_help)
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
     d = sub.add_parser("dispatchable")
-    d.add_argument("--util", type=float, default=0.0)
+    d.add_argument("--util", default="0", help=util_help)
     d.add_argument("--max-concurrent", type=int, default=3)
     rh = sub.add_parser("run-headless", help="drive the whole run in-process (headless mode)")
-    rh.add_argument("--util", type=float, default=0.0)
+    rh.add_argument("--util", default="0", help=util_help)
     rh.add_argument("--max-concurrent", type=int, default=3)
+    rh.add_argument("--wait", action="store_true",
+                    help="sleep through capacity stalls / rate-limit cooldowns instead of "
+                         "returning (the old capacity_wait_loop)")
+    sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
     hd = sub.add_parser("hold", help="park a task at the human approval gate")
     hd.add_argument("--task", required=True)
     hd.add_argument("--reason", required=True, help="what needs human sign-off")
@@ -131,6 +136,18 @@ def main(argv: list[str] | None = None) -> int:
                "deleted": deleted, "dry_run": not args.prune})
         return 0
 
+    if args.cmd == "util":
+        # The capacity sensor (needs no run/project): probe the usage endpoint and emit
+        # the numbers the --util gates consume. A probe miss is an explicit field, not
+        # an error — callers fall back to 0.0 (gates open) knowingly.
+        from dataclasses import asdict
+
+        from .usage_probe import read_usage
+
+        usage = read_usage()
+        _emit({"available": usage is not None, **(asdict(usage) if usage else {})})
+        return 0
+
     if args.cmd == "validate":
         # Loading an external dir already enforces CONTRACT_VERSION + the full surface;
         # validate_config additionally reports on module-path adapters.
@@ -143,6 +160,14 @@ def main(argv: list[str] | None = None) -> int:
     if not args.root or not args.run or not args.project:
         p.error(f"--root, --run and --project are required for {args.cmd}")
     eng = _engine(args)
+
+    # Resolve --util once: a number passes through; 'auto' probes the usage endpoint
+    # (falling back to 0.0 — gates open — with the miss stated, never silent).
+    util_pct = 0.0
+    if hasattr(args, "util"):
+        from .usage_probe import resolve_util
+
+        util_pct, _ = resolve_util(args.util)
 
     if args.cmd == "init-run":
         run = eng.create_run(args.run, ExecutionLane(args.lane))
@@ -164,11 +189,11 @@ def main(argv: list[str] | None = None) -> int:
         # via the registry, so this drain is the interactive lane's equivalent.
         from .stages import STAGE_SPECS
 
-        work = eng.next_work(args.run, args.task, util_pct=args.util)
+        work = eng.next_work(args.run, args.task, util_pct=util_pct)
         while work is not None and STAGE_SPECS[work.stage].deterministic:
             result = eng.registry.resolve(work.lane_policy).dispatch(work)
             eng.record(args.run, result)
-            work = eng.next_work(args.run, args.task, util_pct=args.util)
+            work = eng.next_work(args.run, args.task, util_pct=util_pct)
         _emit(None if work is None else json.loads(work.model_dump_json()))
     elif args.cmd == "record":
         result = StageResult.model_validate_json(Path(args.result).read_text())
@@ -178,15 +203,28 @@ def main(argv: list[str] | None = None) -> int:
 
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
         ready = sched.dispatchable(args.run)
-        limit = eng.capacity.dispatch_limit(args.util, args.max_concurrent)
+        limit = eng.capacity.dispatch_limit(util_pct, args.max_concurrent)
         _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit]})
     elif args.cmd == "run-headless":
+        import time
+
         from adapters.execution.runners import registry_runner
 
         from .scheduler import Scheduler
 
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
-        _emit(sched.run(args.run, registry_runner(eng.registry), util_pct=args.util))
+        util_provider = None
+        if args.util == "auto":
+            from .usage_probe import read_usage
+
+            def util_provider() -> float:  # re-probe each tick so the gate tracks reality
+                usage = read_usage()
+                return usage.five_hour_pct if usage else 0.0
+
+        _emit(sched.run(
+            args.run, registry_runner(eng.registry), util_pct=util_pct,
+            util_provider=util_provider, sleeper=time.sleep if args.wait else None,
+        ))
     elif args.cmd == "hold":
         task = eng.hold_for_approval(args.run, args.task, args.reason)
         _emit({"held": task.task_id, "state": task.state.value, "reason": args.reason})

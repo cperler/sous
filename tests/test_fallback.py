@@ -92,13 +92,27 @@ def test_rate_limit_requeues_on_cheaper_model(tmp_path, project) -> None:
 
 
 def test_rate_limit_no_fallback_when_lane_disallows(tmp_path, project) -> None:
-    """allow_fallback is honored (not dead): with it off, a rate-limit is a hard failure."""
+    """allow_fallback is honored (not dead): with it off, no cheaper-model re-queue —
+    the rate limit is waited out (cooldown), never dodged with a downgrade."""
     from orchestrator.routing import Router
     eng = _engine(tmp_path, project, router=Router(allow_fallback=False),
                   max_attempts=3, breaker_threshold=9)
     w = _advance_to(eng, Stage.SCOPE)
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
-    assert out["outcome"] == "stage_failed_will_retry"  # no graceful re-queue
+    assert out["outcome"] == "stage_rate_limited_cooldown"  # wait, don't downgrade
+    task = eng.store.load_task("r1", "t1")
+    assert task.pending_fallback_model is None  # no cheaper model queued
+    assert task.not_before is not None  # parked until the window resets
+
+
+def test_rate_limit_with_no_wait_budget_is_hard_failure(tmp_path, project) -> None:
+    """max_rate_limit_waits=0 restores the old immediate-failure floor semantics."""
+    from orchestrator.routing import Router
+    eng = _engine(tmp_path, project, router=Router(allow_fallback=False),
+                  max_attempts=3, breaker_threshold=9, max_rate_limit_waits=0)
+    w = _advance_to(eng, Stage.SCOPE)
+    out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+    assert out["outcome"] == "stage_failed_will_retry"
     assert eng.store.load_task("r1", "t1").pending_fallback_model is None
 
 
@@ -113,10 +127,12 @@ def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
 
 
 def test_rate_limit_at_floor_becomes_failure(tmp_path, project) -> None:
-    """Rate-limited on the cheapest model (nothing to fall back to) -> normal failure.
+    """Rate-limited on the cheapest model with NO cooldown budget -> normal failure.
     intake is deterministic (no model), so reach the floor by degrading a model stage
-    down the chain opus -> sonnet -> haiku."""
-    eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9)
+    down the chain opus -> sonnet -> haiku. (With budget, the floor now cooldowns —
+    see test_capacity_wiring.py.)"""
+    eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9,
+                  max_rate_limit_waits=0)
     w = _advance_to(eng, Stage.SCOPE)  # first model stage, on opus
     assert w.model == "claude-opus-4-8"
     eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
