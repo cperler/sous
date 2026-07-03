@@ -8,6 +8,8 @@ docstring agent (no ``phpdoc-writer``), and the test-taxonomy living in config.
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
@@ -82,6 +84,76 @@ class HeysooConfig:
     def schema_for(self, ref: str) -> dict | None:
         # Inherit the engine's canonical stage-output contracts (gives codex full-validation).
         return resolve_stage_schema(ref)
+
+    # --- deterministic review policy gates (#65) --------------------------------
+    def review_findings(self, *, worktree: str | None = None) -> list[dict]:
+        """Reference implementation of the policy-gate seam: the TSC gate (OC:3689)
+        and the e2e-policy check (OC:1201-1316) as engine-merged review findings the
+        model cannot skip. Best-effort: no worktree / git hiccups yield no findings."""
+        if not worktree or not Path(worktree).is_dir():
+            return []
+        return self._tsc_finding(worktree) + self._e2e_policy_finding(worktree)
+
+    def _tsc_finding(self, worktree: str) -> list[dict]:
+        try:
+            proc = subprocess.run(  # noqa: S603
+                self.typecheck_cmd(), cwd=worktree, capture_output=True, text=True,
+                timeout=300,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return []
+        if proc.returncode == 0:
+            return []
+        tail = f"{proc.stdout}\n{proc.stderr}".strip()[-400:]
+        return [{
+            "severity": "critical", "blocking": True,
+            "description": f"deterministic TSC gate: typecheck fails (rc={proc.returncode}): {tail}",
+            "suggested_fix": "fix the type errors before this PR can be approved",
+        }]
+
+    def _changed_files(self, worktree: str) -> list[str]:
+        for base in ("origin/main", "main", "master"):
+            try:
+                mb = subprocess.run(  # noqa: S603
+                    ["git", "merge-base", "HEAD", base], cwd=worktree,
+                    capture_output=True, text=True, timeout=30,
+                )
+                if mb.returncode != 0:
+                    continue
+                diff = subprocess.run(  # noqa: S603
+                    ["git", "diff", "--name-only", f"{mb.stdout.strip()}..HEAD"],
+                    cwd=worktree, capture_output=True, text=True, timeout=30,
+                )
+                if diff.returncode == 0:
+                    return [f for f in diff.stdout.splitlines() if f.strip()]
+            except (OSError, subprocess.SubprocessError):
+                return []
+        return []
+
+    def _e2e_policy_finding(self, worktree: str) -> list[dict]:
+        """E2E policy: a user-facing frontend change without any e2e spec change is a
+        blocking finding (ports evaluate_e2e_policy's core heuristic)."""
+        files = self._changed_files(worktree)
+        if not files:
+            return []
+        frontend = [
+            f for f in files
+            if f.startswith("frontend/") and f.endswith((".ts", ".tsx"))
+            and ".spec." not in f and "/tests/" not in f
+        ]
+        specs = [f for f in files if f.endswith(".spec.ts")]
+        if frontend and not specs:
+            shown = ", ".join(frontend[:5])
+            return [{
+                "severity": "critical", "blocking": True,
+                "description": (
+                    f"e2e policy: user-facing frontend change ({len(frontend)} file(s): "
+                    f"{shown}) with no e2e spec change"
+                ),
+                "suggested_fix": "add/extend a Playwright spec covering the change, or "
+                                 "record an explicit exemption in the PR",
+            }]
+        return []
 
 
 def get_config() -> HeysooConfig:

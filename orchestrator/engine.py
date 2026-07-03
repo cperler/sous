@@ -451,6 +451,12 @@ class Engine:
             result if gate_error is None
             else result.model_copy(update={"status": ResultStatus.FAILURE, "error": gate_error})
         )
+        # Deterministic project policy gates (#65): merge the adapter's review_findings
+        # into a completed REVIEW result BEFORE the verdict is read — the old
+        # merge_e2e_policy_review_finding semantics (a blocking deterministic finding
+        # overrides the model's approval; the model can't skip a policy gate).
+        if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
+            effective = self._merge_policy_findings(run_id, task, effective)
         # A rate-limit with a cheaper model still available is transient — re-queue the
         # SAME stage+attempt on that model rather than burning a retry or tripping the
         # breaker. Gated on the lane's allow_fallback (so the flag is honored, not dead).
@@ -682,6 +688,59 @@ class Engine:
                 return reason
             return "scope reported the task is not feasible (feasible=false)"
         return None
+
+    def _merge_policy_findings(self, run_id: str, task: Task, result: StageResult) -> StageResult:
+        """Fold the project's deterministic ``review_findings`` into a REVIEW result
+        (#65 — the seam the old e2e-policy gate / API-contract trigger / TSC gate
+        family lost in the rebuild). Duck-typed and best-effort: no hook, an empty
+        list, or a raising hook (evented) leaves the result untouched.
+
+        Finding shape: ``{description, severity?, file?, line?, suggested_fix?,
+        blocking?=True}``. Blocking findings join ``issues`` and force
+        ``approved=false`` (severity defaults to critical so a repeated policy finding
+        can never convergence-auto-approve past the gate); non-blocking ones join
+        ``non_blocking`` and get filed as follow-up issues at finalize."""
+        hook = getattr(self.project, "review_findings", None)
+        if not callable(hook):
+            return result
+        try:
+            findings = [f for f in (hook(worktree=task.context.get("worktree")) or [])
+                        if isinstance(f, dict) and str(f.get("description") or "").strip()]
+        except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "policy_findings_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+            return result
+        if not findings:
+            return result
+        out = dict(result.structured_output or {})
+        blocking = [f for f in findings if f.get("blocking", True)]
+        advisory = [f for f in findings if not f.get("blocking", True)]
+        if blocking:
+            issues = list(out.get("issues") or [])
+            for f in blocking:
+                issue = {k: v for k, v in f.items() if k != "blocking"}
+                issue.setdefault("severity", "critical")  # a policy gate is a hard gate
+                issues.append(issue)
+            out["issues"] = issues
+            out["approved"] = False  # deterministic override of the model's approval
+        if advisory:
+            nb = list(out.get("non_blocking") or [])
+            nb.extend(
+                {"title": str(f.get("description"))[:80],
+                 "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"})}
+                for f in advisory
+            )
+            out["non_blocking"] = nb
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "policy_findings_merged", "run_id": run_id,
+             "task_id": task.task_id, "blocking": len(blocking), "advisory": len(advisory),
+             "findings": [format_review_issue(f)[:200] for f in findings[:10]]},
+        )
+        return result.model_copy(update={"structured_output": out})
 
     @staticmethod
     def _issue_fingerprint(issue: object) -> str:

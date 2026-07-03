@@ -49,6 +49,17 @@ class TaskSource(Protocol):
     #   file_followup(title, body, labels=None) -> str | None
     #       open a follow-up (e.g. a review's non-blocking finding); return its ref/URL.
     # The shared GitHubIssuesSource and LocalFileTaskSource implement both.
+    #
+    # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
+    # itself rather than the task source):
+    #   review_findings(*, worktree: str | None) -> list[dict]
+    #       Deterministic review policy gates (#65 — the seam for the old e2e-policy
+    #       gate / API-contract trigger / TSC gate family). Called by the engine when
+    #       a REVIEW stage completes; each finding is {description, severity?, file?,
+    #       line?, suggested_fix?, blocking?=True}. Blocking findings merge into the
+    #       review's `issues` and force approved=false (the model cannot skip a policy
+    #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups.
+    #       Must be best-effort and fast — it runs inline in record().
 
 
 @runtime_checkable
