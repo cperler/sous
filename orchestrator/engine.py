@@ -197,6 +197,12 @@ class Engine:
         # filters terminal states, but next_work must be self-safe for direct callers.
         if task.state in TERMINAL_TASK_STATES:
             return None
+        # A task parked at the human gate (approval hold or scope-not-feasible, issue #45)
+        # is non-terminal but quiescent: it must not be dispatched until approve() releases
+        # it to PENDING. The scheduler is safe because `dispatchable` filters it, but — as
+        # with the terminal guard above — next_work must be self-safe for direct callers.
+        if task.state is TaskState.BLOCKED_ON_HUMAN:
+            return None
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
         # so recovery is the explicit resume=True path — never a silent re-dispatch that
@@ -398,6 +404,7 @@ class Engine:
         task.pending_content_hash = None
 
         outcome: str
+        scope_blocked_reason: str | None = None
         if effective.status is ResultStatus.RATE_LIMITED:
             # Transient: re-queue the stage (RUNNING marker keeps the attempt) on the
             # cheaper model; no apply_result/learnings/breaker, but cost is recorded.
@@ -423,7 +430,17 @@ class Engine:
                 # gate-vetoed attempt's commits must never become a reset target.
                 if effective.checkpoint:
                     task.last_checkpoint = effective.checkpoint
-                if is_done(task):
+                # Feasibility gate (issue #45): a completed SCOPE stage that explicitly
+                # reports feasible=false parks the task at the human approval gate rather
+                # than advancing to implement a no-op. apply_result already folded
+                # blocked_reason into task.context (CONTEXT_KEYS[SCOPE]); we reuse the
+                # non-terminal BLOCKED_ON_HUMAN state (park-for-human) — an autonomous
+                # hard-close is deferred to its own issue. Fail-open (see helper).
+                scope_blocked_reason = self._scope_not_feasible(effective)
+                if scope_blocked_reason is not None:
+                    task.state = TaskState.BLOCKED_ON_HUMAN
+                    outcome = "scope_not_feasible_held"
+                elif is_done(task):
                     task.state = TaskState.COMPLETED
                     outcome = "task_completed"
                 else:
@@ -479,6 +496,15 @@ class Engine:
                 "task_state": task.state.value,
             },
         )
+        # Audit the WHY of a feasibility park alongside the generic stage record, so the
+        # event stream shows the blocked_reason that routed the task to the human gate.
+        if scope_blocked_reason is not None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "scope_not_feasible", "run_id": run_id,
+                 "task_id": result.task_id, "stage": result.stage.value,
+                 "blocked_reason": scope_blocked_reason},
+            )
         # Post-transition run-level effects: cascade-block dependents of a failed task,
         # mark_complete + finalize the run when everything is terminal.
         if task.state is TaskState.FAILED:
@@ -517,6 +543,28 @@ class Engine:
                 "exercise the change (tests_meaningful=false). Add/adjust assertions so "
                 "the tests would fail if this change regressed."
             )
+        return None
+
+    def _scope_not_feasible(self, result: StageResult) -> str | None:
+        """Feasibility gate over a completed SCOPE stage (issue #45); returns the
+        blocked_reason to park on, or None to proceed.
+
+        The scope contract reports ``feasible`` / ``blocked_reason``. When a green scope
+        result explicitly reports ``feasible=false`` the task is genuinely blocked, so
+        advancing to implement would only produce a no-op — instead we park it for a
+        human (BLOCKED_ON_HUMAN).
+
+        Fail-OPEN on a MISSING/true field, mirroring ``_stage_gate``: only an explicit
+        ``feasible=false`` parks; a result that omits the field (or reports true) advances
+        as before, so a soft/unschema'd field never dead-ends otherwise-feasible work."""
+        if result.stage is not Stage.SCOPE:
+            return None
+        out = result.structured_output or {}
+        if out.get("feasible") is False:  # explicit self-report only
+            reason = out.get("blocked_reason")
+            if isinstance(reason, str) and reason.strip():
+                return reason
+            return "scope reported the task is not feasible (feasible=false)"
         return None
 
     def _handle_failure(self, task: Task, result: StageResult) -> str:
