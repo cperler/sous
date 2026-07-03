@@ -30,6 +30,7 @@ You never call a model directly and you never run `claude -p`.
      ceiling.
 2. **dispatch**: invoke the **Workflow shim** (`run_targets/workflow_shim.js`) with
    `{ workItems: [WORK], dispatchLimit: <engine limit>, now: <ISO timestamp>, schemas: {...} }`.
+   The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds the WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it — the engine classifies TIMEOUT and retries from the checkpoint. Never leave a hung dispatch un-recorded.
    The shim calls `agent()` in-session and **returns** an array of `StageResult`
    objects (it cannot write to disk). It does the actual work in the task's worktree.
 3. **persist + record**: write each returned `StageResult` to a temp file and run

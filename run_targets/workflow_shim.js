@@ -11,6 +11,11 @@
 //    parallel()/agent() cap here is only a ceiling — never exceed args.dispatchLimit.
 //  - Every result is lane-attributed interactive:claude so the cost ledger can never
 //    see an unattributed call (closes as-built D6).
+//  - TIMEOUTS: the sandbox has no clock or timers (Date.now/setTimeout unavailable),
+//    so wi.timeout_s CANNOT be enforced here. The SUPERVISOR owns it: if a dispatch
+//    visibly exceeds the WorkItem's timeout_s, stop waiting and record a StageResult
+//    with status 'timeout' (see the skill's step 2) so the engine classifies TIMEOUT
+//    and retries from the checkpoint instead of hanging the run.
 //
 // Input  (args): { workItems: WorkItem[], dispatchLimit: number }
 // Output (return): StageResult[]  — the supervisor writes each to a temp file and

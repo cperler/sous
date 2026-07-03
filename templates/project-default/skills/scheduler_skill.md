@@ -32,6 +32,7 @@ directly and never run `claude -p`.
    Collect them into a single batch.
 3. **dispatch ONE Workflow batch**: invoke `run_targets/workflow_shim.js` with
    `{ workItems: [...all collected...], dispatchLimit: <engine limit>, now: <ISO>, schemas: {...} }`.
+   The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds a WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it. Never leave a hung dispatch un-recorded.
    The shim runs the stages in-session (hub-and-spoke) and **returns** the
    StageResults (it cannot persist).
 4. **record** each returned StageResult: write to a temp file → `… record --result <file>`.

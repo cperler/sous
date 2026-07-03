@@ -107,9 +107,10 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         checkpoint=True,
         template=(
             "Add/refresh docstrings for changed source, then open a pull request for "
-            "the task branch. If the context above already shows a pr_url for this "
-            "task (a review fix cycle), push the branch and reuse that PR — never "
-            "open a duplicate.\n"
+            "the task branch. If the task is a GitHub issue (#N), include 'Closes #N' "
+            "in the PR description so the merge closes the issue. If the context above "
+            "already shows a pr_url for this task (a review fix cycle), push the "
+            "branch and reuse that PR — never open a duplicate.\n"
             "Return: pr_number, pr_url."
         ),
     ),
