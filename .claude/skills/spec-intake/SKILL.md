@@ -55,6 +55,10 @@ the human confirms the plan before anything is created.**
    the `spec:<slug>` label lists them as a group). The engine builds the DAG and drives.
 
 ## Notes
+- **Two producers, one scheduler.** This skill is for a *new idea* — it files the issues and
+  their edges together. When the issues **already exist** (filed independently, no encoded
+  edges) and only need dependency analysis + lane wiring, use the **`batch-plan`** skill
+  instead; both hand the batch lane the same dependency-ordered shape.
 - Every issue a spec files carries `spec:<slug>` — `gh issue list --label spec:<slug>`
   recovers the batch later.
 - `spec validate` / `spec plan` are pure (no `--project`); only `spec file` needs the

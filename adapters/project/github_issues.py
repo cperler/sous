@@ -34,6 +34,23 @@ def _ref_from_url(url: str) -> str:
     return f"#{m.group(1)}" if m else url
 
 
+def _parse_depends_on(body: str) -> list[str]:
+    """Extract the ``#N`` refs from a ``Depends-on:`` line in an issue body — the spec
+    front door's own encoding (``spec_intake._compose_body`` writes ``Depends-on: #12,
+    #34``). Reading it back means a spec-filed issue arrives with its real edges already
+    known, so the batch-plan model doesn't re-derive edges the front door already recorded.
+    Case-insensitive on the label; de-duplicated in first-seen order."""
+    refs: list[str] = []
+    for line in body.splitlines():
+        m = re.match(r"\s*depends[- ]on\s*:\s*(.+)", line, re.IGNORECASE)
+        if not m:
+            continue
+        for ref in re.findall(r"#\d+", m.group(1)):
+            if ref not in refs:
+                refs.append(ref)
+    return refs
+
+
 class GitHubIssuesSource:
     """Task source backed by GitHub issues via the ``gh`` CLI."""
 
@@ -67,6 +84,37 @@ class GitHubIssuesSource:
             depends_on=[],  # no analysis step yet; add-task --depends-on supplies edges
             labels=labels,
         )
+
+    def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
+        """List OPEN issues as candidate batch tasks (#57). Optional, duck-typed method
+        the batch-plan ``candidates`` fetch calls to hand the model its input — not part of
+        the versioned TaskSource contract. Filters to open issues (a candidate batch is
+        actionable work), optionally by ``label``, capped at ``limit``. Each returned
+        ``TaskSpec`` pre-populates ``depends_on`` from any ``Depends-on:`` line in the body
+        (the front door's encoding), so edges a spec already recorded aren't re-derived."""
+        argv = [
+            "gh", "issue", "list", "--repo", self.repo, "--state", "open",
+            "--limit", str(limit), "--json", "number,title,body,labels",
+        ]
+        if label:
+            argv += ["--label", label]
+        raw = self._run(argv)
+        data = json.loads(raw) if raw.strip() else []
+        out: list[TaskSpec] = []
+        for d in data:
+            body = d.get("body") or ""
+            labels = [lbl["name"] for lbl in d.get("labels", [])]
+            out.append(
+                TaskSpec(
+                    task_id=f"#{d['number']}",
+                    title=d.get("title", ""),
+                    body=body,
+                    issue_number=d.get("number"),
+                    depends_on=_parse_depends_on(body),
+                    labels=labels,
+                )
+            )
+        return out
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         num = _issue_number(task_id)

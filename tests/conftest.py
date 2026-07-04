@@ -27,6 +27,13 @@ class FakeTaskSource:
         self.notes: list[dict] = []  # publish_note calls
         self.followups: list[dict] = []  # file_followup calls
         self.progress: list[dict] = []  # publish_progress calls (mid-run, #64)
+        self.candidates: list[TaskSpec] = []  # list_tasks output (batch-plan #57)
+
+    def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
+        pool = self.candidates
+        if label is not None:
+            pool = [t for t in pool if label in t.labels]
+        return pool[:limit]
 
     def resolve(self, task_id: str) -> TaskSpec:
         return TaskSpec(

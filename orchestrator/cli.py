@@ -185,6 +185,28 @@ def main(argv: list[str] | None = None) -> int:
     # Accept --project after the subcommand too (SUPPRESS: don't clobber the global one).
     spf.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also precede 'spec')")
+    bp = sub.add_parser("batch-plan", help="producer (#57): auto-analysis DAG over an "
+                                           "ALREADY-FILED batch of issues (skill authors the "
+                                           "plan; this validates/applies it)")
+    bpsub = bp.add_subparsers(dest="batch_cmd", required=True)
+    bpc = bpsub.add_parser("candidates", help="list open issues as the model's analysis "
+                                              "input (JSON: id/title/body-excerpt/labels/deps)")
+    bpc.add_argument("--label", default=None, help="only issues with this label")
+    bpc.add_argument("--limit", type=int, default=50, help="max issues to list")
+    bpc.add_argument("--project", default=argparse.SUPPRESS,
+                     help="project-config module/dir supplying the task source (may also precede 'batch-plan')")
+    bpv = bpsub.add_parser("validate", help="schema + DAG check a plan file (cycles/dups/"
+                                            "unknown refs). With --project, verifies external "
+                                            "edges against the repo's issues")
+    bpv.add_argument("file", help="batch plan JSON file")
+    bpv.add_argument("--project", default=argparse.SUPPRESS,
+                     help="verify external edges against this project's open issues")
+    bpa = bpsub.add_parser("apply", help="add the plan's tasks to a run in topological order")
+    bpa.add_argument("file", help="batch plan JSON file")
+    bpa.add_argument("--dry-run", action="store_true",
+                     help="print exactly what would be added; add nothing")
+    bpa.add_argument("--project", default=argparse.SUPPRESS,
+                     help="project-config module/dir supplying the task source (may also precede 'batch-plan')")
     gc = sub.add_parser("gc", help="list/prune long-lived git checkpoint tags (no run/project needed)")
     gc.add_argument("--repo", default=".", help="git repo/worktree to scan for checkpoint tags")
     gc.add_argument("--keep-latest", type=int, default=0,
@@ -314,6 +336,70 @@ def main(argv: list[str] | None = None) -> int:
         except SpecError as exc:
             _emit({"ok": False, "error": str(exc)})
             return 1
+        return 0
+
+    if args.cmd == "batch-plan":
+        # The auto-analysis producer (#57). candidates/validate are lightweight (no run);
+        # apply needs the engine. The model authors the plan — this only fetches, validates,
+        # and applies. load_plan raises BatchPlanError (a clear message) on bad input.
+        from .batch_plan import BatchPlanError, apply_plan, load_plan, topological_order
+        from .batch_plan import validate_plan as validate_batch_plan
+
+        def _known_ids(project_arg: str | None) -> list[str] | None:
+            """Open-issue ids the plan's external edges may reference (also the candidate
+            set). None when no source / no list_tasks — validate then skips external checks."""
+            if not project_arg:
+                return None
+            source = load_project(project_arg).task_source
+            lister = getattr(source, "list_tasks", None)
+            if not callable(lister):
+                return None
+            return [t.task_id for t in lister()]
+
+        if args.batch_cmd == "candidates":
+            if not args.project:
+                p.error("--project is required for `batch-plan candidates`")
+            source = load_project(args.project).task_source
+            lister = getattr(source, "list_tasks", None)
+            if not callable(lister):
+                _emit({"ok": False, "error": "task source exposes no list_tasks(label, "
+                       "limit) hook — cannot fetch batch candidates"})
+                return 1
+            tasks = lister(label=args.label, limit=args.limit)
+            candidates = [
+                {"task_id": t.task_id, "title": t.title,
+                 "body_excerpt": (t.body[:500] + "…") if len(t.body) > 500 else t.body,
+                 "labels": t.labels, "depends_on": t.depends_on}
+                for t in tasks
+            ]
+            _emit({"repo": getattr(source, "repo", None), "label": args.label,
+                   "count": len(candidates), "candidates": candidates})
+            return 0
+        try:
+            plan = load_plan(args.file)
+        except BatchPlanError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        if args.batch_cmd == "validate":
+            try:
+                validate_batch_plan(plan, _known_ids(args.project))
+            except BatchPlanError as exc:
+                _emit({"ok": False, "error": str(exc)})
+                return 1
+            _emit({"ok": True, "tasks": len(plan["tasks"]),
+                   "order": topological_order(plan)})
+            return 0
+        # batch-plan apply — needs the engine (root/run/project).
+        if not args.root or not args.run or not args.project:
+            p.error("--root, --run and --project are required for `batch-plan apply`")
+        eng = _engine(args)
+        try:
+            result = apply_plan(eng, args.run, plan, known_ids=_known_ids(args.project),
+                                dry_run=args.dry_run)
+        except BatchPlanError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        _emit(result)
         return 0
 
     if not args.root or not args.run or not args.project:

@@ -41,6 +41,16 @@ class TaskSource(Protocol):
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None: ...
 
+    # Optional, duck-typed (NOT part of the versioned contract — the batch-plan
+    # ``candidates`` fetch calls it via ``getattr``, so a source without it simply can't
+    # feed batch planning):
+    #   list_tasks(label=None, limit=50) -> list[TaskSpec]
+    #       List candidate tasks (e.g. OPEN issues) for the batch-plan producer (#57) — the
+    #       model's input for auto-analysis over an already-filed batch. Should pre-populate
+    #       each TaskSpec's ``depends_on`` from whatever edge encoding the source carries
+    #       (GitHubIssuesSource reads ``Depends-on: #N`` lines the spec front door wrote), so
+    #       edges already recorded aren't re-derived. The shared GitHubIssuesSource implements it.
+
     # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
     # them only via ``getattr`` at task finalize, so an older external adapter that omits
     # them keeps running unchanged; that's why adding them needs no CONTRACT_VERSION bump):

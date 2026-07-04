@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "batch_plan",
+  "description": "The auto-analysis producer's output (#57): a dependency plan over an ALREADY-FILED, independently-authored batch of issues. The model authors it during a conversation (see the batch-plan skill) after inspecting candidate issue bodies; batch_plan consumes it — validating the DAG and adding the tasks to a run. Unlike a spec (#18), the tasks already exist as issues; task_id is a real issue ref (#N), not a local id.",
+  "type": "object",
+  "required": ["tasks"],
+  "properties": {
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "description": "the per-issue plan, in any order; batch_plan topologically orders it for scheduling",
+      "items": {
+        "type": "object",
+        "required": ["task_id"],
+        "properties": {
+          "task_id": {"type": "string", "minLength": 1, "description": "the real issue ref (e.g. #42) or task-source id this entry plans"},
+          "depends_on": {"type": "array", "items": {"type": "string"}, "default": [], "description": "task_ids this one depends on — each must be another task in the plan or an already-terminal known issue id"},
+          "pipeline": {"type": ["string", "null"], "enum": ["full", "lite", "micro", null], "description": "lane preset for this task (docs-only -> micro, small mechanical -> lite, risky/cross-cutting -> full); null uses the run's default lane"},
+          "provider_tag": {"type": ["string", "null"], "description": "per-task provider routing tag (e.g. codex)"},
+          "deterministic_stages": {"type": ["array", "null"], "items": {"type": "string", "enum": ["intake", "scope", "implement", "test", "deliver", "review"]}, "description": "stages to run on the $0 ENGINE lane instead of a model (e.g. test/deliver for a docs-only task); null keeps the preset's model stages"},
+          "rationale": {"type": "string", "description": "why these edges/lane were chosen — the model's analysis, human-visible"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
