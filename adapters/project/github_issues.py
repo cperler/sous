@@ -9,6 +9,7 @@ injectable so unit tests never hit the network.
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from collections.abc import Callable
 
@@ -23,6 +24,14 @@ def _gh(argv: list[str]) -> str:
 
 def _issue_number(task_id: str) -> str:
     return task_id.lstrip("#")
+
+
+def _ref_from_url(url: str) -> str:
+    """Turn the ``gh issue create`` URL into a ``#N`` ref (matching the task_id
+    convention ``resolve`` consumes), falling back to the raw URL if no number is found."""
+    url = url.strip()
+    m = re.search(r"/(\d+)/?$", url)
+    return f"#{m.group(1)}" if m else url
 
 
 class GitHubIssuesSource:
@@ -88,3 +97,12 @@ class GitHubIssuesSource:
         for label in labels or []:
             argv += ["--label", label]
         return self._run(argv).strip() or None
+
+    def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
+        """Open a new issue and return its ``#N`` ref (the spec front door's filing hook,
+        #18). Thin ``gh issue create`` wrapper on the same injectable runner as the rest of
+        this source; the ``#N`` form feeds back into ``resolve`` and Depends-on lines."""
+        argv = ["gh", "issue", "create", "--repo", self.repo, "--title", title, "--body", body]
+        for label in labels or []:
+            argv += ["--label", label]
+        return _ref_from_url(self._run(argv))

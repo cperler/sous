@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "spec",
+  "description": "The front-door decomposition doc: an idea broken into small, dependency-ordered, independently-shippable tasks that deterministic code files as issues into the batch lane. The model authors it during a conversation; spec_intake consumes it.",
+  "type": "object",
+  "required": ["title", "summary", "tasks"],
+  "properties": {
+    "title": {"type": "string", "minLength": 1, "description": "the idea's name"},
+    "summary": {"type": "string", "minLength": 1, "description": "goal / constraints / non-goals in prose"},
+    "slug": {"type": ["string", "null"], "description": "optional override for the spec:<slug> batch label; derived from the title when absent"},
+    "tasks": {
+      "type": "array",
+      "minItems": 1,
+      "description": "the task graph, in any order; spec_intake topologically orders it for filing",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "body"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "description": "local id, unique within the spec (e.g. t1) — used only to express depends_on edges before real issue refs exist"},
+          "title": {"type": "string", "minLength": 1, "description": "the issue title"},
+          "body": {"type": "string", "minLength": 1, "description": "the full issue body: scope, acceptance criteria, out-of-scope"},
+          "depends_on": {"type": "array", "items": {"type": "string"}, "default": [], "description": "local ids this task depends on"},
+          "labels": {"type": "array", "items": {"type": "string"}, "default": []},
+          "provider_tag": {"type": ["string", "null"], "description": "per-task provider routing tag (e.g. codex)"},
+          "pipeline": {"type": ["string", "null"], "description": "lane preset hint (e.g. micro/lite/full) for the batch run"},
+          "estimate": {"type": ["string", "null"], "description": "human-readable size/cost estimate"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

@@ -68,6 +68,29 @@ docs/                    design doc, plan, and the as-built/target spec (see bel
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
 
+## The front door: idea → issues
+
+A run starts from an already-written issue. The **spec front door** is the missing
+upstream: it turns *an idea* into small, dependency-ordered, independently-shippable
+issues that feed the batch lane. The model authors a spec file during a conversation
+(the `spec-intake` skill guides it); deterministic code validates and files it. The
+spec shape is a JSON doc validated by `orchestrator/schemas/spec.json` — a `title`,
+`summary`, and `tasks[]` where each task has a local `id`, `title`, full-issue `body`,
+`depends_on` (local ids), and optional `labels`/`provider_tag`/`pipeline`/`estimate`.
+
+```bash
+uv run orchestrator spec validate spec.json     # schema + DAG (cycles, unknown refs, dup ids)
+uv run orchestrator spec plan spec.json          # print the topological filing plan — no writes
+uv run orchestrator --project $PROJECT spec file spec.json --dry-run   # preview exactly what would be created
+uv run orchestrator --project $PROJECT spec file spec.json            # file each task in dependency order
+```
+
+`spec file` files each task via the project's task source in topological order,
+translating local `depends_on` ids into the real issue refs of already-filed tasks
+(a `Depends-on: #N` line in each body), applying the task's labels plus a `spec:<slug>`
+batch label so the whole set is queryable (`gh issue list --label spec:<slug>`). The
+filed issues then feed the batch lane below (`add-task --task "#N"` for each).
+
 ## Running it
 
 Two things vary independently: **how you launch** (from a plain terminal, or from inside

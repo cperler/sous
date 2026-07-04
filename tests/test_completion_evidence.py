@@ -314,6 +314,21 @@ def test_github_source_publish_note_and_file_followup() -> None:
     assert ref == "https://github.com/o/r/issues/99"
 
 
+def test_github_source_create_task_returns_hash_ref(tmp_path) -> None:
+    # The spec front door's filing hook (#18): thin `gh issue create`, ref parsed to #N.
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> str:
+        calls.append(argv)
+        return "https://github.com/o/r/issues/42\n"
+
+    src = GitHubIssuesSource("o/r", runner=runner)
+    ref = src.create_task("New task", "the body", labels=["spec:x", "frontend"])
+    assert calls[-1] == ["gh", "issue", "create", "--repo", "o/r", "--title", "New task",
+                         "--body", "the body", "--label", "spec:x", "--label", "frontend"]
+    assert ref == "#42"  # translated from the URL for Depends-on lines
+
+
 def test_localfile_source_publish_note_and_file_followup(tmp_path) -> None:
     src = LocalFileTaskSource(tmp_path / "tasks.json")
 
@@ -324,6 +339,19 @@ def test_localfile_source_publish_note_and_file_followup(tmp_path) -> None:
     assert ref == "local:A title"
     log = (tmp_path / "followups.log").read_text()
     assert "deferred-scope" in log and "A title" in log
+
+
+def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
+    import json
+
+    path = tmp_path / "tasks.json"
+    path.write_text(json.dumps({"t1": {"title": "existing", "body": "x"}}))
+    src = LocalFileTaskSource(path)
+
+    ref = src.create_task("New", "body", labels=["spec:x"])
+    assert ref == "t2"
+    data = json.loads(path.read_text())
+    assert data["t2"] == {"title": "New", "body": "body", "labels": ["spec:x"]}
 
 
 # --- review schema -----------------------------------------------------------------

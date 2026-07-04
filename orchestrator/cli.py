@@ -122,6 +122,19 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
+    sp = sub.add_parser("spec", help="front door (#18): idea → validated spec → dependency-ordered issues")
+    spsub = sp.add_subparsers(dest="spec_cmd", required=True)
+    spv = spsub.add_parser("validate", help="schema + DAG check a spec file (no writes)")
+    spv.add_argument("file", help="spec JSON file")
+    spp = spsub.add_parser("plan", help="print the ordered filing plan (no writes)")
+    spp.add_argument("file", help="spec JSON file")
+    spf = spsub.add_parser("file", help="file each task as an issue in dependency order")
+    spf.add_argument("file", help="spec JSON file")
+    spf.add_argument("--dry-run", action="store_true",
+                     help="print exactly what would be created; file nothing")
+    # Accept --project after the subcommand too (SUPPRESS: don't clobber the global one).
+    spf.add_argument("--project", default=argparse.SUPPRESS,
+                     help="project-config module/dir supplying the task source (may also precede 'spec')")
     gc = sub.add_parser("gc", help="list/prune long-lived git checkpoint tags (no run/project needed)")
     gc.add_argument("--repo", default=".", help="git repo/worktree to scan for checkpoint tags")
     gc.add_argument("--keep-latest", type=int, default=0,
@@ -176,6 +189,35 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"project": getattr(config, "name", None), "valid": not missing,
                "missing": missing, "contract_version": ADAPTER_CONTRACT_VERSION})
         return 1 if missing else 0
+
+    if args.cmd == "spec":
+        # The front door (#18). validate/plan are pure (no project); file needs a task
+        # source. load_spec raises SpecError (a clear message) on any bad input.
+        from .spec_intake import SpecError, file_spec, load_spec, topological_order
+        from .spec_intake import plan as spec_plan
+
+        try:
+            spec = load_spec(args.file)
+        except SpecError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        if args.spec_cmd == "validate":
+            _emit({"ok": True, "title": spec["title"], "tasks": len(spec["tasks"]),
+                   "order": topological_order(spec)})
+            return 0
+        if args.spec_cmd == "plan":
+            sys.stdout.write(spec_plan(spec) + "\n")
+            return 0
+        # spec file — needs the project's task source.
+        if not args.project:
+            p.error("--project is required for `spec file`")
+        source = load_project(args.project).task_source
+        try:
+            _emit(file_spec(spec, source, dry_run=args.dry_run))
+        except SpecError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        return 0
 
     if not args.root or not args.run or not args.project:
         p.error(f"--root, --run and --project are required for {args.cmd}")

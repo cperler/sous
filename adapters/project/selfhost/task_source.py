@@ -63,3 +63,16 @@ class LocalFileTaskSource:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"{ref}\t{','.join(labels or [])}\t{title}\n{body}\n\n")
         return ref
+
+    def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
+        """Create a new task in the tasks file and return its id (the offline mirror of the
+        GitHub source's spec-filing hook, #18). Assigns the next free ``t<N>`` id so the
+        spec front door's Depends-on translation works against the local lane too."""
+        data = self._load() if self.tasks_path.exists() else {}
+        n = len(data) + 1
+        while f"t{n}" in data:
+            n += 1
+        task_id = f"t{n}"
+        data[task_id] = {"title": title, "body": body, "labels": list(labels or [])}
+        self.tasks_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        return task_id
