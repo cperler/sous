@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "brainstorm",
+  "description": "A divergent-exploration session captured as a durable, replayable record: a fuzzy area/goal plus the candidate ideas it produced, each scored by impact/effort/risk. The model authors it during a conversation (see the brainstorm skill) after exploring the codebase, the issue backlog, and run history; brainstorm.py consumes it — ranking the ideas into a shortlist and filing the human's picks as issues. The front door ABOVE spec-intake: ideas out, which then become standalone enhancement issues or feed spec-intake to become a full spec/batch.",
+  "type": "object",
+  "required": ["area", "ideas"],
+  "properties": {
+    "area": {"type": "string", "minLength": 1, "description": "the fuzzy area/goal the session explored (e.g. 'reduce batch-run cost')"},
+    "ideas": {
+      "type": "array",
+      "minItems": 1,
+      "description": "the candidate ideas, in any order; brainstorm.py ranks them deterministically for the shortlist",
+      "items": {
+        "type": "object",
+        "required": ["title", "problem", "proposal", "impact", "effort", "risk"],
+        "properties": {
+          "title": {"type": "string", "minLength": 1, "description": "the idea's name — becomes the issue title when filed"},
+          "problem": {"type": "string", "minLength": 1, "description": "the concrete gap/pain this idea addresses"},
+          "proposal": {"type": "string", "minLength": 1, "description": "the proposal sketch — how it would be addressed"},
+          "impact": {"enum": ["high", "medium", "low"], "description": "expected value if shipped (ranked descending)"},
+          "effort": {"enum": ["small", "medium", "large"], "description": "rough build cost (ranked ascending — cheaper first)"},
+          "risk": {"enum": ["low", "medium", "high"], "description": "delivery/behavioral risk (ranked ascending — safer first)"},
+          "evidence": {"type": "array", "items": {"type": "string"}, "default": [], "description": "pointers that back the idea: file paths, issue refs, run-log observations"}
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

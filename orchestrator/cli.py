@@ -221,6 +221,23 @@ def main(argv: list[str] | None = None) -> int:
                      help="print exactly what would be added; add nothing")
     bpa.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also precede 'batch-plan')")
+    bs = sub.add_parser("brainstorm", help="front door above intake (#2): a fuzzy area → "
+                                           "ranked shortlist of ideas → filed enhancement "
+                                           "issues (skill authors the ideas; this ranks/files)")
+    bssub = bs.add_subparsers(dest="brainstorm_cmd", required=True)
+    bsv = bssub.add_parser("validate", help="schema-check a brainstorm session file (no writes)")
+    bsv.add_argument("file", help="brainstorm JSON file")
+    bsc = bssub.add_parser("capture", help="print the ranked shortlist; --file-selected files "
+                                           "the chosen ideas as issues")
+    bsc.add_argument("file", help="brainstorm JSON file")
+    bsc.add_argument("--file-selected", default=None,
+                     help="comma-separated 1-based shortlist ranks to file as issues "
+                          "(e.g. 1,3); omit to only print the shortlist")
+    bsc.add_argument("--dry-run", action="store_true",
+                     help="with --file-selected: print exactly what would be filed; file nothing")
+    bsc.add_argument("--project", default=argparse.SUPPRESS,
+                     help="project-config module/dir supplying the task source (may also "
+                          "precede 'brainstorm')")
     gc = sub.add_parser("gc", help="list/prune long-lived git checkpoint tags (no run/project needed)")
     gc.add_argument("--repo", default=".", help="git repo/worktree to scan for checkpoint tags")
     gc.add_argument("--keep-latest", type=int, default=0,
@@ -454,6 +471,48 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": False, "error": str(exc)})
             return 1
         _emit(result)
+        return 0
+
+    if args.cmd == "brainstorm":
+        # The front door ABOVE intake (#2). validate/capture-print are pure (no project);
+        # capture --file-selected needs a task source. The model authors the ideas — this
+        # only ranks and files. load_brainstorm raises BrainstormError on any bad input.
+        from .brainstorm import (
+            BrainstormError,
+            file_selected,
+            load_brainstorm,
+            rank_ideas,
+            render_shortlist,
+        )
+
+        try:
+            doc = load_brainstorm(args.file)
+        except BrainstormError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        if args.brainstorm_cmd == "validate":
+            _emit({"ok": True, "area": doc["area"], "ideas": len(doc["ideas"]),
+                   "order": [i["title"] for i in rank_ideas(doc)]})
+            return 0
+        # capture: always print the durable, replayable shortlist.
+        sys.stdout.write(render_shortlist(doc) + "\n")
+        if args.file_selected is None:
+            return 0  # no selection — just the shortlist
+        try:
+            selected = [int(s.strip()) for s in args.file_selected.split(",") if s.strip()]
+        except ValueError:
+            _emit({"ok": False, "error": "--file-selected must be comma-separated integers "
+                   "(1-based shortlist ranks)"})
+            return 1
+        # Filing opens real issues — needs the project's task source (dry-run excepted).
+        if not args.project and not args.dry_run:
+            p.error("--project is required to file selected ideas (or use --dry-run)")
+        source = load_project(args.project).task_source if args.project else None
+        try:
+            _emit(file_selected(doc, source, selected, dry_run=args.dry_run))
+        except BrainstormError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
         return 0
 
     if not args.root or not args.run or not args.project:
