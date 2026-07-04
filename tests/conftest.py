@@ -26,6 +26,7 @@ class FakeTaskSource:
         self.deps: dict[str, list[str]] = {}  # task_id -> depends_on (test-configurable)
         self.notes: list[dict] = []  # publish_note calls
         self.followups: list[dict] = []  # file_followup calls
+        self.progress: list[dict] = []  # publish_progress calls (mid-run, #64)
 
     def resolve(self, task_id: str) -> TaskSpec:
         return TaskSpec(
@@ -42,6 +43,13 @@ class FakeTaskSource:
     # Optional evidence-out hooks (duck-typed by the engine at finalize).
     def publish_note(self, task_id: str, body: str, *, pr_url: str | None = None) -> None:
         self.notes.append({"task_id": task_id, "body": body, "pr_url": pr_url})
+
+    def publish_progress(
+        self, task_id: str, body: str, *, marker: str, pr_url: str | None = None
+    ) -> None:
+        self.progress.append(
+            {"task_id": task_id, "body": body, "marker": marker, "pr_url": pr_url}
+        )
 
     def file_followup(self, title: str, body: str, labels: list[str] | None = None) -> str:
         ref = f"https://example.test/issues/{len(self.followups) + 1}"

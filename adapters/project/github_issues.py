@@ -88,6 +88,69 @@ class GitHubIssuesSource:
                  "--body", body]
             )
 
+    def publish_progress(
+        self, task_id: str, body: str, *, marker: str, pr_url: str | None = None
+    ) -> None:
+        """Mid-run progress commentary (#64) with UPSERT semantics — ONE living comment/
+        section per task, never comment spam. ``marker`` is an opaque token the engine owns
+        (e.g. ``orchestrator:progress:#12``); this source wraps it in an HTML comment so it
+        is invisible in the rendered Markdown yet findable on the next update.
+
+        Routes on ``pr_url``: with a PR known, upsert a marker-delimited ``## Run progress``
+        section in the PR body (one section, edited in place); otherwise upsert a marker-
+        tagged issue comment (found via the REST comments list, edited via a PATCH, created
+        when absent). Upsert (edit-in-place) is the deliberate default over per-stage
+        append: a long run touches many stage boundaries, and a fresh comment each time
+        would bury the issue — the reader wants the CURRENT picture, not a scroll of
+        superseded ones."""
+        if pr_url:
+            self._upsert_pr_section(pr_url, body, marker)
+        else:
+            self._upsert_issue_comment(task_id, body, marker)
+
+    def _upsert_issue_comment(self, task_id: str, body: str, marker: str) -> None:
+        num = _issue_number(task_id)
+        tag = f"<!-- {marker} -->"
+        full = f"{tag}\n{body}"
+        # Find our previous progress comment by the hidden marker. `gh api` (not
+        # `gh issue view --json comments`) is used because the REST payload carries the
+        # numeric comment id the PATCH edit needs; --paginate folds multiple pages into
+        # one JSON array.
+        raw = self._run(
+            ["gh", "api", f"repos/{self.repo}/issues/{num}/comments", "--paginate"]
+        )
+        comments = json.loads(raw) if raw.strip() else []
+        existing = next((c for c in comments if tag in (c.get("body") or "")), None)
+        if existing is not None:
+            self._run(
+                ["gh", "api", "-X", "PATCH",
+                 f"repos/{self.repo}/issues/comments/{existing['id']}",
+                 "-f", f"body={full}"]
+            )
+        else:
+            self._run(
+                ["gh", "issue", "comment", num, "--repo", self.repo, "--body", full]
+            )
+
+    def _upsert_pr_section(self, pr_url: str, body: str, marker: str) -> None:
+        start = f"<!-- {marker}:start -->"
+        end = f"<!-- {marker}:end -->"
+        section = f"{start}\n## Run progress\n\n{body}\n{end}"
+        raw = self._run(["gh", "pr", "view", pr_url, "--json", "body"])
+        current = (json.loads(raw).get("body") if raw.strip() else "") or ""
+        if start in current and end in current:
+            # Replace the existing section in place (a lambda replacement so a `body`
+            # containing backslashes/group refs is inserted literally).
+            new_body = re.sub(
+                re.escape(start) + r".*?" + re.escape(end),
+                lambda _m: section,
+                current,
+                flags=re.DOTALL,
+            )
+        else:
+            new_body = f"{current}\n\n{section}" if current else section
+        self._run(["gh", "pr", "edit", pr_url, "--body", new_body])
+
     def file_followup(
         self, title: str, body: str, labels: list[str] | None = None
     ) -> str | None:

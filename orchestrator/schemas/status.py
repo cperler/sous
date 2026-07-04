@@ -230,6 +230,12 @@ class Run(BaseModel):
     # re-queue and a fallback-disallowing lane are never downgraded. Additive field: pre-#12
     # run docs load with the default. Default off.
     route_by_capacity: bool = False
+    # Mid-run progress commentary (#64): when True, the engine upserts a living progress
+    # comment/PR-body section on the driving issue/PR at each stage boundary (throttled),
+    # so a human can follow a long run from GitHub. Outward-facing, so default OFF — a run
+    # against a real repo only posts when explicitly opted in. Additive field: pre-#64 run
+    # docs load with the default, no SCHEMA_VERSION bump.
+    progress_comments: bool = False
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""

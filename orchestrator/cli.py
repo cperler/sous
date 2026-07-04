@@ -82,6 +82,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="enable capacity-aware model downgrade (#12): a FRESH dispatch "
                          "drops to a cheaper model while utilization is high (>=70%%, below "
                          "the 90%% wait gate) so work keeps progressing under load")
+    ir.add_argument("--progress-comments", action="store_true",
+                    help="post mid-run progress commentary to the driving issue/PR (#64): "
+                         "an upserted living comment/PR-body section at each stage boundary "
+                         "(default off — outward-facing, opt-in for real-repo runs)")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
@@ -327,10 +331,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "init-run":
         run = eng.create_run(args.run, ExecutionLane(args.lane),
                              budget_usd=args.budget_usd, route_by_cost=args.route_by_cost,
-                             route_by_capacity=args.route_by_capacity)
+                             route_by_capacity=args.route_by_capacity,
+                             progress_comments=args.progress_comments)
         _emit({"created_run": run.run_id, "lane": run.lane.value,
                "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
-               "route_by_capacity": run.route_by_capacity})
+               "route_by_capacity": run.route_by_capacity,
+               "progress_comments": run.progress_comments})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage
 

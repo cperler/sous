@@ -53,6 +53,17 @@ class LocalFileTaskSource:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"# {task_id} {pr_url or ''}\n{body}\n\n")
 
+    def publish_progress(
+        self, task_id: str, body: str, *, marker: str, pr_url: str | None = None
+    ) -> None:
+        """Upsert mid-run progress (#64) into a sibling ``progress.json`` keyed by the
+        ``marker`` — the offline stand-in for the GitHub source's one-living-comment upsert.
+        Overwriting the same key each stage keeps a single current entry, never a pile."""
+        path = self.tasks_path.with_name("progress.json")
+        data = json.loads(path.read_text()) if path.exists() else {}
+        data[marker] = {"task_id": task_id, "pr_url": pr_url, "body": body}
+        path.write_text(json.dumps(data, indent=2), encoding="utf-8")
+
     def file_followup(
         self, title: str, body: str, labels: list[str] | None = None
     ) -> str | None:

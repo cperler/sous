@@ -46,9 +46,19 @@ class TaskSource(Protocol):
     # them keeps running unchanged; that's why adding them needs no CONTRACT_VERSION bump):
     #   publish_note(task_id, body, *, pr_url=None) -> None
     #       publish a run's completion evidence (a PR/issue comment, a log line, …).
+    #   publish_progress(task_id, body, *, marker, pr_url=None) -> None
+    #       upsert MID-RUN progress (#64) — the living status the engine refreshes at each
+    #       stage boundary (opt-in per run, throttled, best-effort) so a human can follow a
+    #       long run from GitHub. UPSERT semantics (one living comment/section per task, never
+    #       spam): the source finds its previous progress by the opaque ``marker`` token
+    #       (which it wraps in a hidden HTML comment) and EDITS it, else creates it. Routes on
+    #       ``pr_url``: a PR-body ``## Run progress`` section when a PR is known, else an issue
+    #       comment — one method, one seam. Same duck-typed best-effort contract as
+    #       publish_note: getattr-called at stage boundaries, a raising/missing hook is
+    #       swallowed + evented (``progress_publish_failed``) and NEVER breaks record().
     #   file_followup(title, body, labels=None) -> str | None
     #       open a follow-up (e.g. a review's non-blocking finding); return its ref/URL.
-    # The shared GitHubIssuesSource and LocalFileTaskSource implement both.
+    # The shared GitHubIssuesSource and LocalFileTaskSource implement all three.
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
     # itself rather than the task source):

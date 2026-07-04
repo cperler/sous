@@ -8,7 +8,7 @@ so they are trivially testable and the engine just writes their output.
 
 from __future__ import annotations
 
-from .schemas.enums import STAGE_ORDER, ExecutionMode
+from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
 from .schemas.status import StageRecord, Task
 
 
@@ -404,6 +404,109 @@ def render_completion_note(
               "findings are tracked as follow-up issues; the improvement idea is filed as an "
               "enhancement._", ""]
     return "\n".join(lines)
+
+
+_STAGE_GLYPH = {
+    StageStatus.COMPLETED: "✅",
+    StageStatus.RUNNING: "▶️",
+    StageStatus.FAILED: "❌",
+    StageStatus.PENDING: "…",
+    StageStatus.SKIPPED: "⏭️",
+}
+
+
+def render_progress(task: Task, *, now: str | None = None) -> str:
+    """Render a compact MID-RUN progress body (#64) — the living status the engine upserts
+    onto the driving issue/PR while a long run is in flight (distinct from
+    ``render_completion_note``, which is the once-at-finalize evidence).
+
+    Derived purely from the task's recorded stages, so it is reconstructible on replay:
+    a stage table over the task's own pipeline (done ✅ / running ▶️ / next … / failed ❌),
+    per-stage attempt counts, the review-cycle / salvage / infra-reset budgets when non-zero,
+    elapsed wall time, and metered cost-to-date summed across the recorded stages.
+    ``now`` (ISO) overrides the elapsed clock for deterministic tests."""
+    state = task.state.value.replace("_", " ")
+    lines = [
+        f"## Run progress — {task.task_id}",
+        "",
+        f"- **Task:** {task.title or '(no title)'}",
+        f"- **State:** {state}",
+    ]
+    if task.pr_url:
+        lines.append(f"- **PR:** {task.pr_url}")
+
+    # Metered cost-to-date: sum the recorded per-stage costs. Interactive stages record
+    # 0.0 (they cannot meter in-session), so note them rather than implying "free".
+    total = 0.0
+    metered = False
+    unmetered_stages = 0
+    for stage in task.pipeline:
+        rec = task.stages[stage]
+        if rec.status is StageStatus.COMPLETED and rec.lane is ExecutionMode.INTERACTIVE:
+            unmetered_stages += 1
+        elif isinstance(rec.cost_usd, (int, float)):
+            total += rec.cost_usd
+            metered = True
+    if metered and unmetered_stages:
+        cost_str = f"${total:.4f} (+{unmetered_stages} unmetered interactive stage(s))"
+    elif metered:
+        cost_str = f"${total:.4f}"
+    elif unmetered_stages:
+        cost_str = "n/a (interactive lane — unmetered)"
+    else:
+        cost_str = "—"
+    lines.append(f"- **Cost to date:** {cost_str}")
+
+    elapsed = _elapsed_min(task.created_at, now)
+    if elapsed is not None:
+        lines.append(f"- **Elapsed:** {elapsed:.1f} min")
+
+    notes = []
+    if task.review_cycles:
+        notes.append(f"{task.review_cycles} review cycle(s)")
+    if task.salvage_count:
+        notes.append(f"{task.salvage_count} salvage-keep(s)")
+    if task.infra_resets:
+        notes.append(f"{task.infra_resets} infra-reset(s)")
+    if task.rate_limit_waits:
+        notes.append(f"{task.rate_limit_waits} rate-limit wait(s)")
+    if notes:
+        lines.append(f"- **Recovery:** {', '.join(notes)}")
+
+    lines += [
+        "",
+        "| Stage | Status | Attempts | Cost |",
+        "|---|---|---:|---:|",
+    ]
+    next_marked = False
+    for stage in task.pipeline:
+        rec = task.stages[stage]
+        glyph = _STAGE_GLYPH.get(rec.status, "")
+        label = f"{glyph} {rec.status.value}".strip()
+        # Flag the first not-yet-started stage as the upcoming one.
+        if rec.status is StageStatus.PENDING and not next_marked:
+            label += " (next)"
+            next_marked = True
+        lines.append(
+            f"| {stage.value} | {label} | {rec.attempt} | {_cost_cell(rec)} |"
+        )
+    lines += ["", "_Live progress from the orchestration harness; updated as stages land._", ""]
+    return "\n".join(lines)
+
+
+def _elapsed_min(created_at: str, now: str | None) -> float | None:
+    from datetime import UTC, datetime
+
+    try:
+        start = datetime.fromisoformat(created_at)
+        end = datetime.fromisoformat(now) if now else datetime.now(UTC)
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=UTC)
+        if end.tzinfo is None:
+            end = end.replace(tzinfo=UTC)
+        return max(0.0, (end - start).total_seconds()) / 60.0
+    except ValueError:
+        return None
 
 
 def render_rejection_note(

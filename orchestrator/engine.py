@@ -30,6 +30,7 @@ from .render import (
     render_completion_note,
     render_cost_report,
     render_cost_summary,
+    render_progress,
     render_rejection_note,
     render_retrospective,
     render_stage,
@@ -124,6 +125,7 @@ class Engine:
         rate_limit_cooldown_s: int = 900,
         max_infra_resets: int = 2,
         max_salvage_keeps: int = 1,
+        progress_throttle_s: float = 60.0,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -163,6 +165,13 @@ class Engine:
         # if the salvaged work didn't unstick the retry, the next salvageable failure
         # discards the pile and starts clean from the checkpoint.
         self.max_salvage_keeps = max_salvage_keeps
+        # Mid-run progress commentary (#64): don't hammer the GitHub API on rapid stage
+        # boundaries — skip a publish if this task's last one was < this many seconds ago.
+        # The last-publish stamp is per-PROCESS in-memory (record() is frequent and this is
+        # best-effort audit UX, not durable state): a resumed run simply re-publishes, which
+        # is harmless given the upsert (one living comment, never spam). Keyed by (run, task).
+        self.progress_throttle_s = progress_throttle_s
+        self._last_progress_at: dict[tuple[str, str], float] = {}
 
     # --- run/task setup -------------------------------------------------------
     def create_run(
@@ -173,16 +182,19 @@ class Engine:
         budget_usd: float | None = None,
         route_by_cost: bool = False,
         route_by_capacity: bool = False,
+        progress_comments: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
         enables cost-aware lane routing for un-pinned tasks; ``route_by_capacity`` enables
-        capacity-aware model downgrade of fresh dispatches under high utilization (#12).
-        All default off; the two routers are DISTINCT levers (USD vs rate-limit headroom)."""
+        capacity-aware model downgrade of fresh dispatches under high utilization (#12);
+        ``progress_comments`` opts into mid-run progress commentary on the driving issue/PR
+        (#64 — outward-facing, so default off). All default off; the two routers are DISTINCT
+        levers (USD vs rate-limit headroom)."""
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
-            route_by_capacity=route_by_capacity,
+            route_by_capacity=route_by_capacity, progress_comments=progress_comments,
         )
         self.store.save_run(run)
         return run
@@ -751,6 +763,12 @@ class Engine:
                 "task_state": task.state.value,
             },
         )
+        # Mid-run progress commentary (#64): upsert the living progress comment/PR-body
+        # section on the driving issue/PR at this stage boundary (opt-in, throttled,
+        # best-effort). A rate-limit re-queue is NOT a boundary (same stage/attempt goes
+        # back on the wire) — skip it so the running/next picture doesn't flicker.
+        if not outcome.startswith("stage_rate_limited"):
+            self._maybe_publish_progress(run_id, task)
         # Audit a cooldown park: when the task may dispatch again, and how much of the
         # wait budget is spent — so a stalled-looking run explains itself in the events.
         if outcome == "stage_rate_limited_cooldown":
@@ -1893,6 +1911,48 @@ class Engine:
                 {"ts": _now(), "type": "completion_note_failed", "run_id": run_id,
                  "task_id": task.task_id, "error": str(exc)},
             )
+
+    def _maybe_publish_progress(self, run_id: str, task: Task) -> None:
+        """Mid-run progress commentary (#64): if the run opted in (``progress_comments``)
+        and the task source exposes ``publish_progress``, upsert a compact progress body onto
+        the driving issue/PR. Throttled per (run, task) and best-effort — a missing hook, a
+        disabled run, or a RAISING hook NEVER breaks record() (mirrors ``publish_note``);
+        each attempt is evented (``progress_published`` / ``progress_publish_failed``)."""
+        run = self.store.load_run(run_id)
+        if not getattr(run, "progress_comments", False):
+            return
+        publish = getattr(self.project.task_source, "publish_progress", None)
+        if not callable(publish) or task.issue_number is None:
+            return
+        # Throttle: skip a rapid successive publish unless the task is now terminal — the
+        # final state must always land, whatever the timing.
+        key = (run_id, task.task_id)
+        now = time.monotonic()
+        last = self._last_progress_at.get(key)
+        if (
+            not task.is_terminal
+            and last is not None
+            and (now - last) < self.progress_throttle_s
+        ):
+            return
+        marker = f"orchestrator:progress:{task.task_id}"
+        body = render_progress(task)
+        try:
+            publish(task.task_id, body, marker=marker, pr_url=task.pr_url)
+        except Exception as exc:  # noqa: BLE001 - progress commentary must never break a run
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "progress_publish_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+            return
+        self._last_progress_at[key] = now
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "progress_published", "run_id": run_id,
+             "task_id": task.task_id, "target": "pr" if task.pr_url else "issue",
+             "task_state": task.state.value},
+        )
 
     def _cascade_from(self, run_id: str, failed_task_id: str) -> None:
         """Transitively cascade-block every dependent of a failed task (fix D14)."""
