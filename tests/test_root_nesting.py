@@ -124,3 +124,17 @@ def test_fresh_root_still_writes_flat(tmp_path, capsys) -> None:
 
     assert (tmp_path / "status-r1.json").exists()
     assert not (tmp_path / "r1").exists()
+
+
+def test_trailing_slash_root_does_not_false_positive_nesting_note(tmp_path, capsys) -> None:
+    # #90: a trailing slash on a fresh --root normalizes to the same Path as the
+    # resolved store root, so no nesting happens and the note must stay silent.
+    # (Pre-fix the note compared raw arg-string to normalized Path str and printed.)
+    base = ["--root", f"{tmp_path}/", "--run", "r1", "--project", "tests.fakeproject"]
+    assert main([*base, "init-run", "--lane", "full"]) == 0
+
+    err = capsys.readouterr().err
+    assert "shared runs-root" not in err
+    # Store still lands flat at the given root — no surprise nesting from the slash.
+    assert (tmp_path / "status-r1.json").exists()
+    assert not (tmp_path / "r1").exists()
