@@ -78,7 +78,7 @@ from .schemas.enums import (
     TaskState,
 )
 from .schemas.status import Run, Task, TaskRef
-from .schemas.work import LanePolicy, StageResult, WorkItem
+from .schemas.work import LanePolicy, LaneUsed, StageResult, TokenUsage, WorkItem
 from .stages import STAGE_SPECS, render_prompt
 from .state_machine import (
     apply_result,
@@ -105,6 +105,13 @@ def _in_future(iso: str | None) -> bool:
         return datetime.fromisoformat(iso) > datetime.now(UTC)
     except ValueError:
         return False
+
+
+# Default liveness window for `abandon` (#82): a mid-dispatch abandon is refused when the
+# task's provider stream grew within this many seconds of now (the dispatch may still be
+# alive). Five minutes is comfortably longer than a normal inter-event gap on a live
+# headless stream; `force=True` overrides it when the operator knows the process is dead.
+DEFAULT_ABANDON_MIN_IDLE_S = 300
 
 
 # Failure kinds whose committed work is NOT implicated by the failure itself, so any
@@ -1903,6 +1910,184 @@ class Engine:
                 {"ts": _now(), "type": "rejection_note_published", "run_id": run_id,
                  "task_id": task.task_id},
             )
+
+    def abandon(
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        reason: str,
+        disposition: str = "failed",
+        min_idle_s: int = DEFAULT_ABANDON_MIN_IDLE_S,
+        force: bool = False,
+    ) -> Task:
+        """Sanctioned finalize for a task whose run was killed mid-dispatch (#82).
+
+        When a run dies mid-dispatch (supervisor killed, machine rebooted, human walked
+        away) the task is left holding an outstanding lease (``pending_work_item_id``) that
+        every state-changing path correctly refuses to step over: ``record`` demands the
+        dispatch's matching result, ``hold`` refuses while a dispatch is outstanding, and
+        ``reject`` demands an already-held task. The only prior escape was hand-crafting a
+        synthetic lease-matching ``StageResult`` and feeding it to ``record`` — this is that
+        escape, sanctioned and guarded.
+
+        It synthesizes the abandonment INTERNALLY (an honest $0 cost-ledger row, raw output
+        naming the reason, outcome ``dispatch_abandoned``) WITHOUT routing through
+        ``record``'s retry/fallback machinery, clears the lease, bumps the stage counter, and
+        transitions the task DIRECTLY to a terminal state — FAILED (``disposition='failed'``)
+        or CLOSED_INFEASIBLE (``disposition='rejected'``, writing the same durable rejection
+        artifact ``reject`` does). It then runs the SAME post-transition run-level effects
+        ``reject`` performs (cascade-block dependents, release ports, harvest learnings,
+        finalize the run) so the run actually reaches terminal instead of hanging open.
+
+        Guards (all ``ContractError``):
+          - nothing to abandon: the task has no outstanding dispatch;
+          - the task is already terminal;
+          - the dispatch appears ALIVE — its provider stream grew within ``min_idle_s`` of
+            now (the #66 probe is the liveness sensor). ``force=True`` overrides this last
+            guard: the operator asserting the dispatch is dead despite a recent stream write.
+        """
+        if disposition not in ("failed", "rejected"):
+            raise ContractError(
+                f"unknown abandon disposition {disposition!r} (expected 'failed' or 'rejected')"
+            )
+        task = self.store.load_task(run_id, task_id)
+        if task.state in TERMINAL_TASK_STATES:
+            raise ContractError(
+                f"task {task_id} is terminal ({task.state.value}); nothing to abandon"
+            )
+        if task.pending_work_item_id is None:
+            raise ContractError(
+                f"task {task_id} has no outstanding dispatch to abandon "
+                f"(state {task.state.value})"
+            )
+        stage = task.current_stage
+        if stage is None:  # a lease without a current stage is a corrupt doc — refuse
+            raise ContractError(
+                f"task {task_id} holds a lease {task.pending_work_item_id} but has no "
+                f"current stage; cannot abandon"
+            )
+        work_item_id = task.pending_work_item_id
+        content_hash = task.pending_content_hash
+
+        # Liveness guard (#66 probe as the sensor): refuse if the dispatch's provider stream
+        # grew recently — it may still be running. ``last_event_at`` is the stream file mtime
+        # (epoch seconds). A missing stream (interactive/ENGINE lane, or nothing teed) leaves
+        # ``stream_last_grew`` None, so the guard is vacuous there and the abandon proceeds.
+        snap = probe_current_stream(self.store.root, task_id, stage.value, tail_lines=0)
+        stream_last_grew = snap.get("last_event_at") if snap else None
+        if not force and isinstance(stream_last_grew, (int, float)):
+            idle_s = time.time() - stream_last_grew
+            if idle_s < min_idle_s:
+                raise ContractError(
+                    f"dispatch for task {task_id} appears alive: its stream last grew "
+                    f"{idle_s:.0f}s ago (< min_idle_s {min_idle_s}s). Wait it out, lower "
+                    f"--min-idle-s, or pass --force if you know the process is dead."
+                )
+
+        # Synthesize the lease-matching abandonment honestly. No model ran, so the lane_used
+        # invocation says exactly that and the token usage is empty (the ledger reprices to
+        # $0). We reuse the intended lane cell (router) for accurate attribution.
+        dispatched = task.stages[stage]
+        lane = self.router.lane_for(stage, task)
+        completed_at = _now()
+        synthetic = StageResult(
+            work_item_id=work_item_id,
+            content_hash=content_hash or "",
+            run_id=run_id,
+            task_id=task_id,
+            stage=stage,
+            attempt=dispatched.attempt,
+            model=dispatched.model or ENGINE_MODEL,
+            status=ResultStatus.FAILURE,
+            raw_output=f"Dispatch abandoned (no model call completed): {reason}",
+            lane_used=LaneUsed(
+                execution_mode=lane.execution_mode,
+                provider=lane.provider,
+                invocation=f"abandoned: dispatch orphaned, no model call ({reason})",
+            ),
+            token_usage=TokenUsage(),
+            error=f"dispatch_abandoned: {reason}",
+            completed_at=completed_at,
+        )
+        duration_s: float | None = None
+        if dispatched.started_at:
+            try:
+                duration_s = max(
+                    0.0,
+                    (datetime.now(UTC) - datetime.fromisoformat(dispatched.started_at))
+                    .total_seconds(),
+                )
+            except ValueError:
+                duration_s = None
+        cost = self.ledger.record(synthetic, duration_s=duration_s)["cost_usd"]
+
+        # Clear the lease and fold the abandonment into the stage record + task state DIRECTLY
+        # (not via apply_result / record — an abandoned dispatch never converges, so none of
+        # the retry/salvage/fallback machinery applies).
+        task.pending_work_item_id = None
+        task.pending_content_hash = None
+        task.pending_fallback_model = None
+        dispatched.status = StageStatus.FAILED
+        dispatched.completed_at = completed_at
+        dispatched.error = f"dispatch_abandoned: {reason}"
+        dispatched.provider = lane.provider
+        dispatched.lane = lane.execution_mode
+        dispatched.cost_usd = cost
+        task.last_error = f"dispatch_abandoned: {reason}"
+        task.state = (
+            TaskState.CLOSED_INFEASIBLE if disposition == "rejected" else TaskState.FAILED
+        )
+        task.updated_at = _now()
+
+        task.stage_counter += 1
+        seq = task.stage_counter
+        payload = {
+            "work_item_id": work_item_id,
+            "stage": stage.value,
+            "task_id": task_id,
+            "attempt": dispatched.attempt,
+            "status": synthetic.status.value,
+            "outcome": "dispatch_abandoned",
+            "model": synthetic.model,
+            "lane_used": synthetic.lane_used.model_dump(),
+            "cost_usd": cost,
+            "raw_output": synthetic.raw_output,
+            "error": synthetic.error,
+            "completed_at": completed_at,
+        }
+        self.store.write_stage_log(task_id, seq, stage.value, payload)
+        self.store.write_stage_markdown(task_id, seq, stage.value, render_stage(payload))
+        # A rejected abandon writes the SAME durable rejection artifact reject() does (the
+        # gate record), so status()/retrospective read the reason back the identical way.
+        rejection_reason = None
+        if disposition == "rejected":
+            rejection_reason = reason
+            self.store.write_rejection(
+                run_id, task_id,
+                {"rejected_by": "abandon", "at": completed_at, "reason": reason,
+                 "run_id": run_id, "task_id": task_id},
+            )
+        self.store.save_task(task)
+        self.store.write_task_index(
+            task_id, render_task_index(task, rejection_reason=rejection_reason)
+        )
+        self._set_ref_state(run_id, task_id, task.state)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "dispatch_abandoned", "run_id": run_id, "task_id": task_id,
+             "stage": stage.value, "attempt": dispatched.attempt, "work_item_id": work_item_id,
+             "reason": reason, "disposition": disposition,
+             "stream_last_grew": stream_last_grew, "forced": force},
+        )
+        # Same out-of-band post-transition run-level effects reject() performs: cascade-block
+        # dependents of the now-terminal task, release its port block (best-effort), harvest
+        # any learnings it accrued, and finalize the run so it closes instead of hanging open.
+        self._cascade_from(run_id, task_id)
+        self._release_ports(run_id, task)
+        self._harvest_task_learnings(run_id, task)
+        self._maybe_finalize_run(run_id)
+        return task
 
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
