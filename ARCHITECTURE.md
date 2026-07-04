@@ -125,6 +125,18 @@ conversation:
 - **Cross-provider fallthrough.** A `provider_unavailable` result (codex CLI missing / auth
   expired) can fall through to claude when the run opts in (`cross_provider_fallback`); off, it
   degrades to a normal retry-then-fail.
+- **Human approval gate.** A task parks in the non-terminal `BLOCKED_ON_HUMAN` state — via an
+  explicit `hold`, a scope stage reporting `feasible=false`, or exhausted fix cycles — and the
+  run cannot silently complete past it. The only exits are `Engine.approve()` (writes a durable
+  approval artifact recording who/what) and `Engine.reject()` (task ends
+  `completed_with_rejections`, rejection surfaced to the task source). This is the engine-side
+  enforcement of the live-run checkpoint: autonomous paths park; humans release.
+- **Cross-run learnings KB.** `orchestrator/learnings_kb.py` persists a shared
+  `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
+  (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
+  entries into the `prior_learnings` context key — read-only advisory text, folded once per
+  task, rendered (hedged) into every stage prompt. `orchestrator kb capture|apply|show|gc`
+  is the manual surface.
 - **Batch scheduler.** `orchestrator/scheduler.py` is a thin hub-and-spoke loop over the DAG
   (`orchestrator/dag.py` — transitive cascade-blocking). Each tick dispatches the
   dependency-satisfied, non-terminal tasks within the capacity limit; a batch-wide circuit
@@ -136,7 +148,10 @@ conversation:
 ## Observability
 
 Every run is a self-contained directory (`runs/<run>/`, gitignored, **retained until the
-human deletes it** — cleanup never touches it):
+human deletes it** — cleanup never touches it). `--root runs` is the natural spelling
+everywhere: per-run commands auto-nest the store under `<root>/<run>/` when the root is a
+shared runs-root (holds other runs' stores or the learnings KB), so run dirs and the
+cross-run `learnings-kb.jsonl` share one parent:
 
 ```
   runs/<run>/
@@ -152,7 +167,9 @@ human deletes it** — cleanup never touches it):
 - **CLIs** (`orchestrator/cli.py`): `status` (progress + cost + lane-attribution audit),
   `watch` (poll one run to terminal, alerting on stalls), `tail` (live tail of a running
   stage's stream via `stream_probe.py`), `dashboard` (`dashboard.py` — cross-session board of
-  all runs, "what needs a human" lifted to an attention band), `cost-report`, `retrospective`.
+  all runs, "what needs a human" lifted to an attention band), `cost-report`, `retrospective`,
+  `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
+  utilization for the Claude Code status bar, off the same usage cache).
 - **Seams** (`adapters/project/base.py`, all duck-typed/best-effort): `notify` /
   `emit_notification` for stall + transition alerts (`alerting.py`), `publish_progress` /
   `publish_note` to post progress to the task source, `file_followup` to file follow-up
@@ -169,7 +186,7 @@ human deletes it** — cleanup never touches it):
    flow hangs off these two methods.
 3. `orchestrator/state_machine.py` — stage transitions, the context-plane fold, fix-cycle reset.
 4. `orchestrator/scheduler.py` — how a batch fans the engine over a DAG.
-5. `tests/` (725 cases) — the behavioural spec; a `test_<subsystem>.py` exists per module, and
+5. `tests/` (838 cases) — the behavioural spec; a `test_<subsystem>.py` exists per module, and
    reading one is the fastest way to see a subsystem's contract exercised.
 
 Then, for depth and history: `docs/orchestration-spec/target.md` (the implementation-agnostic
