@@ -251,7 +251,7 @@ def test_prompt_orders_stable_parts_before_per_task_context(tmp_path, project) -
 
 
 # --- helpers ---------------------------------------------------------------
-def make_result_stub(stage: Stage, output: dict):
+def make_result_stub(stage: Stage, output: dict, *, mode=None, provider=None):
     from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
     from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
 
@@ -259,7 +259,35 @@ def make_result_stub(stage: Stage, output: dict):
         work_item_id="wi", content_hash="h", run_id="r", task_id="t", stage=stage,
         attempt=0, model="claude-opus-4-8", status=ResultStatus.SUCCESS,
         structured_output=output,
-        lane_used=LaneUsed(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE,
-                           invocation="x"),
+        lane_used=LaneUsed(execution_mode=mode or ExecutionMode.INTERACTIVE,
+                           provider=provider or Provider.CLAUDE, invocation="x"),
         token_usage=TokenUsage(), completed_at="2026-07-01T00:00:00Z",
     )
+
+
+# --- #41: the change_class fold is deterministic-only (no model loophole) --------------
+def test_change_class_folds_only_from_the_engine_lane() -> None:
+    from orchestrator.schemas.enums import ExecutionMode, Provider
+    from orchestrator.schemas.status import Task
+    from orchestrator.state_machine import DETERMINISTIC_ONLY_KEYS
+
+    assert "change_class" in DETERMINISTIC_ONLY_KEYS
+    assert "change_class" in CONTEXT_KEYS[Stage.TEST]
+
+    # A MODEL-lane (interactive) TEST result claiming docs-only is IGNORED — a model must
+    # not be able to relax downstream gates by asserting the tag.
+    model_task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    _absorb_outputs(model_task, make_result_stub(
+        Stage.TEST,
+        {"passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only"},
+    ))
+    assert "change_class" not in model_task.context
+
+    # The SAME output on the deterministic ENGINE lane DOES fold — only a git-diff sets it.
+    engine_task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    _absorb_outputs(engine_task, make_result_stub(
+        Stage.TEST,
+        {"passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only"},
+        mode=ExecutionMode.ENGINE, provider=Provider.NONE,
+    ))
+    assert engine_task.context["change_class"] == "docs-only"

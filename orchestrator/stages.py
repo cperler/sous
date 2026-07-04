@@ -213,6 +213,19 @@ def render_prompt(
             parts.append(f"## Context from earlier stages\n{rendered}")
 
     instruction = f"## {stage.value.upper()}\n{spec.template}"
+    # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell the
+    # TEST/REVIEW stages to skip test-coverage / tests_meaningful criteria for it, so the
+    # reviewer doesn't demand (or reject over) unreachable coverage. The tag is set only by
+    # the ENGINE-lane git diff, so this directive can't be triggered by a model's own claim.
+    if stage in (Stage.TEST, Stage.REVIEW) and (context or {}).get("change_class") == "docs-only":
+        instruction += (
+            "\n\n## Change classification: DOCS-ONLY\n"
+            "This change was deterministically classified as documentation-only (every "
+            "changed file is docs). It has no behavioral surface, so DO NOT apply "
+            "test-coverage criteria: treat tests_meaningful as satisfied and do not reject "
+            "or hold this change for lacking new/updated tests. Judge it on documentation "
+            "correctness and clarity instead."
+        )
     if learnings:
         instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
     parts.append(instruction)

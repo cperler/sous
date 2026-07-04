@@ -145,6 +145,75 @@ def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, pro
     assert out2["outcome"] == "task_completed"
 
 
+def _advance_to_review_with_test(eng, *, test_output, test_mode=None, test_provider=None,
+                                 run="r1", task="t1"):
+    """Drive intake→scope→implement with defaults, record TEST with a custom result, then
+    deliver; return the REVIEW WorkItem. Lets a test inject a change_class-tagged TEST."""
+    from orchestrator.schemas.enums import ExecutionMode, Provider
+    for _ in range(3):  # intake, scope, implement
+        eng.record(run, make_result(eng.next_work(run, task)))
+    wt = eng.next_work(run, task)
+    assert wt.stage is Stage.TEST
+    eng.record(run, make_result(
+        wt, structured_output=test_output,
+        mode=test_mode or ExecutionMode.ENGINE, provider=test_provider or Provider.NONE,
+    ))
+    eng.record(run, make_result(eng.next_work(run, task)))  # deliver
+    w = eng.next_work(run, task)
+    assert w.stage is Stage.REVIEW
+    return w
+
+
+def test_docs_only_tag_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
+    """#41: a deterministically-tagged docs-only change has no behavioral surface, so a
+    reviewer's tests_meaningful=false must NOT reject it (engine-side, deterministic)."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review_with_test(eng, test_output={
+        "passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only",
+    })
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": False,
+    }))
+    assert out["outcome"] == "task_completed"  # docs-only exempts the missing-tests rejection
+    assert eng.store.load_task("r1", "t1").context["change_class"] == "docs-only"
+
+
+def test_docs_only_tag_does_not_exempt_an_explicit_rejection(tmp_path, project) -> None:
+    """Docs-only relaxes only the tests criterion — a substantive approved=false still rejects."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review_with_test(eng, test_output={
+        "passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only",
+    })
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": False, "issues": [{"severity": "critical", "description": "wrong doc claim"}],
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"  # docs-only never waves through a real reject
+
+
+def test_model_claimed_docs_only_is_ignored_still_rejects(tmp_path, project) -> None:
+    """The loophole guard: a MODEL-lane TEST claiming docs-only is not folded, so a
+    reviewer's tests_meaningful=false STILL rejects (a model can't self-exempt)."""
+    from orchestrator.schemas.enums import ExecutionMode, Provider
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review_with_test(
+        eng,
+        test_output={"passed": True, "failures": [], "tests_meaningful": True,
+                     "change_class": "docs-only"},
+        test_mode=ExecutionMode.INTERACTIVE, test_provider=Provider.CLAUDE,  # a MODEL claim
+    )
+    assert "change_class" not in eng.store.load_task("r1", "t1").context  # dropped at the fold
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": False,
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"  # no exemption from a model's claim
+
+
 def test_vacuous_tests_never_auto_approve_as_suggestions(tmp_path, project) -> None:
     """tests_meaningful=false must not slip through the suggestion-only severity gate."""
     eng = _engine(tmp_path, project)

@@ -107,13 +107,20 @@ def apply_result(
 # blobs — so nothing project-specific leaks into the engine's context. The map is
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
-    Stage.INTAKE: ("branch", "worktree", "baseline_failures"),
+    Stage.INTAKE: ("branch", "worktree", "base_sha", "baseline_failures"),
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
-    Stage.TEST: ("failures", "tests_meaningful", "validation_notes"),
+    Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
 }
+
+# Context keys only a DETERMINISTIC ENGINE-lane runner is trusted to fold (#41): the
+# docs-only change tag gates downstream effort (lighter TEST, relaxed REVIEW criteria, no
+# missing-tests rejection), so a MODEL claiming ``change_class: docs-only`` must be ignored —
+# only a git-diff by the engine lane may set it. A non-ENGINE result carrying such a key has
+# it dropped at the fold, closing the loophole at the single choke point.
+DETERMINISTIC_ONLY_KEYS: frozenset[str] = frozenset({"change_class"})
 
 # Bounds so the context (fed into every later prompt) stays bounded regardless of what a
 # model returns. Deterministic (no wall-clock/random) → replay reproduces the same fold.
@@ -189,9 +196,15 @@ def _absorb_outputs(task: Task, result: StageResult) -> None:
         if "pr_url" in out:
             task.pr_url = out.get("pr_url")
     # Generalized fold: every whitelisted key present in the result, bounded.
+    engine_lane = result.lane_used.execution_mode is ExecutionMode.ENGINE
     for key in CONTEXT_KEYS.get(result.stage, ()):
-        if key in out:
-            task.context[key] = _cap_value(out[key])
+        if key not in out:
+            continue
+        # #41 loophole guard: a deterministic-only key (change_class) folds ONLY from the
+        # ENGINE lane — a model result claiming it is ignored (dropped here).
+        if key in DETERMINISTIC_ONLY_KEYS and not engine_lane:
+            continue
+        task.context[key] = _cap_value(out[key])
     _enforce_context_ceiling(task)
 
 

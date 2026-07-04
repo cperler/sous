@@ -224,6 +224,13 @@ class StageResult(BaseModel):
     # — like session_ref/checkpoint it rides RawResult -> StageResult and is recorded on the
     # cost-ledger row; it never feeds a verdict or a state transition.
     schema_retries: int = 0
+    # Paths (relative to the run root) the runner teed this call's FULL raw provider stdout /
+    # stderr to, under the per-stage log dir — ``{"stream": ..., "stderr": ...}`` (or
+    # ``{"error": ...}`` when the best-effort tee failed) (#56). Pure audit metadata: it lets a
+    # human jump from a recorded failure to the raw stream; it never feeds a verdict or a
+    # transition. None on lanes without a provider stream (interactive/ENGINE) or when no
+    # teeing wrapper is installed.
+    stream_files: dict | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

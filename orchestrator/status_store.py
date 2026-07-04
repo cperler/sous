@@ -41,6 +41,14 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def safe_task_dirname(task_id: str) -> str:
+    """The filesystem-safe directory component for a task's per-stage log tree
+    (``stages/<safe>/``). Extracted so the execution adapters that tee raw provider
+    streams write into the SAME per-stage dir this store writes stage records into —
+    one sanitization, one location."""
+    return task_id.replace("#", "").replace("/", "_") or "task"
+
+
 class StatusStore:
     """File-backed persistence for Run/Task documents plus an audit sidecar."""
 
@@ -61,8 +69,7 @@ class StatusStore:
         return self.root / "events.jsonl"
 
     def _stages_dir(self, task_id: str) -> Path:
-        safe = task_id.replace("#", "").replace("/", "_") or "task"
-        return self.root / "stages" / safe
+        return self.root / "stages" / safe_task_dirname(task_id)
 
     # ---- atomic write ---------------------------------------------------
 
@@ -286,26 +293,26 @@ class StatusStore:
 
     def write_approval(self, run_id: str, task_id: str, payload: dict) -> Path:
         """Durable human-approval artifact (design pass §4): who approved what, when."""
-        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        safe = safe_task_dirname(task_id)
         path = self.root / f"approval-{run_id}-{safe}.json"
         self._atomic_write(path, json.dumps(payload, indent=2, default=str))
         return path
 
     def load_approval(self, run_id: str, task_id: str) -> dict | None:
-        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        safe = safe_task_dirname(task_id)
         path = self.root / f"approval-{run_id}-{safe}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
     def write_rejection(self, run_id: str, task_id: str, payload: dict) -> Path:
         """Durable human-rejection artifact (issue #49): who rejected what, when, why —
         the terminal confirm-and-close counterpart to write_approval."""
-        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        safe = safe_task_dirname(task_id)
         path = self.root / f"rejection-{run_id}-{safe}.json"
         self._atomic_write(path, json.dumps(payload, indent=2, default=str))
         return path
 
     def load_rejection(self, run_id: str, task_id: str) -> dict | None:
-        safe = task_id.replace("#", "").replace("/", "_") or "task"
+        safe = safe_task_dirname(task_id)
         path = self.root / f"rejection-{run_id}-{safe}.json"
         return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 

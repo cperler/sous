@@ -7,6 +7,7 @@
   "properties": {
     "branch": {"type": "string"},
     "worktree": {"type": "string"},
+    "base_sha": {"type": "string", "description": "#41: the fork-point commit (worktree HEAD right after branch creation). The deterministic TEST runner diffs base_sha..worktree to classify the change (docs-only vs code)."},
     "baseline_captured": {"type": "boolean", "description": "true only if the unit-test command actually ran at base (never fabricated)"},
     "baseline_failures": {
       "type": "array",

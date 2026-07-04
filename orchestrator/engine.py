@@ -629,6 +629,7 @@ class Engine:
             "checkpoint": result.checkpoint,
             "salvage": result.salvage,
             "salvage_kept": task.salvage_in_place,
+            "stream_files": result.stream_files,  # #56: raw provider stdout/stderr on disk
             "structured_output": result.structured_output,
             "raw_output": result.raw_output,
             "error": effective.error,
@@ -865,7 +866,14 @@ class Engine:
             return None
         out = result.structured_output or {}
         approved_false = out.get("approved") is False  # explicit self-report only
-        tests_vacuous = out.get("tests_meaningful") is False  # independent verdict
+        # #41: a deterministically-detected docs-only change has no behavioral surface, so a
+        # `tests_meaningful=false` verdict must NOT reject it for lacking new tests (the
+        # reviewer is asked to skip that criterion for docs-only, but we enforce it engine-side
+        # too — the tag is ENGINE-lane-only, so a model can't fabricate this exemption). An
+        # explicit `approved=false` still rejects normally: docs-only relaxes the tests
+        # criterion, never the reviewer's substantive approval.
+        docs_only = task.context.get("change_class") == "docs-only"
+        tests_vacuous = out.get("tests_meaningful") is False and not docs_only
         if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")

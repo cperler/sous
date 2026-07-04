@@ -126,7 +126,8 @@ class DeterministicSetupRunner:
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         head = _git(str(worktree), "rev-parse", "HEAD")
-        base_sha = head.stdout.strip()[:12] if head.returncode == 0 else "?"
+        base_full = head.stdout.strip() if head.returncode == 0 else ""
+        base_sha = base_full[:12] if base_full else "?"
 
         # ACTUALLY capture the test baseline (ADR-035 parity): run the project's unit
         # tests at base and record the pre-existing failures, so the TEST stage can
@@ -137,6 +138,10 @@ class DeterministicSetupRunner:
         out = {
             "branch": branch,
             "worktree": str(worktree),
+            # The fork point (worktree HEAD right after branch creation, before any
+            # implement work). The deterministic TEST runner diffs base_sha..worktree to
+            # classify the change (#41 docs-only detection). Empty when HEAD is unreadable.
+            "base_sha": base_full,
             "baseline_captured": baseline["captured"],
             "baseline_failures": baseline["failures"],
             "baseline": (

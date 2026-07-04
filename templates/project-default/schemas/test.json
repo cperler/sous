@@ -15,7 +15,16 @@
       "type": "boolean",
       "description": "true only if the tests genuinely exercise the change (would fail if it regressed)"
     },
-    "validation_notes": {"type": "string", "description": "what the tests assert / any gaps"}
+    "validation_notes": {"type": "string", "description": "what the tests assert / any gaps"},
+    "change_class": {
+      "type": "string",
+      "enum": ["docs-only", "code"],
+      "description": "#41: deterministic change classification from the git diff (base_sha..worktree). Set ONLY by the ENGINE-lane runner — a model claim here is ignored at the context fold. 'docs-only' relaxes downstream test-coverage criteria and short-circuits this stage to an honest skip."
+    },
+    "skipped": {
+      "type": "string",
+      "description": "#41: reason this stage was short-circuited without running the suite (e.g. 'docs-only'). Present only on a skip; never a faked green run — 'passed' means 'nothing to fail'."
+    }
   },
   "additionalProperties": true
 }

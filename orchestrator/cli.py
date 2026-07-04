@@ -46,6 +46,7 @@ def _engine(args: argparse.Namespace) -> Engine:
         headless_schema_provider=schema_provider,
         codex_schema_provider=schema_provider,
         setup_project=project,  # wires the deterministic ENGINE-lane intake runner
+        run_log_root=root,  # #56: tee each provider call's raw stdout/stderr under stages/
     )
     router = Router(execution_mode=mode, orchestrator_provider=provider)
     return Engine(store, ledger, project, router=router, registry=registry)

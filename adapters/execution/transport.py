@@ -22,6 +22,7 @@ from jsonschema import ValidationError as _JSONSchemaError
 
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
+from orchestrator.status_store import safe_task_dirname
 
 
 @dataclass
@@ -32,6 +33,15 @@ class RawResult:
     exit_code: int = 0
     error: str | None = None
     invocation: str = ""
+    # FULL, untruncated provider stderr (the ``error`` field above is a bounded excerpt
+    # for the ledger). Kept whole so the stream-teeing wrapper can persist it verbatim as
+    # the primary post-mortem evidence (#56). None on lanes/paths without a provider stream.
+    raw_stderr: str | None = None
+    # Paths (relative to the run root) the raw provider stdout/stderr were teed to under the
+    # per-stage log dir — ``{"stream": ..., "stderr": ...}`` (or ``{"error": ...}`` if the
+    # best-effort tee failed). Stamped by ``stream_teeing_transport`` (#56); None when no
+    # teeing wrapper is installed or there was no provider stream to save.
+    stream_files: dict | None = None
     # Provider session the call used/created (design pass §2); None if unsupported.
     session_ref: str | None = None
     # {"tag", "sha"} stamped by the checkpoint wrapper after a successful
@@ -211,6 +221,67 @@ def _corrective_prompt(
     return "\n".join(lines)
 
 
+# --- raw provider stream retention (#56) -------------------------------------------------
+# The old bash system kept each stage's FULL raw provider stream + full stderr on disk; the
+# rebuild parsed the stream for usage then dropped it (truncating stderr to 500 chars), so a
+# post-mortem of a weird model call lost its primary evidence. This wrapper tees the whole
+# stdout stream and whole stderr to files alongside the per-stage JSON record, under the same
+# ``stages/<task>/`` dir the StatusStore writes into. Best-effort: a tee failure NEVER breaks
+# the dispatch (it is recorded on ``stream_files["error"]`` instead). Plain files, NOT gzip —
+# the point is full, directly-greppable evidence; gzip would force a decompress step between a
+# failure and its raw stream. Interactive/ENGINE lanes carry no provider stream, so a
+# RawResult with neither stdout nor stderr is skipped cleanly (nothing to tee).
+
+
+def _stream_dir(root: Path, task_id: str) -> Path:
+    return root / "stages" / safe_task_dirname(task_id)
+
+
+def _tee_streams(root: Path, work: WorkItem, raw: RawResult) -> dict | None:
+    """Write raw stdout/stderr to ``stages/<task>/<stage>-attempt<N>.{stream.jsonl,stderr.log}``
+    and return the saved paths RELATIVE to the run root (portable if the run dir is moved), or
+    None when there is nothing to save. Named per (stage, attempt) so a retry doesn't clobber a
+    prior attempt's evidence. Raises nothing the caller must handle — failures are caught in the
+    wrapper."""
+    if raw.raw_output is None and not raw.raw_stderr:
+        return None  # no provider stream (deterministic/interactive lane) — skip cleanly
+    d = _stream_dir(root, work.task_id)
+    d.mkdir(parents=True, exist_ok=True)
+    base = f"{work.stage.value}-attempt{work.attempt}"
+    files: dict = {}
+    if raw.raw_output is not None:
+        p = d / f"{base}.stream.jsonl"
+        p.write_text(raw.raw_output, encoding="utf-8")
+        files["stream"] = str(p.relative_to(root))
+    if raw.raw_stderr:
+        p = d / f"{base}.stderr.log"
+        p.write_text(raw.raw_stderr, encoding="utf-8")
+        files["stderr"] = str(p.relative_to(root))
+    return files or None
+
+
+def stream_teeing_transport(inner: Transport, run_log_root: str | Path | None) -> Transport:
+    """Wrap a provider transport so each call's FULL raw stdout/stderr is teed to disk under
+    the run's per-stage log dir (#56), and the saved paths are stamped onto the RawResult
+    (``stream_files``) so a human can navigate from a recorded failure straight to the raw
+    stream. Best-effort by contract: any teeing error is swallowed and noted in
+    ``stream_files["error"]`` — retaining evidence must never break the model call. A None
+    root (no run dir wired) is a no-op passthrough."""
+    root = Path(run_log_root) if run_log_root is not None else None
+
+    def run(work: WorkItem) -> RawResult:
+        raw = inner(work)
+        if root is None:
+            return raw
+        try:
+            files = _tee_streams(root, work, raw)
+        except Exception as exc:  # noqa: BLE001 - retaining evidence is never worth a failed call
+            return replace(raw, stream_files={"error": f"stream tee failed: {exc}"[:300]})
+        return replace(raw, stream_files=files) if files else raw
+
+    return run
+
+
 def to_stage_result(
     work: WorkItem,
     raw: RawResult,
@@ -241,6 +312,7 @@ def to_stage_result(
         session_ref=raw.session_ref,
         checkpoint=raw.checkpoint,
         salvage=raw.salvage,
+        stream_files=raw.stream_files,
         schema_retries=raw.schema_retries,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
@@ -443,13 +515,14 @@ def claude_cli_transport(
                              error=f"timed out after {work.timeout_s}s", invocation=invocation)
         if proc.returncode != 0:
             return RawResult(None, exit_code=proc.returncode, error=proc.stderr.strip()[:500],
-                             raw_output=proc.stdout, invocation=invocation)
+                             raw_output=proc.stdout, raw_stderr=proc.stderr,
+                             invocation=invocation)
         try:
             data = json.loads(proc.stdout) if proc.stdout.strip() else {}
         except json.JSONDecodeError as exc:
             # Exit 0 but non-JSON stdout (banner/notice): fail the dispatch, never
             # let the exception escape (every dispatch must yield a StageResult).
-            return RawResult(None, raw_output=proc.stdout, exit_code=0,
+            return RawResult(None, raw_output=proc.stdout, raw_stderr=proc.stderr, exit_code=0,
                              error=f"non-JSON output: {exc}", invocation=invocation)
         # Presence check, not truthiness: a valid-but-empty structured_output ({})
         # must not fall through to the prose `result`.
@@ -465,7 +538,7 @@ def claude_cli_transport(
         # invalid object here would throw away exactly what the retry needs to quote back.
         session_id = data.get("session_id")
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
-                         exit_code=0, invocation=invocation,
+                         raw_stderr=proc.stderr, exit_code=0, invocation=invocation,
                          session_ref=session_id if isinstance(session_id, str) else None)
 
     def run(work: WorkItem) -> RawResult:
@@ -552,7 +625,7 @@ def codex_cli_transport() -> Transport:
                 except json.JSONDecodeError:
                     structured = None
             return RawResult(structured, usage=_codex_usage(proc.stdout), raw_output=proc.stdout,
-                             exit_code=proc.returncode,
+                             raw_stderr=proc.stderr, exit_code=proc.returncode,
                              error=(proc.stderr.strip()[:500] or None) if proc.returncode else None,
                              invocation=invocation)
 

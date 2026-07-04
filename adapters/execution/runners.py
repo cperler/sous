@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
@@ -19,7 +20,13 @@ from orchestrator.schemas.work import StageResult, WorkItem
 from .base import SUPPORTED, CapabilityDescriptor, Registry
 from .codex import CodexRunner, SchemaProvider
 from .headless_claude import HeadlessClaudeRunner
-from .transport import Transport, checkpointing_transport, claude_cli_transport
+from .transport import (
+    Transport,
+    checkpointing_transport,
+    claude_cli_transport,
+    codex_cli_transport,
+    stream_teeing_transport,
+)
 
 
 def _schema_json_provider(schema_for: SchemaProvider) -> Callable[[str], str | None]:
@@ -48,6 +55,7 @@ def build_registry(
     codex_schema_provider: SchemaProvider | None = None,
     setup_project: object | None = None,
     include_interactive: bool = True,
+    run_log_root: str | Path | None = None,
 ) -> Registry:
     """Registry covering interactive×claude (external) + headless×claude + any×codex +
     the deterministic ENGINE lane.
@@ -61,6 +69,11 @@ def build_registry(
     for the ENGINE lane (intake worktree/baseline, no model call). When omitted the
     ENGINE cell is still registered as a sanctioned descriptor (for the lane audit) but
     has no runner — real deterministic dispatch needs the project.
+
+    ``run_log_root`` (the run's status/log dir) wires the #56 stream-teeing wrapper around
+    the auto-built provider transports, so each headless/codex call's full raw stdout/stderr
+    is retained under ``stages/<task>/`` for post-mortems. It is ignored for an explicitly
+    injected transport (tests wrap their own) and when None (no run dir — no teeing).
     """
     reg = Registry()
     if include_interactive:
@@ -74,10 +87,17 @@ def build_registry(
             )
         )
     if headless_transport is None and headless_schema_provider is not None:
-        headless_transport = checkpointing_transport(
-            claude_cli_transport(_schema_json_provider(headless_schema_provider))
-        )
+        inner = claude_cli_transport(_schema_json_provider(headless_schema_provider))
+        if run_log_root is not None:
+            inner = stream_teeing_transport(inner, run_log_root)
+        headless_transport = checkpointing_transport(inner)
     reg.register_runner(HeadlessClaudeRunner(headless_transport))
+    if codex_transport is None and run_log_root is not None:
+        # Build codex explicitly (rather than letting CodexRunner default it) so the raw
+        # codex event stream + stderr are teed too — the headless×claude twin of #56.
+        codex_transport = checkpointing_transport(
+            stream_teeing_transport(codex_cli_transport(), run_log_root)
+        )
     reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))
     if setup_project is not None:
         from .deterministic_setup import DeterministicSetupRunner

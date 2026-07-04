@@ -24,13 +24,63 @@ loops engage; a green (or only-inherited) run succeeds.
 from __future__ import annotations
 
 import subprocess
+from pathlib import PurePosixPath
 
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from .transport import RawResult, _tag_head, to_stage_result
+from .transport import RawResult, _git, _tag_head, to_stage_result
 
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
+
+# Documentation-file classification for the #41 docs-only change tag. Deliberately
+# conservative: a change is "docs-only" only when EVERY changed file is unambiguously
+# documentation, so a non-doc file can never be mislabeled away from a real test run.
+_DOC_SUFFIXES = {".md", ".markdown", ".rst", ".txt", ".adoc"}
+_DOC_STEMS = {"license", "notice", "authors", "changelog", "contributing", "readme"}
+
+
+def _is_doc_file(path: str) -> bool:
+    p = PurePosixPath(path.strip())
+    if not p.name:
+        return False
+    if "docs" in p.parts:  # anything under a docs/ directory
+        return True
+    if p.suffix.lower() in _DOC_SUFFIXES:
+        return True
+    # Extensionless doc files (LICENSE, NOTICE, …). Only when there is no suffix, so a
+    # source file that merely shares the stem (license.py) is NOT treated as docs.
+    return not p.suffix and p.stem.lower() in _DOC_STEMS
+
+
+def _changed_files(cwd: str, base_sha: str) -> list[str] | None:
+    """Files changed between ``base_sha`` and the current worktree — committed AND
+    uncommitted tracked changes (``git diff --name-only <base>``) plus untracked new files
+    (``git ls-files --others``). Returns None on any git error (detection simply doesn't
+    fire; the full test run proceeds — a read we can't do is never a false docs-only tag)."""
+    diff = _git(cwd, "diff", "--name-only", base_sha)
+    if diff.returncode != 0:
+        return None
+    files = [ln.strip() for ln in diff.stdout.splitlines() if ln.strip()]
+    others = _git(cwd, "ls-files", "--others", "--exclude-standard")
+    if others.returncode == 0:
+        files += [ln.strip() for ln in others.stdout.splitlines() if ln.strip()]
+    return files
+
+
+def classify_change(cwd: str | None, base_sha: str | None) -> str | None:
+    """Deterministically classify the task's diff as ``"docs-only"`` or ``"code"`` — or
+    None when it can't be determined (missing cwd/base, git error, or an empty diff). Only
+    a real git read sets this, so a model can never claim docs-only (the #41 loophole guard
+    lives at the fold, but detection itself is git-only by construction). ``"docs-only"``
+    requires a NON-EMPTY changeset where every file is documentation; a single non-doc file
+    yields ``"code"``."""
+    if not cwd or not base_sha:
+        return None
+    files = _changed_files(cwd, base_sha)
+    if not files:  # None (git error) or [] (nothing changed) → undetermined
+        return None
+    return "docs-only" if all(_is_doc_file(f) for f in files) else "code"
 
 
 class DeterministicTestRunner:
@@ -69,6 +119,30 @@ class DeterministicTestRunner:
         inherited_count = 0
         notes: list[str] = []
 
+        # #41: classify the change deterministically (git diff of base_sha..worktree). A
+        # docs-only change has no behavioral surface, so a full test run is wasted effort —
+        # short-circuit to an HONEST skip (marked skipped: docs-only, never a faked green).
+        # The tag also flows into the context plane (ENGINE-lane-only fold) so REVIEW skips
+        # test-coverage criteria and the engine won't reject it for lacking new tests.
+        change_class = classify_change(work.cwd, (work.context or {}).get("base_sha"))
+        if change_class == "docs-only":
+            out = {
+                "passed": True,
+                "failures": [],
+                "tests_meaningful": True,  # not judged here — see module docstring / REVIEW
+                "change_class": "docs-only",
+                "skipped": "docs-only",
+                "validation_notes": "docs-only change (every changed file is documentation): "
+                                    "no behavioral surface to test — skipped the suite. "
+                                    "Classified deterministically by diffing base_sha..worktree "
+                                    "(no test run faked green).",
+            }
+            return out, None, True
+
+        # For a non-docs-only change, surface the classification too (informative in the
+        # log; "code" is the normal path — it changes no downstream behavior).
+        extra = {"change_class": change_class} if change_class else {}
+
         if not commands:
             out = {
                 "passed": True,
@@ -76,6 +150,7 @@ class DeterministicTestRunner:
                 "tests_meaningful": True,  # not judged here — see module docstring / REVIEW
                 "validation_notes": "deterministic test run: no test commands defined "
                                     "(nothing to run); meaningfulness judged by REVIEW.",
+                **extra,
             }
             return out, None, True
 
@@ -130,6 +205,7 @@ class DeterministicTestRunner:
             "failures": caused[:40],
             "tests_meaningful": True,  # see module docstring: never false from a script
             "validation_notes": "; ".join(notes),
+            **extra,
         }
         error = None if passed else (
             f"test stage red: {len(caused)} caused failure(s) "
