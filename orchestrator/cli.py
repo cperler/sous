@@ -221,9 +221,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="sleep through capacity stalls / rate-limit cooldowns instead of "
                          "returning (the old capacity_wait_loop)")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
-    sub.add_parser("statusline",
-                   help="one-line 5h/7d utilization for the Claude Code status bar "
-                        "(reads the same usage cache as util; quiet on a probe miss)")
+    sl = sub.add_parser("statusline",
+                        help="one-line 5h/7d utilization for the Claude Code status bar "
+                             "(reads the same usage cache as util; quiet on a probe miss)")
+    sl.add_argument("--watch", action="store_true",
+                    help="clear-screen + reprint on a loop (supervise a batch from a terminal)")
+    sl.add_argument("--interval", type=int, default=30,
+                    help="--watch refresh interval seconds (amortizes over the 2-min cache)")
     hd = sub.add_parser("hold", help="park a task at the human approval gate")
     hd.add_argument("--task", required=True)
     hd.add_argument("--reason", required=True, help="what needs human sign-off")
@@ -507,8 +511,16 @@ def main(argv: list[str] | None = None) -> int:
         # Display-only sibling of `util`: same cache, but a raw line for Claude Code's
         # statusLine (which consumes plain text, not JSON). Quiet on a probe miss so the
         # status bar shows nothing rather than an error. Always exit 0.
-        from .usage_probe import format_statusline, read_usage
+        from .usage_probe import format_statusline, read_usage, watch_statusline
 
+        if args.watch:
+            import contextlib
+            import time
+
+            # Ctrl-C ends the loop cleanly (watch_statusline also swallows KeyboardInterrupt).
+            with contextlib.suppress(KeyboardInterrupt):
+                watch_statusline(emit=print, sleeper=time.sleep, interval=args.interval)
+            return 0
         line = format_statusline(read_usage())
         if line:
             print(line)

@@ -8,7 +8,7 @@ from datetime import UTC, datetime
 
 from orchestrator import usage_probe
 from orchestrator.cli import main
-from orchestrator.usage_probe import Usage, format_statusline
+from orchestrator.usage_probe import Usage, format_statusline, watch_statusline
 
 _NOW = datetime(2026, 7, 3, 15, 0, 0, tzinfo=UTC)
 
@@ -74,3 +74,67 @@ def test_cli_statusline_is_quiet_and_zero_on_probe_miss(capsys, monkeypatch) -> 
     monkeypatch.setattr(usage_probe, "read_usage", lambda *a, **k: None)
     assert main(["statusline"]) == 0
     assert capsys.readouterr().out.strip() == ""
+
+
+# --- #79: --watch refresh loop -------------------------------------------------------------
+
+
+def test_watch_statusline_reprints_each_iter_and_sleeps_between() -> None:
+    """Clears + reprints once per iteration, sleeping ``interval`` between (but not after the
+    last), so a max_iters=3 run yields 3 renders and 2 sleeps."""
+    usage = Usage(50.0, 25.0, "", "")
+    emitted: list[str] = []
+    sleeps: list[float] = []
+    watch_statusline(
+        emit=emitted.append,
+        sleeper=sleeps.append,
+        clear=lambda: emitted.append("<clear>"),
+        interval=45,
+        max_iters=3,
+        reader=lambda *a, **k: usage,
+    )
+    assert emitted == ["<clear>", "⧗ 5h 50% · 7d 25%"] * 3
+    assert sleeps == [45, 45]  # no trailing sleep after the final render
+
+
+def test_watch_statusline_shows_placeholder_on_probe_miss() -> None:
+    emitted: list[str] = []
+    watch_statusline(
+        emit=emitted.append,
+        sleeper=lambda _s: None,
+        clear=lambda: None,
+        max_iters=1,
+        reader=lambda *a, **k: None,
+    )
+    assert emitted == ["⧗ usage unavailable"]
+
+
+def test_watch_statusline_stops_cleanly_on_keyboardinterrupt() -> None:
+    usage = Usage(10.0, 20.0, "", "")
+    emitted: list[str] = []
+
+    def _boom(_s: float) -> None:
+        raise KeyboardInterrupt
+
+    # Ctrl-C mid-sleep ends the loop without propagating; the first render still lands.
+    watch_statusline(
+        emit=emitted.append,
+        sleeper=_boom,
+        clear=lambda: None,
+        reader=lambda *a, **k: usage,
+    )
+    assert emitted == ["⧗ 5h 10% · 7d 20%"]
+
+
+def test_cli_statusline_watch_loops_via_injected_sleep(capsys, monkeypatch) -> None:
+    """The CLI wiring drives the loop with real print/time.sleep; a sleeper that raises
+    KeyboardInterrupt after the first render exercises the terminal path and exits 0."""
+    usage = Usage(50.0, 25.0, "", "")
+    monkeypatch.setattr(usage_probe, "read_usage", lambda *a, **k: usage)
+
+    def _stop(_s: float) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(usage_probe.time, "sleep", _stop)
+    assert main(["statusline", "--watch", "--interval", "5"]) == 0
+    assert "⧗ 5h 50% · 7d 25%" in capsys.readouterr().out
