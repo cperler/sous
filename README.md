@@ -222,11 +222,16 @@ $ORCH statusline      # the same numbers as one line, for the status bar
 **At-a-glance utilization while supervising runs (#61).** `orchestrator statusline`
 prints one line — `⧗ 5h 87% (resets 3h0m) · 7d 41% (resets 4d9h)` — off the same
 2-min usage cache the `util` sensor feeds (no extra network cost). Wire it into Claude
-Code's status bar via `settings.json`:
+Code's status bar by adding a `statusLine` field to your user settings
+(`~/.claude/settings.json`) or project settings — set `type` to `"command"` and point
+`command` at the CLI (`padding` is optional and defaults to `0`):
 
 ```json
 { "statusLine": { "type": "command", "command": "orchestrator statusline" } }
 ```
+
+Verified against Claude Code's [status line docs](https://code.claude.com/docs/en/statusline)
+(2026-07-04); check that page for the current schema before copying.
 
 It stays quiet (empty line, exit 0) whenever the probe is unavailable, so the bar
 never shows an error.
