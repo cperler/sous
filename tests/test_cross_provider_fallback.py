@@ -61,9 +61,18 @@ def test_is_provider_unavailable_detects_cli_and_auth() -> None:
     assert is_provider_unavailable(RawResult(None, exit_code=127, error="No such file"))
     assert is_provider_unavailable(RawResult(None, exit_code=1, error="Error: not logged in"))
     assert is_provider_unavailable(RawResult(None, exit_code=1, error="401 Unauthorized"))
+    # #80: a configured-model-not-available refusal is provider-unavailable (the codex 400 that
+    # never matched the auth-only markers). Both the codex plan-mismatch wording and the bare
+    # "model is not supported" phrasing classify.
+    assert is_provider_unavailable(RawResult(
+        None, exit_code=1,
+        error="The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account"))
+    assert is_provider_unavailable(RawResult(None, exit_code=1, error="model is not supported"))
     # a genuine task/tool failure is NOT provider-unavailable
     assert not is_provider_unavailable(RawResult(None, exit_code=1, error="TypeError: undefined"))
     assert not is_provider_unavailable(RawResult(None, exit_code=1, error="2 tests failed"))
+    # a bare invalid_request_error (no model/plan phrasing) is NOT reclassified — keeps the guard
+    assert not is_provider_unavailable(RawResult(None, exit_code=1, error="invalid_request_error"))
     # a rate-limit is its own class, not provider-unavailable
     assert not is_provider_unavailable(RawResult(None, exit_code=1, error="429 rate limit"))
 
@@ -80,6 +89,12 @@ def test_codex_runner_maps_provider_unavailable(monkeypatch) -> None:
         transport=lambda w: RawResult(None, exit_code=1, error="Error: please run `codex login`")
     )
     assert r_auth.dispatch(wi).status is ResultStatus.PROVIDER_UNAVAILABLE
+    # #80: the configured model is refused by the provider/plan -> PROVIDER_UNAVAILABLE (so the
+    # engine can fall through) instead of a plain FAILURE that just burns codex retries.
+    r_model = CodexRunner(transport=lambda w: RawResult(
+        None, exit_code=1,
+        error="The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account"))
+    assert r_model.dispatch(wi).status is ResultStatus.PROVIDER_UNAVAILABLE
     # a genuine failure stays FAILURE (not reclassified)
     r_fail = CodexRunner(transport=lambda w: RawResult(None, exit_code=1, error="tests failed"))
     assert r_fail.dispatch(wi).status is ResultStatus.FAILURE
