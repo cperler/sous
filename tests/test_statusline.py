@@ -138,3 +138,17 @@ def test_cli_statusline_watch_loops_via_injected_sleep(capsys, monkeypatch) -> N
     monkeypatch.setattr(usage_probe.time, "sleep", _stop)
     assert main(["statusline", "--watch", "--interval", "5"]) == 0
     assert "⧗ 5h 50% · 7d 25%" in capsys.readouterr().out
+
+
+def test_cli_statusline_interval_accepts_fractional_seconds(monkeypatch) -> None:
+    """#105: `--interval` is type=float, so a fractional value like 7.5 parses (no argparse
+    error) and reaches watch_statusline as the float 7.5, not truncated to an int."""
+    captured: dict[str, object] = {}
+
+    def _capture(**kwargs) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(usage_probe, "watch_statusline", _capture)
+    assert main(["statusline", "--watch", "--interval", "7.5"]) == 0
+    assert captured["interval"] == 7.5
+    assert isinstance(captured["interval"], float)

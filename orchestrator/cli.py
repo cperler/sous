@@ -226,7 +226,7 @@ def main(argv: list[str] | None = None) -> int:
                              "(reads the same usage cache as util; quiet on a probe miss)")
     sl.add_argument("--watch", action="store_true",
                     help="clear-screen + reprint on a loop (supervise a batch from a terminal)")
-    sl.add_argument("--interval", type=int, default=30,
+    sl.add_argument("--interval", type=float, default=30,
                     help="--watch refresh interval seconds (amortizes over the 2-min cache)")
     hd = sub.add_parser("hold", help="park a task at the human approval gate")
     hd.add_argument("--task", required=True)
