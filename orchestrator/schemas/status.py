@@ -125,6 +125,17 @@ class Task(BaseModel):
     # Infra-failure reset loop (#14): how many environment resets this task has spent
     # re-running an infra-classified failure's attempt (vs the engine's max_infra_resets).
     infra_resets: int = 0
+    # Salvage loop (#59): how many times the current stage's committed work was KEPT in
+    # place across a salvageable failure (timeout/infra/rate-limit) instead of being reset
+    # to the checkpoint. Bounded by the engine's max_salvage_keeps — past it, a repeat
+    # salvageable failure resets fully (a salvaged pile that isn't converging is discarded,
+    # never an infinite heap of half-work). Refreshed to 0 by a clean stage, like the
+    # infra_resets / rate_limit_waits budgets.
+    salvage_count: int = 0
+    # Set by failure handling when the last attempt's COMMITTED work is being kept for the
+    # retry (#59); consumed by next_work to SUPPRESS the pre-dispatch checkpoint reset so
+    # the retry inherits the work. Transient — cleared when the dispatch is committed.
+    salvage_in_place: bool = False
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing

@@ -113,6 +113,13 @@ class WorkItem(BaseModel):
     #     failed attempt's debris.
     checkpoint_tag: str | None = None
     reset_to: str | None = None
+    # Salvage protocol (#59) — the last-good checkpoint tag the runner-side wrapper diffs
+    # (``<salvage_anchor>..HEAD``) on a FAILED/TIMED-OUT result to report any commits the
+    # attempt made past it, so the engine can KEEP that work for the retry instead of
+    # resetting it away. Always populated on a checkpoint stage (independent of reset_to,
+    # which is only set on a discard); engine-derived bookkeeping, excluded from
+    # content_hash like checkpoint_tag/reset_to. None off a checkpoint stage / no anchor.
+    salvage_anchor: str | None = None
     # Read-only task context the deterministic ENGINE-lane runners read STRUCTURALLY
     # (the folded context plane — state_machine CONTEXT_KEYS — plus the few task fields
     # deterministic TEST/DELIVER need: baseline_failures, issue_number, title, pr_url).
@@ -144,6 +151,7 @@ class WorkItem(BaseModel):
         session_ref: str | None = None,
         checkpoint_tag: str | None = None,
         reset_to: str | None = None,
+        salvage_anchor: str | None = None,
         context: dict | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
@@ -172,6 +180,7 @@ class WorkItem(BaseModel):
             session_ref=session_ref,
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
+            salvage_anchor=salvage_anchor,
             context=context,
             created_at=created_at,
         )
@@ -203,6 +212,12 @@ class StageResult(BaseModel):
     # task.last_checkpoint. None when the stage doesn't checkpoint or tagging failed
     # (fail-open: a missing checkpoint only means no reset anchor later).
     checkpoint: dict | None = None
+    # Salvage report (#59): committed work the failed/timed-out attempt made past the
+    # last checkpoint — ``{"anchor", "count", "commits": [{"sha", "subject"}, ...]}`` —
+    # stamped by the runner-side wrapper (a pure git read of ``anchor..HEAD``). None when
+    # the stage succeeded, made no commits past the anchor, or has no anchor. The engine
+    # reads it to decide, by failure KIND, whether to keep that work for the retry.
+    salvage: dict | None = None
     # How many corrective schema-retries the transport spent salvaging a malformed structured
     # output before this result (headless×claude schema-validate-and-retry, #32). 0 on the
     # first-try-valid path (the common case) and on lanes without the loop. Pure audit metadata

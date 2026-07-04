@@ -79,6 +79,17 @@ def _in_future(iso: str | None) -> bool:
         return False
 
 
+# Failure kinds whose committed work is NOT implicated by the failure itself, so any
+# commits the attempt made before dying are worth KEEPING for the retry (#59): the model
+# ran out of wall-clock (TIMEOUT) or hit a transient provider wall (RATE_LIMITED) — the
+# code it committed is unrelated to why the stage failed. An infra-classified failure
+# (FailureKind.INFRA — a broken environment, not broken code) is salvageable too and is
+# folded in separately (it is a classifier verdict, not a ResultStatus). A plain FAILURE
+# — notably a genuine TEST failure — is DELIBERATELY excluded: the committed code may BE
+# the defect, so the safe default (reset to the checkpoint) stands.
+SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RATE_LIMITED})
+
+
 def _ref_safe(s: str) -> str:
     """Make an id safe inside a git ref component (tags: design pass §3). Conservative:
     anything outside [word . -] becomes '-', which also rules out the refname-forbidden
@@ -107,6 +118,7 @@ class Engine:
         max_rate_limit_waits: int = 4,
         rate_limit_cooldown_s: int = 900,
         max_infra_resets: int = 2,
+        max_salvage_keeps: int = 1,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -134,6 +146,11 @@ class Engine:
         # failure may reset the environment and re-run the SAME attempt before it
         # degrades to a normal failure (the old MAX_CONSECUTIVE_INFRA_FAILURES halt).
         self.max_infra_resets = max_infra_resets
+        # Salvage cap (#59): how many times the current stage may KEEP its committed work
+        # across a salvageable failure before a repeat failure resets fully. 1 = keep once;
+        # if the salvaged work didn't unstick the retry, the next salvageable failure
+        # discards the pile and starts clean from the checkpoint.
+        self.max_salvage_keeps = max_salvage_keeps
 
     # --- run/task setup -------------------------------------------------------
     def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
@@ -322,16 +339,26 @@ class Engine:
         # Checkpoint protocol (design pass §3): the engine only NAMES the tag and picks
         # the reset anchor — the runner-side wrapper does the git I/O. Tags include the
         # run id (open Q3: yes — bench replays will recur task ids across runs).
-        checkpoint_tag = reset_to = None
+        checkpoint_tag = reset_to = salvage_anchor = None
         if spec.checkpoint:
             checkpoint_tag = (
                 f"task/{_ref_safe(run_id)}/{_ref_safe(task_id)}/{stage.value}/{attempt}"
             )
+            # Anchor = last SUCCESSFUL checkpoint. Always handed to the runner (salvage_anchor)
+            # so a failed attempt can report the commits it made past it (#59), independent
+            # of whether this dispatch resets.
+            anchor = task.last_checkpoint.get("tag") if task.last_checkpoint else None
+            salvage_anchor = anchor
             # Reset only a retry (FAILED) or crash-resume (RUNNING) — a first attempt
-            # starts from a clean tree by construction. Anchor = last SUCCESSFUL
-            # checkpoint, so the failed attempt's debris (tracked or not) is discarded.
-            if rec.status in (StageStatus.FAILED, StageStatus.RUNNING) and task.last_checkpoint:
-                reset_to = task.last_checkpoint.get("tag")
+            # starts from a clean tree by construction — AND only when the prior attempt's
+            # work isn't being salvaged. When salvage_in_place is set, the committed work is
+            # KEPT (no reset) so the retry builds on it; the flag is consumed at commit.
+            if (
+                rec.status in (StageStatus.FAILED, StageStatus.RUNNING)
+                and anchor
+                and not task.salvage_in_place
+            ):
+                reset_to = anchor
         learnings = "\n".join(task.learnings)
         prompt = render_prompt(
             stage,
@@ -366,6 +393,7 @@ class Engine:
             session_ref=task.session_ref,
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
+            salvage_anchor=salvage_anchor,
             # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
@@ -387,6 +415,7 @@ class Engine:
             t.pending_content_hash = work.content_hash
             t.pending_fallback_model = None  # consumed into this dispatch's model
             t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
+            t.salvage_in_place = False  # consumed: this dispatch honored (or ignored) it
 
         self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
@@ -525,6 +554,11 @@ class Engine:
             rec.error = None
             task.state = TaskState.RETRYING
             task.updated_at = _now()
+            # Rate-limit is a salvageable KIND (SALVAGEABLE_FAILURE_STATUSES): if the
+            # attempt committed real work before the 429, keep it in place so the seamless
+            # re-queue (cheaper model / post-cooldown) builds on it instead of resetting to
+            # the checkpoint. Same cap as the failure path (#59).
+            self._apply_salvage(task, effective)
             if cooldown_until is None:
                 task.pending_fallback_model = fallback_model
                 outcome = "stage_rate_limited_fallback"
@@ -538,6 +572,8 @@ class Engine:
                 task.error_signatures = []  # streak resets on a clean stage
                 task.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
                 task.infra_resets = 0  # ... and the infra-reset budget (#14)
+                task.salvage_count = 0  # ... and the salvage-keep budget (#59)
+                task.salvage_in_place = False  # a clean stage leaves nothing to keep
                 # Session chaining (design pass §2): reuse across SUCCESSFUL stage
                 # transitions only. A runner that reports no ref leaves the prior one
                 # in place (resuming a slightly-stale session is safe: prompts are
@@ -591,6 +627,8 @@ class Engine:
             "cost_usd": cost,
             "session_ref": result.session_ref,
             "checkpoint": result.checkpoint,
+            "salvage": result.salvage,
+            "salvage_kept": task.salvage_in_place,
             "structured_output": result.structured_output,
             "raw_output": result.raw_output,
             "error": effective.error,
@@ -900,6 +938,62 @@ class Engine:
         verdict["disposition"] = "held"
         return "review_rejected_held"
 
+    def _apply_salvage(
+        self, task: Task, result: StageResult, *, infra_only: bool = False
+    ) -> None:
+        """Salvage decision (#59): keep or discard the work a failed/timed-out attempt
+        COMMITTED past the checkpoint, by failure KIND. Pure state — the git report was
+        produced by the runner-side wrapper (``result.salvage``); this only reads it, sets
+        the task's flag/counter, appends a retry learning, and emits an event. Called from
+        both the failure path and the transient rate-limit re-queue. Silent (no flag, no
+        event) when the attempt committed nothing past the anchor — a no-commits failure
+        resets plainly. Uncommitted/dirty scraps are never salvaged (the wrapper reports
+        commits only)."""
+        salvage = result.salvage
+        commits = list((salvage or {}).get("commits") or [])
+        if not commits:
+            return  # nothing committed past the checkpoint — plain reset, no salvage noise
+        salvageable = result.status in SALVAGEABLE_FAILURE_STATUSES or infra_only
+        shas = [str(c.get("sha", ""))[:9] for c in commits]
+        total = int(salvage.get("count") or len(commits))
+        if salvageable and task.salvage_count < self.max_salvage_keeps:
+            task.salvage_count += 1
+            task.salvage_in_place = True  # next_work suppresses the reset -> work is kept
+            shown = [
+                f"{s} {str(c.get('subject', '')).strip()}"
+                for s, c in zip(shas, commits, strict=True)
+            ][:10]
+            more = f"\n  (+{total - len(shown)} more)" if total > len(shown) else ""
+            task.learnings.append(
+                f"{result.stage.value} (attempt {result.attempt}): the previous attempt "
+                f"COMMITTED work before it failed ({result.status.value}) — that work was "
+                f"KEPT in your worktree, NOT discarded. Review these commits, keep what is "
+                f"good, and fix what is not:\n  " + "\n  ".join(shown) + more
+            )
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "salvage_kept", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "kind": result.status.value, "attempt": result.attempt, "shas": shas,
+                 "count": total, "keeps_used": task.salvage_count,
+                 "keeps_budget": self.max_salvage_keeps},
+            )
+        else:
+            # Not a salvageable kind (the committed code may BE the defect — e.g. a real
+            # test failure) OR the keep budget is spent (kept once already and it didn't
+            # unstick the retry): discard by leaving the flag clear so next_work resets to
+            # the checkpoint as usual — no infinite pile of half-work.
+            task.salvage_in_place = False
+            reason = "budget_exhausted" if salvageable else "kind_not_salvageable"
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "salvage_discarded", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "kind": result.status.value, "attempt": result.attempt, "shas": shas,
+                 "reason": reason, "keeps_used": task.salvage_count,
+                 "keeps_budget": self.max_salvage_keeps},
+            )
+
     def _handle_failure(self, task: Task, result: StageResult) -> str:
         failures = None
         if result.structured_output:
@@ -926,6 +1020,12 @@ class Engine:
                  "kinds": sorted({f.kind.value for f in classified}),
                  "infra_only": infra_only},
             )
+
+        # Salvage (#59): before any reset decision, if the failure's KIND doesn't implicate
+        # the committed work (timeout / infra), KEEP the commits the attempt made past the
+        # checkpoint so the retry builds on them. Sets the flag next_work reads to suppress
+        # the reset. Runs for both the infra-reset re-run and the ordinary retry below.
+        self._apply_salvage(task, result, infra_only=infra_only)
 
         # Infra-failure reset loop (#14, ports OC:3835-3860): reset the environment via
         # the project's infra_reset command, then re-run the SAME attempt (RUNNING marker

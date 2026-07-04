@@ -37,6 +37,9 @@ class RawResult:
     # {"tag", "sha"} stamped by the checkpoint wrapper after a successful
     # git-affecting stage (design pass §3); None otherwise.
     checkpoint: dict | None = None
+    # {"anchor", "count", "commits": [...]} stamped by the checkpoint wrapper when a
+    # FAILED/TIMED-OUT attempt left commits past the anchor (#59); None otherwise.
+    salvage: dict | None = None
     # How many corrective schema-retries the transport spent salvaging a malformed
     # structured output (#32). 0 = valid on the first call (the overwhelming case).
     # Audit-only metadata: surfaced on the cost-ledger row, never a correctness input.
@@ -237,6 +240,7 @@ def to_stage_result(
         ),
         session_ref=raw.session_ref,
         checkpoint=raw.checkpoint,
+        salvage=raw.salvage,
         schema_retries=raw.schema_retries,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
@@ -300,6 +304,43 @@ def _reset_worktree(cwd: str | None, ref: str) -> str | None:
     return None
 
 
+# Cap on how many commit records a salvage report carries — bounded like the failure
+# learning's failing-test list, so a runaway attempt can't balloon the task state.
+_SALVAGE_COMMIT_CAP = 20
+
+
+def _salvageable_commits(cwd: str | None, anchor: str) -> dict | None:
+    """Report the COMMITTED work an attempt left past ``anchor`` (design §59) — a pure,
+    non-destructive git read of ``anchor..HEAD``. Returns
+    ``{"anchor", "count", "commits": [{"sha", "subject"}, ...]}`` (commit list capped),
+    or None when the tree didn't advance past the anchor (nothing to salvage) or any git
+    step fails (fail-OPEN: a salvage we can't read is simply a reset, never a broken
+    dispatch). Uncommitted/dirty changes are DELIBERATELY ignored — salvage is for vetted,
+    committed work only; scraps in the index/worktree are reset with the retry."""
+    if not cwd:
+        return None
+    try:
+        log = _git(cwd, "log", "--reverse", "--format=%H%x1f%s", f"{anchor}..HEAD")
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover - defensive
+        return None
+    if log.returncode != 0:
+        return None
+    commits: list[dict] = []
+    for line in log.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        sha, _, subject = line.partition("\x1f")
+        commits.append({"sha": sha, "subject": subject.strip()[:200]})
+    if not commits:
+        return None
+    return {
+        "anchor": anchor,
+        "count": len(commits),
+        "commits": commits[:_SALVAGE_COMMIT_CAP],
+    }
+
+
 def _tag_head(cwd: str, tag: str) -> dict | None:
     """Tag HEAD (``-f``: a crash between tag and record re-runs the stage and
     overwrites the same attempt's tag). Returns {"tag", "sha"} or None — fail-OPEN:
@@ -336,6 +377,12 @@ def checkpointing_transport(inner: Transport) -> Transport:
             tag_dir = work.cwd or out.get("worktree")
             if isinstance(tag_dir, str) and tag_dir:
                 raw.checkpoint = _tag_head(tag_dir, work.checkpoint_tag)
+        elif work.salvage_anchor and (raw.exit_code != 0 or raw.error):
+            # A failed/timed-out attempt may have COMMITTED real work before it died.
+            # Report those commits so the engine can KEEP them for the retry (#59) rather
+            # than resetting them away. Git I/O stays HERE with the checkpoint reset it
+            # mirrors; the engine only reads the report and decides by failure kind.
+            raw.salvage = _salvageable_commits(work.cwd, work.salvage_anchor)
         return raw
 
     return run
