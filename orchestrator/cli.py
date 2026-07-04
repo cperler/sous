@@ -372,6 +372,10 @@ def main(argv: list[str] | None = None) -> int:
     db = sub.add_parser("dashboard", help="cross-session board (#6): one attention-first view "
                                           "over ALL runs under --root (runs/), not just one")
     db.add_argument("--watch", action="store_true", help="clear-screen + reprint on a loop")
+    db.add_argument("--serve", action="store_true",
+                    help="serve a read-only web dashboard (polls for run updates) instead of printing")
+    db.add_argument("--port", type=int, default=8787, help="--serve bind port")
+    db.add_argument("--host", default="127.0.0.1", help="--serve bind host (default localhost only)")
     db.add_argument("--interval", type=int, default=30, help="--watch refresh interval seconds")
     db.add_argument("--limit", type=int, default=20, help="max runs to show")
     db.add_argument("--all", action="store_true",
@@ -497,6 +501,19 @@ def main(argv: list[str] | None = None) -> int:
             stale_after_s=args.stale_after, limit=args.limit, show_all=args.all,
             engine_factory=factory, usage_reader=read_usage,
         )
+        if args.serve:
+            # Read-only web skin (#94): serve dashboard_snapshot()/stream_probe as JSON + a
+            # self-contained polling page. Same runs-root + read-only engine as the text board.
+            from .web_dashboard import serve as serve_web
+
+            serve_web(
+                args.root, factory, host=args.host, port=args.port, usage_reader=read_usage,
+                snap_kwargs=dict(
+                    stale_after_s=args.stale_after, limit=args.limit, show_all=args.all,
+                ),
+                on_ready=lambda url: print(f"orchestrator dashboard serving at {url} (Ctrl-C to stop)"),
+            )
+            return 0
         if args.watch:
             import contextlib
             import time

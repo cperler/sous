@@ -186,3 +186,30 @@ def test_cli_tail_follow_prints_appended_lines(tmp_path, capsys, monkeypatch) ->
     out = capsys.readouterr().out
     assert rc == 0
     assert "x1" in out and "x2" in out  # initial tail + the appended line
+
+
+# --- #94: `dashboard --serve` wires the read-only web skin (no blocking serve_forever) ---
+
+def test_cli_dashboard_serve_wires_web_dashboard(tmp_path, capsys, monkeypatch) -> None:
+    from orchestrator import web_dashboard
+
+    captured = {}
+
+    def fake_serve(root, factory, **kw) -> None:  # stands in for the blocking serve()
+        captured["root"] = root
+        captured["factory"] = factory
+        captured["kw"] = kw
+        if kw.get("on_ready"):
+            kw["on_ready"]("http://127.0.0.1:8787/")  # exercise the CLI's ready-print
+
+    monkeypatch.setattr(web_dashboard, "serve", fake_serve)
+    rc = main([
+        "--root", str(tmp_path), "--project", "tests.fakeproject",
+        "dashboard", "--serve", "--port", "9191", "--host", "0.0.0.0",
+    ])
+    assert rc == 0
+    assert captured["root"] == str(tmp_path)
+    assert captured["kw"]["port"] == 9191 and captured["kw"]["host"] == "0.0.0.0"
+    assert "stale_after_s" in captured["kw"]["snap_kwargs"]
+    assert callable(captured["kw"]["usage_reader"])
+    assert "serving at" in capsys.readouterr().out
