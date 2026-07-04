@@ -19,6 +19,7 @@ import subprocess
 import time
 import urllib.request
 from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
 from pathlib import Path
 
 _USAGE_URL = "https://api.anthropic.com/oauth/usage"
@@ -116,6 +117,49 @@ def read_usage(
         except OSError:
             pass  # cache write is a nicety, never a failure
     return usage
+
+
+def _reset_countdown(resets_at: str, now: datetime) -> str:
+    """Human 'resets in Xh Ym' from an ISO timestamp, or '' if absent/past/malformed.
+    Best-effort like the rest of the probe — a bad string never raises into a caller."""
+    if not resets_at:
+        return ""
+    try:
+        target = datetime.fromisoformat(resets_at.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if target.tzinfo is None:
+        target = target.replace(tzinfo=UTC)
+    remaining = int((target - now).total_seconds())
+    if remaining <= 0:
+        return ""
+    days, rem = divmod(remaining, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    minutes = rem // 60
+    if days:
+        return f"{days}d{hours}h"
+    if hours:
+        return f"{hours}h{minutes}m"
+    return f"{minutes}m"
+
+
+def format_statusline(usage: Usage | None, *, now: datetime | None = None) -> str:
+    """One compact status-bar line from a probe: 5h/7d utilization + reset countdown.
+    Empty string when the probe is unavailable so the status bar shows nothing rather
+    than an error (ports the old ``statusline-command.sh``). Plain text, not JSON —
+    Claude Code's ``statusLine`` consumes a raw line."""
+    if usage is None:
+        return ""
+    now = now or datetime.now(UTC)
+
+    def _seg(label: str, pct: float, resets_at: str) -> str:
+        countdown = _reset_countdown(resets_at, now)
+        tail = f" (resets {countdown})" if countdown else ""
+        return f"{label} {pct:.0f}%{tail}"
+
+    five = _seg("5h", usage.five_hour_pct, usage.five_hour_resets_at)
+    seven = _seg("7d", usage.seven_day_pct, usage.seven_day_resets_at)
+    return f"⧗ {five} · {seven}"
 
 
 def resolve_util(spec: str | float | None, *, reader=read_usage) -> tuple[float, dict]:
