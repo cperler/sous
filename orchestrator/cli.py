@@ -49,7 +49,7 @@ def _is_shared_runs_root(root: Path, run: str) -> bool:
     return False
 
 
-def _resolve_store_root(root: Path, run: str | None) -> Path:
+def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False) -> Path:
     """Resolve the actual per-run store directory from ``--root`` (#81).
 
     ``--root`` is ambiguous: dashboard/kb/tail treat it as the runs-root (parent
@@ -65,13 +65,20 @@ def _resolve_store_root(root: Path, run: str | None) -> Path:
     not flip a flat run into a nested one): if the run's own flat run-doc already
     sits in ``<root>`` we keep it there; if ``<root>/<run>/`` already exists we use
     that; only a fresh run under a shared root nests. Otherwise use ``<root>``
-    directly, preserving callers that already point at the per-run dir."""
+    directly, preserving callers that already point at the per-run dir.
+
+    ``force_nest`` (the ``--shared-root`` flag, #91) closes the day-one bootstrapping
+    gap: the structural heuristic cannot recognize a *fresh* shared ``runs/`` dir (no
+    KB, no sibling run stores yet), so the very first run under it would land flat.
+    When the caller asserts ``--root`` is the shared runs-root, force the nest even
+    with no markers. The established-flat guard still wins so an in-progress flat run
+    stays stable."""
     if not run:
         return root
     if (root / f"status-{run}.json").exists():
         return root  # this run is already established flat here — stay put
     nested = root / run
-    if nested.is_dir() or _is_shared_runs_root(root, run):
+    if nested.is_dir() or force_nest or _is_shared_runs_root(root, run):
         return nested
     return root
 
@@ -79,7 +86,10 @@ def _resolve_store_root(root: Path, run: str | None) -> Path:
 def _engine(args: argparse.Namespace) -> Engine:
     from .status_store import StatusStore
 
-    root = _resolve_store_root(Path(args.root), getattr(args, "run", None))
+    root = _resolve_store_root(
+        Path(args.root), getattr(args, "run", None),
+        force_nest=getattr(args, "shared_root", False),
+    )
     root.mkdir(parents=True, exist_ok=True)
     if root != Path(args.root):
         # Never silent: state the nesting so the operator sees where the store landed.
@@ -124,6 +134,12 @@ def main(argv: list[str] | None = None) -> int:
                         "commands auto-nest under <root>/<run>/ when <root> is a shared "
                         "runs-root (holds a learnings-kb.jsonl or other runs' stores), so "
                         "--root runs is the natural spelling shared with dashboard/kb/tail")
+    p.add_argument("--shared-root", action="store_true",
+                   help="assert --root IS the shared runs-root and force per-run nesting to "
+                        "<root>/<run>/ even with no markers (#91). Closes the day-one gap the "
+                        "auto-detect heuristic misses: a FRESH runs/ dir holds no KB or sibling "
+                        "stores yet, so the first run would otherwise land flat. Pass this when "
+                        "--root is the top-level runs/ dir")
     p.add_argument("--run", help="run id (not needed for validate)")
     p.add_argument("--project",
                    help="project-config module (e.g. adapters.project.heysoo) or a "

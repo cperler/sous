@@ -70,6 +70,27 @@ def test_missing_run_id_returns_root(tmp_path) -> None:
     assert _resolve_store_root(tmp_path, None) == tmp_path
 
 
+# --- #91: --shared-root forces the nest on a fresh runs-root the heuristic misses ---
+
+
+def test_force_nest_on_fresh_empty_root(tmp_path) -> None:
+    # The day-one gap: a fresh runs/ dir has no markers, so auto-detect keeps it flat...
+    assert _is_shared_runs_root(tmp_path, "r1") is False
+    assert _resolve_store_root(tmp_path, "r1") == tmp_path
+    # ...but --shared-root (force_nest) nests it anyway.
+    assert _resolve_store_root(tmp_path, "r1", force_nest=True) == tmp_path / "r1"
+
+
+def test_force_nest_does_not_override_established_flat_run(tmp_path) -> None:
+    # An in-progress flat run stays stable even under --shared-root (idempotent).
+    (tmp_path / "status-r1.json").write_text("{}")
+    assert _resolve_store_root(tmp_path, "r1", force_nest=True) == tmp_path
+
+
+def test_force_nest_needs_a_run_id(tmp_path) -> None:
+    assert _resolve_store_root(tmp_path, None, force_nest=True) == tmp_path
+
+
 # --- CLI: two runs under one shared parent never interleave --------------------
 
 
@@ -124,6 +145,22 @@ def test_fresh_root_still_writes_flat(tmp_path, capsys) -> None:
 
     assert (tmp_path / "status-r1.json").exists()
     assert not (tmp_path / "r1").exists()
+
+
+def test_shared_root_flag_nests_a_fresh_runs_dir(tmp_path, capsys) -> None:
+    # #91: on a brand-new runs/ dir (no KB, no sibling stores), --shared-root forces
+    # the very first run to nest instead of landing flat — the day-one bootstrap gap.
+    parent = tmp_path / "runs"
+    base = ["--root", str(parent), "--shared-root",
+            "--run", "run-a", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    _run(capsys, *base, "add-task", "--task", "#42")
+
+    nested = parent / "run-a"
+    assert (nested / "status-run-a.json").exists()
+    assert (nested / "status-run-a-#42.json").exists()
+    # Nothing leaked flat into the shared parent.
+    assert not (parent / "status-run-a.json").exists()
 
 
 def test_trailing_slash_root_does_not_false_positive_nesting_note(tmp_path, capsys) -> None:
