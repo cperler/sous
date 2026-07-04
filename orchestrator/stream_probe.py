@@ -110,6 +110,131 @@ def find_current_stream(
     return max(cands, key=lambda p: p.stat().st_mtime)
 
 
+# --- final-text extraction (#93) ---------------------------------------------------------
+# Since #66 the headless transports stream `--output-format stream-json` / codex `--json`, and
+# the raw JSONL event stream was landing in `RawResult.raw_output` — which is what the human-
+# facing per-stage .md Commentary, the failure-learning output tail, and schema-retry prompts
+# all show. The full stream is already teed to `<stage>-attempt<N>.stream.jsonl`, so the stream
+# in raw_output is pure noise. These helpers recover the model's READABLE final text from a
+# stream so the transport can put THAT on raw_output, and the renderer can retro-extract it from
+# any old-style stream payload. Owned here (orchestrator layer) so both `adapters.execution`
+# and `orchestrator.render` reach it without render importing adapters. Deterministic parse;
+# a partial/non-JSON line is skipped, mirroring the rest of this module.
+
+# Last-resort tail when a stream carries no readable final text at all (a crashed/textless
+# call). Bounded so raw_output can never balloon back to the whole stream.
+_STREAM_TAIL_CHARS = 2000
+
+
+def _iter_stream_objects(text: str):
+    """Yield each complete, parseable JSON object line of a provider stream (skipping banners
+    and partial trailing writes) — the shared spine of the stream-shape helpers."""
+    for line in text.splitlines():
+        s = line.strip()
+        if not s.startswith("{"):
+            continue
+        try:
+            ev = json.loads(s)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict):
+            yield ev
+
+
+def _assistant_text(ev: dict) -> str | None:
+    """The concatenated ``text`` blocks of a claude ``assistant`` event, or None if it has none
+    (a tool-only turn)."""
+    content = (ev.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return None
+    parts = [
+        c["text"] for c in content
+        if isinstance(c, dict) and c.get("type") == "text" and isinstance(c.get("text"), str)
+    ]
+    joined = "\n".join(p for p in parts if p.strip())
+    return joined if joined.strip() else None
+
+
+def claude_final_text(stdout: str) -> str | None:
+    """The model's readable final text from a claude ``stream-json`` stdout: the final
+    ``result`` event's ``result`` prose, else the LAST assistant turn's text block(s). None
+    when the stream carries neither (a crashed/textless call), leaving the caller to fall back
+    to a bounded stream tail."""
+    result_text: str | None = None
+    assistant_text: str | None = None
+    for ev in _iter_stream_objects(stdout):
+        t = ev.get("type")
+        if t == "result":
+            r = ev.get("result")
+            if isinstance(r, str) and r.strip():
+                result_text = r
+        elif t == "assistant":
+            blocks = _assistant_text(ev)
+            if blocks is not None:
+                assistant_text = blocks
+    return result_text or assistant_text
+
+
+def codex_final_text(stdout: str) -> str | None:
+    """The model's readable final text from a codex ``--json`` stdout: the LAST ``agent_message``
+    item's text. Covers the newer ``item.completed``→``item`` shape and the older ``msg``-wrapped /
+    top-level shapes; None when the stream carries no agent message (leaving a fallback to the
+    prose ``--output-last-message`` content or a bounded tail)."""
+    text: str | None = None
+    for ev in _iter_stream_objects(stdout):
+        item = ev.get("item") if isinstance(ev.get("item"), dict) else None
+        msg = ev.get("msg") if isinstance(ev.get("msg"), dict) else None
+        for src in (item, msg, ev):
+            if not isinstance(src, dict):
+                continue
+            if src.get("type") == "agent_message" or src.get("item_type") == "agent_message":
+                for key in ("text", "message", "content"):
+                    v = src.get(key)
+                    if isinstance(v, str) and v.strip():
+                        text = v
+    return text
+
+
+def stream_tail_note(stdout: str, relpath: str | None, *, max_chars: int = _STREAM_TAIL_CHARS) -> str:
+    """The LAST-RESORT ``raw_output`` for a call that produced no readable final text (a hard
+    failure / textless crash): a one-line note pointing at the retained full stream, then a
+    bounded tail of the stream. Evidence lives in the stream file; this is only a breadcrumb."""
+    tail = (stdout or "").strip()
+    if len(tail) > max_chars:
+        tail = tail[-max_chars:]
+    pointer = relpath or "(the retained stream file)"
+    note = f"[no final text — stream tail; full stream: {pointer}]"
+    return f"{note}\n{tail}" if tail else note
+
+
+def looks_like_event_stream(text: str, *, min_lines: int = 3) -> bool:
+    """True when ``text`` looks like a raw provider JSONL event stream rather than model prose:
+    at least ``min_lines`` non-empty lines with a MAJORITY parsing as JSON objects that carry a
+    ``type`` key. The renderer's belt-and-suspenders guard against dumping a stream into the
+    human-facing Commentary — including on a replay of an old-style (pre-#93) payload (#93)."""
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    if len(lines) < min_lines:
+        return False
+    typed = 0
+    for ln in lines:
+        if not ln.startswith("{"):
+            continue
+        try:
+            ev = json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict) and "type" in ev:
+            typed += 1
+    return typed * 2 > len(lines)
+
+
+def readable_text_from_stream(text: str) -> str | None:
+    """Extract the model's readable final text from a raw event-stream payload of unknown lane
+    (claude or codex) — the renderer's extractor once ``looks_like_event_stream`` has flagged a
+    payload. None when neither lane's shape yields prose."""
+    return claude_final_text(text) or codex_final_text(text)
+
+
 # --- activity extraction (parse, don't interpret) ----------------------------------------
 
 # Bound every piece of extracted text so a snapshot can never balloon (a model can emit a

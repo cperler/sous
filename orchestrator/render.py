@@ -10,6 +10,7 @@ from __future__ import annotations
 
 from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
 from .schemas.status import StageRecord, Task
+from .stream_probe import looks_like_event_stream, readable_text_from_stream
 
 
 def _cost_cell(rec: StageRecord) -> str:
@@ -309,9 +310,36 @@ def render_stage(payload: dict) -> str:
     if payload.get("structured_output") is not None:
         lines += ["", "## Result", "", *_render_struct(payload["structured_output"])]
     if payload.get("raw_output"):
-        lines += ["", "## Commentary", "", str(payload["raw_output"])]
+        lines += ["", "## Commentary", "", *_commentary(str(payload["raw_output"]), payload)]
     lines.append("")
     return "\n".join(lines)
+
+
+def _stream_pointer(payload: dict) -> str | None:
+    """The relpath of the stage's retained full provider stream (``stream_files["stream"]``),
+    for the Commentary pointer line — or None when no stream was teed."""
+    sf = payload.get("stream_files")
+    if isinstance(sf, dict) and isinstance(sf.get("stream"), str) and sf["stream"]:
+        return sf["stream"]
+    return None
+
+
+def _commentary(raw: str, payload: dict) -> list[str]:
+    """The ``## Commentary`` body for a stage's raw_output. Normally the raw_output IS the
+    model's readable final text (transport puts it there since #93), rendered verbatim. But an
+    OLD-style (pre-#93) or replayed payload may still carry a whole JSONL event stream — dumping
+    that into the human view is the #93 regression. So if it still LOOKS like an event stream,
+    extract the readable text instead and add a pointer to the retained full stream."""
+    if not looks_like_event_stream(raw):
+        return [raw]
+    extracted = readable_text_from_stream(raw)
+    pointer = _stream_pointer(payload)
+    body = [extracted] if extracted else [
+        "_(the model produced no final text; the raw provider event stream is elided here)_"
+    ]
+    if pointer:
+        body += ["", f"_Full provider event stream: `{pointer}`_"]
+    return body
 
 
 def render_task_index(task: Task, rejection_reason: str | None = None) -> str:

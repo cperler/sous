@@ -28,9 +28,12 @@ from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
 from orchestrator.status_store import safe_task_dirname
 from orchestrator.stream_probe import (
+    claude_final_text,
+    codex_final_text,
     stderr_filename,
     stream_filename,
     stream_relpath,
+    stream_tail_note,
 )
 
 
@@ -802,11 +805,18 @@ def checkpointing_transport(inner: Transport) -> Transport:
 
 
 def _envelope_to_raw(
-    data: dict, *, stdout: str, stderr: str, invocation: str, stream_files: dict | None
+    data: dict, *, stdout: str, stderr: str, invocation: str, stream_files: dict | None,
+    raw_output: str | None = None,
 ) -> RawResult:
     """Build a RawResult from a claude result envelope (the whole ``--output-format json``
     object, or the ``type=="result"`` event of the ``stream-json`` stream — same field
-    names). Shared so both output formats recover structured output identically."""
+    names). Shared so both output formats recover structured output identically.
+
+    ``raw_output`` (#93) sets the human-facing ``raw_output`` explicitly: the single-shot
+    ``--output-format json`` path leaves it None so it defaults to ``stdout`` (which there IS the
+    readable JSON envelope), while the streaming path passes the model's extracted FINAL TEXT so
+    the raw event stream never lands in the .md Commentary / failure-learning tail (the full
+    stream is already teed to ``.stream.jsonl``)."""
     # Presence check, not truthiness: a valid-but-empty structured_output ({}) must not
     # fall through to the prose `result`.
     structured = data["structured_output"] if "structured_output" in data else data.get("result")
@@ -815,8 +825,10 @@ def _envelope_to_raw(
         # recover the JSON object it printed (validated later by the schema-retry loop).
         structured = _json_object_from_text(structured)
     session_id = data.get("session_id")
-    return RawResult(structured, _usage_from(data), raw_output=stdout, raw_stderr=stderr,
-                     exit_code=0, invocation=invocation, stream_files=stream_files,
+    return RawResult(structured, _usage_from(data),
+                     raw_output=raw_output if raw_output is not None else stdout,
+                     raw_stderr=stderr, exit_code=0, invocation=invocation,
+                     stream_files=stream_files,
                      session_ref=session_id if isinstance(session_id, str) else None)
 
 
@@ -923,17 +935,27 @@ def claude_cli_transport(
             # A hung CLI must not hang the scheduler — fail the dispatch on timeout.
             return RawResult(None, exit_code=124,
                              error=f"timed out after {work.timeout_s}s", invocation=invocation)
+        # #93: on the streaming path, raw_output is the model's readable final text (result
+        # event / last assistant text), falling back to a bounded stream-tail note — NOT the
+        # raw JSONL event stream (already teed to `.stream.jsonl`). The single-shot path keeps
+        # raw_output = stdout, which there is the readable JSON envelope, not a stream.
+        stream_rel = (stream_files or {}).get("stream")
         if returncode != 0:
+            raw_out = stdout
+            if streaming:
+                raw_out = claude_final_text(stdout) or stream_tail_note(stdout, stream_rel)
             return RawResult(None, exit_code=returncode, error=stderr.strip()[:500],
-                             raw_output=stdout, raw_stderr=stderr,
+                             raw_output=raw_out, raw_stderr=stderr,
                              invocation=invocation, stream_files=stream_files)
         if streaming:
             data = _last_result_event(stdout)
             if data is None:
                 # Exit 0 but no result event (partial/killed stream): fail the dispatch.
-                return RawResult(None, raw_output=stdout, raw_stderr=stderr, exit_code=0,
+                return RawResult(None, raw_output=stream_tail_note(stdout, stream_rel),
+                                 raw_stderr=stderr, exit_code=0,
                                  error="no result event in stream-json output",
                                  invocation=invocation, stream_files=stream_files)
+            raw_output_value = claude_final_text(stdout) or stream_tail_note(stdout, stream_rel)
         else:
             try:
                 data = json.loads(stdout) if stdout.strip() else {}
@@ -942,11 +964,13 @@ def claude_cli_transport(
                 # let the exception escape (every dispatch must yield a StageResult).
                 return RawResult(None, raw_output=stdout, raw_stderr=stderr, exit_code=0,
                                  error=f"non-JSON output: {exc}", invocation=invocation)
+            raw_output_value = None  # single-shot: default raw_output=stdout (the JSON envelope)
         # NB: the shape-gate is deliberately NOT applied here — the `run` loop below
         # validates (and, on failure, retries with a corrective prompt). Nulling out an
         # invalid object here would throw away exactly what the retry needs to quote back.
         return _envelope_to_raw(data, stdout=stdout, stderr=stderr,
-                                invocation=invocation, stream_files=stream_files)
+                                invocation=invocation, stream_files=stream_files,
+                                raw_output=raw_output_value)
 
     def run(work: WorkItem) -> RawResult:
         raw = _call(work, work.session_ref)
@@ -1192,10 +1216,11 @@ def codex_cli_transport(
                 return RawResult(None, exit_code=124,
                                  error=f"timed out after {work.timeout_s}s", invocation=invocation)
             structured = None
+            last_txt: str | None = None
             if last.exists():
-                txt = last.read_text().strip()
+                last_txt = last.read_text().strip()
                 try:
-                    structured = json.loads(txt)
+                    structured = json.loads(last_txt)
                 except json.JSONDecodeError:
                     structured = None
             error = None
@@ -1207,7 +1232,18 @@ def codex_cli_transport(
                 error = (_codex_failure_cause(stdout) or stderr.strip() or None)
                 if error:
                     error = error[:500]
-            return RawResult(structured, usage=_codex_usage(stdout), raw_output=stdout,
+            # #93: raw_output is the model's readable final text — the last `agent_message` item,
+            # falling back to the prose `--output-last-message` content (when it's prose, not the
+            # structured JSON object that already rode `structured_output`), then a bounded stream-
+            # tail note. NOT the raw `--json` event stream, which is already teed to `.stream.jsonl`.
+            # `_codex_usage`/`_codex_session_id`/`_codex_failure_cause`/`_codex_schema_rejected` all
+            # read the local `stdout`/`error`, not raw_output, so this change doesn't touch them.
+            final_text = codex_final_text(stdout)
+            if final_text is None and last_txt and not last_txt.startswith("{"):
+                final_text = last_txt
+            if final_text is None:
+                final_text = stream_tail_note(stdout, (stream_files or {}).get("stream"))
+            return RawResult(structured, usage=_codex_usage(stdout), raw_output=final_text,
                              raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
                              error=error,
                              invocation=invocation, session_ref=_codex_session_id(stdout))

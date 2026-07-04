@@ -42,6 +42,60 @@ def test_render_stage_renders_structured_output_as_readable_markdown() -> None:
     assert "## Commentary" in md and "did the thing" in md
 
 
+def test_render_stage_prose_commentary_is_rendered_verbatim() -> None:
+    # A normal raw_output (the model's final text since #93) is shown as-is — the guard must
+    # not touch prose.
+    payload = {
+        "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
+        "outcome": "stage_completed", "model": "m", "lane_used": {}, "cost_usd": 0.1,
+        "raw_output": "I reviewed the change and it looks correct.\nNo blocking issues.",
+        "error": None, "completed_at": "t",
+    }
+    md = render_stage(payload)
+    assert "I reviewed the change and it looks correct." in md
+    assert "Full provider event stream" not in md  # not a stream → no pointer
+
+
+def test_render_stage_guards_against_a_raw_event_stream_payload() -> None:
+    # #93 belt-and-suspenders: an OLD-style (pre-fix) or replayed payload whose raw_output is
+    # still a raw JSONL event stream must NOT be dumped into Commentary — the renderer extracts
+    # the readable text and points at the retained full stream instead.
+    import json
+
+    stream = "\n".join([
+        json.dumps({"type": "system", "subtype": "init"}),
+        json.dumps({"type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "here is the analysis"}]}}),
+        json.dumps({"type": "result", "result": "the readable final answer", "usage": {}}),
+    ]) + "\n"
+    payload = {
+        "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
+        "outcome": "stage_completed", "model": "m", "lane_used": {}, "cost_usd": 0.1,
+        "raw_output": stream, "error": None, "completed_at": "t",
+        "stream_files": {"stream": "stages/9/review-attempt0.stream.jsonl"},
+    }
+    md = render_stage(payload)
+    assert "## Commentary" in md
+    assert "the readable final answer" in md  # extracted, not the stream
+    assert '"type":' not in md and '"type": ' not in md  # no raw JSONL leaked through
+    assert "Full provider event stream: `stages/9/review-attempt0.stream.jsonl`" in md
+
+
+def test_render_stage_stream_payload_without_extractable_text() -> None:
+    import json
+
+    stream = "\n".join(json.dumps({"type": "system", "n": i}) for i in range(4)) + "\n"
+    payload = {
+        "stage": "review", "task_id": "#9", "attempt": 0, "status": "failure",
+        "outcome": "stage_failed", "model": "m", "lane_used": {}, "cost_usd": 0.1,
+        "raw_output": stream, "error": "boom", "completed_at": "t",
+        "stream_files": {"stream": "stages/9/review-attempt0.stream.jsonl"},
+    }
+    md = render_stage(payload)
+    assert "no final text" in md and '"type":' not in md
+    assert "Full provider event stream:" in md
+
+
 def test_render_stage_titled_findings_are_readable_blocks() -> None:
     payload = {
         "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
