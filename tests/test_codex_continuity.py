@@ -168,8 +168,30 @@ def test_codex_surfaces_stream_failure_cause_into_error(monkeypatch) -> None:
     # the real cause is surfaced, NOT the deprecation banner
     assert "model is not supported" in raw.error
     assert "--full-auto" not in raw.error
+    # #88: the clean INNER message is surfaced, not the double-encoded JSON blob
+    assert raw.error == ("The 'gpt-5-codex' model is not supported when using Codex "
+                         "with a ChatGPT account.")
+    assert '"type"' not in raw.error and '"status"' not in raw.error
     # and it classifies as the provider being out, not a task failure
     assert is_provider_unavailable(raw)
+
+
+def test_codex_non_json_failure_cause_passes_through_unchanged(monkeypatch) -> None:
+    """#88: a plain (non-JSON) failure message is surfaced verbatim — the nested-decode only
+    unwraps a message that IS a JSON blob with a nested ``error.message``."""
+    stream = "\n".join([
+        json.dumps({"type": "turn.started"}),
+        json.dumps({"type": "turn.failed",
+                    "error": {"message": "boom: the build step exploded"}}),
+    ])
+    monkeypatch.setattr(subprocess, "run", _queue_codex_fake([], [{
+        "structured": None, "returncode": 1, "stdout": stream, "stderr": "",
+    }]))
+
+    raw = codex_cli_transport()(_work())
+
+    assert raw.exit_code == 1 and raw.error == "boom: the build step exploded"
+    assert not is_provider_unavailable(raw)
 
 
 def test_codex_error_falls_back_to_stderr_without_a_stream_cause(monkeypatch) -> None:
