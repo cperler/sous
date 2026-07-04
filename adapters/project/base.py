@@ -60,6 +60,21 @@ class TaskSource(Protocol):
     #       review's `issues` and force approved=false (the model cannot skip a policy
     #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups.
     #       Must be best-effort and fast — it runs inline in record().
+    #
+    #   notify(kind: str, payload: dict) -> None
+    #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify
+    #       plugged into). The engine calls it via ``Engine.emit_notification`` at the
+    #       events it matters for: a task terminally failed, a task parked
+    #       BLOCKED_ON_HUMAN autonomously, the batch circuit breaker paused the run, the
+    #       run finalized, and (poll-driven, from the scheduler loop / the ``watch`` CLI)
+    #       a task went stale. ``kind`` is one of alerting.NOTIFY_* ; ``payload`` carries
+    #       {run_id, task_id?, kind, summary, and specifics like stage/reason}. Same
+    #       duck-typed, best-effort contract as the hooks above: getattr-called, so a
+    #       raising hook is swallowed + evented (``notify_failed``) and NEVER breaks a
+    #       run, and adding it needs no CONTRACT_VERSION bump. Every notification is ALSO
+    #       appended to events.jsonl (type ``notification``) so the audit trail shows
+    #       what was signalled even when no hook is installed. HeysooConfig.notify is the
+    #       reference sink (stderr line + best-effort macOS desktop notification).
 
 
 @runtime_checkable

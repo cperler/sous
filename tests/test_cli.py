@@ -65,3 +65,27 @@ def test_cli_next_terminates_when_deterministic_setup_fails(tmp_path, capsys) ->
     assert work is None  # terminated instead of re-dispatching a failed task forever
     status = _run(capsys, *base, "status")
     assert status["tasks"]["#7"]["state"] == "failed"
+
+
+def test_cli_watch_exits_on_terminal_run(tmp_path, capsys) -> None:
+    # `watch` polls to a terminal state and prints a final summary. Driving the task to
+    # completion first means the run is already terminal, so watch returns on the first
+    # poll without ever sleeping (a passing test can't block on real time).
+    base = ["--root", str(tmp_path), "--run", "w1", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    _run(capsys, *base, "add-task", "--task", "#9")
+    for _ in range(10):
+        work = _run(capsys, *base, "next", "--task", "#9")
+        if work is None:
+            break
+        from orchestrator.schemas.work import WorkItem
+
+        wi = WorkItem.model_validate(work)
+        rf = tmp_path / "result.json"
+        rf.write_text(make_result(wi).model_dump_json())
+        _run(capsys, *base, "record", "--result", str(rf))
+
+    summary = _run(capsys, *base, "watch", "--interval", "1")
+    assert summary["watch"] == "done"
+    assert summary["run_state"] == "completed"
+    assert summary["progress"]["completed"] == 1

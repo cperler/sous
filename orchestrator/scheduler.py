@@ -19,6 +19,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 
+from .alerting import stale_notifications
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
 from .schemas.enums import TERMINAL_TASK_STATES
@@ -88,6 +89,7 @@ class Scheduler:
         util_provider: Callable[[], float] | None = None,
         sleeper: Callable[[int], None] | None = None,
         drain_wait_s: int = 300,
+        stale_after_s: int = 1800,
         max_ticks: int = 10_000,
     ) -> dict:
         """Loop until no task is dispatchable (all terminal or capacity-stalled).
@@ -105,9 +107,15 @@ class Scheduler:
         paused run refuses to schedule until ``orchestrator unpause``.
         """
         consecutive_failures = 0
+        stale_sent: set[str] = set()
         for _ in range(max_ticks):
             if self.engine.store.load_run(run_id).state.value == "paused":
                 break  # human-gated: unpause first
+            # Stall alerting (#55): poll the liveness sensor each pass and notify ONCE
+            # per task per stall episode. The shared alerting core owns the dedupe (the
+            # `watch` CLI feeds it the same way), so a re-ping is impossible until the
+            # task moves again and re-stalls.
+            stale_sent = self._alert_stale(run_id, stale_sent, stale_after_s)
             if not self.dispatchable(run_id):
                 # Nothing dispatchable — but a rate-limit cooldown is a wait, not an end.
                 wait = self._cooldown_wait(run_id)
@@ -130,11 +138,20 @@ class Scheduler:
                 elif outcome == "task_completed":
                     consecutive_failures = 0  # real progress resets the streak
             if self.batch_failure_threshold and consecutive_failures >= self.batch_failure_threshold:
-                self.engine.pause_run(
-                    run_id,
+                reason = (
                     f"batch circuit breaker: {consecutive_failures} consecutive task "
                     f"failures — check for a systemic cause (env, base branch), then "
-                    f"`orchestrator unpause`",
+                    f"`orchestrator unpause`"
+                )
+                self.engine.pause_run(run_id, reason)
+                # Alerting (#55): the breaker pause is a scheduler-layer event (no engine
+                # transition to hang it on), so it emits here — a paused batch is exactly
+                # the unattended stall a human needs told about.
+                self.engine.emit_notification(
+                    run_id, "run_paused",
+                    {"run_id": run_id, "kind": "run_paused", "reason": reason,
+                     "summary": f"run {run_id} PAUSED by the batch circuit breaker "
+                                f"({consecutive_failures} consecutive failures)"},
                 )
                 break
             if res["dispatched"] == 0:
@@ -144,6 +161,16 @@ class Scheduler:
                     continue
                 break  # caller retries later
         return self.engine.status(run_id)
+
+    def _alert_stale(self, run_id: str, sent: set[str], stale_after_s: int) -> set[str]:
+        """Poll the liveness sensor and fire any newly-due stall notifications, returning
+        the updated dedupe set. Shares the pure ``stale_notifications`` core with the
+        ``watch`` CLI so both apply identical once-per-episode semantics."""
+        status = self.engine.status(run_id, stale_after_s=stale_after_s)
+        notes, sent = stale_notifications(status, sent)
+        for note in notes:
+            self.engine.emit_notification(run_id, note["kind"], note)
+        return sent
 
     def _cooldown_wait(self, run_id: str) -> int | None:
         """Seconds until the SOONEST rate-limit cooldown among non-terminal tasks

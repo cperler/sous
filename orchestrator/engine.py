@@ -628,6 +628,31 @@ class Engine:
                  "task_id": result.task_id, "stage": result.stage.value,
                  "blocked_reason": scope_blocked_reason},
             )
+        # Alerting (#55): fire the transition notifications HERE in the engine, not in
+        # the scheduler tick — this is the ONE layer that catches BOTH scheduler-driven
+        # batches AND single-task engine-lane runs (the interactive `next`/`record`
+        # drain has no scheduler loop). A terminal failure and an AUTONOMOUS park at the
+        # human gate (scope-infeasible / review-rejected-held — NOT the human-initiated
+        # hold_for_approval, which the human already knows about) are exactly the
+        # unattended-run events the old monitor alerted on.
+        if outcome.startswith("task_failed"):
+            self.emit_notification(
+                run_id, "task_failed",
+                {"run_id": run_id, "task_id": result.task_id, "kind": "task_failed",
+                 "summary": f"task {result.task_id} FAILED at {result.stage.value} "
+                            f"({outcome})",
+                 "stage": result.stage.value,
+                 "reason": effective.error or outcome},
+            )
+        elif task.state is TaskState.BLOCKED_ON_HUMAN:
+            self.emit_notification(
+                run_id, "task_blocked",
+                {"run_id": run_id, "task_id": result.task_id, "kind": "task_blocked",
+                 "summary": f"task {result.task_id} BLOCKED_ON_HUMAN at "
+                            f"{result.stage.value} ({outcome}) — needs a human decision",
+                 "stage": result.stage.value,
+                 "reason": scope_blocked_reason or task.last_error or outcome},
+            )
         # Post-transition run-level effects: cascade-block dependents of a failed task,
         # mark_complete + finalize the run when everything is terminal.
         if task.state is TaskState.FAILED:
@@ -1063,6 +1088,32 @@ class Engine:
         )
         return task
 
+    # --- alerting seam (#55) ----------------------------------------------------
+    def emit_notification(self, run_id: str, kind: str, payload: dict) -> None:
+        """Best-effort alerting: ALWAYS append a ``notification`` audit row (so the
+        trail shows what was signalled even when no hook is installed), then call the
+        project's optional duck-typed ``notify(kind, payload)`` hook.
+
+        The hook is the seam the old bash monitor's email + desktop-notify plugs into.
+        Like ``review_findings``/``publish_note`` it is getattr-called and NOT part of
+        the versioned contract (no CONTRACT_VERSION bump). A raising hook is swallowed
+        and evented (``notify_failed``) — an alert must NEVER break a run."""
+        row = {"ts": _now(), "type": "notification", "run_id": run_id, "kind": kind}
+        for key, value in payload.items():  # fold the payload for a self-describing row
+            row.setdefault(key, value)
+        self.store.append_event(run_id, row)
+        hook = getattr(self.project, "notify", None)
+        if not callable(hook):
+            return
+        try:
+            hook(kind, payload)
+        except Exception as exc:  # noqa: BLE001 - an alert hook must never break the run
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "notify_failed", "run_id": run_id,
+                 "kind": kind, "error": str(exc)},
+            )
+
     # --- run pause (batch-wide circuit breaker, #58) ----------------------------
     def pause_run(self, run_id: str, reason: str) -> None:
         """Pause a run (no further scheduler dispatch until unpaused). Used by the
@@ -1480,6 +1531,16 @@ class Engine:
                 run_id,
                 {"ts": _now(), "type": "run_finalized", "run_id": run_id,
                  "state": new_state.value},
+            )
+            # Alerting (#55): the "batch is done" ping. Emitted at the finalize
+            # transition so it fires exactly once, on every path that finalizes a run
+            # (scheduler, engine-lane record, and the out-of-band reject()).
+            progress = run.progress()
+            self.emit_notification(
+                run_id, "run_finalized",
+                {"run_id": run_id, "kind": "run_finalized", "state": new_state.value,
+                 "summary": f"run {run_id} finalized {new_state.value} — "
+                            f"{progress.completed}/{progress.total} tasks completed"},
             )
         # Final cost artifacts (the per-record write was removed for O(N^2)).
         rows = self.ledger.rows()

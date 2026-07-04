@@ -110,6 +110,12 @@ def main(argv: list[str] | None = None) -> int:
     rj.add_argument("--reason", required=True, help="why the task is infeasible")
     sub.add_parser("resume")
     sub.add_parser("status")
+    wt = sub.add_parser("watch", help="poll a run to terminal, alerting (project notify "
+                                      "hook) on stalls and terminal states — works for "
+                                      "any run, incl. single-task engine-lane runs")
+    wt.add_argument("--interval", type=int, default=60, help="poll interval seconds")
+    wt.add_argument("--stale-after", type=int, default=1800,
+                    help="a task with no update for this many seconds is flagged stale")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
@@ -258,6 +264,17 @@ def main(argv: list[str] | None = None) -> int:
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
         _emit(eng.status(args.run))
+    elif args.cmd == "watch":
+        import time
+
+        from .alerting import watch as watch_run
+
+        final = watch_run(
+            eng, args.run, interval=args.interval, stale_after_s=args.stale_after,
+            sleeper=time.sleep, emit=lambda line: print(line, file=sys.stderr),
+        )
+        _emit({"watch": "done", "run_id": args.run, "run_state": final["run_state"],
+               "progress": final["progress"]})
     elif args.cmd == "cost-report":
         _emit(eng.ledger.analysis())
     elif args.cmd == "retrospective":

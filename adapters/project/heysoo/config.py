@@ -7,8 +7,10 @@ docstring agent (no ``phpdoc-writer``), and the test-taxonomy living in config.
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 
 from orchestrator.schemas.enums import Stage
@@ -84,6 +86,29 @@ class HeysooConfig:
     def schema_for(self, ref: str) -> dict | None:
         # Inherit the engine's canonical stage-output contracts (gives codex full-validation).
         return resolve_stage_schema(ref)
+
+    # --- alerting sink (#55) ----------------------------------------------------
+    def notify(self, kind: str, payload: dict) -> None:
+        """Reference implementation of the alerting seam the old monitor's email +
+        desktop-notify plugged into. Deliberately dead simple: always log a line to
+        stderr, and best-effort fire a macOS desktop notification via ``osascript``
+        (short timeout). Swallows ALL errors — the engine already guards this hook, so
+        this is belt-and-suspenders. No email: SMTP config doesn't belong in this pass."""
+        summary = str(payload.get("summary") or kind)
+        print(f"[orchestrator:{kind}] {summary}", file=sys.stderr)
+        try:
+            # json.dumps yields valid AppleScript double-quoted string literals (no shell
+            # involved — argv, not a shell string — so no injection surface).
+            script = (
+                f"display notification {json.dumps(summary)} "
+                f"with title {json.dumps(f'orchestrator: {kind}')}"
+            )
+            subprocess.run(  # noqa: S603
+                ["osascript", "-e", script],
+                capture_output=True, timeout=5, check=False,
+            )
+        except Exception:  # noqa: BLE001 - an alert sink must never break the run
+            pass
 
     # --- deterministic review policy gates (#65) --------------------------------
     def review_findings(self, *, worktree: str | None = None) -> list[dict]:

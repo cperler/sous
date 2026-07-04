@@ -30,7 +30,11 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
     assert types.count("stage_dispatched") == 6
     assert types.count("stage_recorded") == 6
     assert "task_completed" in types
-    assert types[-1] == "run_finalized"
+    # run_finalized is immediately followed by its alerting `notification` row (#55),
+    # so it's the penultimate event and the finalize notification is the last.
+    assert types[-2] == "run_finalized"
+    assert types[-1] == "notification"
+    assert events[-1]["kind"] == "run_finalized"
     # dispatched precedes recorded for each stage
     assert types.index("stage_dispatched") < types.index("stage_recorded")
 
