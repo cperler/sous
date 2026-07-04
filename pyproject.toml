@@ -1,7 +1,7 @@
 [project]
 name = "orchestration-template"
 version = "0.1.0"
-description = "Deterministic orchestration engine + interactive execution lane (Phase 3a)"
+description = "Installable, project-agnostic orchestration engine + interactive/headless execution lanes and project-config adapters"
 requires-python = ">=3.11"
 dependencies = [
     "jsonschema>=4.26.0",
@@ -11,6 +11,13 @@ dependencies = [
 [project.scripts]
 orchestrator = "orchestrator.cli:main"
 orchestrator-scaffold = "orchestrator.scaffold:main"
+
+# The in-repo reference project-config adapters, registered so the engine can resolve
+# them by short name (`--project heysoo`) via entry-point discovery — the same seam any
+# third-party package uses to ship its own adapter. This self-tests the mechanism.
+[project.entry-points."orchestrator.project_adapters"]
+heysoo = "adapters.project.heysoo"
+selfhost = "adapters.project.selfhost"
 
 [dependency-groups]
 dev = [
@@ -26,9 +33,22 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["orchestrator", "adapters"]
 
+# The starter kit (templates/project-default/ — schemas, agents, hooks, skills, manifest)
+# lives at the repo root for a source checkout but must ride inside the wheel so an
+# installed `orchestrator-scaffold` can seed it. Force-include it under the package;
+# scaffold._kit_dir() resolves either layout.
+[tool.hatch.build.targets.wheel.force-include]
+"templates" = "orchestrator/templates"
+
+[tool.hatch.build.targets.sdist]
+include = ["orchestrator", "adapters", "templates", "README.md"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+markers = [
+    "slow: builds a wheel + throwaway venv (the install smoke test); deselect with -m 'not slow'",
+]
 
 [tool.ruff]
 line-length = 100

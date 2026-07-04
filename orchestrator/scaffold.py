@@ -21,7 +21,23 @@ from pathlib import Path
 
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
 
-KIT_DIR = Path(__file__).resolve().parent.parent / "templates" / "project-default"
+
+def _kit_dir() -> Path:
+    """Locate the starter kit in both a source checkout and an installed wheel.
+
+    In an installed wheel the kit is force-included under the package
+    (``orchestrator/templates/project-default``); in a source checkout it lives at the
+    repo root (``../templates/project-default``). Prefer whichever exists so the same code
+    path works CWD-independently in either layout.
+    """
+    here = Path(__file__).resolve().parent
+    packaged = here / "templates" / "project-default"
+    if packaged.is_dir():
+        return packaged
+    return here.parent / "templates" / "project-default"
+
+
+KIT_DIR = _kit_dir()
 
 # Command method <-> profile key. Order is the order they appear in the generated config.
 _COMMAND_METHODS: list[tuple[str, str, bool]] = [

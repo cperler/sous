@@ -91,6 +91,39 @@ translating local `depends_on` ids into the real issue refs of already-filed tas
 batch label so the whole set is queryable (`gh issue list --label spec:<slug>`). The
 filed issues then feed the batch lane below (`add-task --task "#N"` for each).
 
+## Install
+
+The engine runs straight from a checkout (`uv run orchestrator …`, the zero-packaging
+path), or install it as a library so any repo can drive its own project:
+
+```bash
+# console scripts: `orchestrator` + `orchestrator-scaffold`
+uv tool install "git+https://github.com/cperler/orchestration-template"
+# or into a project's own venv
+uv pip install "git+https://github.com/cperler/orchestration-template"
+```
+
+(PyPI publication isn't in scope — install from git.) The starter kit, stage schemas,
+and reference adapters all ride inside the wheel, so `orchestrator-scaffold` and codex
+full-validation work from an installed copy exactly as from a checkout.
+
+A project plugs its adapter in one of three ways (in resolution order for `--project`):
+a **directory path** (`../my-project/.orchestration` — the zero-packaging option, the
+adapter lives in the project repo), a **dotted module** (`adapters.project.heysoo`), or
+an **entry-point name** once a package registers one. To ship an adapter as an installable
+package, register it under the `orchestrator.project_adapters` group — then
+`--project <name>` resolves it:
+
+```toml
+# in the adapter package's pyproject.toml
+[project.entry-points."orchestrator.project_adapters"]
+myproj = "myproj_orchestration"                    # module: CONTRACT_VERSION + get_config
+# or: myproj = "myproj_orchestration:MyProjConfig" # a ProjectConfig class (class-level CONTRACT_VERSION)
+```
+
+The engine's own `heysoo` / `selfhost` reference adapters are registered exactly this way
+(`--project heysoo`), which self-tests the mechanism.
+
 ## Running it
 
 Two things vary independently: **how you launch** (from a plain terminal, or from inside
