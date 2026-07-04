@@ -158,6 +158,33 @@ $ORCH run-headless --mode headless --util 0
 $ORCH status
 ```
 
+#### Unattended: a queue file + `run-queue` (cron)
+
+For a fully hands-off launch, feed batches through a **queue file** instead of adding tasks
+by hand. The file is a `ralph-queue.json`-style JSON array of batch entries
+(`{tasks, branch, enqueued_at}` — the as-built scheduler §1.8 format); `enqueue` appends one
+entry (lock-free atomic append — no engine needed, so a cron job can top it up), and
+`run-queue` is the unattended entrypoint that drains it batch-by-batch, driving each derived
+run in-process to terminal.
+
+```bash
+# a producer (cron, CI, or a human) appends batches — no engine/store touched:
+$ORCH enqueue --queue-file runs/queue.json --tasks "#42,#43" --branch batch-a
+
+# the daemon drains the queue, deriving one run per batch (run id from enqueued_at):
+$ORCH --root runs --project adapters.project.heysoo \
+      run-queue --queue-file runs/queue.json --wait --idle-timeout 300
+```
+
+Each batch's run id is derived deterministically from its `enqueued_at`, so a driver that
+crashes and is relaunched **reuses** the same run (create-or-reuse, idempotent adds) rather
+than forking a duplicate. `--wait` idle-waits on an empty queue (polling every
+`--poll-interval` seconds up to `--idle-timeout`, then exits) and sleeps through capacity /
+rate-limit stalls; without it `run-queue` makes a single drain pass and returns. On an ingest
+failure the popped batch is re-prepended to the head (never silently dropped) and the failure
+is surfaced. Everything below the ingest step is the same already-resumable `Scheduler.run`
+loop mode 1 uses.
+
 ### 2. From within a Claude session — interactive (subscription)
 
 Invoke a supervisor **slash command** and Claude drives the run in-session. This runs the

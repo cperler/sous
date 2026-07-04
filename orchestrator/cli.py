@@ -104,8 +104,8 @@ def _engine(args: argparse.Namespace) -> Engine:
 
     # Config-only execution mode (interactive×claude default; headless = in-process).
     mode = ExecutionMode(getattr(args, "mode", "interactive"))
-    if args.cmd == "run-headless":
-        mode = ExecutionMode.HEADLESS  # this command drives in-process; force the lane
+    if args.cmd in ("run-headless", "run-queue"):
+        mode = ExecutionMode.HEADLESS  # these commands drive in-process; force the lane
     provider = Provider(args.provider) if getattr(args, "provider", None) else None
     interactive = mode is ExecutionMode.INTERACTIVE and provider is not Provider.CODEX
     # Codex full-validation AND the headless×claude --json-schema both need the project's
@@ -220,6 +220,25 @@ def main(argv: list[str] | None = None) -> int:
     rh.add_argument("--wait", action="store_true",
                     help="sleep through capacity stalls / rate-limit cooldowns instead of "
                          "returning (the old capacity_wait_loop)")
+    eq = sub.add_parser("enqueue", help="append one batch entry to a queue file for the "
+                                        "unattended run-queue loop (#1); no engine needed")
+    eq.add_argument("--queue-file", required=True, help="ralph-queue.json-style queue file")
+    eq.add_argument("--tasks", required=True,
+                    help="comma-separated task ids for this batch")
+    eq.add_argument("--branch", default=None, help="optional batch branch (recorded metadata)")
+    rq = sub.add_parser("run-queue", help="unattended (cron) entrypoint (#1): drain a queue "
+                                          "file batch-by-batch, driving each run in-process")
+    rq.add_argument("--queue-file", required=True, help="ralph-queue.json-style queue file")
+    rq.add_argument("--util", default="0", help=util_help)
+    rq.add_argument("--max-concurrent", type=int, default=3)
+    rq.add_argument("--lane", default="full", help="lane preset for created runs (default full)")
+    rq.add_argument("--idle-timeout", type=int, default=300,
+                    help="with --wait: seconds to keep polling an empty queue before exiting")
+    rq.add_argument("--poll-interval", type=int, default=15,
+                    help="with --wait: empty-queue poll interval seconds (default 15)")
+    rq.add_argument("--wait", action="store_true",
+                    help="idle-wait on an empty queue and sleep through capacity/cooldown "
+                         "stalls (the cron/daemon mode); default is a single drain pass")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
     sl = sub.add_parser("statusline",
                         help="one-line 5h/7d utilization for the Claude Code status bar "
@@ -725,6 +744,61 @@ def main(argv: list[str] | None = None) -> int:
         except BrainstormError as exc:
             _emit({"ok": False, "error": str(exc)})
             return 1
+        return 0
+
+    if args.cmd == "enqueue":
+        # Unattended-queue producer (#1): append one batch entry to the queue file and
+        # exit. No engine/project/run — enqueue is pure file I/O so a cron job (or a human)
+        # can top up the queue without touching a store. Lock-free atomic append per §1.8.
+        from .queue_file import QueueError, QueueFile, make_entry
+
+        tasks = [t.strip() for t in args.tasks.split(",") if t.strip()]
+        try:
+            entry = QueueFile(args.queue_file).append(make_entry(tasks, args.branch))
+        except QueueError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        _emit({"ok": True, "queue_file": args.queue_file, "enqueued": entry})
+        return 0
+
+    if args.cmd == "run-queue":
+        # Unattended (cron) entrypoint (#1): drain the queue file batch-by-batch, driving
+        # each derived run in-process (headless). Needs --root/--project to build the engine
+        # (like run-headless) but NOT --run — run ids are derived from each batch's
+        # enqueued_at, so one launch can process many runs.
+        import time
+
+        from adapters.execution.runners import registry_runner
+
+        from .queue_file import QueueError, QueueFile, drive_queue
+
+        if not args.root or not args.project:
+            p.error("--root and --project are required for run-queue")
+        eng = _engine(args)
+        from .usage_probe import resolve_util
+
+        util_pct, _ = resolve_util(args.util)
+        util_provider = None
+        if args.util == "auto":
+            from .usage_probe import read_usage
+
+            def util_provider() -> float:  # re-probe each tick so the gate tracks reality
+                usage = read_usage()
+                return usage.five_hour_pct if usage else 0.0
+
+        try:
+            summary = drive_queue(
+                eng, QueueFile(args.queue_file), registry_runner(eng.registry),
+                lane=ExecutionLane(args.lane), util_pct=util_pct,
+                util_provider=util_provider,
+                sleeper=time.sleep if args.wait else None,
+                max_concurrent=args.max_concurrent,
+                idle_timeout_s=args.idle_timeout, poll_interval_s=args.poll_interval,
+            )
+        except QueueError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        _emit(summary)
         return 0
 
     if not args.root or not args.run or not args.project:

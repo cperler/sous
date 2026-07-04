@@ -186,3 +186,28 @@ def test_cli_tail_follow_prints_appended_lines(tmp_path, capsys, monkeypatch) ->
     out = capsys.readouterr().out
     assert rc == 0
     assert "x1" in out and "x2" in out  # initial tail + the appended line
+
+
+def test_cli_enqueue_and_run_queue(tmp_path, capsys) -> None:
+    # #1: the `enqueue` producer appends a batch (no engine), and `run-queue` drains it
+    # in-process (headless) to terminal, deriving the run id from the batch's enqueued_at.
+    queue = tmp_path / "queue.json"
+    out = _run(capsys, "enqueue", "--queue-file", str(queue),
+               "--tasks", "#42,#43", "--branch", "batch-a")
+    assert out["ok"] is True
+    assert out["enqueued"]["tasks"] == ["#42", "#43"]
+    assert out["enqueued"]["branch"] == "batch-a"
+
+    # run-queue drains the batch in-process, deriving one run and driving it to terminal.
+    # (FakeProject has no real headless model, so the run terminates failed — the point of
+    # this CLI test is the enqueue->ingest->drive->dequeue WIRING; the scripted-lane e2e in
+    # test_queue_file covers a green completion.)
+    summary = _run(capsys, "--root", str(tmp_path), "--project", "tests.fakeproject",
+                   "run-queue", "--queue-file", str(queue))
+    assert summary["batches_processed"] == 1
+    assert summary["runs_created"] == 1
+    assert summary["runs"][0]["tasks"] == ["#42", "#43"]
+    assert summary["runs"][0]["final_state"] in ("completed", "failed")
+
+    # the queue drained to empty after the single pass (the head was dequeued).
+    assert json.loads(queue.read_text()) == []
