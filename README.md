@@ -7,6 +7,9 @@ Workflow on the subscription, and headless via the Agent SDK / `claude -p` / `co
 It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 `.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
 
+New here? **`ARCHITECTURE.md`** is a one-page map of the whole system — the engine/adapter
+split, the six-stage pipeline, the front doors, the control loops, and where to start reading.
+
 **Status: built and live-proven.** Phases 1–5 complete plus two engine-hardening passes
 and a workflow code-review pass. 294 pytest cases green, ruff clean. Driven real GitHub
 issues to merged/draft PRs on the reference project (heysoo PRs #556–#560) with clean
