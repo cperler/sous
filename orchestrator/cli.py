@@ -1,8 +1,25 @@
-"""Engine CLI — the supervisor's Bash entry points (target.md §3).
+"""Engine CLI — supervisor and unattended entrypoints (target.md §3).
 
-The supervisor loop is: ``ready`` -> ``next`` (get a WorkItem) -> [the execution
-lane runs it] -> ``record`` (ingest the StageResult) -> repeat. The CLI speaks JSON
-on stdout so a Bash/skill supervisor can drive it. It never calls a model.
+Three operational modes share this CLI:
+
+* **Interactive supervisor loop** — the human-in-the-loop flow where a
+  Bash/skill supervisor drives ``next`` → [lane executes] → ``record`` → repeat.
+  The CLI speaks JSON on stdout; the supervisor owns the outer loop.
+
+* **Headless in-process** (``run-headless``) — the engine scheduler drives the
+  whole run autonomously, dispatching in-process over the registry runners without
+  a human supervisor. Suitable for scripted or CI contexts.
+
+* **Unattended queue drain** (``enqueue`` + ``run-queue``) — a cron-friendly
+  front door for the headless lane. ``enqueue`` atomically appends a batch entry
+  to a ``ralph-queue.json``-style queue file (no engine needed). ``run-queue``
+  drains the queue batch-by-batch: each entry becomes a stable run id (derived
+  from ``enqueued_at``) that is created-or-reused and then driven to terminal
+  through ``Scheduler.run``. On an ingest failure the batch is re-prepended so
+  nothing is silently dropped. See ``orchestrator.queue_file`` for the contract.
+
+The CLI never calls a model. All model-level work is delegated to the execution
+lane runners wired into the engine registry.
 """
 
 from __future__ import annotations
@@ -104,6 +121,16 @@ def _consumes_shared_root(args: argparse.Namespace) -> bool:
 
 
 def _engine(args: argparse.Namespace) -> Engine:
+    """Build and return a fully-wired ``Engine`` from the parsed CLI args.
+
+    Resolves the per-run store directory (auto-nesting under a shared runs-root
+    when appropriate), then constructs the ``StatusStore``, ``CostLedger``,
+    project adapter, ``Router``, and execution-lane ``Registry`` in one shot.
+
+    Execution mode is derived from ``--mode`` but overridden to
+    ``HEADLESS`` for ``run-headless`` and ``run-queue`` — those commands drive
+    the engine in-process and must never open an interactive session.
+    """
     from .status_store import StatusStore
 
     root = _resolve_store_root(
