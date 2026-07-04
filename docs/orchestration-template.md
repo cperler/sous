@@ -1,5 +1,9 @@
 # Orchestration Template — Design Notes & Extraction Plan
 
+> **HISTORICAL (June 2026).** The pre-build design doc, kept as the decision record.
+> The system has since been built well past it — see `ARCHITECTURE.md` for the as-built
+> map and `docs/orchestration-spec/target.md` for the spec.
+
 > Working document. Captures the assessment of Hey Soo!'s existing `.claude/`
 > orchestration system, the analysis of the June 15 2026 billing change, the
 > strategy for adapting to it, and the plan to extract the system into a

@@ -10,3 +10,4 @@ runs/
 specs/
 .worktrees/
 .claude/worktrees/
+.DS_Store
