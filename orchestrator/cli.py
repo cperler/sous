@@ -16,7 +16,7 @@ from adapters.execution.runners import build_registry
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
 
 from .cost_ledger import CostLedger
-from .engine import Engine
+from .engine import DEFAULT_ABANDON_MIN_IDLE_S, Engine
 from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
@@ -244,6 +244,20 @@ def main(argv: list[str] | None = None) -> int:
     rj.add_argument("--task", required=True)
     rj.add_argument("--by", required=True, help="who is rejecting")
     rj.add_argument("--reason", required=True, help="why the task is infeasible")
+    ab = sub.add_parser("abandon", help="finalize a task whose run was killed mid-dispatch "
+                                        "(#82): release the outstanding lease and drive the "
+                                        "task terminal without a hand-crafted synthetic result")
+    ab.add_argument("--task", required=True)
+    ab.add_argument("--reason", required=True, help="why the dispatch is being abandoned")
+    ab.add_argument("--disposition", choices=["failed", "rejected"], default="failed",
+                    help="terminal state: 'failed' (execution died) or 'rejected' "
+                         "(close-infeasible, writes the rejection artifact). Default failed")
+    ab.add_argument("--min-idle-s", type=int, default=DEFAULT_ABANDON_MIN_IDLE_S,
+                    help="refuse if the dispatch's provider stream grew within this many "
+                         "seconds (it may still be alive); default "
+                         f"{DEFAULT_ABANDON_MIN_IDLE_S}")
+    ab.add_argument("--force", action="store_true",
+                    help="override the liveness guard (the process is known dead)")
     sub.add_parser("resume")
     sub.add_parser("status")
     wt = sub.add_parser("watch", help="poll a run to terminal, alerting (project notify "
@@ -825,6 +839,12 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "reject":
         task = eng.reject(args.run, args.task, rejected_by=args.by, reason=args.reason)
         _emit({"rejected": task.task_id, "state": task.state.value, "by": args.by})
+    elif args.cmd == "abandon":
+        task = eng.abandon(args.run, args.task, reason=args.reason,
+                           disposition=args.disposition, min_idle_s=args.min_idle_s,
+                           force=args.force)
+        _emit({"abandoned": task.task_id, "state": task.state.value,
+               "disposition": args.disposition})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":

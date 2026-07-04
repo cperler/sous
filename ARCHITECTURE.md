@@ -131,6 +131,16 @@ conversation:
   approval artifact recording who/what) and `Engine.reject()` (task ends
   `completed_with_rejections`, rejection surfaced to the task source). This is the engine-side
   enforcement of the live-run checkpoint: autonomous paths park; humans release.
+- **Abandon path for a killed-mid-dispatch run.** When a run dies while a dispatch is
+  outstanding (`pending_work_item_id` held), every state-changing path correctly refuses —
+  `record` demands the matching result, `hold`/`reject` demand a quiescent/held task — leaving
+  the lease stuck. `Engine.abandon()` (`orchestrator abandon`) is the sanctioned finalize: it
+  synthesizes the lease-matching abandonment internally (honest $0 cost row, `dispatch_abandoned`
+  stage log + event), clears the lease, and drives the task terminal (`failed`, or
+  `rejected` → `closed_infeasible` with the rejection artifact), then runs the same
+  cascade/release-ports/harvest/finalize effects `reject` does. A liveness guard (the `#66`
+  stream probe) refuses while the dispatch's provider stream grew within `--min-idle-s`; `--force`
+  overrides when the operator knows the process is dead.
 - **Cross-run learnings KB.** `orchestrator/learnings_kb.py` persists a shared
   `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
