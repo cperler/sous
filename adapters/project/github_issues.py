@@ -34,6 +34,22 @@ def _ref_from_url(url: str) -> str:
     return f"#{m.group(1)}" if m else url
 
 
+def _find_pr_url(texts: list[str], repo: str) -> str | None:
+    """Best-effort PR discovery: the first ``github.com/<repo>/pull/<n>`` url across the
+    given texts (issue body + comments), preferring this repo's PRs. The engine's
+    ``mark_complete`` / ``publish_note`` post an ``Implemented via <pr_url>`` comment, so a
+    finished task's PR is usually recoverable from its issue thread. Returns None if none."""
+    pat = re.compile(r"https?://github\.com/([^/\s]+/[^/\s]+)/pull/(\d+)")
+    fallback: str | None = None
+    for text in texts:
+        for m in pat.finditer(text or ""):
+            url = f"https://github.com/{m.group(1)}/pull/{m.group(2)}"
+            if m.group(1) == repo:
+                return url
+            fallback = fallback or url
+    return fallback
+
+
 def _parse_depends_on(body: str) -> list[str]:
     """Extract the ``#N`` refs from a ``Depends-on:`` line in an issue body — the spec
     front door's own encoding (``spec_intake._compose_body`` writes ``Depends-on: #12,
@@ -115,6 +131,28 @@ class GitHubIssuesSource:
                 )
             )
         return out
+
+    def describe_issue(self, ref: str) -> dict:
+        """Look up a filed issue's state + PR for the conformance gate (#18 bullet 2).
+
+        Optional, duck-typed (like ``list_tasks`` / the evidence-out hooks; NOT part of
+        the versioned contract). Returns ``{ref, state (open/closed), body, pr}``. Unlike
+        ``resolve`` this does NOT refuse a closed issue — a conformance check is precisely
+        about closed ones. PR discovery is best-effort from the issue body + comments."""
+        num = _issue_number(ref)
+        raw = self._run(
+            ["gh", "issue", "view", num, "--repo", self.repo,
+             "--json", "number,state,body,comments"]
+        )
+        data = json.loads(raw)
+        texts = [data.get("body") or ""]
+        texts += [c.get("body") or "" for c in data.get("comments", []) or []]
+        return {
+            "ref": ref,
+            "state": str(data.get("state", "")).lower() or "unknown",
+            "body": data.get("body") or "",
+            "pr": _find_pr_url(texts, self.repo),
+        }
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         num = _issue_number(task_id)

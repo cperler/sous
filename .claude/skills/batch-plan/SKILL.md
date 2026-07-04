@@ -65,6 +65,13 @@ topological order. **Applying mutates a real run: the human confirms the plan be
    emits a `batch_planned` event. The run must already exist (`init-run`).
 7. **Drive the batch.** The run now carries the DAG. Point at `orchestrate-batch-interactive`
    to fan the tasks out; the engine walks the graph you built.
+8. **Acceptance pass (spec-originated batches only).** If this batch is a `spec:<slug>` group
+   (filed by `spec-intake` from a spec), close the loop after it completes: run the
+   whole-spec conformance gate and walk each acceptance criterion against the merged changes,
+   filing `spec-gap` follow-ups for anything unmet — see the **Acceptance pass** section of
+   the `spec-intake` skill for the procedure (`spec conformance ./specs/<slug>.json`). A pile
+   of independently-filed issues with no originating spec has no whole-spec gate — per-task
+   review is the ceiling there.
 
 ## Notes
 - **Two producers, one scheduler.** Use `spec-intake` when the work is a *new idea* (it files

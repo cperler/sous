@@ -43,6 +43,25 @@ class LocalFileTaskSource:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"{task_id}\t{pr_url or ''}\n")
 
+    def describe_issue(self, ref: str) -> dict:
+        """Look up a task's state + PR for the conformance gate (#18 bullet 2) — the offline
+        mirror of the GitHub source's ``describe_issue``. A task is ``closed`` once it has a
+        line in the sibling ``completed.log`` (what ``mark_complete`` writes), else ``open``;
+        the recorded PR url, if any, comes from that same line."""
+        data = self._load() if self.tasks_path.exists() else {}
+        entry = data.get(ref)
+        body = entry.get("body", "") if isinstance(entry, dict) else ""
+        state, pr = "open", None
+        log = self.tasks_path.with_name("completed.log")
+        if log.exists():
+            for line in log.read_text(encoding="utf-8").splitlines():
+                cols = line.split("\t")
+                if cols and cols[0] == ref:
+                    state = "closed"
+                    pr = cols[1] if len(cols) > 1 and cols[1] else None
+                    break
+        return {"ref": ref, "state": state, "body": body, "pr": pr}
+
     # --- optional evidence-out hooks (the offline mirror of the GitHub source's; the
     # engine duck-types these, so implementing them keeps the local lane at parity) ---
 

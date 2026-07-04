@@ -8,6 +8,15 @@
     "title": {"type": "string", "minLength": 1, "description": "the idea's name"},
     "summary": {"type": "string", "minLength": 1, "description": "goal / constraints / non-goals in prose"},
     "slug": {"type": ["string", "null"], "description": "optional override for the spec:<slug> batch label; derived from the title when absent"},
+    "filed": {
+      "type": ["object", "null"],
+      "description": "filing provenance written by `spec file --archive-dir` (#18): the spec:<slug> batch label plus the local-id → issue-ref map, so the conformance gate can find the filed issues afterward. Absent until the spec is filed and archived.",
+      "properties": {
+        "spec_label": {"type": "string"},
+        "mapping": {"type": "object", "additionalProperties": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
     "tasks": {
       "type": "array",
       "minItems": 1,

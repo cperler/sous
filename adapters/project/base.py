@@ -50,6 +50,12 @@ class TaskSource(Protocol):
     #       each TaskSpec's ``depends_on`` from whatever edge encoding the source carries
     #       (GitHubIssuesSource reads ``Depends-on: #N`` lines the spec front door wrote), so
     #       edges already recorded aren't re-derived. The shared GitHubIssuesSource implements it.
+    #   describe_issue(ref) -> {"ref", "state", "body", "pr"}
+    #       Look up a filed issue's state (open/closed) and any discoverable PR url for the
+    #       spec-conformance gate (#18 bullet 2 — ``spec_conformance.conformance_report``).
+    #       Unlike ``resolve`` it does NOT refuse a closed issue (conformance is about the
+    #       closed ones). Best-effort: PR discovery from the issue thread. Both the shared
+    #       GitHubIssuesSource and LocalFileTaskSource implement it.
 
     # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
     # them only via ``getattr`` at task finalize, so an older external adapter that omits

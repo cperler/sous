@@ -196,9 +196,22 @@ def main(argv: list[str] | None = None) -> int:
                           "tasks' estimated total overruns this budget")
     spf.add_argument("--strict", action="store_true",
                      help="with --budget-usd: refuse to file (exit non-zero) on overrun")
+    spf.add_argument("--archive-dir", default="./specs",
+                     help="dir to archive the filed spec + local-id→issue-ref mapping into, "
+                          "as <slug>.json, so the conformance gate can find it later "
+                          "(default ./specs/; skipped on --dry-run)")
     # Accept --project after the subcommand too (SUPPRESS: don't clobber the global one).
     spf.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also precede 'spec')")
+    spc = spsub.add_parser("conformance",
+                           help="whole-spec acceptance gate (#18): checklist of each spec "
+                                "task's filed issue, state, PR + acceptance criteria; exit 1 "
+                                "if any issue is still open")
+    spc.add_argument("file", help="spec JSON file (ideally an archived <slug>.json)")
+    spc.add_argument("--json", action="store_true", help="emit the checklist as JSON")
+    spc.add_argument("--project", default=argparse.SUPPRESS,
+                     help="project-config module/dir supplying the task source used to look "
+                          "up issue state + PRs (may also precede 'spec')")
     bp = sub.add_parser("batch-plan", help="producer (#57): auto-analysis DAG over an "
                                            "ALREADY-FILED batch of issues (skill authors the "
                                            "plan; this validates/applies it)")
@@ -389,6 +402,20 @@ def main(argv: list[str] | None = None) -> int:
                 if est["overrun"] and args.strict:
                     return 1
             return 0
+        if args.spec_cmd == "conformance":
+            # The deterministic half of the acceptance gate (#18 bullet 2). --project is
+            # optional: without a task source, states read "unknown" and everything is
+            # unverified (exit 1) — the checklist is still worth printing for inspection.
+            from .spec_conformance import conformance_report, render_conformance
+
+            source = load_project(args.project).task_source if args.project else None
+            checklist = conformance_report(args.file, source)
+            if args.json:
+                _emit(checklist)
+            else:
+                sys.stdout.write(render_conformance(checklist))
+            # Exit 1 when the batch is not demonstrably complete (any open/unknown issue).
+            return 0 if checklist["complete"] else 1
         # spec file — needs the project's task source.
         if not args.project:
             p.error("--project is required for `spec file`")
@@ -403,10 +430,17 @@ def main(argv: list[str] | None = None) -> int:
                 return 1
         source = load_project(args.project).task_source
         try:
-            _emit(file_spec(spec, source, dry_run=args.dry_run))
+            result = file_spec(spec, source, dry_run=args.dry_run)
         except SpecError as exc:
             _emit({"ok": False, "error": str(exc)})
             return 1
+        # Archive the filed spec + local-id→issue-ref mapping so the conformance gate can
+        # find it later (#18 bullet 2). Nothing was filed on a dry-run — nothing to record.
+        if not args.dry_run:
+            from .spec_intake import archive_spec
+
+            result["archived"] = str(archive_spec(spec, result, args.archive_dir))
+        _emit(result)
         return 0
 
     if args.cmd == "batch-plan":

@@ -300,3 +300,26 @@ def file_spec(spec: dict, task_source: Any, *, dry_run: bool = False) -> dict:
         "filed": filed,
         "dry_run": dry_run,
     }
+
+
+def archive_spec(spec: dict, result: dict, archive_dir: str | Path) -> Path:
+    """Persist the just-filed spec so the conformance gate (#18 bullet 2) can find it.
+
+    Writes ``<archive_dir>/<slug>.json`` — the validated spec verbatim plus a ``filed``
+    block appended as provenance: the ``spec:<slug>`` batch label and the local-id →
+    issue-ref mapping from ``result`` (a ``file_spec`` return). That mapping is what
+    ``conformance_report`` walks to look up each spec task's real issue and its state,
+    long after the run. Returns the path written.
+
+    The caller skips this on ``--dry-run`` (nothing was filed, so there is no provenance
+    to record). Overwrites a prior archive of the same slug — a re-file supersedes it."""
+    d = Path(archive_dir)
+    d.mkdir(parents=True, exist_ok=True)
+    archived = dict(spec)
+    archived["filed"] = {
+        "spec_label": result["spec_label"],
+        "mapping": result["mapping"],
+    }
+    path = d / f"{spec_slug(spec)}.json"
+    path.write_text(json.dumps(archived, indent=2) + "\n", encoding="utf-8")
+    return path
