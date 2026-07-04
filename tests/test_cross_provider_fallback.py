@@ -68,6 +68,10 @@ def test_is_provider_unavailable_detects_cli_and_auth() -> None:
         None, exit_code=1,
         error="The 'gpt-5-codex' model is not supported when using Codex with a ChatGPT account"))
     assert is_provider_unavailable(RawResult(None, exit_code=1, error="model is not supported"))
+    # #87: the "…when using…" marker is pinned to the codex/ChatGPT-plan phrasing — a generic
+    # "X is not supported when using Y" that is NOT codex/chatgpt-related no longer reclassifies.
+    assert not is_provider_unavailable(RawResult(
+        None, exit_code=1, error="feature Foo is not supported when using bar mode"))
     # a genuine task/tool failure is NOT provider-unavailable
     assert not is_provider_unavailable(RawResult(None, exit_code=1, error="TypeError: undefined"))
     assert not is_provider_unavailable(RawResult(None, exit_code=1, error="2 tests failed"))

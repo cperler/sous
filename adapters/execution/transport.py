@@ -109,13 +109,16 @@ def is_rate_limited(raw: RawResult) -> bool:
 # provider/config-level refusal the task's content can't influence, so falling through to
 # claude is exactly right; it's kept narrow to the "model … not supported" wording (not a bare
 # "invalid_request_error", which could ride a genuine bad request) so a real failure is never
-# reclassified.
+# reclassified. The "is not supported when using {codex,a chatgpt}" variants (#87) are pinned
+# to the codex/ChatGPT-plan phrasing (not a bare "is not supported when using X") so a generic
+# unsupported-feature message can never be mistaken for a provider-plan refusal.
 _PROVIDER_UNAVAILABLE_MARKERS = (
     "not logged in", "not authenticated", "unauthorized", "401 unauthorized",
     "authentication failed", "authentication error", "invalid api key", "missing api key",
     "no api key", "expired token", "token expired", "please log in", "please login",
     "run `codex login`", "codex login", "openai_api_key",
-    "model is not supported", "is not supported when using",
+    "model is not supported",
+    "is not supported when using codex", "is not supported when using a chatgpt",
 )
 
 
@@ -655,6 +658,25 @@ def _codex_schema_rejected(raw: RawResult) -> bool:
     return any(m in text for m in _SCHEMA_REJECTED_MARKERS)
 
 
+def _unwrap_codex_error_message(message: str) -> str:
+    """Codex double-encodes its 400 refusal: the event's ``message`` is ITSELF a JSON string
+    encoding ``{"type","status","error":{"type","message"}}``. Return the clean inner
+    ``error.message`` when the message parses to that shape, else the message unchanged (#88) —
+    a plain (non-JSON) cause always passes through verbatim. Unwrapping gives the ledger/events
+    the short human message ("The 'gpt-5-codex' model is not supported when using Codex with a
+    ChatGPT account") instead of the encoded blob, and fits the 500-char error cap better; the
+    provider-unavailable markers still match, since the marker phrasing lives in the inner text."""
+    try:
+        decoded = json.loads(message)
+    except (json.JSONDecodeError, ValueError, TypeError):
+        return message
+    if isinstance(decoded, dict):
+        err = decoded.get("error")
+        if isinstance(err, dict) and isinstance(err.get("message"), str) and err["message"]:
+            return err["message"]
+    return message
+
+
 def _codex_failure_cause(events_stdout: str) -> str | None:
     """The real failure cause from a codex ``--json`` event stream — the ``turn.failed`` event's
     ``error.message`` (or a top-level ``{"type":"error", "message": …}`` event). codex reports a
@@ -662,8 +684,9 @@ def _codex_failure_cause(events_stdout: str) -> str | None:
     ChatGPT account") ONLY on this stdout event stream; stderr carries just banners/warnings (the
     ``--full-auto`` deprecation notice). Surfacing this into ``RawResult.error`` lets the verdict's
     rate-limit / provider-unavailable classification (and the ledger) see the actual cause instead
-    of an innocuous stderr excerpt (#80). Returns the LAST such message seen, or None when the
-    stream reported no failure event."""
+    of an innocuous stderr excerpt (#80). The message is nested-JSON-decoded (#88) so the ledger
+    records the clean inner ``error.message`` rather than the double-encoded blob. Returns the LAST
+    such message seen, or None when the stream reported no failure event."""
     cause: str | None = None
     for line in events_stdout.splitlines():
         line = line.strip()
@@ -681,7 +704,7 @@ def _codex_failure_cause(events_stdout: str) -> str | None:
                 cause = err["message"]
         elif ev.get("type") == "error" and isinstance(ev.get("message"), str) and ev["message"]:
             cause = ev["message"]
-    return cause
+    return _unwrap_codex_error_message(cause) if cause is not None else None
 
 
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
@@ -1161,7 +1184,9 @@ def codex_cli_transport(
     prefers it over the stderr excerpt for ``RawResult.error``. This matters because codex
     reports provider-side refusals (e.g. a 400 "model is not supported when using Codex with a
     ChatGPT account") ONLY on the event stream; stderr carries just banners and deprecation
-    notices that would otherwise be what the verdict and ledger see."""
+    notices that would otherwise be what the verdict and ledger see. That refusal's ``message``
+    is itself double-encoded JSON, so it is nested-decoded (#88) to the clean inner
+    ``error.message`` before it lands on ``RawResult.error``."""
     root = Path(run_log_root) if run_log_root is not None else None
 
     def _call(work: WorkItem, session_ref: str | None, retry: int = 0,
