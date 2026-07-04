@@ -1604,7 +1604,9 @@ class Engine:
     # --- human approval gate (design pass §4) ----------------------------------
     def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
         """Park a task at the human gate. Refuses while a dispatch is outstanding
-        (record the in-flight result first — a held task must be quiescent)."""
+        (record the in-flight result first — a held task must be quiescent). If the
+        result can never arrive because the run was killed mid-dispatch, use
+        ``abandon()`` to release the lease and drive the task terminal instead."""
 
         def _hold(t: Task) -> None:
             if t.state in TERMINAL_TASK_STATES:
