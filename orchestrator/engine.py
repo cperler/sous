@@ -832,6 +832,7 @@ class Engine:
             "salvage": result.salvage,
             "salvage_kept": task.salvage_in_place,
             "stream_files": result.stream_files,  # #56: raw provider stdout/stderr on disk
+            "persona_injected": result.persona_injected,  # #74: codex worktree AGENTS.md persona
             "structured_output": result.structured_output,
             "raw_output": result.raw_output,
             "error": effective.error,

@@ -241,6 +241,13 @@ class StageResult(BaseModel):
     # transition. None on lanes without a provider stream (interactive/ENGINE) or when no
     # teeing wrapper is installed.
     stream_files: dict | None = None
+    # The stage persona the codex transport injected into the task worktree's AGENTS.md for this
+    # dispatch (#74 codex persona parity) — ``{"agent", "path"}`` (or ``{"agent", "error"}`` on a
+    # best-effort failure). Pure audit metadata: it rides RawResult -> StageResult -> the stage
+    # log (like ``stream_files``), so a human can see which persona a codex-routed stage ran with;
+    # it never feeds a verdict or a transition. None on the claude lane (persona arrives via the
+    # CLI's ``--agent``) and when no agent resolved.
+    persona_injected: dict | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

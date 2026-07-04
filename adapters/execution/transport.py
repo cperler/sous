@@ -12,6 +12,7 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import subprocess
 import tempfile
 import threading
@@ -62,6 +63,12 @@ class RawResult:
     # structured output (#32). 0 = valid on the first call (the overwhelming case).
     # Audit-only metadata: surfaced on the cost-ledger row, never a correctness input.
     schema_retries: int = 0
+    # The stage persona injected into the codex worktree's AGENTS.md for this dispatch
+    # (#74 codex persona parity) — ``{"agent", "path"}`` (or ``{"agent", "error"}`` when the
+    # best-effort injection failed). Audit-only metadata that rides RawResult -> StageResult ->
+    # the stage log, like ``stream_files``; it never feeds a verdict or a transition. None on
+    # the claude lane (persona arrives via ``--agent``) and when no agent resolved.
+    persona_injected: dict | None = None
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -488,6 +495,7 @@ def to_stage_result(
         salvage=raw.salvage,
         stream_files=raw.stream_files,
         schema_retries=raw.schema_retries,
+        persona_injected=raw.persona_injected,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
     )
@@ -853,6 +861,125 @@ def _codex_git_common_dir(work: WorkItem) -> str | None:
     return str((Path(work.cwd) / common).resolve())
 
 
+# --- codex-native persona parity (#74) ---------------------------------------------------
+# claude reaches its stage persona via ``claude -p --agent <name>`` (the CLI reads the
+# roster's ``.claude/agents/<name>.md``). codex has no ``--agent``; its persona/system-
+# instructions convention is an ``AGENTS.md`` read from the working directory (and parents).
+# So a codex-routed stage would run BARE while the equivalent claude stage gets the persona.
+# This closes that gap: for each codex dispatch we resolve the WorkItem's agent content and
+# materialize it as ``AGENTS.md`` in the task worktree — composing (not clobbering) any project-
+# shipped AGENTS.md via an idempotent marker-delimited section (the same upsert shape as #64's
+# PR-body section, so a repeated/next-stage dispatch REPLACES the section, never stacks it).
+# File-based (not a flag) composes cleanly with #9's resume, which accepts no ``--add-dir``/
+# persona flag. Best-effort by contract: any resolution/write failure is swallowed and noted on
+# the RawResult, NEVER a failed call — exactly like the stream tee.
+
+_PERSONA_MARKER_START = "<!-- orchestrator:stage-persona:start -->"
+_PERSONA_MARKER_END = "<!-- orchestrator:stage-persona:end -->"
+
+
+def _strip_frontmatter(text: str) -> str:
+    """Return an agent markdown's persona BODY, dropping a leading YAML frontmatter block
+    (``---``\\n…\\n``---`` as the very first lines). Agent files carry a ``name``/``description``
+    frontmatter the claude CLI parses; codex wants the instructions prose, not that metadata.
+    Only a frontmatter fence that opens on line 1 is stripped (a ``---`` horizontal rule mid-file
+    is left alone); an unterminated fence is treated as body (never lose content)."""
+    lines = text.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return text.strip()
+    for i in range(1, len(lines)):
+        if lines[i].strip() == "---":
+            return "\n".join(lines[i + 1:]).strip()
+    return text.strip()
+
+
+def _agent_md_candidates(work: WorkItem) -> list[Path]:
+    """Ordered locations to find the WorkItem's agent markdown: the driving repo's
+    ``.claude/agents/<name>.md`` (repo_root taken as the parent of the worktree's git-common-dir
+    — the transport-visible analog of the #42 ``repo_root`` hook), then the worktree checkout's
+    own ``.claude/agents/`` (the CWD convention, for a repo that commits its roster), then the
+    packaged starter kit (how seeded agents ship)."""
+    name = work.agent
+    paths: list[Path] = []
+    common = _codex_git_common_dir(work)  # <repo_root>/.git resolved, or None
+    if common:
+        paths.append(Path(common).parent / ".claude" / "agents" / f"{name}.md")
+    if work.cwd:
+        paths.append(Path(work.cwd) / ".claude" / "agents" / f"{name}.md")
+    with contextlib.suppress(Exception):  # packaged-kit lookup must never break resolution
+        from orchestrator.scaffold import KIT_DIR
+
+        paths.append(Path(KIT_DIR) / "agents" / f"{name}.md")
+    return paths
+
+
+def _resolve_agent_content(work: WorkItem) -> tuple[str, Path] | None:
+    """``(persona_body, source_path)`` for the WorkItem's agent, or None when it carries no
+    agent or none of the candidate locations hold a readable, non-empty file. Frontmatter is
+    stripped so codex gets the instructions prose."""
+    if not work.agent:
+        return None
+    for path in _agent_md_candidates(work):
+        try:
+            if path.is_file():
+                body = _strip_frontmatter(path.read_text(encoding="utf-8"))
+                if body:
+                    return body, path
+        except OSError:
+            continue
+    return None
+
+
+def _compose_agents_md(existing: str | None, persona: str) -> str:
+    """The AGENTS.md content: any project-shipped AGENTS.md with the stage persona upserted under
+    an idempotent marker-delimited section. A repeated dispatch (retry) or a stage transition
+    REPLACES the section in place rather than stacking a new one; with no existing file the
+    section is the whole file."""
+    section = (
+        f"{_PERSONA_MARKER_START}\n"
+        "# Stage persona (orchestrator-injected)\n\n"
+        f"{persona}\n"
+        f"{_PERSONA_MARKER_END}"
+    )
+    if existing is None:
+        return section + "\n"
+    if _PERSONA_MARKER_START in existing and _PERSONA_MARKER_END in existing:
+        # Lambda replacement so a persona containing backslashes/group refs inserts literally.
+        return re.sub(
+            re.escape(_PERSONA_MARKER_START) + r".*?" + re.escape(_PERSONA_MARKER_END),
+            lambda _m: section,
+            existing,
+            flags=re.DOTALL,
+        )
+    sep = "" if existing.endswith("\n") else "\n"
+    return f"{existing}{sep}\n{section}\n"
+
+
+def _materialize_persona(work: WorkItem) -> dict | None:
+    """Materialize the WorkItem's stage persona into ``<worktree>/AGENTS.md`` for a codex
+    dispatch so codex — which has no ``--agent`` flag and reads AGENTS.md from cwd — runs WITH
+    the roster's persona (parity with the claude ``--agent`` path, #74). Composes onto any
+    project-shipped AGENTS.md via an idempotent marker section (replaced per dispatch, never
+    stacked). Returns ``{"agent", "path"}`` for the observability slot (rides onto
+    ``RawResult.persona_injected`` -> the stage log, like ``stream_files``), or None when there's
+    no worktree, no agent, or nothing resolved (in which case any existing AGENTS.md is left
+    UNTOUCHED and nothing is written). Best-effort: any failure returns ``{"agent", "error"}``
+    and never breaks the call."""
+    if not work.cwd or not work.agent:
+        return None
+    try:
+        resolved = _resolve_agent_content(work)
+        if resolved is None:
+            return None  # no persona content -> leave any existing AGENTS.md untouched
+        persona, source = resolved
+        target = Path(work.cwd) / "AGENTS.md"
+        existing = target.read_text(encoding="utf-8") if target.exists() else None
+        target.write_text(_compose_agents_md(existing, persona), encoding="utf-8")
+        return {"agent": work.agent, "path": str(source)}
+    except Exception as exc:  # noqa: BLE001 - persona injection must never break the model call
+        return {"agent": work.agent, "error": f"persona injection failed: {exc}"[:300]}
+
+
 def codex_cli_transport(
     schema_json_for: Callable[[str], str | None] | None = None,
     *,
@@ -942,6 +1069,12 @@ def codex_cli_transport(
                              invocation=invocation, session_ref=_codex_session_id(stdout))
 
     def run(work: WorkItem) -> RawResult:
+        # #74: refresh the worktree's AGENTS.md with this stage's persona BEFORE dispatch (fresh
+        # OR resumed), so codex — which reads AGENTS.md from cwd and has no `--agent` flag — runs
+        # with the roster's persona, and a stage transition (implement -> reviewer) swaps it. The
+        # marker-section upsert is idempotent, so the corrective schema-retries below (which
+        # re-enter `_call`) never stack it. Best-effort; recorded on the RawResult, never fatal.
+        persona = _materialize_persona(work)
         raw = _call(work, work.session_ref)
         # Resume fell over on a stale/rejected/missing session id → one cold retry, same
         # dispatch (#9). Any other resume error fails normally, mirroring the claude path.
@@ -949,8 +1082,8 @@ def codex_cli_transport(
             raw = _call(work, None)
         # Without a schema wired there's nothing to validate — keep validate-at-runner behavior.
         schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
-        if not schema_json:
-            return raw
-        return _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
+        if schema_json:
+            raw = _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
+        return replace(raw, persona_injected=persona) if persona is not None else raw
 
     return run
