@@ -272,7 +272,59 @@ def main(argv: list[str] | None = None) -> int:
     db.add_argument("--stale-after", type=int, default=1800,
                     help="a task with no update for this many seconds is flagged stale")
 
+    kb = sub.add_parser("kb", help="cross-run learnings KB (#72): show relevant prior "
+                                   "learnings, or teach the system a lesson (--root = runs/)")
+    kbsub = kb.add_subparsers(dest="kb_cmd", required=True)
+    kbs = kbsub.add_parser("show", help="print KB entries, most-relevant-first when --query given")
+    kbs.add_argument("--query", help="space-separated tokens to score entries against")
+    kbs.add_argument("--limit", type=int, default=20, help="max entries to show")
+    kba = kbsub.add_parser("add", help="append a manual learning (the human teaching the system)")
+    kba.add_argument("text", help="the lesson text (bounded to ~500 chars)")
+    kba.add_argument("--kind", default="manual",
+                     help="failure|review|infra|salvage|manual (default manual)")
+    kba.add_argument("--stage", help="optional stage this lesson is about")
+    kba.add_argument("--files", help="optional comma-separated files this lesson touches")
+
     args = p.parse_args(argv)
+
+    if args.cmd == "kb":
+        # The cross-run learnings KB (#72). --root is the runs-root (parent of the run dirs,
+        # same as dashboard); the KB lives at <runs-root>/learnings-kb.jsonl unless a project
+        # override / env var relocates it. --project is optional (only for that override).
+        from .learnings_kb import (
+            append_learnings,
+            read_entries,
+            relevant_learnings,
+            resolve_kb_path,
+            tokenize,
+        )
+
+        if not args.root:
+            p.error("--root is required for kb (the runs-root, e.g. runs/)")
+        project = load_project(args.project) if args.project else None
+        path = resolve_kb_path(Path(args.root), project)
+        if args.kb_cmd == "add":
+            files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
+            written = append_learnings(path, [{
+                "kind": args.kind, "text": args.text, "stage": args.stage,
+                "files": files, "run_id": None, "task_id": None,
+            }])
+            _emit({"ok": True, "path": str(path), "added": len(written),
+                   "entry": written[0] if written else None})
+            return 0
+        # show
+        if args.query:
+            tokens = tokenize(args.query)
+            texts = relevant_learnings(
+                path, {"files": [], "stage": None, "failure_kind": None,
+                       "title_tokens": tokens}, limit=args.limit,
+            )
+            _emit({"path": str(path), "query": args.query, "count": len(texts),
+                   "learnings": texts})
+        else:
+            entries = read_entries(path)[-args.limit:]
+            _emit({"path": str(path), "count": len(entries), "entries": entries})
+        return 0
 
     if args.cmd == "gc":
         # Checkpoint tags (task/<run>/<task>/<stage>/<attempt>) outlive their run; list

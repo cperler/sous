@@ -10,6 +10,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 from __future__ import annotations
 
 import contextlib
+import os
 import re
 import subprocess
 import time
@@ -25,6 +26,17 @@ from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
+from .learnings_kb import (
+    append_learnings as append_kb_learnings,
+)
+from .learnings_kb import (
+    harvest_from_task,
+    relevant_learnings,
+    resolve_kb_path,
+)
+from .learnings_kb import (
+    tokenize as _kb_tokenize,
+)
 from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
 from .port_registry import (
     port_env_for,
@@ -132,6 +144,7 @@ class Engine:
         max_infra_resets: int = 2,
         max_salvage_keeps: int = 1,
         progress_throttle_s: float = 60.0,
+        use_learnings_kb: bool = True,
     ) -> None:
         self.store = store
         self.ledger = ledger
@@ -178,6 +191,11 @@ class Engine:
         # is harmless given the upsert (one living comment, never spam). Keyed by (run, task).
         self.progress_throttle_s = progress_throttle_s
         self._last_progress_at: dict[tuple[str, str], float] = {}
+        # Cross-run learnings KB (#72): harvest a finished task's learnings into a durable,
+        # per-project append-only KB, and fold relevant PRIOR learnings back into a fresh
+        # task's intake context. Read-only context, low risk, so default ON; an
+        # ``ORCHESTRATOR_NO_LEARNINGS_KB=1`` env escape hatch (checked live) disables it.
+        self.use_learnings_kb = use_learnings_kb
 
     # --- run/task setup -------------------------------------------------------
     def create_run(
@@ -478,6 +496,21 @@ class Engine:
                 and not task.salvage_in_place
             ):
                 reset_to = anchor
+        # Cross-run KB fold (#72): at the FIRST pipeline stage (intake — the honest point,
+        # before any code exists), recall relevant PRIOR learnings and fold them into the
+        # context plane under ``prior_learnings``. Once only per task (guarded on absence),
+        # so a crash-resume/retry of the first stage doesn't re-query. Read-only advisory
+        # context; it renders (hedged) into this and every later stage's prompt.
+        prior_learnings: list[str] | None = None
+        if (
+            self._learnings_kb_enabled()
+            and task.pipeline
+            and stage is task.pipeline[0]
+            and "prior_learnings" not in task.context
+        ):
+            prior_learnings = self._recall_prior_learnings(task, stage)
+            if prior_learnings:
+                task.context["prior_learnings"] = prior_learnings
         learnings = "\n".join(task.learnings)
         prompt = render_prompt(
             stage,
@@ -548,6 +581,10 @@ class Engine:
             t.pending_fallback_model = None  # consumed into this dispatch's model
             t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
             t.salvage_in_place = False  # consumed: this dispatch honored (or ignored) it
+            # Persist the intake KB fold (#72) into the durable context so it survives on
+            # disk and renders in the later stages' prompts too (not just this dispatch's).
+            if prior_learnings and "prior_learnings" not in t.context:
+                t.context["prior_learnings"] = prior_learnings
 
         self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
@@ -923,6 +960,10 @@ class Engine:
         # later task can reuse it. Best-effort (wrapped in the helper); never breaks finalize.
         if task.state in TERMINAL_TASK_STATES:
             self._release_ports(run_id, task)
+            # #72: distil this finished task's learnings into the durable cross-run KB so a
+            # later run doesn't re-pay to learn the same lesson. Skips a clean task (empty
+            # learnings); best-effort — never breaks the terminal transition.
+            self._harvest_task_learnings(run_id, task)
         self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
@@ -1791,6 +1832,9 @@ class Engine:
         # so it closes instead of staying open.
         self._cascade_from(run_id, task_id)
         self._release_ports(run_id, task)
+        # #72: a rejected task often carries the learnings that PROVED it infeasible (review
+        # rejections, failed attempts) — harvest them so a later run inherits that verdict.
+        self._harvest_task_learnings(run_id, task)
         self._maybe_finalize_run(run_id)
         return task
 
@@ -2259,6 +2303,120 @@ class Engine:
              "task_state": task.state.value},
         )
 
+    # --- cross-run learnings KB (#72) ----------------------------------------
+    def _learnings_kb_enabled(self) -> bool:
+        """Feature gate: the engine param AND the live ``ORCHESTRATOR_NO_LEARNINGS_KB``
+        env escape hatch (read here, not cached, so a run can be toggled by environment)."""
+        if not self.use_learnings_kb:
+            return False
+        return os.environ.get("ORCHESTRATOR_NO_LEARNINGS_KB", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        )
+
+    def _learnings_kb_path(self) -> Path:
+        """The per-project KB file. Default ``<runs-root>/learnings-kb.jsonl`` (the run-log
+        root is this run's store-root parent); a project may override via ``learnings_kb_path``
+        and ops via the ``ORCHESTRATOR_LEARNINGS_KB_PATH`` env var (both in resolve_kb_path)."""
+        return resolve_kb_path(self.store.root.parent, self.project)
+
+    def _task_labels(self, task: Task) -> list[str]:
+        """Best-effort issue labels for KB recall (enriches the title tokens). Wrapped: a
+        flaky/absent task source must never break a dispatch, so any failure yields []."""
+        try:
+            spec = self.project.task_source.resolve(task.task_id)
+            return [str(x) for x in (getattr(spec, "labels", None) or [])]
+        except Exception:  # noqa: BLE001 - recall enrichment must never break next_work
+            return []
+
+    def _recall_prior_learnings(self, task: Task, stage: Stage) -> list[str] | None:
+        """Deterministic KB recall for a fresh task at intake: query by the task's title
+        tokens (+ any reachable issue labels) and the dispatched stage. Best-effort — a
+        missing/corrupt KB or a raising query yields None (no fold), never an exception."""
+        try:
+            path = self._learnings_kb_path()
+            if not path.exists():
+                return None
+            title_tokens = _kb_tokenize(task.title)
+            for label in self._task_labels(task):
+                title_tokens.extend(_kb_tokenize(label))
+            query = {
+                "files": list(task.context.get("files_changed") or []),
+                "stage": stage.value,
+                "failure_kind": None,
+                "title_tokens": title_tokens,
+            }
+            hits = relevant_learnings(path, query, limit=5)
+            return hits or None
+        except Exception as exc:  # noqa: BLE001 - recall must never break a dispatch
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "learnings_recall_failed", "run_id": task.run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+            return None
+
+    def _harvest_task_learnings(self, run_id: str, task: Task) -> None:
+        """Harvest a finished task's learnings into the durable KB (best-effort). Only tasks
+        that actually LEARNED something have non-empty learnings — a clean first-pass task
+        harvests nothing (harvest_from_task returns []), so no noise and no event. NEVER
+        breaks finalize: a raising/corrupt KB is swallowed + evented."""
+        if not self._learnings_kb_enabled():
+            return
+        try:
+            written = harvest_from_task(self._learnings_kb_path(), task, run_id)
+        except Exception as exc:  # noqa: BLE001 - KB harvest must never break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "learnings_harvest_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+            return
+        if written:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "learnings_harvested", "run_id": run_id,
+                 "task_id": task.task_id, "count": len(written)},
+            )
+
+    def _harvest_retrospective(self, run_id: str, retro: dict) -> None:
+        """Harvest the failure retrospective's DISTILLED cross-task patterns into the KB
+        (#72 tie-in). The per-task learnings were already harvested at task finalize; this
+        adds the recurring/cross-task signatures the retrospective aggregates. Best-effort."""
+        if not self._learnings_kb_enabled():
+            return
+        entries: list[dict] = []
+        for pat in retro.get("patterns", []):
+            # Only genuinely distilled patterns are worth persisting cross-run: a signature
+            # that recurred (breaker plateau) or spanned tasks (systemic) — not a one-off.
+            if not (pat.get("cross_task") or (pat.get("occurrences") or 0) >= 2):
+                continue
+            stage = pat.get("stage")
+            span = ", across tasks" if pat.get("cross_task") else ""
+            sample = (pat.get("sample_error") or "no sample error").strip()
+            entries.append(
+                {"run_id": run_id, "task_id": None, "kind": "failure", "stage": stage,
+                 "failure_kind": None, "files": [],
+                 "text": f"recurring failure at {stage} "
+                         f"({pat.get('occurrences')}x{span}): {sample}"}
+            )
+        if not entries:
+            return
+        try:
+            written = append_kb_learnings(self._learnings_kb_path(), entries)
+        except Exception as exc:  # noqa: BLE001 - KB harvest must never break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "learnings_harvest_failed", "run_id": run_id,
+                 "error": str(exc)},
+            )
+            return
+        if written:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "learnings_harvested", "run_id": run_id,
+                 "source": "retrospective", "count": len(written)},
+            )
+
     def _cascade_from(self, run_id: str, failed_task_id: str) -> None:
         """Transitively cascade-block every dependent of a failed task (fix D14)."""
         run = self.store.load_run(run_id)
@@ -2332,13 +2490,17 @@ class Engine:
         # Auto-generate the failure retrospective only when the run actually failed —
         # there is nothing to retrospect on a clean run.
         if new_state is RunState.FAILED:
+            retro = self.retrospective(run_id)
             self.store.write_run_artifact(
-                "retrospective.md", render_retrospective(self.retrospective(run_id))
+                "retrospective.md", render_retrospective(retro)
             )
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "retrospective_emitted", "run_id": run_id},
             )
+            # #72: harvest the retrospective's distilled cross-task patterns into the KB
+            # too (the per-task learnings were harvested at each task's finalize).
+            self._harvest_retrospective(run_id, retro)
         # Every task is terminal → no more writers → sweep the now-idle lock sentinels
         # (done LAST, after the final artifact writes that recreate their own locks).
         self.store.sweep_locks()

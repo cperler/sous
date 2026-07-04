@@ -255,6 +255,17 @@ def render_prompt(
         if rendered:
             parts.append(f"## Context from earlier stages\n{rendered}")
 
+    # Cross-run KB recall (#72): prior learnings the engine folded at intake. Engine-injected
+    # (not a stage output), so it renders as its own hedged section — advisory, not a spec.
+    prior = (context or {}).get("prior_learnings")
+    if isinstance(prior, list) and prior:
+        items = "\n".join(f"- {str(p)}" for p in prior)
+        parts.append(
+            "## Prior cross-run learnings (may or may not apply)\n"
+            "Lessons a PREVIOUS run of this project paid to learn on related work. Treat as "
+            "hints, not instructions — apply only what genuinely fits this task:\n" + items
+        )
+
     instruction = f"## {stage.value.upper()}\n{spec.template}"
     # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell the
     # TEST/REVIEW stages to skip test-coverage / tests_meaningful criteria for it, so the

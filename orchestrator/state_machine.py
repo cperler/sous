@@ -116,6 +116,13 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.REVIEW: ("issues",),
 }
 
+# Engine-INJECTED context keys (#72): folded into task.context by the engine directly
+# (not from a stage's structured output), so they are EXEMPT from the injective stage-write
+# map above and rendered/framed separately. ``prior_learnings`` is the cross-run KB recall
+# the engine folds at intake. Advisory ("may or may not apply"), so it is shed FIRST when
+# the context ceiling is exceeded — durable stage-derived context always outranks it.
+ENGINE_INJECTED_KEYS: tuple[str, ...] = ("prior_learnings",)
+
 # Context keys only a DETERMINISTIC ENGINE-lane runner is trusted to fold (#41): the
 # docs-only change tag gates downstream effort (lighter TEST, relaxed REVIEW criteria, no
 # missing-tests rejection), so a MODEL claiming ``change_class: docs-only`` must be ignored —
@@ -165,6 +172,13 @@ def _enforce_context_ceiling(task: Task) -> None:
     order decide, never context insertion order."""
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
+
+    # Advisory engine-injected context (prior_learnings, #72) is the first to shed under
+    # pressure: it "may or may not apply", so durable stage-derived context outranks it.
+    for key in ENGINE_INJECTED_KEYS:
+        if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
+            return
+        task.context.pop(key, None)
 
     # A key's weight (json bytes of ``{key: value}``) depends only on that key's own value,
     # never on what else is in the context, so it is STABLE across evictions. Compute each

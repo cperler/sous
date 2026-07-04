@@ -112,6 +112,16 @@ def project() -> FakeProject:
     return FakeProject()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_learnings_kb(tmp_path, monkeypatch):
+    """Isolate the cross-run learnings KB (#72) per test. The production default lives at
+    the store-root's parent (``<runs-root>/learnings-kb.jsonl``), which for a single-run
+    ``StatusStore(tmp_path)`` test would resolve to pytest's SHARED basetemp — leaking
+    harvested learnings across tests. Pin it to each test's own tmp_path so harvest/fold
+    stay hermetic; tests that want a shared KB (the two-run flow) just use one tmp_path."""
+    monkeypatch.setenv("ORCHESTRATOR_LEARNINGS_KB_PATH", str(tmp_path / "learnings-kb.jsonl"))
+
+
 def make_result(
     work: WorkItem,
     *,
