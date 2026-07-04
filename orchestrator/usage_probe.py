@@ -18,6 +18,7 @@ import json
 import subprocess
 import time
 import urllib.request
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -160,6 +161,42 @@ def format_statusline(usage: Usage | None, *, now: datetime | None = None) -> st
     five = _seg("5h", usage.five_hour_pct, usage.five_hour_resets_at)
     seven = _seg("7d", usage.seven_day_pct, usage.seven_day_resets_at)
     return f"⧗ {five} · {seven}"
+
+
+def watch_statusline(
+    *,
+    emit: Callable[[str], None],
+    sleeper: Callable[[float], None],
+    clear: Callable[[], None] | None = None,
+    interval: float = 30,
+    max_iters: int | None = None,
+    reader: Callable[..., Usage | None] | None = None,
+) -> None:
+    """Clear-screen + reprint the statusline every ``interval`` seconds until interrupted (#79).
+
+    For supervising a batch run from a standalone terminal: a 30-60s poll amortizes over the
+    2-min usage cache (``read_usage`` serves the cached value between probes) while keeping the
+    display fresh. Mirrors ``dashboard.render_watch``'s injected-sleeper pattern so it is drivable
+    without real sleeping: ``sleeper`` is ``time.sleep`` in production and a stub in tests, and a
+    ``KeyboardInterrupt`` from anywhere (Ctrl-C, or a test sleeper that raises to stop) ends the
+    loop cleanly. ``max_iters`` bounds it for tests; ``clear`` defaults to an ANSI clear. On a probe
+    miss the line is a quiet placeholder rather than an empty screen, so the terminal still shows
+    the poll is live."""
+    if reader is None:
+        reader = read_usage
+    if clear is None:
+        clear = lambda: emit("\x1b[2J\x1b[H")  # noqa: E731 - tiny ANSI clear
+    iters = 0
+    try:
+        while max_iters is None or iters < max_iters:
+            clear()
+            emit(format_statusline(reader()) or "⧗ usage unavailable")
+            iters += 1
+            if max_iters is not None and iters >= max_iters:
+                break
+            sleeper(interval)
+    except KeyboardInterrupt:
+        pass
 
 
 def resolve_util(spec: str | float | None, *, reader=read_usage) -> tuple[float, dict]:
