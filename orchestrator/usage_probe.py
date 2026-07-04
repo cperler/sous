@@ -137,9 +137,9 @@ def _reset_countdown(resets_at: str, now: datetime) -> str:
     hours, rem = divmod(rem, 3_600)
     minutes = rem // 60
     if days:
-        return f"{days}d{hours}h"
+        return f"{days}d{hours}h" if hours else f"{days}d"
     if hours:
-        return f"{hours}h{minutes}m"
+        return f"{hours}h{minutes}m" if minutes else f"{hours}h"
     return f"{minutes}m"
 
 
