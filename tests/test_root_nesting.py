@@ -171,6 +171,47 @@ def test_shared_root_flag_nests_a_fresh_runs_dir(tmp_path, capsys) -> None:
     assert not (parent / "status-run-a.json").exists()
 
 
+# --- #101: warn when --shared-root is passed to a command that ignores it -----
+
+
+def test_shared_root_warns_on_non_engine_command(tmp_path, capsys) -> None:
+    # `kb` never routes through _engine(), so --shared-root has no effect there.
+    # A mis-positioned flag must not be silently dropped — warn to stderr.
+    parent = tmp_path / "runs"
+    parent.mkdir()
+    (parent / "learnings-kb.jsonl").write_text("")
+    assert main(["--root", str(parent), "--shared-root", "kb", "show"]) == 0
+
+    err = capsys.readouterr().err
+    assert "--shared-root is ignored by the 'kb' command" in err
+
+
+def test_shared_root_silent_on_engine_command(tmp_path, capsys) -> None:
+    # #101: the flag is legitimate on an engine command (it drives store nesting),
+    # so no warning must fire — only the expected nesting note.
+    parent = tmp_path / "runs"
+    base = ["--root", str(parent), "--shared-root",
+            "--run", "run-a", "--project", "tests.fakeproject"]
+    assert main([*base, "init-run", "--lane", "full"]) == 0
+
+    err = capsys.readouterr().err
+    assert "--shared-root is ignored" not in err
+
+
+def test_shared_root_silent_on_batch_plan_apply(tmp_path) -> None:
+    # `batch-plan apply` is the one subcommand outside the engine block that still
+    # builds an Engine, so it consumes --shared-root and must not warn (#101).
+    from argparse import Namespace
+
+    from orchestrator.cli import _consumes_shared_root
+
+    assert _consumes_shared_root(Namespace(cmd="batch-plan", batch_cmd="apply"))
+    assert not _consumes_shared_root(Namespace(cmd="batch-plan", batch_cmd="validate"))
+    assert not _consumes_shared_root(Namespace(cmd="batch-plan", batch_cmd="candidates"))
+    assert not _consumes_shared_root(Namespace(cmd="dashboard"))
+    assert _consumes_shared_root(Namespace(cmd="init-run"))
+
+
 def test_trailing_slash_root_does_not_false_positive_nesting_note(tmp_path, capsys) -> None:
     # #90: a trailing slash on a fresh --root normalizes to the same Path as the
     # resolved store root, so no nesting happens and the note must stay silent.
