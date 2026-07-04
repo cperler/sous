@@ -80,6 +80,9 @@ def main(argv: list[str] | None = None) -> int:
                          "the batch scheduler; overrides the task source)")
     at.add_argument("--provider-tag", default=None, choices=["claude", "codex"],
                     help="per-task provider routing tag (the old '82:codex' tag)")
+    at.add_argument("--deterministic-stages", default=None,
+                    help="comma-separated stages to run on the $0 ENGINE lane instead of a "
+                         "model (e.g. 'test,deliver'); intake is always deterministic (#33)")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -200,20 +203,29 @@ def main(argv: list[str] | None = None) -> int:
             [d.strip() for d in args.depends_on.split(",") if d.strip()]
             if args.depends_on else None
         )
+        det = (
+            [Stage(s.strip()) for s in args.deterministic_stages.split(",") if s.strip()]
+            if getattr(args, "deterministic_stages", None) else None
+        )
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
-                            depends_on=deps, provider_tag=args.provider_tag)
+                            depends_on=deps, provider_tag=args.provider_tag,
+                            deterministic_stages=det)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
+               "deterministic_stages": [s.value for s in task.deterministic_stages],
                "depends_on": task.depends_on, "provider_tag": task.provider_tag})
     elif args.cmd == "next":
-        # Deterministic stages (e.g. intake setup) run in-process on the ENGINE lane —
-        # drain them here so the interactive supervisor only ever sees model WorkItems
-        # (never hand-creates a worktree). The headless scheduler dispatches them itself
-        # via the registry, so this drain is the interactive lane's equivalent.
-        from .stages import STAGE_SPECS
+        # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
+        # the ENGINE lane — #33) run in-process — drain them here so the interactive
+        # supervisor only ever sees model WorkItems (never hand-creates a worktree or runs
+        # `gh pr create`). Keyed on the engine-chosen lane (ExecutionMode.ENGINE), the
+        # single source of truth for "deterministic", so it covers per-task opt-ins without
+        # re-deriving from STAGE_SPECS. The headless scheduler dispatches these itself via
+        # the registry, so this drain is the interactive lane's equivalent.
+        from .schemas.enums import ExecutionMode
 
         work = eng.next_work(args.run, args.task, util_pct=util_pct)
-        while work is not None and STAGE_SPECS[work.stage].deterministic:
+        while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
             result = eng.registry.resolve(work.lane_policy).dispatch(work)
             eng.record(args.run, result)
             work = eng.next_work(args.run, args.task, util_pct=util_pct)

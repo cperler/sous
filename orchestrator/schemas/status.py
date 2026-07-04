@@ -80,6 +80,14 @@ class Task(BaseModel):
     # immutable in spirit thereafter (mutating it mid-run would invalidate the resume
     # cursor's meaning). v1 docs without it derive it from execution_lane on load.
     pipeline: tuple[Stage, ...] = ()
+    # Stages THIS task runs on the deterministic ENGINE lane (no model call) IN ADDITION
+    # to the stages globally marked deterministic in their StageSpec (intake). This is the
+    # per-task/per-lane knob that lets a pipeline opt TEST/DELIVER into the $0 shell runners
+    # (#33) without flipping the global default for every project — the SAME routing
+    # decision (→ ENGINE lane) as intake, just sourced from the task (mirrors how the
+    # pipeline itself became per-task in schema v2). Empty by default: the stock full/lite/
+    # micro presets keep model TEST/DELIVER.
+    deterministic_stages: tuple[Stage, ...] = ()
     pr_number: int | None = None
     pr_url: str | None = None
     # Engine-owned task context plane: well-known fields folded out of each stage's

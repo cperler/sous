@@ -1,15 +1,25 @@
-"""Deterministic intake/setup runner — the ENGINE lane (no model call).
+"""Deterministic ENGINE-lane runner — no model call (heysoo #227).
 
 heysoo #227: an LLM asked to run ``git worktree add`` + emit structured JSON does the
-agentic work then answers in prose, failing schema validation. So setup is a script,
-not a model call. This runner serves the ``(ExecutionMode.ENGINE, Provider.NONE)`` cell:
-it creates/reuses an isolated worktree+branch, best-effort installs deps, tags the
-baseline, and returns the ``intake`` contract — deterministically, at $0. Ports
-``run_setup_stage`` from the reference bash system.
+agentic work then answers in prose, failing schema validation. So the mechanical stages
+are scripts, not model calls. This runner serves the whole
+``(ExecutionMode.ENGINE, Provider.NONE)`` cell and dispatches by stage:
 
-A project may override the git logic with a ``setup_task(task_id) -> dict`` method (the
-intake structured_output) — duck-typed, so tests supply a no-git fake and offline
-projects can pick their own worktree convention.
+  - INTAKE  → this module: create/reuse an isolated worktree+branch, best-effort install,
+    tag the baseline, actually run the unit tests to capture the baseline (``intake``).
+    Ports ``run_setup_stage`` from the reference bash system.
+  - TEST    → ``deterministic_test.DeterministicTestRunner`` (#33): run the project's test
+    commands, classify failures, split inherited baseline red from caused (``test``).
+  - DELIVER → ``deterministic_deliver.DeterministicDeliverRunner`` (#33): push the branch
+    and open/reuse a PR (``deliver``).
+
+The registry keys one runner per cell, so this class is the single ENGINE-lane entry and
+delegates TEST/DELIVER to their focused modules (the engine still never imports any of
+them — they are execution-adapter concerns).
+
+For INTAKE a project may override the git logic with a ``setup_task(task_id) -> dict``
+method (the intake structured_output) — duck-typed, so tests supply a no-git fake and
+offline projects can pick their own worktree convention.
 """
 
 from __future__ import annotations
@@ -18,7 +28,7 @@ import re
 import subprocess
 from pathlib import Path
 
-from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
+from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .base import SUPPORTED, CapabilityDescriptor
@@ -54,6 +64,17 @@ class DeterministicSetupRunner:
         ]
 
     def dispatch(self, work: WorkItem) -> StageResult:
+        # The ENGINE cell serves every deterministic stage; delegate the non-intake ones to
+        # their focused runners (#33). Local imports keep the adapter modules decoupled and
+        # avoid pulling test/deliver in when only intake runs.
+        if work.stage is Stage.TEST:
+            from .deterministic_test import DeterministicTestRunner
+
+            return DeterministicTestRunner(self._project).dispatch(work)
+        if work.stage is Stage.DELIVER:
+            from .deterministic_deliver import DeterministicDeliverRunner
+
+            return DeterministicDeliverRunner(self._project).dispatch(work)
         override = getattr(self._project, "setup_task", None)
         try:
             if callable(override):

@@ -113,6 +113,15 @@ class WorkItem(BaseModel):
     #     failed attempt's debris.
     checkpoint_tag: str | None = None
     reset_to: str | None = None
+    # Read-only task context the deterministic ENGINE-lane runners read STRUCTURALLY
+    # (the folded context plane — state_machine CONTEXT_KEYS — plus the few task fields
+    # deterministic TEST/DELIVER need: baseline_failures, issue_number, title, pr_url).
+    # It is the SAME durable state the prompt is rendered from, so it is excluded from
+    # content_hash like cwd/session_ref/checkpoint_tag. The model lanes ignore it (they
+    # read the rendered prompt); it is populated only for deterministic stages, None
+    # otherwise. NEVER a channel for correctness the prompt lacks — a convenience so a
+    # script doesn't have to re-parse its own rendered prompt.
+    context: dict | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -135,6 +144,7 @@ class WorkItem(BaseModel):
         session_ref: str | None = None,
         checkpoint_tag: str | None = None,
         reset_to: str | None = None,
+        context: dict | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -162,6 +172,7 @@ class WorkItem(BaseModel):
             session_ref=session_ref,
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
+            context=context,
             created_at=created_at,
         )
 

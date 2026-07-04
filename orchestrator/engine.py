@@ -149,10 +149,14 @@ class Engine:
         pipeline: tuple[Stage, ...] | list[Stage] | None = None,
         depends_on: list[str] | None = None,
         provider_tag: str | None = None,
+        deterministic_stages: tuple[Stage, ...] | list[Stage] | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
-        pipeline, not the sequencing mechanism). ``depends_on``/``provider_tag``
+        pipeline, not the sequencing mechanism). ``deterministic_stages`` marks which of
+        those stages run on the $0 ENGINE lane in ADDITION to the globally-deterministic
+        intake (#33 — a pipeline opting TEST/DELIVER into the shell runners); the stock
+        presets pass none, keeping model TEST/DELIVER. ``depends_on``/``provider_tag``
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
         ``82:codex`` tag / ralph dependency analysis, human-supplied). Validation
@@ -187,6 +191,7 @@ class Engine:
             depends_on=deps,
             execution_lane=lane or run.lane,
             pipeline=tuple(pipeline) if pipeline else LANE_STAGES[lane or run.lane],
+            deterministic_stages=tuple(deterministic_stages or ()),
             max_attempts=self.max_attempts,
         )
         self.store.save_task(task)
@@ -274,9 +279,14 @@ class Engine:
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
-        if spec.deterministic:
+        # Deterministic routing: a stage is run by the in-process ENGINE-lane shell runner
+        # (no model call, $0) when it is globally deterministic (intake) OR the task/pipeline
+        # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
+        # sources — never a second selection mechanism.
+        deterministic = spec.deterministic or stage in task.deterministic_stages
+        if deterministic:
             # No model: route to the in-process ENGINE lane (a shell runner does the work).
-            # heysoo #227 — don't ask an LLM to run `git worktree add`.
+            # heysoo #227 — don't ask an LLM to run `git worktree add` / `gh pr create`.
             lane = LanePolicy(
                 execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False
             )
@@ -346,6 +356,10 @@ class Engine:
             session_ref=task.session_ref,
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
+            # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
+            # structurally rather than re-parsing their own rendered prompt; model lanes
+            # get None (they read the prompt). Same durable state, so it is hash-excluded.
+            context=self._deterministic_context(task) if deterministic else None,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -1331,6 +1345,28 @@ class Engine:
         }
 
     # --- helpers --------------------------------------------------------------
+    def _deterministic_context(self, task: Task) -> dict:
+        """The structured task context a deterministic ENGINE-lane runner reads — the
+        SAME facts the model lanes receive through the rendered prompt: the engine-owned
+        folded context plane (branch/worktree/baseline_failures/pr_url/…) plus the task
+        fields the TEST/DELIVER runners need (issue_number/title/body/task_id). Purely
+        engine-derived, so no project-specific logic reaches a model call and it stays
+        reconstructible on replay. ``setdefault`` lets a folded value win over the task
+        field (e.g. a deliver-folded pr_url) without clobbering it."""
+        ctx = dict(task.context)
+        ctx.setdefault("task_id", task.task_id)
+        if task.title:
+            ctx.setdefault("title", task.title)
+        if task.body:
+            ctx.setdefault("body", task.body)
+        if task.issue_number is not None:
+            ctx.setdefault("issue_number", task.issue_number)
+        if task.pr_url:
+            ctx.setdefault("pr_url", task.pr_url)
+        if task.pr_number is not None:
+            ctx.setdefault("pr_number", task.pr_number)
+        return ctx
+
     def _project_commands(self) -> dict[str, str]:
         """The project's stable shell commands, folded into the prompt's cache-stable
         prefix (was decorative — declared on ProjectConfig, consumed by nothing). Only
