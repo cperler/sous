@@ -159,28 +159,32 @@ def _enforce_context_ceiling(task: Task) -> None:
     near-ceiling ``test.failures`` no longer takes ``tests_meaningful`` /
     ``validation_notes`` down with it — whole-stage eviction was needlessly coarse).
     Ties break reverse-pipeline (review's keys first, intake's last) then the fixed key
-    order within each stage's ``CONTEXT_KEYS`` — downstream stages need the earliest
+    order within that stage's ``CONTEXT_KEYS`` tuple — downstream stages need the earliest
     stages' context most. Deterministic: only json byte-lengths and the fixed enum/tuple
     order decide, never context insertion order."""
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
         return
 
-    def _weight(key: str) -> int:
-        return _context_bytes({key: task.context[key]})
+    # A key's weight (json bytes of ``{key: value}``) depends only on that key's own value,
+    # never on what else is in the context, so it is STABLE across evictions. Compute each
+    # weight once and settle the eviction order up front, instead of re-serializing every
+    # candidate on every pass — that was ~O(stages^2) serializations (#26). The candidate
+    # list is built reverse-pipeline then intra-tuple, and ``list.sort`` is stable and keeps
+    # that order for equal weights, so heaviest-first eviction breaks weight-ties by the
+    # latest-pipeline stage's key first, then the first key in that stage's CONTEXT_KEYS
+    # tuple — byte-for-byte the same order the old max()-per-pass produced.
+    ordered = [
+        key
+        for stage in reversed(STAGE_ORDER)
+        for key in CONTEXT_KEYS[stage]
+        if key in task.context
+    ]
+    ordered.sort(key=lambda key: _context_bytes({key: task.context[key]}), reverse=True)
 
-    while _context_bytes(task.context) > _MAX_CONTEXT_BYTES:
-        # context keys present, ordered so max() breaks weight-ties by
-        # evicting the latest-pipeline stage's key first, then the first key in its tuple.
-        candidates = [
-            key
-            for stage in reversed(STAGE_ORDER)
-            for key in CONTEXT_KEYS[stage]
-            if key in task.context
-        ]
-        if not candidates:
+    for key in ordered:
+        if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
             return
-
-        task.context.pop(max(candidates, key=_weight), None)
+        task.context.pop(key, None)
 
 
 def _absorb_outputs(task: Task, result: StageResult) -> None:

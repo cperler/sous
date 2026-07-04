@@ -166,33 +166,80 @@ def test_context_ceiling_tie_break_evicts_latest_pipeline_stage_first() -> None:
     assert task.context["plan"] == plan  # the equal-weight EARLIER stage's key survives
 
 
-def test_context_ceiling_evicts_across_multiple_passes() -> None:
+def test_context_ceiling_evicts_across_multiple_passes_via_absorb() -> None:
+    """#37: drive the multi-pass sweep through the REAL fold path (_absorb_outputs), not a
+    hand-seeded task.context — so this covers the production call site and would catch a
+    break in the absorb→enforce integration for the multi-pass scenario, not just the
+    ceiling function in isolation."""
     from orchestrator.schemas.status import Task
 
     task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
-    # Three fat keys of distinct weight plus a tiny survivor, seeded together so a single
-    # ceiling sweep must run >1 pass: evicting only the heaviest key leaves the context
-    # still over the ceiling. The while-loop must keep going, evicting largest-first, until
-    # it fits — dropping the two heaviest and keeping the third (lighter) fat key.
-    failures = ["z" * 480 for _ in range(33)]  # TEST, ~16KB (heaviest)
-    issues = ["z" * 480 for _ in range(30)]  # REVIEW, ~14.5KB (second)
-    files_changed = ["m" * 480 for _ in range(24)]  # IMPLEMENT, ~11.5KB (survives)
+    # Fold in pipeline order. SCOPE.plan + IMPLEMENT.files_changed land a stable prior
+    # context that sits JUST under the ceiling with BOTH keys present (no eviction yet).
+    plan = ["p" * 498 for _ in range(22)]  # SCOPE, ~11KB
+    files_changed = ["m" * 474 for _ in range(11)]  # IMPLEMENT, ~5.3KB
+    _absorb_outputs(task, make_result_stub(Stage.SCOPE, {"plan": plan}))
+    _absorb_outputs(task, make_result_stub(Stage.IMPLEMENT, {"files_changed": files_changed}))
+    prior_bytes = _context_bytes(task.context)
+    assert prior_bytes <= _MAX_CONTEXT_BYTES  # prior fits: nothing evicted at the folds above
+    assert {"plan", "files_changed"} <= set(task.context)  # both survive into the prior state
+
+    # Now a single TEST fold tips the context WAY over. Its lone _enforce_context_ceiling
+    # call must run >1 pass: evicting the heaviest (failures) alone still leaves plan +
+    # files_changed above the ceiling (prior was near-ceiling), so the sweep keeps going and
+    # evicts plan too — heaviest-first — while the lighter files_changed and the small TEST
+    # siblings survive. One eviction could not have sufficed.
+    failures = ["z" * 498 for _ in range(28)]  # TEST, ~14KB (heaviest)
+    _absorb_outputs(
+        task,
+        make_result_stub(
+            Stage.TEST,
+            {
+                "failures": failures,
+                "validation_notes": "asserts the changed behavior",
+                "tests_meaningful": True,
+            },
+        ),
+    )
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    # >1 pass: the two heaviest keys are both gone (dropping `failures` alone would have left
+    # plan + files_changed still over, since the prior state was near-ceiling).
+    assert "failures" not in task.context
+    assert "plan" not in task.context
+    # the lighter fat key and the small same-stage siblings survive the multi-pass sweep.
+    assert task.context["files_changed"] == files_changed
+    assert task.context["validation_notes"] == "asserts the changed behavior"
+    assert task.context["tests_meaningful"] is True
+
+
+def test_context_ceiling_eviction_order_is_characterized() -> None:
+    """Characterization lock (#26 perf refactor must not change observable behavior): the
+    exact eviction ORDER of _enforce_context_ceiling for a fixed over-ceiling context.
+    Pins heaviest-first eviction AND the reverse-pipeline tie-break in one shot — `issues`
+    (REVIEW) and `plan` (SCOPE) weigh EXACTLY the same, and both are heavier than
+    `failures`; both tie keys are evicted (reverse-pipeline: REVIEW's `issues` first, then
+    SCOPE's `plan`) while the lighter `failures` and the tiny `branch` survive."""
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    failures = ["z" * 480 for _ in range(20)]  # TEST, ~9.7KB
+    issues = ["z" * 498 for _ in range(20)]  # REVIEW  ┐ engineered exact byte-tie:
+    plan = ["z" * 498 for _ in range(19)] + ["z" * 500]  # SCOPE  ┘ heavier than failures
+    files_changed = ["m" * 480 for _ in range(10)]  # IMPLEMENT, ~4.9KB (survives)
     task.context = {
         "branch": "b",  # INTAKE, tiny — always survives
         "files_changed": files_changed,
+        "plan": plan,
         "issues": issues,
         "failures": failures,
     }
-    assert _context_bytes(task.context) > _MAX_CONTEXT_BYTES  # over ceiling by ~2.5x
+    assert _context_bytes({"issues": issues}) == _context_bytes({"plan": plan})  # true tie
+    assert _context_bytes(task.context) > _MAX_CONTEXT_BYTES
     _enforce_context_ceiling(task)
     assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
-    # >1 pass: the two heaviest keys are gone (one eviction would not have sufficed —
-    # dropping `failures` alone still leaves ~26KB > ceiling), largest-first.
-    assert "failures" not in task.context
-    assert "issues" not in task.context
-    # the lighter fat key and the tiny early-stage key both survive the multi-pass sweep.
-    assert task.context["files_changed"] == files_changed
-    assert task.context["branch"] == "b"
+    # both equal-weight heavy keys evicted; the lighter failures + tiny branch + medium
+    # files_changed survive. This is the observable contract the #26 refactor preserves.
+    assert set(task.context) == {"branch", "files_changed", "failures"}
 
 
 def _prompt_at(eng: Engine, stage: Stage, run="r1", task="t1") -> str:
