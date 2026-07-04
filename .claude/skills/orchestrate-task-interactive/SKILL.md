@@ -11,10 +11,16 @@ status, capacity) lives in the `orchestrator` engine CLI. Your only job is the l
 You never call a model directly and you never run `claude -p`.
 
 ## Constants
-- `ROOT` = the run's status/ledger dir (e.g. `runs/<run-id>`).
+- `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
+  each run's store under `runs/<run-id>/` so runs never comingle their files flat.
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
 - `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`, the reference; or your own).
-- Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
+- Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
+  - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#91): it
+    forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet
+    recognize (no KB / sibling stores exist on day one). It's a no-op once nesting is
+    established, so it's safe to pass on every call. Omit it only if you point `ROOT`
+    directly at a pre-existing per-run dir (`runs/<run-id>`).
 
 ## One-time setup
 1. `… init-run --lane full` (or `lite`/`micro`).
