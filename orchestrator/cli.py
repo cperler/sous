@@ -135,6 +135,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="sleep through capacity stalls / rate-limit cooldowns instead of "
                          "returning (the old capacity_wait_loop)")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
+    sub.add_parser("statusline",
+                   help="one-line 5h/7d utilization for the Claude Code status bar "
+                        "(reads the same usage cache as util; quiet on a probe miss)")
     hd = sub.add_parser("hold", help="park a task at the human approval gate")
     hd.add_argument("--task", required=True)
     hd.add_argument("--reason", required=True, help="what needs human sign-off")
@@ -412,6 +415,17 @@ def main(argv: list[str] | None = None) -> int:
 
         usage = read_usage()
         _emit({"available": usage is not None, **(asdict(usage) if usage else {})})
+        return 0
+
+    if args.cmd == "statusline":
+        # Display-only sibling of `util`: same cache, but a raw line for Claude Code's
+        # statusLine (which consumes plain text, not JSON). Quiet on a probe miss so the
+        # status bar shows nothing rather than an error. Always exit 0.
+        from .usage_probe import format_statusline, read_usage
+
+        line = format_statusline(read_usage())
+        if line:
+            print(line)
         return 0
 
     if args.cmd == "validate":

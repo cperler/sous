@@ -215,7 +215,21 @@ The engine assigns a model **per stage by role** — it's never a CLI flag. Two 
 $ORCH status          # progress + cost summary + lane-attribution audit
 $ORCH cost-report     # per-stage / per-task breakdown + the session-reuse win
 $ORCH retrospective   # failure patterns + what the retries learned (on a failed run)
+$ORCH util            # 5h/7d account utilization (JSON) — the --util sensor
+$ORCH statusline      # the same numbers as one line, for the status bar
 ```
+
+**At-a-glance utilization while supervising runs (#61).** `orchestrator statusline`
+prints one line — `⧗ 5h 87% (resets 3h0m) · 7d 41% (resets 4d9h)` — off the same
+2-min usage cache the `util` sensor feeds (no extra network cost). Wire it into Claude
+Code's status bar via `settings.json`:
+
+```json
+{ "statusLine": { "type": "command", "command": "orchestrator statusline" } }
+```
+
+It stays quiet (empty line, exit 0) whenever the probe is unavailable, so the bar
+never shows an error.
 
 Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
 --detect <repo>` reads the repo's stack and prints a draft `profile.toml`;

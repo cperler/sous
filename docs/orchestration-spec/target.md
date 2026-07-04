@@ -163,7 +163,7 @@ Every as-built behavior → exactly one disposition. **Zero TBD rows.** Disposit
 ### Dev/ops periphery (Phase-1 appendix items)
 | Behavior | Source | Disp. | Rationale → target |
 |---|---|---|---|
-| `statusline-command.sh` (status-line display) | files.txt appendix | **drop** | IDE/display tooling, not orchestration; not template scope |
+| `statusline-command.sh` (status-line display) | files.txt appendix | **drop → re-added (#61)** | dropped as display tooling; the util sensor's return (`usage_probe.py`) made it ~5 lines over the same cache, so `orchestrator statusline` ports it for at-a-glance supervision |
 | `silent-failure-lint.py` (lints Python query helpers that swallow exceptions) | files.txt appendix | **drop** | repo-specific CI lint; if wanted, it becomes a project-config review-plugin (§5), not engine code |
 | Other appendix dev/ops (`deploy.sh`, seeders, `e2e-smoke.sh`, `shellcheck-lint.sh`, `sync-shared-modules.sh`, `fetch-usage.sh`, Blade prompts) | files.txt appendix | **drop** | product/CI tooling; `fetch-usage.sh`'s util-cache role is absorbed into the engine `capacity` module |
 
