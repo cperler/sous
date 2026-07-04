@@ -1130,7 +1130,14 @@ def codex_cli_transport(
     accepts no ``--full-auto``/``--sandbox``/``--add-dir``, so the fresh call's write posture is
     replicated with ``-c`` config overrides (workspace-write + non-blocking approvals + the
     worktree's git-common-dir as a writable root). A stale/rejected id cold-starts once inside
-    the same dispatch (continuity is routing metadata; correctness never depends on it)."""
+    the same dispatch (continuity is routing metadata; correctness never depends on it).
+
+    Error surfacing (#80): on a non-zero exit, ``_codex_failure_cause()`` extracts the real
+    provider refusal from the stdout event stream (``turn.failed`` / ``error`` events) and
+    prefers it over the stderr excerpt for ``RawResult.error``. This matters because codex
+    reports provider-side refusals (e.g. a 400 "model is not supported when using Codex with a
+    ChatGPT account") ONLY on the event stream; stderr carries just banners and deprecation
+    notices that would otherwise be what the verdict and ledger see."""
     root = Path(run_log_root) if run_log_root is not None else None
 
     def _call(work: WorkItem, session_ref: str | None, retry: int = 0,
