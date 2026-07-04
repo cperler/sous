@@ -82,6 +82,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="enable capacity-aware model downgrade (#12): a FRESH dispatch "
                          "drops to a cheaper model while utilization is high (>=70%%, below "
                          "the 90%% wait gate) so work keeps progressing under load")
+    ir.add_argument("--cross-provider-fallback", action="store_true",
+                    help="enable codex→claude fallthrough (#7): when a codex stage's "
+                         "same-provider options are exhausted (floor rate-limit, waits spent) "
+                         "or codex is unavailable (CLI missing / auth expired), re-route its "
+                         "next dispatch to the equivalent claude lane instead of failing. "
+                         "One-way, once per stage; the flag is blanket consent (even a "
+                         ":codex-pinned task falls through). Default off")
     ir.add_argument("--progress-comments", action="store_true",
                     help="post mid-run progress commentary to the driving issue/PR (#64): "
                          "an upserted living comment/PR-body section at each stage boundary "
@@ -418,10 +425,12 @@ def main(argv: list[str] | None = None) -> int:
         run = eng.create_run(args.run, ExecutionLane(args.lane),
                              budget_usd=args.budget_usd, route_by_cost=args.route_by_cost,
                              route_by_capacity=args.route_by_capacity,
+                             cross_provider_fallback=args.cross_provider_fallback,
                              progress_comments=args.progress_comments)
         _emit({"created_run": run.run_id, "lane": run.lane.value,
                "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
                "route_by_capacity": run.route_by_capacity,
+               "cross_provider_fallback": run.cross_provider_fallback,
                "progress_comments": run.progress_comments})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage

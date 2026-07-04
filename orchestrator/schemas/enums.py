@@ -117,6 +117,11 @@ class ResultStatus(StrEnum):
     FAILURE = "failure"
     TIMEOUT = "timeout"
     RATE_LIMITED = "rate_limited"  # transient: re-dispatch on a cheaper model (graceful fallback)
+    # The PROVIDER itself is unavailable (codex CLI missing / auth expired) — distinct from a
+    # task FAILURE: the provider never ran the task, so retrying it in-provider is futile. The
+    # engine may cross-provider-fall through to claude when the run opts in (#7); with the flag
+    # off it degrades to a normal FAILURE (retry-then-fail), so pre-#7 behavior is unchanged.
+    PROVIDER_UNAVAILABLE = "provider_unavailable"
 
 
 class ExecutionLane(StrEnum):

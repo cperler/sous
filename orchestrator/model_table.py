@@ -75,8 +75,9 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 }
 
 # Rate-limit fallback chain, per provider (ports MODEL_CHAIN: opus -> sonnet -> haiku).
-# Cross-provider fallthrough (codex -> claude) is a separate, deferred change; within a
-# provider a rate-limited model degrades down its own chain.
+# Within a provider a rate-limited model degrades down its OWN chain (fallback_after). The
+# cross-provider fallthrough (codex -> claude, #7) lives in the engine, not this table: it is
+# a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
     Provider.CLAUDE: ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
     Provider.CODEX: ("gpt-5-codex", "gpt-5", "gpt-5-mini"),

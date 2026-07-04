@@ -148,6 +148,13 @@ class Task(BaseModel):
     # untagged wildcard), so a claude ref is never fed to codex or the reverse. Set alongside
     # session_ref on SUCCESS; cleared with it on failure/reject.
     session_provider: Provider | None = None
+    # Cross-provider fallthrough (#7): stages the engine has re-routed OFF codex onto claude
+    # because the codex provider was persistently out (CLI missing / auth expired / floor
+    # rate-limit with the wait budget spent). The Router routes any stage in this set to
+    # claude, one-way (never back to codex — no ping-pong) and once per stage (a stage already
+    # here never falls through again). Set only on an opted-in run (Run.cross_provider_fallback).
+    # Additive field: pre-#7 task docs load with the empty default.
+    fallthrough_stages: tuple[Stage, ...] = ()
     # Last successful stage checkpoint {"tag", "sha"} (design pass §3): the reset
     # anchor for a retry/crash-resume of a git-affecting stage. Absorbed from
     # StageResult.checkpoint on SUCCESS only, so a failed/vetoed attempt's commits
@@ -237,6 +244,15 @@ class Run(BaseModel):
     # re-queue and a fallback-disallowing lane are never downgraded. Additive field: pre-#12
     # run docs load with the default. Default off.
     route_by_capacity: bool = False
+    # Cross-provider fallthrough (#7): when True, a codex-routed stage whose SAME-PROVIDER
+    # options are exhausted (floor rate-limit with the wait budget spent) OR whose failure is
+    # provider-unavailable-class (codex CLI missing / auth expired) is re-routed to the
+    # equivalent claude lane on its NEXT dispatch, instead of parking/failing forever. One-way
+    # (codex→claude, never the reverse — claude is the home provider), once per stage, and the
+    # human's blanket consent: even a task that explicitly pinned :codex falls through under
+    # this flag. DISTINCT from the within-provider model-chain/rate-limit fallback, which is
+    # always on. Additive field: pre-#7 run docs load with the default. Default OFF.
+    cross_provider_fallback: bool = False
     # Mid-run progress commentary (#64): when True, the engine upserts a living progress
     # comment/PR-body section on the driving issue/PR at each stage boundary (throttled),
     # so a human can follow a long run from GitHub. Outward-facing, so default OFF — a run

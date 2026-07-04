@@ -83,6 +83,31 @@ def is_rate_limited(raw: RawResult) -> bool:
     return bool(text) and any(m in text for m in _RATE_LIMIT_MARKERS)
 
 
+# Substrings marking the PROVIDER itself being unavailable — an auth/login failure, NOT a
+# task failure (→ ResultStatus.PROVIDER_UNAVAILABLE, which the engine may answer by falling
+# through to claude, #7). A missing CLI binary is caught separately by exit code 127
+# (FileNotFoundError, mapped by the transports). Kept narrow + auth-specific on purpose:
+# these markers appear in the CLI's own stderr, never in a task's test output, so they can't
+# reclassify a genuine failure. Case-insensitive.
+_PROVIDER_UNAVAILABLE_MARKERS = (
+    "not logged in", "not authenticated", "unauthorized", "401 unauthorized",
+    "authentication failed", "authentication error", "invalid api key", "missing api key",
+    "no api key", "expired token", "token expired", "please log in", "please login",
+    "run `codex login`", "codex login", "openai_api_key",
+)
+
+
+def is_provider_unavailable(raw: RawResult) -> bool:
+    """True if a RawResult signals the PROVIDER is out (CLI binary missing → exit 127, or an
+    auth/login failure in stderr) rather than the task itself failing. The engine treats this
+    as ``PROVIDER_UNAVAILABLE`` and — on an opted-in run — cross-provider-falls-through to
+    claude (#7). Deliberately narrow so a real task failure is never reclassified."""
+    if raw.exit_code == 127:  # FileNotFoundError: the CLI binary isn't installed
+        return True
+    text = (raw.error or "").lower()
+    return bool(text) and any(m in text for m in _PROVIDER_UNAVAILABLE_MARKERS)
+
+
 # Errors meaning "the session to resume no longer exists" (expired/gc'd/unknown) — and
 # ONLY that. A lost session falls back to a fresh one inside the same dispatch (design
 # pass §2: a session ref is routing metadata; correctness never depends on continuity).

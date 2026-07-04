@@ -22,6 +22,7 @@ from .transport import (
     Transport,
     checkpointing_transport,
     codex_cli_transport,
+    is_provider_unavailable,
     is_rate_limited,
     to_stage_result,
 )
@@ -66,6 +67,12 @@ class CodexRunner:
         if raw.exit_code != 0 or raw.error:
             if raw.exit_code == 124:
                 return ResultStatus.TIMEOUT
+            # The codex PROVIDER itself is out (CLI missing / auth expired) — checked before
+            # the rate-limit/failure fallbacks so a persistently-unavailable provider surfaces
+            # as PROVIDER_UNAVAILABLE, which the engine can cross-provider-fall-through on (#7)
+            # instead of burning retries against a codex that will never answer.
+            if is_provider_unavailable(raw):
+                return ResultStatus.PROVIDER_UNAVAILABLE
             if is_rate_limited(raw):
                 return ResultStatus.RATE_LIMITED  # engine retries on a cheaper model
             return ResultStatus.FAILURE

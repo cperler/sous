@@ -188,19 +188,24 @@ class Engine:
         budget_usd: float | None = None,
         route_by_cost: bool = False,
         route_by_capacity: bool = False,
+        cross_provider_fallback: bool = False,
         progress_comments: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
         enables cost-aware lane routing for un-pinned tasks; ``route_by_capacity`` enables
         capacity-aware model downgrade of fresh dispatches under high utilization (#12);
-        ``progress_comments`` opts into mid-run progress commentary on the driving issue/PR
-        (#64 — outward-facing, so default off). All default off; the two routers are DISTINCT
-        levers (USD vs rate-limit headroom)."""
+        ``cross_provider_fallback`` enables codex→claude fallthrough when the codex provider is
+        persistently out (#7 — the flag is the human's blanket consent, so even a :codex-pinned
+        task falls through under it); ``progress_comments`` opts into mid-run progress
+        commentary on the driving issue/PR (#64 — outward-facing, so default off). All default
+        off; the routers are DISTINCT levers (USD vs rate-limit headroom vs provider outage)."""
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
-            route_by_capacity=route_by_capacity, progress_comments=progress_comments,
+            route_by_capacity=route_by_capacity,
+            cross_provider_fallback=cross_provider_fallback,
+            progress_comments=progress_comments,
         )
         self.store.save_run(run)
         return run
@@ -645,20 +650,46 @@ class Engine:
         )
         # At the floor (or with fallback disabled) the rate limit can't be dodged with a
         # cheaper model — wait it out (the old handle_rate_limit's wait-until-reset) and
-        # retry the ORIGINAL model, bounded by max_rate_limit_waits; only past that
-        # budget does it degrade to a normal failure.
+        # retry the ORIGINAL model, bounded by max_rate_limit_waits; only past that budget is
+        # the provider's same-provider budget exhausted. ``provider_out_reason`` captures the
+        # two "the (codex) provider is out" signals #7 falls through on: a runner-reported
+        # PROVIDER_UNAVAILABLE (CLI missing / auth), OR a floor rate-limit whose wait budget is
+        # spent. It stays None while a cooldown wait remains (that is not exhaustion yet).
         cooldown_until: str | None = None
-        if effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
+        provider_out_reason: str | None = None
+        if effective.status is ResultStatus.PROVIDER_UNAVAILABLE:
+            provider_out_reason = effective.error or "provider reported unavailable"
+        elif effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
             if task.rate_limit_waits < self.max_rate_limit_waits:
                 cooldown_until = (
                     datetime.now(UTC) + timedelta(seconds=self.rate_limit_cooldown_s)
                 ).isoformat()
             else:
-                effective = effective.model_copy(update={
-                    "status": ResultStatus.FAILURE,
-                    "error": "rate-limited with no cheaper fallback available and the "
-                             f"cooldown budget exhausted ({task.rate_limit_waits} waits)",
-                })
+                provider_out_reason = (
+                    "rate-limited with no cheaper fallback available and the "
+                    f"cooldown budget exhausted ({task.rate_limit_waits} waits)"
+                )
+
+        # Cross-provider fallthrough (#7): opt-in, one-way (codex→claude), once per stage. When
+        # a CODEX dispatch's same-provider options are exhausted (provider_out_reason set) and
+        # the run consented (cross_provider_fallback), re-route this stage's NEXT dispatch to the
+        # equivalent claude lane instead of failing/parking. Keyed off the lane ACTUALLY used
+        # (ground truth), so a claude result never falls through — no ping-pong.
+        run = self.store.load_run(run_id)
+        do_fallthrough = (
+            provider_out_reason is not None
+            and run.cross_provider_fallback
+            and result.lane_used.provider is Provider.CODEX
+            and result.stage not in task.fallthrough_stages
+        )
+        if provider_out_reason is not None and not do_fallthrough:
+            # No fallthrough (flag off / not codex / already fell through once): a provider-out
+            # signal degrades to a normal FAILURE — retry within the provider, then fail out,
+            # exactly as before #7 existed. Idempotent for a rate-limit already FAILURE-shaped;
+            # the meaningful conversion is PROVIDER_UNAVAILABLE → FAILURE.
+            effective = effective.model_copy(update={
+                "status": ResultStatus.FAILURE, "error": provider_out_reason,
+            })
 
         task.pending_work_item_id = None
         task.pending_content_hash = None
@@ -666,7 +697,9 @@ class Engine:
         outcome: str
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
-        if effective.status is ResultStatus.RATE_LIMITED:
+        if do_fallthrough:
+            outcome = self._apply_fallthrough(task, result, provider_out_reason)
+        elif effective.status is ResultStatus.RATE_LIMITED:
             # Transient: re-queue the stage (RUNNING marker keeps the attempt) — either
             # immediately on a cheaper model, or after a cooldown on the original one.
             # No apply_result/learnings/breaker, but cost is recorded.
@@ -788,10 +821,22 @@ class Engine:
         )
         # Mid-run progress commentary (#64): upsert the living progress comment/PR-body
         # section on the driving issue/PR at this stage boundary (opt-in, throttled,
-        # best-effort). A rate-limit re-queue is NOT a boundary (same stage/attempt goes
-        # back on the wire) — skip it so the running/next picture doesn't flicker.
-        if not outcome.startswith("stage_rate_limited"):
+        # best-effort). A rate-limit re-queue and a cross-provider fallthrough are NOT
+        # boundaries (the same stage/attempt goes back on the wire) — skip them so the
+        # running/next picture doesn't flicker.
+        if not outcome.startswith("stage_rate_limited") and outcome != "provider_fallthrough":
             self._maybe_publish_progress(run_id, task)
+        # Audit the cross-provider fallthrough (#7): the run consented and codex was out, so
+        # the stage's NEXT dispatch is re-routed to claude — record from→to + why.
+        if outcome == "provider_fallthrough":
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "provider_fallthrough", "run_id": run_id,
+                 "task_id": result.task_id, "stage": result.stage.value,
+                 "from": Provider.CODEX.value, "to": Provider.CLAUDE.value,
+                 "reason": provider_out_reason,
+                 "attempt": result.attempt},
+            )
         # Audit a cooldown park: when the task may dispatch again, and how much of the
         # wait budget is spent — so a stalled-looking run explains itself in the events.
         if outcome == "stage_rate_limited_cooldown":
@@ -1096,6 +1141,49 @@ class Engine:
         task.state = TaskState.BLOCKED_ON_HUMAN
         verdict["disposition"] = "held"
         return "review_rejected_held"
+
+    def _apply_fallthrough(self, task: Task, result: StageResult, reason: str) -> str:
+        """Re-route a codex stage to claude because the codex provider was out (#7).
+
+        Called only when ``record`` has decided a fallthrough applies (run opted in, the failed
+        dispatch actually ran on codex, and this stage hasn't fallen through before). Mirrors
+        the rate-limit re-queue's shape — the provider was unavailable, NOT the task, so the
+        stage attempt is KEPT (RUNNING marker, no breaker, no retry burned) rather than counted
+        against the task's budget. What it changes:
+
+        - Marks the stage in ``fallthrough_stages`` so the Router picks claude on the next
+          dispatch (one-way; a stage already here never routes back to codex).
+        - Clears the codex ``session_ref``/``session_provider`` (#9): a codex thread id means
+          nothing to claude, and next_work's provider-gate would drop it anyway — we clear it
+          explicitly (and regression-test it) so the codex context never leaks to the claude
+          attempt.
+        - Resets the rate-limit / fallback-model state: a DIFFERENT provider gets a fresh
+          cooldown budget and starts at claude's role-default model (no queued codex fallback).
+        - Appends a learning so the claude attempt knows the prior codex context is gone and to
+          work from the task description + learnings. The context/learnings plane itself is
+          provider-neutral and carries over untouched; the pre-dispatch checkpoint reset (a
+          RUNNING re-queue with no salvage) starts claude from the last good checkpoint.
+        """
+        stage = result.stage
+        rec = task.stages[stage]
+        rec.status = StageStatus.RUNNING  # provider was out, not the task — keep the attempt
+        rec.completed_at = None
+        rec.error = None
+        task.state = TaskState.RETRYING
+        task.updated_at = _now()
+        task.fallthrough_stages = (*task.fallthrough_stages, stage)
+        # The codex session must NOT ride onto the claude dispatch (#9).
+        task.session_ref = None
+        task.session_provider = None
+        task.pending_fallback_model = None  # claude starts fresh at its role default
+        task.not_before = None
+        task.rate_limit_waits = 0  # a different provider — a fresh cooldown budget
+        task.learnings.append(
+            f"{stage.value} (attempt {result.attempt}): the codex provider was UNAVAILABLE "
+            f"({reason}) — this stage is re-routed to claude. Any prior codex session/context "
+            f"is NOT carried over; work from the task description and the learnings above."
+        )
+        return "provider_fallthrough"
 
     def _apply_salvage(
         self, task: Task, result: StageResult, *, infra_only: bool = False

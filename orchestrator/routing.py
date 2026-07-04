@@ -31,6 +31,12 @@ class Router:
     allow_fallback: bool = True  # permit graceful model fallback (capacity downgrade + rate-limit)
 
     def _provider(self, stage: Stage, task: Task) -> Provider:
+        # Cross-provider fallthrough (#7): a stage the engine already re-routed off codex (the
+        # codex provider was out) stays on claude — one-way and never back to codex, so a
+        # subsequent claude failure can't ping-pong. Checked FIRST so it overrides both the
+        # global provider switch and a per-task :codex pin.
+        if stage in task.fallthrough_stages:
+            return Provider.CLAUDE
         if self.orchestrator_provider is Provider.CODEX:
             return Provider.CODEX
         if task.provider_tag == "codex" and stage in self.codex_eligible_stages:
