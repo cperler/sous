@@ -136,3 +136,53 @@ def test_cli_watch_exits_on_terminal_run(tmp_path, capsys) -> None:
     assert summary["watch"] == "done"
     assert summary["run_state"] == "completed"
     assert summary["progress"]["completed"] == 1
+
+
+# --- #66: the `tail` command (raw stream tail; no engine/project needed) ---------------
+
+def test_cli_tail_prints_recent_lines(tmp_path, capsys) -> None:
+    from orchestrator.stream_probe import stages_dir, stream_filename
+
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    (d / stream_filename("implement", 0)).write_text("l1\nl2\nl3\n")
+
+    rc = main(["--root", str(tmp_path), "tail", "#42", "--lines", "2"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "l2" in out and "l3" in out and "l1" not in out  # last 2 lines only
+
+
+def test_cli_tail_no_stream_says_so_cleanly(tmp_path, capsys) -> None:
+    # An interactive/ENGINE-lane task (or one that never dispatched) has no stream.
+    rc = main(["--root", str(tmp_path), "tail", "#7"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "no live stream" in out
+
+
+def test_cli_tail_follow_prints_appended_lines(tmp_path, capsys, monkeypatch) -> None:
+    import time as _time
+
+    from orchestrator.stream_probe import stages_dir, stream_filename
+
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    f = d / stream_filename("implement", 0)
+    f.write_text("x1\n")
+
+    state = {"n": 0}
+
+    def fake_sleep(_interval) -> None:  # the injected follow sleeper
+        state["n"] += 1
+        if state["n"] == 1:
+            with f.open("a", encoding="utf-8") as fh:
+                fh.write("x2\n")
+        else:
+            raise KeyboardInterrupt  # the CLI catches this to end the follow
+
+    monkeypatch.setattr(_time, "sleep", fake_sleep)
+    rc = main(["--root", str(tmp_path), "tail", "#42", "--follow", "--interval", "0"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "x1" in out and "x2" in out  # initial tail + the appended line

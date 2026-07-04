@@ -9,9 +9,11 @@ a live model.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import subprocess
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -23,6 +25,11 @@ from jsonschema import ValidationError as _JSONSchemaError
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
 from orchestrator.status_store import safe_task_dirname
+from orchestrator.stream_probe import (
+    stderr_filename,
+    stream_filename,
+    stream_relpath,
+)
 
 
 @dataclass
@@ -247,14 +254,13 @@ def _tee_streams(root: Path, work: WorkItem, raw: RawResult) -> dict | None:
         return None  # no provider stream (deterministic/interactive lane) — skip cleanly
     d = _stream_dir(root, work.task_id)
     d.mkdir(parents=True, exist_ok=True)
-    base = f"{work.stage.value}-attempt{work.attempt}"
     files: dict = {}
     if raw.raw_output is not None:
-        p = d / f"{base}.stream.jsonl"
+        p = d / stream_filename(work.stage.value, work.attempt)
         p.write_text(raw.raw_output, encoding="utf-8")
         files["stream"] = str(p.relative_to(root))
     if raw.raw_stderr:
-        p = d / f"{base}.stderr.log"
+        p = d / stderr_filename(work.stage.value, work.attempt)
         p.write_text(raw.raw_stderr, encoding="utf-8")
         files["stderr"] = str(p.relative_to(root))
     return files or None
@@ -266,13 +272,19 @@ def stream_teeing_transport(inner: Transport, run_log_root: str | Path | None) -
     (``stream_files``) so a human can navigate from a recorded failure straight to the raw
     stream. Best-effort by contract: any teeing error is swallowed and noted in
     ``stream_files["error"]`` — retaining evidence must never break the model call. A None
-    root (no run dir wired) is a no-op passthrough."""
+    root (no run dir wired) is a no-op passthrough.
+
+    A transport that already teed its stream in-flight (#66 — the real provider transports,
+    which stream stdout to the SAME file as it arrives so it can be tailed live) returns a
+    RawResult with ``stream_files`` already set; this wrapper then passes through untouched.
+    So it only does the after-the-fact tee for transports that DON'T stream (injected/test
+    transports that hand back a whole ``raw_output``)."""
     root = Path(run_log_root) if run_log_root is not None else None
 
     def run(work: WorkItem) -> RawResult:
         raw = inner(work)
-        if root is None:
-            return raw
+        if root is None or raw.stream_files is not None:
+            return raw  # no run dir, or the inner transport already streamed+stamped it live
         try:
             files = _tee_streams(root, work, raw)
         except Exception as exc:  # noqa: BLE001 - retaining evidence is never worth a failed call
@@ -280,6 +292,95 @@ def stream_teeing_transport(inner: Transport, run_log_root: str | Path | None) -
         return replace(raw, stream_files=files) if files else raw
 
     return run
+
+
+# --- in-flight stream teeing (#66) -------------------------------------------------------
+# #56 retained the raw stream but wrote it AFTER the call returned, so an in-flight headless
+# stage (10-30 min) could not be tailed. ``_run_teed`` runs the provider subprocess and tees
+# its stdout to the stream file LINE-BY-LINE as it arrives (flushed), while still capturing the
+# full stdout/stderr for parsing. The tee is best-effort: a tee-file write error drops teeing
+# and keeps capturing — retaining/observing evidence must NEVER break the model call. Timeout
+# is enforced with a watchdog that kills the process even when it emits no output, then re-raised
+# as ``subprocess.TimeoutExpired`` so the callers' existing timeout handling is unchanged.
+
+
+def _run_teed(
+    argv: list[str], *, timeout: float | None, cwd: str | None, tee_path: Path
+) -> tuple[int, str, str]:
+    """Run ``argv`` (Popen), teeing stdout to ``tee_path`` as it streams in. Returns
+    ``(returncode, full_stdout, full_stderr)``. Raises ``subprocess.TimeoutExpired`` on
+    timeout (process killed), and ``FileNotFoundError`` if the binary is missing — matching
+    ``subprocess.run`` so the transports' existing except-clauses apply unchanged."""
+    tee = None
+    try:  # best-effort: teeing must never break the call
+        tee_path.parent.mkdir(parents=True, exist_ok=True)
+        tee = open(tee_path, "w", encoding="utf-8")  # noqa: SIM115 - closed in finally
+    except OSError:
+        tee = None
+    # Popen raises FileNotFoundError here for a missing binary (as subprocess.run does).
+    proc = subprocess.Popen(  # noqa: S603
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd
+    )
+    stderr_box: dict[str, str] = {"data": ""}
+
+    def _drain_stderr() -> None:
+        # stderr is post-mortem evidence, not control flow — a read hiccup must not matter.
+        with contextlib.suppress(Exception):
+            stderr_box["data"] = proc.stderr.read() or ""  # type: ignore[union-attr]
+
+    et = threading.Thread(target=_drain_stderr, daemon=True)
+    et.start()
+    killed = {"timeout": False}
+
+    def _kill_on_timeout() -> None:
+        killed["timeout"] = True
+        proc.kill()
+
+    watchdog = threading.Timer(timeout, _kill_on_timeout) if timeout else None
+    if watchdog is not None:
+        watchdog.start()
+    parts: list[str] = []
+    try:
+        for line in proc.stdout:  # type: ignore[union-attr]
+            parts.append(line)
+            if tee is not None:
+                try:
+                    tee.write(line)
+                    tee.flush()
+                except OSError:  # tee target went away — keep capturing, stop teeing
+                    tee.close()
+                    tee = None
+    finally:
+        proc.wait()
+        if watchdog is not None:
+            watchdog.cancel()
+        et.join(timeout=1)
+        if tee is not None:
+            tee.close()
+    if killed["timeout"]:
+        raise subprocess.TimeoutExpired(argv, timeout or 0)
+    return proc.returncode, "".join(parts), stderr_box["data"]
+
+
+def _streaming_stream_files(
+    root: Path, work: WorkItem, stdout: str, stderr: str
+) -> dict:
+    """Assemble the ``stream_files`` map for a call that streamed its stdout live (#66). The
+    ``.stream.jsonl`` was written in-flight by ``_run_teed``; here we only write the stderr
+    file (post-hoc — stderr isn't the live-tail surface) and return both paths RELATIVE to the
+    run root. Both writes are best-effort; a stdout stream with no content is still recorded so
+    a probe/tail finds the (empty) file the stage owns."""
+    files: dict = {"stream": stream_relpath(work.task_id, work.stage.value, work.attempt)}
+    if stderr:
+        try:
+            p = _stream_dir(root, work.task_id) / stderr_filename(work.stage.value, work.attempt)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.write_text(stderr, encoding="utf-8")
+        except OSError:  # pragma: no cover - defensive; stderr is evidence, not control
+            pass
+        else:
+            files["stderr"] = str(p.relative_to(root))
+    return files
 
 
 def to_stage_result(
@@ -460,12 +561,58 @@ def checkpointing_transport(inner: Transport) -> Transport:
     return run
 
 
+def _envelope_to_raw(
+    data: dict, *, stdout: str, stderr: str, invocation: str, stream_files: dict | None
+) -> RawResult:
+    """Build a RawResult from a claude result envelope (the whole ``--output-format json``
+    object, or the ``type=="result"`` event of the ``stream-json`` stream — same field
+    names). Shared so both output formats recover structured output identically."""
+    # Presence check, not truthiness: a valid-but-empty structured_output ({}) must not
+    # fall through to the prose `result`.
+    structured = data["structured_output"] if "structured_output" in data else data.get("result")
+    if isinstance(structured, str):
+        # The model answered in prose/fenced text rather than the structured-output tool —
+        # recover the JSON object it printed (validated later by the schema-retry loop).
+        structured = _json_object_from_text(structured)
+    session_id = data.get("session_id")
+    return RawResult(structured, _usage_from(data), raw_output=stdout, raw_stderr=stderr,
+                     exit_code=0, invocation=invocation, stream_files=stream_files,
+                     session_ref=session_id if isinstance(session_id, str) else None)
+
+
+def _last_result_event(stdout: str) -> dict | None:
+    """The final ``{"type":"result", ...}`` event from a claude ``stream-json`` stdout — the
+    envelope carrying the model's answer/usage/session. ``None`` if the stream ended without
+    one (a crashed/killed call), which the caller treats as a transport error."""
+    result: dict | None = None
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            result = ev
+    return result
+
+
 def claude_cli_transport(
     schema_json_for: Callable[[str], str | None] | None = None,
     *,
     max_schema_retries: int = 2,
+    run_log_root: str | Path | None = None,
 ) -> Transport:
-    """Real headless×claude transport: shells ``claude -p ... --output-format json``.
+    """Real headless×claude transport: shells ``claude -p``.
+
+    ``run_log_root`` (#66): when a run dir is wired, the call streams
+    ``--output-format stream-json --verbose`` and tees stdout to the stage's
+    ``.stream.jsonl`` LINE-BY-LINE as it arrives (so an in-flight stage can be tailed live),
+    then parses the final ``result`` event for the answer. Without a run dir (tests / no log
+    dir) it keeps the single-shot ``--output-format json`` path. Both paths recover the
+    structured output identically via ``_envelope_to_raw``, so the schema-retry loop below is
+    unchanged.
 
     ``schema_json_for`` returns the stage's JSON Schema **inline** (the CLI's
     ``--json-schema`` takes the schema JSON itself, not a file path) so the reply is
@@ -487,59 +634,74 @@ def claude_cli_transport(
     count is recorded on ``RawResult.schema_retries`` for the ledger.
     """
 
+    root = Path(run_log_root) if run_log_root is not None else None
+
     def _call(work: WorkItem, session_ref: str | None) -> RawResult:
+        # #66: with a run dir, stream `stream-json` and tee stdout as it arrives so the stage
+        # is tailable live; otherwise the single-shot `json` path. `--json-schema` +
+        # `_JSON_ONLY_POSTAMBLE` are BEST-EFFORT on `claude -p` (after multi-turn agentic work
+        # the model often ends in PROSE with no `structured_output` — the headless #25 failure),
+        # so both paths recover the object from `result` text and the schema-retry loop below
+        # is the real shape guarantee.
+        streaming = root is not None
+        fmt = ["--output-format", "stream-json", "--verbose"] if streaming \
+            else ["--output-format", "json"]
         argv = ["claude", "-p", work.prompt, "--model", work.model,
-                "--dangerously-skip-permissions", "--output-format", "json"]
+                "--dangerously-skip-permissions", *fmt]
         if work.agent:
             argv += ["--agent", work.agent]
         if schema_json_for and (schema := schema_json_for(work.schema_ref)):
-            # `--json-schema` is BEST-EFFORT on `claude -p`, not a hard constraint: after
-            # multi-turn agentic work the model often ends `stop_reason=end_turn` with a
-            # PROSE summary and no `structured_output` (the headless #25 failure). Force
-            # the contract with a system-prompt directive — the same lever the reference
-            # bash system applied on its codex path (which also lacked --json-schema).
             argv += ["--json-schema", schema, "--append-system-prompt", _JSON_ONLY_POSTAMBLE]
         if session_ref:
             argv += ["--resume", session_ref]
         invocation = (f"claude -p --model {work.model}"
                       + (f" --agent {work.agent}" if work.agent else "")
                       + (f" --resume {session_ref}" if session_ref else ""))
+
+        stream_files: dict | None = None
         try:
-            proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
-                                  timeout=work.timeout_s, cwd=work.cwd)
+            if streaming:
+                tee_path = _stream_dir(root, work.task_id) / stream_filename(
+                    work.stage.value, work.attempt
+                )
+                returncode, stdout, stderr = _run_teed(
+                    argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path
+                )
+                stream_files = _streaming_stream_files(root, work, stdout, stderr)
+            else:
+                proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
+                                      timeout=work.timeout_s, cwd=work.cwd)
+                returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except FileNotFoundError as exc:  # pragma: no cover - env dependent
             return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
         except subprocess.TimeoutExpired:
             # A hung CLI must not hang the scheduler — fail the dispatch on timeout.
             return RawResult(None, exit_code=124,
                              error=f"timed out after {work.timeout_s}s", invocation=invocation)
-        if proc.returncode != 0:
-            return RawResult(None, exit_code=proc.returncode, error=proc.stderr.strip()[:500],
-                             raw_output=proc.stdout, raw_stderr=proc.stderr,
-                             invocation=invocation)
-        try:
-            data = json.loads(proc.stdout) if proc.stdout.strip() else {}
-        except json.JSONDecodeError as exc:
-            # Exit 0 but non-JSON stdout (banner/notice): fail the dispatch, never
-            # let the exception escape (every dispatch must yield a StageResult).
-            return RawResult(None, raw_output=proc.stdout, raw_stderr=proc.stderr, exit_code=0,
-                             error=f"non-JSON output: {exc}", invocation=invocation)
-        # Presence check, not truthiness: a valid-but-empty structured_output ({})
-        # must not fall through to the prose `result`.
-        structured = data["structured_output"] if "structured_output" in data else data.get("result")
-        if isinstance(structured, str):
-            # --json-schema only populates `structured_output` when the model answers via
-            # the structured-output tool; a model that instead prints the JSON object as
-            # text (often fenced ```json) lands it in `result`. Recover that rather than
-            # discarding a schema-shaped answer as a SCHEMA_VIOLATION.
-            structured = _json_object_from_text(structured)
+        if returncode != 0:
+            return RawResult(None, exit_code=returncode, error=stderr.strip()[:500],
+                             raw_output=stdout, raw_stderr=stderr,
+                             invocation=invocation, stream_files=stream_files)
+        if streaming:
+            data = _last_result_event(stdout)
+            if data is None:
+                # Exit 0 but no result event (partial/killed stream): fail the dispatch.
+                return RawResult(None, raw_output=stdout, raw_stderr=stderr, exit_code=0,
+                                 error="no result event in stream-json output",
+                                 invocation=invocation, stream_files=stream_files)
+        else:
+            try:
+                data = json.loads(stdout) if stdout.strip() else {}
+            except json.JSONDecodeError as exc:
+                # Exit 0 but non-JSON stdout (banner/notice): fail the dispatch, never
+                # let the exception escape (every dispatch must yield a StageResult).
+                return RawResult(None, raw_output=stdout, raw_stderr=stderr, exit_code=0,
+                                 error=f"non-JSON output: {exc}", invocation=invocation)
         # NB: the shape-gate is deliberately NOT applied here — the `run` loop below
         # validates (and, on failure, retries with a corrective prompt). Nulling out an
         # invalid object here would throw away exactly what the retry needs to quote back.
-        session_id = data.get("session_id")
-        return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
-                         raw_stderr=proc.stderr, exit_code=0, invocation=invocation,
-                         session_ref=session_id if isinstance(session_id, str) else None)
+        return _envelope_to_raw(data, stdout=stdout, stderr=stderr,
+                                invocation=invocation, stream_files=stream_files)
 
     def run(work: WorkItem) -> RawResult:
         raw = _call(work, work.session_ref)
@@ -587,8 +749,14 @@ def claude_cli_transport(
     return run
 
 
-def codex_cli_transport() -> Transport:
-    """Real codex transport: ``codex exec --json --output-last-message``."""
+def codex_cli_transport(*, run_log_root: str | Path | None = None) -> Transport:
+    """Real codex transport: ``codex exec --json --output-last-message``.
+
+    ``run_log_root`` (#66): codex ``--json`` already emits its events as a JSONL stream, so
+    when a run dir is wired the stdout is teed to the stage's ``.stream.jsonl`` LINE-BY-LINE as
+    it arrives (tailable live), same as the claude path. The result parsing is unchanged — it
+    still reads ``--output-last-message`` and scans the full stdout for usage."""
+    root = Path(run_log_root) if run_log_root is not None else None
 
     def run(work: WorkItem) -> RawResult:
         # A linked worktree's real .git lives in the main checkout — the codex sandbox
@@ -609,9 +777,20 @@ def codex_cli_transport() -> Transport:
             argv = ["codex", "exec", "-m", work.model, "--full-auto", "--skip-git-repo-check",
                     *add_dir, "--json", "--output-last-message", str(last), work.prompt]
             invocation = f"codex exec --json (model {work.model})"
+            stream_files: dict | None = None
             try:
-                proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
-                                      timeout=work.timeout_s, cwd=work.cwd)
+                if root is not None:
+                    tee_path = _stream_dir(root, work.task_id) / stream_filename(
+                        work.stage.value, work.attempt
+                    )
+                    returncode, stdout, stderr = _run_teed(
+                        argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path
+                    )
+                    stream_files = _streaming_stream_files(root, work, stdout, stderr)
+                else:
+                    proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
+                                          timeout=work.timeout_s, cwd=work.cwd)
+                    returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
             except FileNotFoundError as exc:  # pragma: no cover - env dependent
                 return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
             except subprocess.TimeoutExpired:
@@ -624,9 +803,9 @@ def codex_cli_transport() -> Transport:
                     structured = json.loads(txt)
                 except json.JSONDecodeError:
                     structured = None
-            return RawResult(structured, usage=_codex_usage(proc.stdout), raw_output=proc.stdout,
-                             raw_stderr=proc.stderr, exit_code=proc.returncode,
-                             error=(proc.stderr.strip()[:500] or None) if proc.returncode else None,
+            return RawResult(structured, usage=_codex_usage(stdout), raw_output=stdout,
+                             raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
+                             error=(stderr.strip()[:500] or None) if returncode else None,
                              invocation=invocation)
 
     return run

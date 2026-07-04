@@ -137,6 +137,20 @@ def main(argv: list[str] | None = None) -> int:
     wt.add_argument("--interval", type=int, default=60, help="poll interval seconds")
     wt.add_argument("--stale-after", type=int, default=1800,
                     help="a task with no update for this many seconds is flagged stale")
+    wt.add_argument("--activity", action="store_true",
+                    help="also print a live activity line per running task (#66): what the "
+                         "model is doing + seconds since its stream last grew")
+    wt.add_argument("--stall-after", type=int, default=300,
+                    help="with --activity: a stream that hasn't grown for this many seconds "
+                         "while its stage is RUNNING gets a distinct STREAM STALLED note")
+    tl = sub.add_parser("tail", help="print the recent tail of a task's current (or last) "
+                                     "headless stream (#66); --follow to poll for new output")
+    tl.add_argument("task", help="task id whose stream to tail")
+    tl.add_argument("--stage", default=None,
+                    help="a specific stage's stream (default: the most-recent stream)")
+    tl.add_argument("--lines", type=int, default=20, help="how many trailing lines to show")
+    tl.add_argument("--follow", action="store_true", help="poll for and print new output")
+    tl.add_argument("--interval", type=int, default=2, help="--follow poll interval seconds")
     sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
@@ -195,6 +209,31 @@ def main(argv: list[str] | None = None) -> int:
                     deleted.append(tag)
         _emit({"repo": args.repo, "scope": scope, "kept": kept, "candidates": doomed,
                "deleted": deleted, "dry_run": not args.prune})
+        return 0
+
+    if args.cmd == "tail":
+        # In-flight stream tail (#66): reads files under --root only — no engine/project/model.
+        # An interactive/ENGINE-lane task (or one that hasn't dispatched yet) has no stream;
+        # say so cleanly rather than erroring.
+        from .stream_probe import find_current_stream, follow_stream, read_tail
+
+        if not args.root:
+            p.error("--root is required for tail")
+        path = find_current_stream(Path(args.root), args.task, args.stage)
+        if path is None:
+            print(f"(no live stream for task {args.task} — interactive/ENGINE lane, "
+                  "or nothing dispatched yet)")
+            return 0
+        if args.follow:
+            import contextlib
+            import time
+
+            with contextlib.suppress(KeyboardInterrupt):  # interactive Ctrl-C ends the follow
+                follow_stream(path, emit=print, sleeper=time.sleep,
+                              lines=args.lines, poll_interval=args.interval)
+            return 0
+        for line in read_tail(path, lines=args.lines) or []:
+            print(line)
         return 0
 
     if args.cmd == "util":
@@ -383,6 +422,7 @@ def main(argv: list[str] | None = None) -> int:
         final = watch_run(
             eng, args.run, interval=args.interval, stale_after_s=args.stale_after,
             sleeper=time.sleep, emit=lambda line: print(line, file=sys.stderr),
+            activity=args.activity, stall_after_s=args.stall_after,
         )
         _emit({"watch": "done", "run_id": args.run, "run_state": final["run_state"],
                "progress": final["progress"]})

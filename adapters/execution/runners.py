@@ -87,16 +87,22 @@ def build_registry(
             )
         )
     if headless_transport is None and headless_schema_provider is not None:
-        inner = claude_cli_transport(_schema_json_provider(headless_schema_provider))
+        # #66: pass the run dir INTO the transport so it streams `stream-json` and tees stdout
+        # line-by-line as it arrives (in-flight tailable), not after the call returns. The
+        # stream_teeing wrapper stays as the post-hoc fallback: it passes through untouched once
+        # the transport has already streamed+stamped stream_files (#56 evidence retention).
+        inner = claude_cli_transport(
+            _schema_json_provider(headless_schema_provider), run_log_root=run_log_root
+        )
         if run_log_root is not None:
             inner = stream_teeing_transport(inner, run_log_root)
         headless_transport = checkpointing_transport(inner)
     reg.register_runner(HeadlessClaudeRunner(headless_transport))
     if codex_transport is None and run_log_root is not None:
-        # Build codex explicitly (rather than letting CodexRunner default it) so the raw
-        # codex event stream + stderr are teed too — the headless×claude twin of #56.
+        # codex `--json` is already a JSONL stream; passing the run dir tees it live (the
+        # headless×claude twin of the in-flight stream).
         codex_transport = checkpointing_transport(
-            stream_teeing_transport(codex_cli_transport(), run_log_root)
+            stream_teeing_transport(codex_cli_transport(run_log_root=run_log_root), run_log_root)
         )
     reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))
     if setup_project is not None:

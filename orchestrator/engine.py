@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -63,6 +64,7 @@ from .state_machine import (
     resume_point,
 )
 from .status_store import StatusStore
+from .stream_probe import probe_current_stream
 
 
 def _now() -> str:
@@ -1552,7 +1554,9 @@ class Engine:
                 rejections[t.task_id] = {"title": t.title, "reason": record.get("reason")}
         return build_retrospective(run, tasks, events, stage_logs, rejections=rejections)
 
-    def status(self, run_id: str, *, stale_after_s: int = 1800) -> dict:
+    def status(
+        self, run_id: str, *, stale_after_s: int = 1800, include_activity: bool = False
+    ) -> dict:
         run = self.store.load_run(run_id)
         progress = run.progress()
         now = datetime.now(UTC)
@@ -1587,6 +1591,31 @@ class Engine:
                 record = self.store.load_rejection(run_id, ref.task_id)
                 if record:
                     task_status["rejection_reason"] = record.get("reason")
+            # In-flight activity (#66, opt-in): for a non-terminal task whose current stage has
+            # a live provider stream (headless/codex lanes tee it), attach a LEAN snapshot —
+            # what the model is doing + when its stream last grew. Default-off so existing
+            # callers and the cheap cost-poll path are byte-for-byte unchanged; the tail (raw
+            # lines) is deliberately NOT attached here to keep the status JSON small.
+            if (
+                include_activity
+                and task.current_stage is not None
+                and task.state not in TERMINAL_TASK_STATES
+            ):
+                snap = probe_current_stream(
+                    self.store.root, ref.task_id, task.current_stage.value, tail_lines=0
+                )
+                if snap is not None:  # a provider stream exists (headless/codex lane)
+                    last_at = snap.get("last_event_at")
+                    task_status["activity"] = {
+                        "current_activity": snap.get("current_activity"),
+                        "events_seen": snap.get("events_seen"),
+                        "last_event_at": last_at,
+                        "seconds_since_event": (
+                            round(max(0.0, time.time() - last_at), 1)
+                            if isinstance(last_at, (int, float))
+                            else None
+                        ),
+                    }
             tasks[ref.task_id] = task_status
         # One ledger read shared by the summary, the audit, and the cost-summary.md
         # refresh (status() used to read the ledger twice).
