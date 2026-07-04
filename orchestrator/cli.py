@@ -23,11 +23,71 @@ from .schemas.enums import ExecutionLane, ExecutionMode, Provider
 from .schemas.work import StageResult
 
 
+def _is_shared_runs_root(root: Path, run: str) -> bool:
+    """True when ``root`` already holds other runs' store data — i.e. it is a
+    *shared* runs-root (the parent the #6 dashboard scans), not this run's own
+    per-run store dir. Detected structurally (no name heuristics): a
+    ``learnings-kb.jsonl`` living here, a child directory that is itself a run
+    store, or a flat ``status-*.json`` doc belonging to a different run."""
+    if not root.is_dir():
+        return False
+    if (root / "learnings-kb.jsonl").exists():
+        return True
+    for child in root.iterdir():
+        if child.is_dir() and any(child.glob("status-*.json")):
+            return True  # a nested per-run store already lives under root
+        # A flat status-<other>.json / status-<other>-<task>.json belongs to a
+        # comingled sibling run (this run's own docs are prefixed by `status-<run>`).
+        if (
+            child.is_file()
+            and child.name.startswith("status-")
+            and child.suffix == ".json"
+            and child.name != f"status-{run}.json"
+            and not child.name.startswith(f"status-{run}-")
+        ):
+            return True
+    return False
+
+
+def _resolve_store_root(root: Path, run: str | None) -> Path:
+    """Resolve the actual per-run store directory from ``--root`` (#81).
+
+    ``--root`` is ambiguous: dashboard/kb/tail treat it as the runs-root (parent
+    of the per-run dirs), while the per-run commands historically treat it as the
+    run's own store dir. Typing the dashboard spelling (``--root runs --run <id>``)
+    for ``init-run`` therefore wrote the whole store flat into ``runs/`` and pushed
+    the learnings KB (``<store parent>/learnings-kb.jsonl``) up to the repo root.
+
+    To make ``--root runs`` the natural spelling everywhere, auto-nest to
+    ``<root>/<run>/`` when ``<root>`` is a shared runs-root. The decision is
+    anchored to where this run's store already lives so it stays stable across a
+    run's init-run/add-task/next/record calls (a KB file materializing mid-run must
+    not flip a flat run into a nested one): if the run's own flat run-doc already
+    sits in ``<root>`` we keep it there; if ``<root>/<run>/`` already exists we use
+    that; only a fresh run under a shared root nests. Otherwise use ``<root>``
+    directly, preserving callers that already point at the per-run dir."""
+    if not run:
+        return root
+    if (root / f"status-{run}.json").exists():
+        return root  # this run is already established flat here — stay put
+    nested = root / run
+    if nested.is_dir() or _is_shared_runs_root(root, run):
+        return nested
+    return root
+
+
 def _engine(args: argparse.Namespace) -> Engine:
     from .status_store import StatusStore
 
-    root = Path(args.root)
+    root = _resolve_store_root(Path(args.root), getattr(args, "run", None))
     root.mkdir(parents=True, exist_ok=True)
+    if str(root) != str(args.root):
+        # Never silent: state the nesting so the operator sees where the store landed.
+        print(
+            f"note: --root {args.root!s} is a shared runs-root; nesting this run's "
+            f"store at {root!s} (learnings KB stays at {root.parent!s}/learnings-kb.jsonl)",
+            file=sys.stderr,
+        )
     store = StatusStore(root)
     ledger = CostLedger(root / "stage-costs.jsonl")
     project = load_project(args.project)
@@ -59,7 +119,11 @@ def _emit(obj) -> None:
 
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="orchestrator")
-    p.add_argument("--root", help="status/ledger directory for the run (not needed for validate)")
+    p.add_argument("--root",
+                   help="runs-root or per-run store dir (not needed for validate). Per-run "
+                        "commands auto-nest under <root>/<run>/ when <root> is a shared "
+                        "runs-root (holds a learnings-kb.jsonl or other runs' stores), so "
+                        "--root runs is the natural spelling shared with dashboard/kb/tail")
     p.add_argument("--run", help="run id (not needed for validate)")
     p.add_argument("--project",
                    help="project-config module (e.g. adapters.project.heysoo) or a "
