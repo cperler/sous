@@ -21,7 +21,25 @@ def test_format_statusline_probe_hit_shows_both_pcts_and_countdowns() -> None:
         seven_day_resets_at="2026-07-08T00:00:00+00:00",  # +4d9h
     )
     line = format_statusline(usage, now=_NOW)
-    assert line == "⧗ 5h 87% (resets 3h0m) · 7d 41% (resets 4d9h)"
+    # Exactly +3h suppresses the zero-minute suffix (#77): "3h", not "3h0m".
+    assert line == "⧗ 5h 87% (resets 3h) · 7d 41% (resets 4d9h)"
+
+
+def test_reset_countdown_drops_zero_components() -> None:
+    """#77: at hour granularity a zero-minute reset renders "3h" (not "3h0m"), and a
+    nonzero-minute reset still renders "3h12m". At day granularity a zero-hour reset
+    renders "4d" (not "4d0h"); minutes are never shown at day granularity by design."""
+    from orchestrator.usage_probe import _reset_countdown
+
+    now = datetime(2026, 7, 3, 15, 0, 0, tzinfo=UTC)
+    # exactly 3 hours -> "3h"
+    assert _reset_countdown("2026-07-03T18:00:00+00:00", now) == "3h"
+    # 3h12m -> unchanged
+    assert _reset_countdown("2026-07-03T18:12:00+00:00", now) == "3h12m"
+    # exactly 4 days (zero hours) -> "4d", not "4d0h"
+    assert _reset_countdown("2026-07-07T15:00:00+00:00", now) == "4d"
+    # 4 days 9 hours -> "4d9h" (minutes never shown at day granularity)
+    assert _reset_countdown("2026-07-08T00:00:00+00:00", now) == "4d9h"
 
 
 def test_format_statusline_probe_miss_is_quiet() -> None:
