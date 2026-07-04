@@ -58,6 +58,32 @@ def test_real_git_setup_creates_worktree_and_tags(tmp_path, monkeypatch) -> None
     assert res.checkpoint and res.checkpoint["tag"] == "task/r1/-7/intake/0"  # baseline anchor
 
 
+def test_explicit_repo_root_used_instead_of_cwd(tmp_path, monkeypatch) -> None:
+    """#42: when the project exposes ``repo_root``, intake discovers the repo from that
+    explicit path — NOT process CWD. Proven by chdir'ing to a NON-git dir: a CWD-bound
+    lookup would fail 'not inside a git repository', so success can only come from the
+    explicit path."""
+    repo = tmp_path / "product"
+    repo.mkdir()
+    _git_repo(repo)
+    elsewhere = tmp_path / "not-a-repo"
+    elsewhere.mkdir()
+    monkeypatch.chdir(elsewhere)  # process CWD is deliberately NOT the (or any) git repo
+
+    class P(_Proj):
+        repo_root = str(repo)
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.SUCCESS
+    out = res.structured_output
+    assert out["branch"] == "task/7"
+    # the worktree was created under the EXPLICIT repo, not under CWD.
+    wt = Path(out["worktree"])
+    assert wt.exists() and str(wt).startswith(str(repo))
+    assert not (elsewhere / ".worktrees").exists()
+
+
 def test_reuse_existing_worktree_is_idempotent(tmp_path, monkeypatch) -> None:
     _git_repo(tmp_path)
     monkeypatch.chdir(tmp_path)

@@ -76,10 +76,13 @@ class E2EProject:
 
     name = "e2e"
 
-    def __init__(self) -> None:
+    def __init__(self, repo_root: str | None = None) -> None:
         self._classifier = _Classifier()
         self._task_source = FakeTaskSource()
         self.notifications: list[tuple[str, dict]] = []
+        # #42: the explicit product-repo path the deterministic INTAKE runner discovers
+        # the repo from. When None the runner falls back to process CWD.
+        self.repo_root = repo_root
 
     def install_cmd(self):
         return ["sh", "-c", "exit 0"]  # real subprocess, no-op
@@ -241,7 +244,9 @@ def _events(eng: Engine, run: str, kind: str) -> list[dict]:
 
 def test_a_three_task_dag_completes_in_dependency_order(tmp_path, monkeypatch) -> None:
     repo = _repo(tmp_path)
-    monkeypatch.chdir(repo)  # the orchestrator runs from the product repo root (intake uses ".")
+    # #42 fallback case (deliberately kept): no explicit repo_root, so intake discovers
+    # the repo from process CWD — the legacy "orchestrator runs from the product repo" path.
+    monkeypatch.chdir(repo)
     project = E2EProject()
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
@@ -277,8 +282,7 @@ def test_a_three_task_dag_completes_in_dependency_order(tmp_path, monkeypatch) -
 
 def test_b_failing_tests_trip_breaker_then_unpause_resumes(tmp_path, monkeypatch) -> None:
     repo = _repo(tmp_path)
-    monkeypatch.chdir(repo)
-    project = E2EProject()
+    project = E2EProject(repo_root=str(repo))  # #42: explicit path, no chdir needed
     # max_attempts=1: one implement→(red)test cycle fails the task terminally.
     eng = _engine(tmp_path, project, max_attempts=1, breaker_threshold=9)
     eng.create_run("r1")
@@ -318,10 +322,9 @@ def test_b_failing_tests_trip_breaker_then_unpause_resumes(tmp_path, monkeypatch
 
 # --- scenario c: reject a held task mid-batch → CLOSED_INFEASIBLE + dependent handled -
 
-def test_c_reject_held_task_cascades_dependents_without_tripping_breaker(tmp_path, monkeypatch) -> None:
+def test_c_reject_held_task_cascades_dependents_without_tripping_breaker(tmp_path) -> None:
     repo = _repo(tmp_path)
-    monkeypatch.chdir(repo)
-    project = E2EProject()
+    project = E2EProject(repo_root=str(repo))  # #42: explicit path, no chdir needed
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "ta", deterministic_stages=_DET)  # SCOPE says infeasible → held
@@ -356,10 +359,9 @@ def test_c_reject_held_task_cascades_dependents_without_tripping_breaker(tmp_pat
 
 # --- scenario d: rate-limit cooldown → scheduler waits it out, task retries ----------
 
-def test_d_rate_limit_cooldown_is_waited_out_then_retries(tmp_path, monkeypatch) -> None:
+def test_d_rate_limit_cooldown_is_waited_out_then_retries(tmp_path) -> None:
     repo = _repo(tmp_path)
-    monkeypatch.chdir(repo)
-    project = E2EProject()
+    project = E2EProject(repo_root=str(repo))  # #42: explicit path, no chdir needed
     # allow_fallback=False → a rate limit can't be dodged with a cheaper model, so it takes
     # the cooldown path (not_before stamped) that the scheduler must wait out.
     eng = _engine(tmp_path, project, router=Router(allow_fallback=False), rate_limit_cooldown_s=120)
@@ -387,10 +389,9 @@ def test_d_rate_limit_cooldown_is_waited_out_then_retries(tmp_path, monkeypatch)
 
 # --- scenario e: stale alerting + dedupe fire during the scheduler loop --------------
 
-def test_e_stale_alert_fires_once_during_the_loop(tmp_path, monkeypatch) -> None:
+def test_e_stale_alert_fires_once_during_the_loop(tmp_path) -> None:
     repo = _repo(tmp_path)
-    monkeypatch.chdir(repo)
-    project = E2EProject()
+    project = E2EProject(repo_root=str(repo))  # #42: explicit path, no chdir needed
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "stuck", deterministic_stages=_DET)

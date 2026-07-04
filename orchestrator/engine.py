@@ -264,6 +264,15 @@ class Engine:
         # bypasses (a human who knows better can force it).
         if not resume and _in_future(task.not_before):
             raise CapacityExhausted(f"rate-limit cooldown until {task.not_before}")
+        # Explicit resume is ONLY for recovering an outstanding dispatch lease (a crashed
+        # supervisor re-emitting its held WorkItem, #50). With nothing leased there is
+        # nothing to recover — refuse loudly rather than silently minting a fresh dispatch
+        # that could double-run a stage whose original supervisor is still alive.
+        if resume and task.pending_work_item_id is None:
+            raise ContractError(
+                f"task {task_id} has no outstanding dispatch to resume (nothing leased); "
+                f"drop resume to dispatch the next stage normally"
+            )
         # pending_work_item_id is a dispatch lease: while a WorkItem is outstanding the
         # task is NOT re-dispatchable on the normal path. A crash leaves the lease held,
         # so recovery is the explicit resume=True path — never a silent re-dispatch that

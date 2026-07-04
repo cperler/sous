@@ -87,6 +87,10 @@ def main(argv: list[str] | None = None) -> int:
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
     n.add_argument("--util", default="0", help=util_help)
+    n.add_argument("--resume", action="store_true",
+                   help="re-emit the pending WorkItem for a task whose supervisor crashed "
+                        "holding the dispatch lease (bypasses the lease/cooldown guard so a "
+                        "crashed supervisor recovers its item without hand-editing state; #50)")
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
     d = sub.add_parser("dispatchable")
     d.add_argument("--util", default="0", help=util_help)
@@ -266,7 +270,10 @@ def main(argv: list[str] | None = None) -> int:
         # the registry, so this drain is the interactive lane's equivalent.
         from .schemas.enums import ExecutionMode
 
-        work = eng.next_work(args.run, args.task, util_pct=util_pct)
+        # --resume applies only to the FIRST call — the one recovering a lease a crashed
+        # supervisor left held (#50). Any deterministic stages drained afterward are fresh
+        # dispatches with no outstanding lease, so they take the normal path.
+        work = eng.next_work(args.run, args.task, util_pct=util_pct, resume=args.resume)
         while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
             result = eng.registry.resolve(work.lane_policy).dispatch(work)
             eng.record(args.run, result)

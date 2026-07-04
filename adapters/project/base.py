@@ -83,6 +83,12 @@ class ProjectConfig(Protocol):
 
     name: str
 
+    # Optional (duck-typed, no CONTRACT_VERSION bump): filesystem path to the product
+    # repo checkout the deterministic INTAKE runner creates worktrees in. When absent,
+    # intake discovers the repo from process CWD (#42). Expose it (a ``str`` path or a
+    # property) to decouple intake from the orchestrator's working directory.
+    #   repo_root: str
+
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]: ...

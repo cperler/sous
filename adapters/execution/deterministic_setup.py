@@ -20,6 +20,10 @@ them — they are execution-adapter concerns).
 For INTAKE a project may override the git logic with a ``setup_task(task_id) -> dict``
 method (the intake structured_output) — duck-typed, so tests supply a no-git fake and
 offline projects can pick their own worktree convention.
+
+The built-in git path discovers the product repo from an explicit ``repo_root`` the
+project supplies (``ProjectConfig.repo_root`` — optional, duck-typed), falling back to
+process CWD (``.``) when absent (#42: don't bind git to the orchestrator's CWD).
 """
 
 from __future__ import annotations
@@ -99,7 +103,12 @@ class DeterministicSetupRunner:
                                mode=ExecutionMode.ENGINE, provider=Provider.NONE)
 
     def _git_setup(self, work: WorkItem) -> tuple[dict, dict | None]:
-        top = _git(".", "rev-parse", "--show-toplevel")
+        # #42: discover the project repo from an EXPLICIT path the project supplies
+        # (``ProjectConfig.repo_root`` — optional, duck-typed), not process CWD. The
+        # documented fallback is "." (process CWD) so existing callers that run the
+        # orchestrator from the product repo root keep working unchanged.
+        base = str(getattr(self._project, "repo_root", None) or ".")
+        top = _git(base, "rev-parse", "--show-toplevel")
         if top.returncode != 0:
             raise _SetupError("not inside a git repository")
         repo_root = Path(top.stdout.strip())

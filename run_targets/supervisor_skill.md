@@ -65,8 +65,10 @@ that omits them is a silent no-op — satisfying the "nothing silently dropped" 
 
 ## Resumability
 Because the shim only returns results **on Workflow completion**, a session death
-mid-dispatch loses only the in-flight **batch** — re-run from `… next`/`… resume`
-and the engine re-emits the un-recorded stage. Keep batches small.
+mid-dispatch loses only the in-flight **batch**. The crash leaves the dispatch lease
+held, so a plain `… next` refuses (it guards the in-flight result) — recover with
+`… next --resume`, which re-emits the un-recorded stage at the same attempt. Keep
+batches small.
 
 ## Audit (every gate)
 Run `… status` and check `lane_audit.clean == true`: every recorded model call must
