@@ -528,12 +528,10 @@ def main(argv: list[str] | None = None) -> int:
         from .usage_probe import format_statusline, read_usage, watch_statusline
 
         if args.watch:
-            import contextlib
             import time
 
-            # Ctrl-C ends the loop cleanly (watch_statusline also swallows KeyboardInterrupt).
-            with contextlib.suppress(KeyboardInterrupt):
-                watch_statusline(emit=print, sleeper=time.sleep, interval=args.interval)
+            # Ctrl-C ends the loop cleanly — watch_statusline swallows KeyboardInterrupt itself.
+            watch_statusline(emit=print, sleeper=time.sleep, interval=args.interval)
             return 0
         line = format_statusline(read_usage())
         if line:
