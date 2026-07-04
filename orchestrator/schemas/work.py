@@ -203,6 +203,12 @@ class StageResult(BaseModel):
     # task.last_checkpoint. None when the stage doesn't checkpoint or tagging failed
     # (fail-open: a missing checkpoint only means no reset anchor later).
     checkpoint: dict | None = None
+    # How many corrective schema-retries the transport spent salvaging a malformed structured
+    # output before this result (headless×claude schema-validate-and-retry, #32). 0 on the
+    # first-try-valid path (the common case) and on lanes without the loop. Pure audit metadata
+    # — like session_ref/checkpoint it rides RawResult -> StageResult and is recorded on the
+    # cost-ledger row; it never feeds a verdict or a state transition.
+    schema_retries: int = 0
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

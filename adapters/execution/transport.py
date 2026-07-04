@@ -13,7 +13,7 @@ import json
 import subprocess
 import tempfile
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,6 +37,10 @@ class RawResult:
     # {"tag", "sha"} stamped by the checkpoint wrapper after a successful
     # git-affecting stage (design pass §3); None otherwise.
     checkpoint: dict | None = None
+    # How many corrective schema-retries the transport spent salvaging a malformed
+    # structured output (#32). 0 = valid on the first call (the overwhelming case).
+    # Audit-only metadata: surfaced on the cost-ledger row, never a correctness input.
+    schema_retries: int = 0
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -140,6 +144,70 @@ def _validate_shape(obj: dict, schema_json: str) -> dict | None:
     return obj
 
 
+# --- schema-validate-and-retry (#32) -----------------------------------------------------
+# A headless model call that comes back exit-0 but with a wrong-shape structured output used
+# to burn a whole stage attempt (full re-run at full cost). Instead we retry the SAME call a
+# bounded number of times with a corrective follow-up that tells the model exactly what was
+# wrong — cheap and targeted. The band-aid `--append-system-prompt` (`_JSON_ONLY_POSTAMBLE`)
+# stays: it's a first-call preventive nudge that keeps most calls valid so this loop rarely
+# engages; the loop is the guarantee layered behind it.
+
+_MAX_SCHEMA_ERRORS = 6  # bound how many validation errors we echo back (a bad object can have many)
+_SCHEMA_EXCERPT_CHARS = 4000  # bound the schema we quote back into the corrective prompt
+_PREV_INVALID_CHARS = 1500  # bound the model's own prior invalid output when we can't resume
+
+
+def _schema_errors(obj: dict | None, schema_json: str) -> list[str]:
+    """Bounded ``path: message`` strings for why ``obj`` fails the stage schema, or ``[]``
+    when it satisfies the schema (or the schema itself is malformed — a bad schema must never
+    veto real work, mirroring ``_validate_shape``). Feeds the corrective retry prompt so the
+    model is told precisely what to fix instead of re-guessing the whole contract."""
+    try:
+        validator = Draft202012Validator(json.loads(schema_json))
+    except Exception:  # noqa: BLE001 - a malformed schema is not the model's fault
+        return []
+    out: list[str] = []
+    for err in validator.iter_errors(obj):
+        path = "/".join(str(p) for p in err.absolute_path) or "(root)"
+        out.append(f"{path}: {err.message}"[:300])
+        if len(out) >= _MAX_SCHEMA_ERRORS:
+            break
+    return out
+
+
+def _corrective_prompt(
+    errors: list[str], schema_json: str, prev_invalid: dict | None, *, continued: bool
+) -> str:
+    """The follow-up prompt for one schema retry: the specific validation errors, the schema
+    (bounded excerpt), and an instruction to return ONLY corrected structured output. When we
+    could NOT resume the model's session (``continued`` False) we also embed its own prior
+    invalid output, since a fresh call has no memory of what it just returned."""
+    lines = [
+        "Your previous response did not satisfy the required JSON schema for this stage.",
+        "",
+        "Validation errors (JSON path: problem):",
+        *(f"  - {e}" for e in errors),
+        "",
+        "Required JSON schema:",
+        schema_json[:_SCHEMA_EXCERPT_CHARS]
+        + ("\n…(schema truncated)" if len(schema_json) > _SCHEMA_EXCERPT_CHARS else ""),
+    ]
+    if not continued and prev_invalid is not None:
+        blob = json.dumps(prev_invalid)
+        lines += [
+            "",
+            "Your previous (invalid) output was:",
+            blob[:_PREV_INVALID_CHARS] + ("…(truncated)" if len(blob) > _PREV_INVALID_CHARS else ""),
+        ]
+    lines += [
+        "",
+        "Return ONLY a single corrected JSON object that satisfies the schema exactly — using "
+        "the exact required property names, with no prose, no explanation, and no markdown code "
+        "fences before or after it.",
+    ]
+    return "\n".join(lines)
+
+
 def to_stage_result(
     work: WorkItem,
     raw: RawResult,
@@ -169,6 +237,7 @@ def to_stage_result(
         ),
         session_ref=raw.session_ref,
         checkpoint=raw.checkpoint,
+        schema_retries=raw.schema_retries,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
     )
@@ -272,7 +341,11 @@ def checkpointing_transport(inner: Transport) -> Transport:
     return run
 
 
-def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = None) -> Transport:
+def claude_cli_transport(
+    schema_json_for: Callable[[str], str | None] | None = None,
+    *,
+    max_schema_retries: int = 2,
+) -> Transport:
     """Real headless×claude transport: shells ``claude -p ... --output-format json``.
 
     ``schema_json_for`` returns the stage's JSON Schema **inline** (the CLI's
@@ -284,6 +357,15 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
     cache-read; the JSON payload's ``session_id`` is reported back so the engine can
     chain the next stage. A lost/expired session cold-starts a fresh one inside the
     same dispatch — prompts are self-contained, so continuity is never load-bearing.
+
+    Schema-validate-and-retry (#32): when a call returns exit-0 but the structured output
+    fails the stage schema, retry up to ``max_schema_retries`` (default 2) with a corrective
+    follow-up naming the exact validation errors — a cheap, targeted fix instead of burning a
+    whole stage attempt. The retry PREFERS resuming the same session (the model keeps its own
+    context) and falls back to a fresh call that embeds its prior invalid output. On exhaustion
+    the stage fails as before (``structured_output`` None → SCHEMA_VIOLATION), now with the
+    validation errors in ``raw_output`` so the retry-with-learnings starts from specifics. The
+    count is recorded on ``RawResult.schema_retries`` for the ledger.
     """
 
     def _call(work: WorkItem, session_ref: str | None) -> RawResult:
@@ -331,12 +413,9 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
             # text (often fenced ```json) lands it in `result`. Recover that rather than
             # discarding a schema-shaped answer as a SCHEMA_VIOLATION.
             structured = _json_object_from_text(structured)
-        # Shape-gate: the CLI enforces --json-schema ONLY on the tool path, so a recovered
-        # (or tool-path) object must still satisfy the stage schema — else a valid-JSON-but-
-        # wrong-shape answer would record as SUCCESS with a missing required field. Failing
-        # validation drops to None → SCHEMA_VIOLATION (the engine retries).
-        if structured is not None and schema_json_for and (sj := schema_json_for(work.schema_ref)):
-            structured = _validate_shape(structured, sj)
+        # NB: the shape-gate is deliberately NOT applied here — the `run` loop below
+        # validates (and, on failure, retries with a corrective prompt). Nulling out an
+        # invalid object here would throw away exactly what the retry needs to quote back.
         session_id = data.get("session_id")
         return RawResult(structured, _usage_from(data), raw_output=proc.stdout,
                          exit_code=0, invocation=invocation,
@@ -348,7 +427,42 @@ def claude_cli_transport(schema_json_for: Callable[[str], str | None] | None = N
         # other resume failure returns as-is and fails the dispatch normally.
         if work.session_ref and raw.exit_code != 0 and _session_lost(raw.error):
             raw = _call(work, None)
-        return raw
+
+        # Without a schema in hand there is nothing to validate against (the CLI's
+        # best-effort --json-schema wasn't sent) — keep the as-was behavior.
+        schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
+        if not schema_json:
+            return raw
+
+        retries = 0
+        while True:
+            # A transport-level error (timeout / non-JSON / non-zero exit) is not a schema
+            # problem — never spend a schema retry on it.
+            if raw.exit_code != 0 or raw.error:
+                return raw
+            errors = _schema_errors(raw.structured_output, schema_json)
+            if not errors:  # valid (or unvalidatable schema) — done
+                return raw
+            if retries >= max_schema_retries:
+                # Honest failure, as before: no structured output → SCHEMA_VIOLATION. Carry the
+                # validation errors in raw_output so the failure-learning tail is specific
+                # (the engine surfaces raw_output's tail into the next attempt's learnings).
+                summary = (f"[schema-retry] validation still failing after {retries} corrective "
+                           f"retr{'y' if retries == 1 else 'ies'}:\n" + "\n".join(errors))
+                raw = replace(
+                    raw, structured_output=None, schema_retries=retries,
+                    raw_output=((raw.raw_output or "") + "\n\n" + summary),
+                )
+                return raw
+            retries += 1
+            # PREFER continuing the same session (the model keeps its own context); fall back
+            # to a fresh call embedding the prior invalid output when there's no session to resume.
+            resume_ref = raw.session_ref
+            corrective = _corrective_prompt(
+                errors, schema_json, raw.structured_output, continued=bool(resume_ref)
+            )
+            raw = _call(work.model_copy(update={"prompt": corrective}), resume_ref)
+            raw = replace(raw, schema_retries=retries)
 
     return run
 

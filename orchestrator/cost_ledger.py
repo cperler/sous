@@ -65,6 +65,9 @@ class CostLedger:
             "duration_s": round(duration_s, 3) if duration_s is not None else None,
             "status": result.status.value,
             "work_item_id": result.work_item_id,
+            # Corrective schema-retries the transport spent salvaging this call's output (#32).
+            # Almost always 0; a non-zero value flags an invocation that cost extra model turns.
+            "schema_retries": result.schema_retries,
         }
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.path.open("a", encoding="utf-8") as fh:

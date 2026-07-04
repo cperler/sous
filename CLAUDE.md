@@ -10,7 +10,7 @@ implementation plan, and the as-built/target spec.
 mode + codex → dogfood/generalize) plus two engine-hardening passes, a workflow
 code-review pass, and the 2026-07-01 review→execute cycle (context plane, per-task
 pipelines schema v2, session continuity, checkpoints, approval gate — see
-`docs/reviews/`). 430 pytest cases green, ruff clean; live-proven on real heysoo
+`docs/reviews/`). 440 pytest cases green, ruff clean; live-proven on real heysoo
 issues. Ongoing work is incremental — pick from the issue tracker or fix-forward.
 
 ## Working norms
