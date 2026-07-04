@@ -98,12 +98,19 @@ def build_registry(
             inner = stream_teeing_transport(inner, run_log_root)
         headless_transport = checkpointing_transport(inner)
     reg.register_runner(HeadlessClaudeRunner(headless_transport))
-    if codex_transport is None and run_log_root is not None:
-        # codex `--json` is already a JSONL stream; passing the run dir tees it live (the
-        # headless×claude twin of the in-flight stream).
-        codex_transport = checkpointing_transport(
-            stream_teeing_transport(codex_cli_transport(run_log_root=run_log_root), run_log_root)
+    if codex_transport is None and (codex_schema_provider is not None or run_log_root is not None):
+        # Mirror the headless×claude wiring: thread the project's stage schema into the codex
+        # transport so it enforces `--output-schema` AND runs the schema-validate-and-retry loop
+        # where a corrective follow-up can be issued (#21 parity). codex `--json` is already a
+        # JSONL stream, so passing the run dir tees it live (#66, the claude twin). Ignored for
+        # an explicitly injected transport (tests wrap their own).
+        codex_schema_json = (
+            _schema_json_provider(codex_schema_provider) if codex_schema_provider else None
         )
+        inner = codex_cli_transport(codex_schema_json, run_log_root=run_log_root)
+        if run_log_root is not None:
+            inner = stream_teeing_transport(inner, run_log_root)
+        codex_transport = checkpointing_transport(inner)
     reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))
     if setup_project is not None:
         from .deterministic_setup import DeterministicSetupRunner

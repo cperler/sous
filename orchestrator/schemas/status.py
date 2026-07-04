@@ -141,6 +141,13 @@ class Task(BaseModel):
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing
     # metadata only: correctness never depends on it.
     session_ref: str | None = None
+    # Which provider OWNS the current session_ref (#9): a session id is provider-specific —
+    # a claude conversation id means nothing to `codex exec resume` and vice versa. next_work
+    # only chains session_ref into a stage whose lane provider matches (Provider.NONE, from a
+    # deterministic ENGINE-lane stage that never mints a real session, is treated as an
+    # untagged wildcard), so a claude ref is never fed to codex or the reverse. Set alongside
+    # session_ref on SUCCESS; cleared with it on failure/reject.
+    session_provider: Provider | None = None
     # Last successful stage checkpoint {"tag", "sha"} (design pass §3): the reset
     # anchor for a retry/crash-resume of a git-affecting stage. Absorbed from
     # StageResult.checkpoint on SUCCESS only, so a failed/vetoed attempt's commits

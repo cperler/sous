@@ -86,9 +86,12 @@ def is_rate_limited(raw: RawResult) -> bool:
 # Errors meaning "the session to resume no longer exists" (expired/gc'd/unknown) — and
 # ONLY that. A lost session falls back to a fresh one inside the same dispatch (design
 # pass §2: a session ref is routing metadata; correctness never depends on continuity).
-# Any other resume error fails the dispatch normally.
+# Any other resume error fails the dispatch normally. Covers both providers' phrasings:
+# claude (`--resume`) and codex (`codex exec resume` → "no rollout found for thread id …",
+# "thread/resume failed").
 _SESSION_LOST_MARKERS = (
     "no conversation found", "session not found", "unknown session", "invalid session",
+    "no rollout found", "thread/resume failed", "thread not found",
 )
 
 
@@ -227,6 +230,49 @@ def _corrective_prompt(
         "fences before or after it.",
     ]
     return "\n".join(lines)
+
+
+def _schema_retry_loop(
+    raw: RawResult,
+    work: WorkItem,
+    schema_json: str,
+    max_schema_retries: int,
+    call: Callable[[WorkItem, str | None], RawResult],
+) -> RawResult:
+    """The provider-agnostic schema-validate-and-retry loop (#32). Shared verbatim by the
+    claude and codex transports so the corrective-prompt shape, retry budget, and
+    ``schema_retries`` accounting are identical on both lanes (#9/#21 codex parity).
+
+    ``call(work, session_ref)`` issues ONE provider call — resuming ``session_ref`` when the
+    provider/CLI supports it, else a fresh call. On each invalid-but-exit-0 result the loop
+    re-dispatches with a corrective follow-up (the exact validation errors + schema), PREFERRING
+    to resume the same session so the model keeps its own context; when there is no session to
+    resume it falls back to a fresh call that embeds the model's own prior invalid output. A
+    transport-level error (timeout / non-JSON / non-zero exit) is never spent on a schema retry.
+    On exhaustion the result is failed honestly (``structured_output`` None → SCHEMA_VIOLATION),
+    with the validation errors appended to ``raw_output`` so the failure-learning tail is
+    specific. ``schema_retries`` rides the RawResult onto the ledger row."""
+    retries = 0
+    while True:
+        if raw.exit_code != 0 or raw.error:
+            return raw
+        errors = _schema_errors(raw.structured_output, schema_json)
+        if not errors:  # valid (or unvalidatable schema) — done
+            return raw
+        if retries >= max_schema_retries:
+            summary = (f"[schema-retry] validation still failing after {retries} corrective "
+                       f"retr{'y' if retries == 1 else 'ies'}:\n" + "\n".join(errors))
+            return replace(
+                raw, structured_output=None, schema_retries=retries,
+                raw_output=((raw.raw_output or "") + "\n\n" + summary),
+            )
+        retries += 1
+        resume_ref = raw.session_ref
+        corrective = _corrective_prompt(
+            errors, schema_json, raw.structured_output, continued=bool(resume_ref)
+        )
+        raw = call(work.model_copy(update={"prompt": corrective}), resume_ref)
+        raw = replace(raw, schema_retries=retries)
 
 
 # --- raw provider stream retention (#56) -------------------------------------------------
@@ -451,6 +497,32 @@ def _codex_usage(events_stdout: str) -> TokenUsage:
         if isinstance(u, dict):
             usage = _usage_from({"usage": u})
     return usage
+
+
+def _codex_session_id(events_stdout: str) -> str | None:
+    """The codex session/thread id from the ``codex exec --json`` event stream — the resume
+    handle for session continuity (#9). The installed CLI (verified against real output) emits
+    it as ``thread_id`` on an early ``{"type":"thread.started", ...}`` event; other/older
+    shapes carry it as ``session_id``/``conversation_id`` (top-level or under ``msg``). Returns
+    the FIRST id seen (the session's own id, before any nested tool-call ids), or None when the
+    stream has none — in which case the next codex dispatch cold-starts (continuity is routing
+    metadata; correctness never depends on it)."""
+    for line in events_stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("msg") if isinstance(ev.get("msg"), dict) else {}
+        for key in ("thread_id", "session_id", "conversation_id"):
+            v = ev.get(key) or msg.get(key)
+            if isinstance(v, str) and v:
+                return v
+    return None
 
 
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
@@ -726,73 +798,91 @@ def claude_cli_transport(
             raw = _call(work, None)
 
         # Without a schema in hand there is nothing to validate against (the CLI's
-        # best-effort --json-schema wasn't sent) — keep the as-was behavior.
+        # best-effort --json-schema wasn't sent) — keep the as-was behavior. The retry loop
+        # itself is shared with the codex transport (_schema_retry_loop).
         schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
         if not schema_json:
             return raw
-
-        retries = 0
-        while True:
-            # A transport-level error (timeout / non-JSON / non-zero exit) is not a schema
-            # problem — never spend a schema retry on it.
-            if raw.exit_code != 0 or raw.error:
-                return raw
-            errors = _schema_errors(raw.structured_output, schema_json)
-            if not errors:  # valid (or unvalidatable schema) — done
-                return raw
-            if retries >= max_schema_retries:
-                # Honest failure, as before: no structured output → SCHEMA_VIOLATION. Carry the
-                # validation errors in raw_output so the failure-learning tail is specific
-                # (the engine surfaces raw_output's tail into the next attempt's learnings).
-                summary = (f"[schema-retry] validation still failing after {retries} corrective "
-                           f"retr{'y' if retries == 1 else 'ies'}:\n" + "\n".join(errors))
-                raw = replace(
-                    raw, structured_output=None, schema_retries=retries,
-                    raw_output=((raw.raw_output or "") + "\n\n" + summary),
-                )
-                return raw
-            retries += 1
-            # PREFER continuing the same session (the model keeps its own context); fall back
-            # to a fresh call embedding the prior invalid output when there's no session to resume.
-            resume_ref = raw.session_ref
-            corrective = _corrective_prompt(
-                errors, schema_json, raw.structured_output, continued=bool(resume_ref)
-            )
-            raw = _call(work.model_copy(update={"prompt": corrective}), resume_ref)
-            raw = replace(raw, schema_retries=retries)
+        return _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
 
     return run
 
 
-def codex_cli_transport(*, run_log_root: str | Path | None = None) -> Transport:
-    """Real codex transport: ``codex exec --json --output-last-message``.
+def _codex_git_common_dir(work: WorkItem) -> str | None:
+    """The MAIN checkout's git-common-dir a linked worktree must be able to write to for its
+    commits to land (the worktree's ``.git`` is a file pointing there). Best-effort: no cwd /
+    not a repo / any git hiccup returns None (no grant, never a failure). Shared by the fresh
+    call (``--add-dir``) and the resume call (``-c`` writable-root, since ``codex exec resume``
+    takes no ``--add-dir``)."""
+    if not work.cwd:
+        return None
+    try:
+        gcd = _git(work.cwd, "rev-parse", "--git-common-dir")
+    except Exception:  # noqa: BLE001 - the grant is an optimization, never a failure
+        return None
+    common = gcd.stdout.strip()
+    if gcd.returncode != 0 or not common:
+        return None
+    return str((Path(work.cwd) / common).resolve())
+
+
+def codex_cli_transport(
+    schema_json_for: Callable[[str], str | None] | None = None,
+    *,
+    max_schema_retries: int = 2,
+    run_log_root: str | Path | None = None,
+) -> Transport:
+    """Real codex transport: ``codex exec --json --output-last-message`` (with session
+    continuity + schema-validate-and-retry — codex parity, #9/#21).
 
     ``run_log_root`` (#66): codex ``--json`` already emits its events as a JSONL stream, so
     when a run dir is wired the stdout is teed to the stage's ``.stream.jsonl`` LINE-BY-LINE as
-    it arrives (tailable live), same as the claude path. The result parsing is unchanged — it
-    still reads ``--output-last-message`` and scans the full stdout for usage."""
+    it arrives (tailable live), same as the claude path.
+
+    ``schema_json_for`` returns the stage's JSON Schema JSON so codex enforces the final-message
+    shape (``--output-schema <file>`` — the codex analog of claude's ``--json-schema``) and, more
+    importantly, so the transport can validate the structured output and RETRY on a violation —
+    the loop lives here (shared ``_schema_retry_loop``), where a corrective follow-up can be
+    issued, rather than only at the runner verdict (#21). None (the default) keeps the as-was
+    validate-at-runner behavior for callers that don't wire a schema.
+
+    Session continuity (#9): the installed ``codex`` CLI DOES expose resume. The first call's
+    thread id (``thread.started``/``thread_id`` on the ``--json`` stream) is captured onto
+    ``RawResult.session_ref``; a WorkItem carrying a ``session_ref`` resumes it
+    (``codex exec resume <id>``) so later stages/retries of a task keep warm context. ``resume``
+    accepts no ``--full-auto``/``--sandbox``/``--add-dir``, so the fresh call's write posture is
+    replicated with ``-c`` config overrides (workspace-write + non-blocking approvals + the
+    worktree's git-common-dir as a writable root). A stale/rejected id cold-starts once inside
+    the same dispatch (continuity is routing metadata; correctness never depends on it)."""
     root = Path(run_log_root) if run_log_root is not None else None
 
-    def run(work: WorkItem) -> RawResult:
-        # A linked worktree's real .git lives in the main checkout — the codex sandbox
-        # must be granted that dir too or commits from the worktree fail (the reference
-        # system's --add-dir <git-common-dir>). Best-effort: no cwd / not a repo / any
-        # git hiccup just means no extra grant.
-        add_dir: list[str] = []
-        if work.cwd:
-            try:
-                gcd = _git(work.cwd, "rev-parse", "--git-common-dir")
-                common = gcd.stdout.strip()
-                if gcd.returncode == 0 and common:
-                    add_dir = ["--add-dir", str((Path(work.cwd) / common).resolve())]
-            except Exception:  # noqa: BLE001 - the grant is an optimization, never a failure
-                add_dir = []
+    def _call(work: WorkItem, session_ref: str | None) -> RawResult:
+        grant = _codex_git_common_dir(work)
+        proc_env = subprocess_env(work)  # #5: per-task port block for the codex subprocess
         with tempfile.TemporaryDirectory() as td:
             last = Path(td) / "last.json"
-            argv = ["codex", "exec", "-m", work.model, "--full-auto", "--skip-git-repo-check",
-                    *add_dir, "--json", "--output-last-message", str(last), work.prompt]
-            invocation = f"codex exec --json (model {work.model})"
-            proc_env = subprocess_env(work)  # #5: per-task port block for the codex subprocess
+            schema_flags: list[str] = []
+            if schema_json_for and (schema := schema_json_for(work.schema_ref)):
+                # `--output-schema` takes a FILE — the codex analog of claude's inline
+                # `--json-schema`. Preventive first-call nudge; the retry loop is the guarantee.
+                schema_file = Path(td) / "schema.json"
+                schema_file.write_text(schema, encoding="utf-8")
+                schema_flags = ["--output-schema", str(schema_file)]
+            tail = ["-m", work.model, "--skip-git-repo-check", *schema_flags,
+                    "--json", "--output-last-message", str(last), work.prompt]
+            if session_ref:
+                # Resume carries the warm session. It takes no sandbox/approval/--add-dir flags,
+                # so replicate `--full-auto`'s write posture via `-c` config overrides.
+                write_cfg = ["-c", 'sandbox_mode="workspace-write"',
+                             "-c", 'approval_policy="never"']
+                if grant:
+                    write_cfg += ["-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(grant)}]"]
+                argv = ["codex", "exec", "resume", session_ref, *write_cfg, *tail]
+                invocation = f"codex exec resume {session_ref} --json (model {work.model})"
+            else:
+                add_dir = ["--add-dir", grant] if grant else []
+                argv = ["codex", "exec", "--full-auto", *add_dir, *tail]
+                invocation = f"codex exec --json (model {work.model})"
             stream_files: dict | None = None
             try:
                 if root is not None:
@@ -822,6 +912,18 @@ def codex_cli_transport(*, run_log_root: str | Path | None = None) -> Transport:
             return RawResult(structured, usage=_codex_usage(stdout), raw_output=stdout,
                              raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
                              error=(stderr.strip()[:500] or None) if returncode else None,
-                             invocation=invocation)
+                             invocation=invocation, session_ref=_codex_session_id(stdout))
+
+    def run(work: WorkItem) -> RawResult:
+        raw = _call(work, work.session_ref)
+        # Resume fell over on a stale/rejected/missing session id → one cold retry, same
+        # dispatch (#9). Any other resume error fails normally, mirroring the claude path.
+        if work.session_ref and raw.exit_code != 0 and _session_lost(raw.error):
+            raw = _call(work, None)
+        # Without a schema wired there's nothing to validate — keep validate-at-runner behavior.
+        schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
+        if not schema_json:
+            return raw
+        return _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
 
     return run

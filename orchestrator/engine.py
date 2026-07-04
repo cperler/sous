@@ -498,8 +498,15 @@ class Engine:
             # Chain the task's provider session (design pass §2). None on the first
             # stage and after a failure (warm retry is deliberately off); a crash-
             # resume passes whatever ref survives — a dead session is the transport's
-            # fallback-to-fresh, never a correctness problem.
-            session_ref=task.session_ref,
+            # fallback-to-fresh, never a correctness problem. Provider-gated (#9): a
+            # session id is provider-specific, so it only rides a stage whose lane
+            # provider matches the ref's owner (NONE = untagged wildcard) — a claude ref
+            # is never handed to codex or the reverse.
+            session_ref=(
+                task.session_ref
+                if task.session_provider in (None, Provider.NONE, lane.provider)
+                else None
+            ),
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
             salvage_anchor=salvage_anchor,
@@ -695,6 +702,9 @@ class Engine:
                 # self-contained and a dead session cold-starts in the transport).
                 if effective.session_ref:
                     task.session_ref = effective.session_ref
+                    # Tag the ref with the provider that produced it (#9) so a later stage
+                    # on the other provider won't try to resume a foreign session.
+                    task.session_provider = effective.lane_used.provider
                 # Checkpoint anchor (design pass §3): SUCCESS only — a failed or
                 # gate-vetoed attempt's commits must never become a reset target.
                 if effective.checkpoint:
@@ -726,6 +736,7 @@ class Engine:
                 # Warm retry is deliberately OFF: a failed attempt's session is as
                 # likely poisoned as useful; learnings carry the distilled failure.
                 task.session_ref = None
+                task.session_provider = None
                 outcome = self._handle_failure(task, effective)
 
         # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
@@ -1067,6 +1078,7 @@ class Engine:
         # Fix work must not inherit the reviewer's session (same rationale as warm-retry
         # OFF: a rejecting session's context is as likely poisoned as useful).
         task.session_ref = None
+        task.session_provider = None
         if task.review_cycles < self.max_review_cycles:
             reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
             if reset:
