@@ -2,9 +2,10 @@
 
 heysoo #227 follow-up (#33): pushing the task branch and opening a PR is mechanical
 git/gh work. This runner verifies the branch has commits vs its base, pushes it, and
-opens — or, on a review fix cycle, REUSES — a pull request, deterministically at $0,
-mirroring the DELIVER stage template in orchestrator/stages.py (PR title/body from the
-task id/title/issue; ``Closes #N`` when an issue number is present; never a duplicate PR).
+opens — or, on a review fix cycle, REUSES (leaving an advisory comment that the branch was
+re-pushed, #68) — a pull request, deterministically at $0, mirroring the DELIVER stage
+template in orchestrator/stages.py (PR title/body from the task id/title/issue; ``Closes #N``
+when an issue number is present; never a duplicate PR).
 
 Two things the model DELIVER did are deliberately NOT done here:
   - the docstring refresh — a model judgment; a pipeline that wants it keeps model DELIVER;
@@ -17,6 +18,7 @@ unit tests never touch the network or a real ``gh``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import re
 import subprocess
@@ -86,8 +88,28 @@ class DeterministicDeliverRunner:
         if existing:
             # Fix cycle: the branch was already pushed above, so the PR now reflects the new
             # commits. Reuse it — never open a duplicate.
+            self._comment_fix_cycle(cwd, branch, existing, ctx)
             return {"pr_number": existing["number"], "pr_url": existing["url"], "reused": True}
         return self._open_pr(cwd, branch, work, ctx)
+
+    def _comment_fix_cycle(self, cwd: str, branch: str, existing: dict, ctx: dict) -> None:
+        """Best-effort note on a REUSED PR that a review fix cycle re-pushed the branch (#68 —
+        the optional half of #33's reuse path). Trail-only: a missing selector or a
+        failing/absent ``gh`` never fails the stage (the push + reuse already succeeded), so
+        the comment is swallowed silently."""
+        # gh pr comment takes the PR as a positional selector (url or number), not a flag.
+        selector = existing.get("url") or (str(existing["number"]) if existing.get("number") else "")
+        if not selector:
+            return
+        cycles = _to_int(ctx.get("review_cycles"))
+        which = f" (fix cycle {cycles})" if cycles else ""
+        body = (
+            f"Orchestrator re-pushed `{branch}` with the review-fix commits{which}; "
+            "this PR now reflects the latest changes."
+        )
+        # Advisory only: a failing/absent gh never breaks an already-successful deliver.
+        with contextlib.suppress(Exception):
+            self._run(["gh", "pr", "comment", selector, "--body", body], cwd)
 
     # --- git / gh (all via the injected runner) -------------------------------
     def _run(self, argv: list[str], cwd: str) -> subprocess.CompletedProcess:

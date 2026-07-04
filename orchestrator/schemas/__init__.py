@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from .enums import (
+    LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
     SCHEMA_VERSION,
     STAGE_ORDER,
@@ -38,6 +39,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "STAGE_ORDER",
     "LANE_STAGES",
+    "LANE_DETERMINISTIC_STAGES",
     "TERMINAL_TASK_STATES",
     "Stage",
     "ExecutionMode",

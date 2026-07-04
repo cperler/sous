@@ -64,6 +64,7 @@ from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
+    LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
     TERMINAL_RUN_STATES,
     TERMINAL_TASK_STATES,
@@ -263,8 +264,10 @@ class Engine:
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
         pipeline, not the sequencing mechanism). ``deterministic_stages`` marks which of
         those stages run on the $0 ENGINE lane in ADDITION to the globally-deterministic
-        intake (#33 — a pipeline opting TEST/DELIVER into the shell runners); the stock
-        presets pass none, keeping model TEST/DELIVER. ``depends_on``/``provider_tag``
+        intake (#33 — a pipeline opting TEST/DELIVER into the shell runners). Omitted, a
+        task resolved from a lane preset inherits that preset's default (#68): micro/lite
+        run TEST/DELIVER deterministically, FULL keeps model TEST/DELIVER. An explicit
+        pipeline pin opts out of the preset default. ``depends_on``/``provider_tag``
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
         ``82:codex`` tag / ralph dependency analysis, human-supplied). Validation
@@ -300,6 +303,7 @@ class Engine:
         # deterministic (band table over the remaining budget fraction) and evented below.
         route_reason: dict | None = None
         effective_lane = lane or run.lane
+        pipeline_pinned = pipeline is not None
         if pipeline is None and run.route_by_cost:
             est = estimate if estimate is not None else self._estimate_from_labels(spec.labels)
             decision = self.cost_router.route(self._remaining_budget_fraction(run), est)
@@ -308,6 +312,14 @@ class Engine:
             if deterministic_stages is None:
                 deterministic_stages = decision.deterministic_stages
             route_reason = decision.reason
+        # #68: a task resolved from a lane PRESET (no explicit pipeline pin) adopts that
+        # preset's default deterministic stages — micro/lite run TEST/DELIVER on the $0
+        # ENGINE lane, FULL keeps model TEST/DELIVER. An explicit ``deterministic_stages``
+        # (--deterministic-stages) or a cost-routing decision above already set it and wins;
+        # an explicit pipeline pin is a bespoke pipeline that states its own deterministic
+        # stages, so the preset default does not reach it.
+        if deterministic_stages is None and not pipeline_pinned:
+            deterministic_stages = LANE_DETERMINISTIC_STAGES.get(effective_lane, ())
         # Register the task ref + dependency edge as a locked read-modify-write so a
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
         # Done BEFORE writing the task doc so a duplicate never clobbers an existing
@@ -2256,6 +2268,10 @@ class Engine:
             ctx.setdefault("pr_url", task.pr_url)
         if task.pr_number is not None:
             ctx.setdefault("pr_number", task.pr_number)
+        # #68: the fix-cycle count lets the deterministic DELIVER runner annotate a REUSED
+        # PR with which review cycle re-pushed it (best-effort comment; never load-bearing).
+        if task.review_cycles:
+            ctx.setdefault("review_cycles", task.review_cycles)
         return ctx
 
     def _port_env_for_task(self, task: Task) -> dict[str, str] | None:

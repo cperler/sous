@@ -15,7 +15,13 @@ from adapters.execution.deterministic_test import DeterministicTestRunner
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.failure_classifier import Failure
-from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
+from orchestrator.schemas.enums import (
+    ExecutionLane,
+    ExecutionMode,
+    Provider,
+    ResultStatus,
+    Stage,
+)
 from orchestrator.schemas.stage_schemas import load_stage_schema
 from orchestrator.schemas.work import LanePolicy, WorkItem
 from orchestrator.status_store import StatusStore
@@ -244,7 +250,9 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
 
     gh = _FakeGh(responder)
     res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
-        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+        _deliver_wi(context={
+            "pr_url": "https://github.com/o/r/pull/77", "pr_number": 77, "review_cycles": 2,
+        })
     )
 
     assert res.status is ResultStatus.SUCCESS
@@ -252,6 +260,55 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
     assert out["pr_url"].endswith("/pull/77") and out["pr_number"] == 77 and out.get("reused") is True
     assert gh.ran("push")  # branch is re-pushed so the existing PR reflects the fix
     assert not gh.ran("gh", "pr", "create")  # NEVER a duplicate PR
+    # #68: the reuse path leaves an advisory comment on the PR (the optional half of #33).
+    comment = next(c for c in gh.calls if c[0][:3] == ["gh", "pr", "comment"])
+    argv, _cwd = comment
+    assert "https://github.com/o/r/pull/77" in argv  # selected by the reused PR url
+    body = argv[argv.index("--body") + 1]
+    assert "task/42" in body and "fix cycle 2" in body  # names the branch + review cycle
+
+
+def test_deliver_reuse_comment_uses_number_when_no_url(tmp_path) -> None:
+    # No folded pr_url: reuse is discovered via `gh pr list`, and the advisory comment then
+    # selects the PR by number (a url isn't available from the list shape here).
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        if "push" in argv:
+            return _cp(0)
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, '[{"number": 88}]')  # existing PR, number only
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(_deliver_wi())
+    assert res.status is ResultStatus.SUCCESS and res.structured_output.get("reused") is True
+    comment = next(c for c in gh.calls if c[0][:3] == ["gh", "pr", "comment"])
+    assert "88" in comment[0]  # PR selected by number
+    body = comment[0][comment[0].index("--body") + 1]
+    assert "fix cycle" not in body  # no review_cycles in context → no cycle suffix
+
+
+def test_deliver_reuse_comment_failure_never_fails_stage(tmp_path) -> None:
+    # gh pr comment blowing up (or gh missing) must NOT fail an already-delivered reuse.
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        if "push" in argv:
+            return _cp(0)
+        if argv[:3] == ["gh", "pr", "comment"]:
+            raise RuntimeError("gh comment exploded")
+        return _cp(0)
+
+    res = DeterministicDeliverRunner(FakeProject(), runner=_FakeGh(responder)).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+    assert res.status is ResultStatus.SUCCESS  # deliver succeeded despite the comment error
+    assert res.structured_output["pr_number"] == 77 and res.structured_output.get("reused") is True
 
 
 def test_deliver_refuses_when_no_commits(tmp_path) -> None:
@@ -336,3 +393,47 @@ def test_engine_routes_opted_in_stages_to_engine_lane(tmp_path) -> None:
     # deterministic stages carry structured context; model stages do not.
     assert ctx_seen[Stage.DELIVER] is not None and ctx_seen[Stage.DELIVER]["task_id"] == "t1"
     assert ctx_seen[Stage.SCOPE] is None
+
+
+# --- #68: micro/lite presets default to deterministic TEST/DELIVER --------------
+def _eng(tmp_path) -> Engine:
+    return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), FakeProject())
+
+
+def test_lite_preset_defaults_to_deterministic_test_and_deliver(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.LITE)
+    task = eng.add_task("r", "t1")  # no explicit deterministic_stages
+    assert task.deterministic_stages == (Stage.TEST, Stage.DELIVER)
+
+
+def test_micro_preset_defaults_to_deterministic_deliver_only(tmp_path) -> None:
+    # MICRO has no TEST stage, so the default is DELIVER only (intersected with the pipeline).
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.MICRO)
+    task = eng.add_task("r", "t1")
+    assert task.deterministic_stages == (Stage.DELIVER,)
+    assert Stage.TEST not in task.pipeline
+
+
+def test_full_preset_keeps_model_test_and_deliver(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.FULL)
+    task = eng.add_task("r", "t1")
+    assert task.deterministic_stages == ()  # FULL pays for model TEST/DELIVER
+
+
+def test_explicit_deterministic_stages_override_the_preset_default(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.LITE)
+    task = eng.add_task("r", "t1", deterministic_stages=[Stage.DELIVER])
+    assert task.deterministic_stages == (Stage.DELIVER,)  # caller wins, TEST stays model
+
+
+def test_explicit_pipeline_pin_opts_out_of_the_preset_default(tmp_path) -> None:
+    # A bespoke pipeline states its own deterministic stages; the lane preset default
+    # does not silently reach it.
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.LITE)
+    task = eng.add_task("r", "t1", pipeline=[Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER])
+    assert task.deterministic_stages == ()
