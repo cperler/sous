@@ -93,8 +93,9 @@ class Task(BaseModel):
     # per-task/per-lane knob that lets a pipeline opt TEST/DELIVER into the $0 shell runners
     # (#33) without flipping the global default for every project — the SAME routing
     # decision (→ ENGINE lane) as intake, just sourced from the task (mirrors how the
-    # pipeline itself became per-task in schema v2). Empty by default: the stock full/lite/
-    # micro presets keep model TEST/DELIVER.
+    # pipeline itself became per-task in schema v2). Empty by default on the model; add_task
+    # fills it from the lane preset (#68 — micro/lite default to deterministic TEST/DELIVER,
+    # FULL keeps model TEST/DELIVER), so a hand-built/loaded doc keeps exactly its stored set.
     deterministic_stages: tuple[Stage, ...] = ()
     pr_number: int | None = None
     pr_url: str | None = None

@@ -140,6 +140,25 @@ LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
     ExecutionLane.MICRO: (Stage.INTAKE, Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW),
 }
 
+# Stages a preset runs on the $0 deterministic ENGINE lane BY DEFAULT (#68, promoting #33's
+# opt-in): the cheaper micro/lite lanes adopt the deterministic TEST/DELIVER runners so the
+# mechanical suite-run and PR-open don't each burn a model call — matching the cost-router's
+# preference (cost_policy._CHEAP_DETERMINISTIC) as the standing default, not just under budget
+# pressure. FULL keeps model TEST/DELIVER (it pays for the extra judgment). A pipeline that
+# opts in KEEPS a model REVIEW (micro/lite do): the deterministic TEST runner never judges
+# meaningfulness, so that veto still lives on a model. Resolved at add_task; an explicit
+# --deterministic-stages (or a cost-routing decision) overrides it. Intersected with the
+# stage set that actually runs, so MICRO (no TEST stage) gets DELIVER only.
+_DETERMINISTIC_BY_DEFAULT: frozenset[Stage] = frozenset({Stage.TEST, Stage.DELIVER})
+LANE_DETERMINISTIC_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
+    lane: (
+        ()
+        if lane is ExecutionLane.FULL
+        else tuple(s for s in stages if s in _DETERMINISTIC_BY_DEFAULT)
+    )
+    for lane, stages in LANE_STAGES.items()
+}
+
 
 class FailureKind(StrEnum):
     """Failure-classifier taxonomy buckets (concrete patterns live in project-config)."""
