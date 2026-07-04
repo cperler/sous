@@ -223,6 +223,13 @@ class Run(BaseModel):
     # cheaper lane preset as the remaining budget thins (deterministic band table).
     # Explicit per-task pipeline pins are always honored. Default off.
     route_by_cost: bool = False
+    # Capacity-aware model downgrade (#12): when True, next_work drops a FRESH dispatch to
+    # a cheaper model while CURRENT utilization is in the high band (>= downgrade_threshold
+    # but < the per-call gate that already blocks dispatch) — the old "run cheaper under
+    # load" behavior. DISTINCT from route_by_cost (capacity headroom, not USD). A rate-limit
+    # re-queue and a fallback-disallowing lane are never downgraded. Additive field: pre-#12
+    # run docs load with the default. Default off.
+    route_by_capacity: bool = False
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""

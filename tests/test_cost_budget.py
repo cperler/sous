@@ -336,6 +336,14 @@ def test_cli_init_run_accepts_budget_flags(tmp_path, capsys) -> None:
     assert out["budget_usd"] == 3.5 and out["route_by_cost"] is True
 
 
+def test_cli_init_run_accepts_route_by_capacity(tmp_path, capsys) -> None:
+    # #12: capacity routing is a DISTINCT opt-in flag from cost routing (both default off).
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+    main([*base, "init-run", "--lane", "full", "--route-by-capacity"])
+    out = json.loads(capsys.readouterr().out)
+    assert out["route_by_capacity"] is True and out["route_by_cost"] is False
+
+
 @pytest.mark.parametrize("raise_flag,expected", [(["--raise-budget", "9"], 9.0), ([], None)])
 def test_cli_unpause_raise_budget(tmp_path, capsys, raise_flag, expected) -> None:
     proj = NotifyProject()

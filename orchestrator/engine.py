@@ -19,7 +19,7 @@ from pathlib import Path
 from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
 
-from .capacity import DEFAULT_CAPACITY, CapacityPolicy
+from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
@@ -172,13 +172,17 @@ class Engine:
         *,
         budget_usd: float | None = None,
         route_by_cost: bool = False,
+        route_by_capacity: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
-        enables cost-aware lane routing for un-pinned tasks. Both default off."""
+        enables cost-aware lane routing for un-pinned tasks; ``route_by_capacity`` enables
+        capacity-aware model downgrade of fresh dispatches under high utilization (#12).
+        All default off; the two routers are DISTINCT levers (USD vs rate-limit headroom)."""
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
+            route_by_capacity=route_by_capacity,
         )
         self.store.save_run(run)
         return run
@@ -369,6 +373,7 @@ class Engine:
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
+        run = self.store.load_run(run_id)  # for route_by_capacity (#12); cheap single read
         # Deterministic routing: a stage is run by the in-process ENGINE-lane shell runner
         # (no model call, $0) when it is globally deterministic (intake) OR the task/pipeline
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
@@ -389,6 +394,29 @@ class Engine:
             model = task.pending_fallback_model or self.models.model_for_role(
                 spec.model_role, lane.provider
             )
+            # Capacity-aware downgrade (#12): on a route_by_capacity run, when CURRENT util
+            # is in the high band (>= downgrade_threshold, and < the per-call gate that
+            # already blocked dispatch above), drop a FRESH dispatch to a cheaper model to
+            # keep progressing under load. DISTINCT from cost routing (headroom, not USD).
+            # Skipped for a rate-limit re-queue (``pending_fallback_model`` already picked
+            # the cheaper model — never double-drop; the rate-limit floor/cooldown logic
+            # stays intact) and when the lane disallows fallback (an explicit pin honored).
+            # Never silent: every applied downgrade emits ``model_downgraded``.
+            if (
+                run.route_by_capacity
+                and task.pending_fallback_model is None
+                and lane.allow_fallback
+                and self.capacity.dispatch_band(util_pct) is DispatchBand.DOWNGRADE
+            ):
+                downgraded = self._capacity_downgrade(model)
+                if downgraded != model:
+                    self.store.append_event(
+                        run_id,
+                        {"ts": _now(), "type": "model_downgraded", "run_id": run_id,
+                         "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
+                         "from": model, "to": downgraded},
+                    )
+                    model = downgraded
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump
@@ -1363,6 +1391,19 @@ class Engine:
             return 1.0
         spent = self.ledger.metered_spend()
         return max(0.0, min(1.0, (run.budget_usd - spent) / run.budget_usd))
+
+    # --- capacity-aware model downgrade (#12) ----------------------------------
+    def _capacity_downgrade(self, model: str) -> str:
+        """The cheaper model ``capacity.downgrade_steps`` down the provider's fallback
+        chain, floored at the chain's cheapest tier (never off the end). Reuses the SAME
+        ``fallback_after`` chain the rate-limit fallback walks, so a downgrade and a
+        subsequent rate-limit degrade compose along one ordering instead of two."""
+        for _ in range(max(0, self.capacity.downgrade_steps)):
+            nxt = self.models.fallback_after(model)
+            if nxt is None:
+                break  # already at the chain floor — nothing cheaper to drop to
+            model = nxt
+        return model
 
     def _estimate_from_labels(self, labels: list[str] | None) -> str | None:
         """Pull a size hint off a task's labels for cost routing: a ``size:``/``estimate:``

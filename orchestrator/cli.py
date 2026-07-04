@@ -78,6 +78,10 @@ def main(argv: list[str] | None = None) -> int:
     ir.add_argument("--route-by-cost", action="store_true",
                     help="enable cost-aware lane routing: un-pinned tasks get a cheaper "
                          "lane preset as the remaining budget thins")
+    ir.add_argument("--route-by-capacity", action="store_true",
+                    help="enable capacity-aware model downgrade (#12): a FRESH dispatch "
+                         "drops to a cheaper model while utilization is high (>=70%%, below "
+                         "the 90%% wait gate) so work keeps progressing under load")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
@@ -322,9 +326,11 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "init-run":
         run = eng.create_run(args.run, ExecutionLane(args.lane),
-                             budget_usd=args.budget_usd, route_by_cost=args.route_by_cost)
+                             budget_usd=args.budget_usd, route_by_cost=args.route_by_cost,
+                             route_by_capacity=args.route_by_capacity)
         _emit({"created_run": run.run_id, "lane": run.lane.value,
-               "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost})
+               "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
+               "route_by_capacity": run.route_by_capacity})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage
 
