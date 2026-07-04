@@ -83,6 +83,26 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
     return root
 
 
+# Commands whose store dir is resolved through _engine() — the only place
+# --shared-root (force_nest) has any effect (#101). Every other subcommand ignores
+# the flag, so passing it there is a no-op worth warning about (mis-positioned flag).
+_ENGINE_COMMANDS = frozenset({
+    "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
+    "hold", "approve", "unpause", "reject", "abandon", "resume", "status",
+    "watch", "cost-report", "retrospective",
+})
+
+
+def _consumes_shared_root(args: argparse.Namespace) -> bool:
+    """True when the parsed command actually routes through ``_engine()`` and so
+    honors ``--shared-root``. Only the per-run engine commands and ``batch-plan
+    apply`` build an Engine; kb/dashboard/gc/tail/util/statusline/validate/spec/
+    brainstorm/batch-plan-candidates|validate all ignore the flag (#101)."""
+    if args.cmd in _ENGINE_COMMANDS:
+        return True
+    return args.cmd == "batch-plan" and getattr(args, "batch_cmd", None) == "apply"
+
+
 def _engine(args: argparse.Namespace) -> Engine:
     from .status_store import StatusStore
 
@@ -393,6 +413,19 @@ def main(argv: list[str] | None = None) -> int:
     kba.add_argument("--files", help="optional comma-separated files this lesson touches")
 
     args = p.parse_args(argv)
+
+    # --shared-root lives on the global parser (so it can precede any engine command),
+    # but it only affects per-run store nesting inside _engine(). A user who mistypes
+    # its position onto a non-engine command would otherwise have it silently dropped;
+    # warn instead of erroring so a legitimate global-position pass to an engine command
+    # stays valid (#101).
+    if getattr(args, "shared_root", False) and not _consumes_shared_root(args):
+        print(
+            f"warning: --shared-root is ignored by the '{args.cmd}' command; it only "
+            "affects per-run store nesting for engine commands (init-run/add-task/next/"
+            "record/dispatchable/run-headless/... and batch-plan apply)",
+            file=sys.stderr,
+        )
 
     if args.cmd == "kb":
         # The cross-run learnings KB (#72). --root is the runs-root (parent of the run dirs,
