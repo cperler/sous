@@ -26,6 +26,7 @@ from orchestrator.stream_probe import (
     probe_stream,
     read_tail,
     stages_dir,
+    stream_basename,
     stream_filename,
     stream_relpath,
 )
@@ -141,6 +142,37 @@ def test_probe_unrecognized_events_degrade_to_count_and_tail(tmp_path) -> None:
 def test_stream_relpath_matches_the_tee_naming() -> None:
     assert stream_relpath("#42", "implement", 0) == "stages/42/implement-attempt0.stream.jsonl"
     assert stream_relpath("#42", "review", 2) == "stages/42/review-attempt2.stream.jsonl"
+
+
+def test_stream_basename_appends_a_retry_suffix_only_when_retrying() -> None:
+    # #70: the first call (retry 0) keeps the bare name; a schema-retry sub-call gets .retry<K>.
+    assert stream_basename("implement", 0) == "implement-attempt0"
+    assert stream_basename("implement", 0, 0) == "implement-attempt0"  # explicit 0 == no suffix
+    assert stream_basename("implement", 0, 1) == "implement-attempt0.retry1"
+    assert stream_basename("review", 2, 3) == "review-attempt2.retry3"
+    assert stream_relpath("#42", "implement", 0, 1) == \
+        "stages/42/implement-attempt0.retry1.stream.jsonl"
+
+
+def test_find_current_stream_prefers_highest_retry_within_an_attempt(tmp_path) -> None:
+    # #70: with a base + retry sub-call file present, the probe/tail follows the newest sub-call.
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    (d / stream_filename("implement", 0)).write_text("a\n")
+    (d / stream_filename("implement", 0, 1)).write_text("b\n")
+    (d / stream_filename("implement", 0, 2)).write_text("c\n")
+    assert find_current_stream(tmp_path, "#42", "implement").name == \
+        "implement-attempt0.retry2.stream.jsonl"
+
+
+def test_find_current_stream_newer_attempt_beats_a_prior_attempts_retry(tmp_path) -> None:
+    # A higher ATTEMPT still wins over a prior attempt's retry sub-call (attempt sorts first).
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    (d / stream_filename("implement", 0, 2)).write_text("old-retry\n")
+    (d / stream_filename("implement", 1)).write_text("new-attempt\n")
+    assert find_current_stream(tmp_path, "#42", "implement").name == \
+        "implement-attempt1.stream.jsonl"
 
 
 def test_find_current_stream_prefers_highest_attempt_for_a_stage(tmp_path) -> None:

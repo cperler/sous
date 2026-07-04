@@ -49,7 +49,10 @@ class RawResult:
     # Paths (relative to the run root) the raw provider stdout/stderr were teed to under the
     # per-stage log dir — ``{"stream": ..., "stderr": ...}`` (or ``{"error": ...}`` if the
     # best-effort tee failed). Stamped by ``stream_teeing_transport`` (#56); None when no
-    # teeing wrapper is installed or there was no provider stream to save.
+    # teeing wrapper is installed or there was no provider stream to save. When a dispatch spent
+    # schema-retry sub-calls (#70), ``stream``/``stderr`` are the FINAL call's files and
+    # ``retries: [{stream, stderr}, ...]`` (oldest first) carries each superseded sub-call's
+    # files so the whole retry chain's evidence survives.
     stream_files: dict | None = None
     # Provider session the call used/created (design pass §2); None if unsupported.
     session_ref: str | None = None
@@ -264,46 +267,65 @@ def _corrective_prompt(
     return "\n".join(lines)
 
 
+def _with_retry_chain(raw: RawResult, chain: list[dict]) -> RawResult:
+    """Attach the superseded schema-retry sub-calls' stream-file pairs to the FINAL result's
+    ``stream_files`` as ``retries: [{stream, stderr}, ...]`` (oldest first), keeping the
+    top-level ``stream``/``stderr`` = the final call's files for backward compatibility (#70).
+    A no-op when nothing was teed (the no-run-dir path), so ``stream_files`` stays None/flat
+    there."""
+    if not chain:
+        return raw
+    files = dict(raw.stream_files) if raw.stream_files else {}
+    files["retries"] = chain
+    return replace(raw, stream_files=files)
+
+
 def _schema_retry_loop(
     raw: RawResult,
     work: WorkItem,
     schema_json: str,
     max_schema_retries: int,
-    call: Callable[[WorkItem, str | None], RawResult],
+    call: Callable[[WorkItem, str | None, int], RawResult],
 ) -> RawResult:
     """The provider-agnostic schema-validate-and-retry loop (#32). Shared verbatim by the
     claude and codex transports so the corrective-prompt shape, retry budget, and
     ``schema_retries`` accounting are identical on both lanes (#9/#21 codex parity).
 
-    ``call(work, session_ref)`` issues ONE provider call — resuming ``session_ref`` when the
-    provider/CLI supports it, else a fresh call. On each invalid-but-exit-0 result the loop
-    re-dispatches with a corrective follow-up (the exact validation errors + schema), PREFERRING
-    to resume the same session so the model keeps its own context; when there is no session to
-    resume it falls back to a fresh call that embeds the model's own prior invalid output. A
-    transport-level error (timeout / non-JSON / non-zero exit) is never spent on a schema retry.
-    On exhaustion the result is failed honestly (``structured_output`` None → SCHEMA_VIOLATION),
-    with the validation errors appended to ``raw_output`` so the failure-learning tail is
-    specific. ``schema_retries`` rides the RawResult onto the ledger row."""
+    ``call(work, session_ref, retry)`` issues ONE provider call — resuming ``session_ref`` when
+    the provider/CLI supports it, else a fresh call — teeing its stream to the ``retry``-indexed
+    file (0 = the first call's bare name, K>=1 = a ``.retry<K>`` sub-call file, #70). On each
+    invalid-but-exit-0 result the loop re-dispatches with a corrective follow-up (the exact
+    validation errors + schema), PREFERRING to resume the same session so the model keeps its own
+    context; when there is no session to resume it falls back to a fresh call that embeds the
+    model's own prior invalid output. A transport-level error (timeout / non-JSON / non-zero exit)
+    is never spent on a schema retry. On exhaustion the result is failed honestly
+    (``structured_output`` None → SCHEMA_VIOLATION), with the validation errors appended to
+    ``raw_output`` so the failure-learning tail is specific. ``schema_retries`` rides the
+    RawResult onto the ledger row, and each superseded sub-call's stream files ride on
+    ``stream_files["retries"]`` so a post-mortem keeps the whole chain's evidence (#70)."""
     retries = 0
+    chain: list[dict] = []  # superseded sub-calls' stream-file pairs, oldest first (#70)
     while True:
         if raw.exit_code != 0 or raw.error:
-            return raw
+            return _with_retry_chain(raw, chain)
         errors = _schema_errors(raw.structured_output, schema_json)
         if not errors:  # valid (or unvalidatable schema) — done
-            return raw
+            return _with_retry_chain(raw, chain)
         if retries >= max_schema_retries:
             summary = (f"[schema-retry] validation still failing after {retries} corrective "
                        f"retr{'y' if retries == 1 else 'ies'}:\n" + "\n".join(errors))
-            return replace(
+            return _with_retry_chain(replace(
                 raw, structured_output=None, schema_retries=retries,
                 raw_output=((raw.raw_output or "") + "\n\n" + summary),
-            )
+            ), chain)
+        if raw.stream_files:  # this sub-call is about to be superseded — keep its evidence
+            chain.append(raw.stream_files)
         retries += 1
         resume_ref = raw.session_ref
         corrective = _corrective_prompt(
             errors, schema_json, raw.structured_output, continued=bool(resume_ref)
         )
-        raw = call(work.model_copy(update={"prompt": corrective}), resume_ref)
+        raw = call(work.model_copy(update={"prompt": corrective}), resume_ref, retries)
         raw = replace(raw, schema_retries=retries)
 
 
@@ -443,17 +465,20 @@ def _run_teed(
 
 
 def _streaming_stream_files(
-    root: Path, work: WorkItem, stdout: str, stderr: str
+    root: Path, work: WorkItem, stdout: str, stderr: str, retry: int = 0
 ) -> dict:
     """Assemble the ``stream_files`` map for a call that streamed its stdout live (#66). The
     ``.stream.jsonl`` was written in-flight by ``_run_teed``; here we only write the stderr
     file (post-hoc — stderr isn't the live-tail surface) and return both paths RELATIVE to the
     run root. Both writes are best-effort; a stdout stream with no content is still recorded so
-    a probe/tail finds the (empty) file the stage owns."""
-    files: dict = {"stream": stream_relpath(work.task_id, work.stage.value, work.attempt)}
+    a probe/tail finds the (empty) file the stage owns. ``retry`` (>=1) selects the schema-retry
+    sub-call's ``.retry<K>`` name so each corrective sub-call's stream is its own file (#70)."""
+    files: dict = {"stream": stream_relpath(work.task_id, work.stage.value, work.attempt, retry)}
     if stderr:
         try:
-            p = _stream_dir(root, work.task_id) / stderr_filename(work.stage.value, work.attempt)
+            p = _stream_dir(root, work.task_id) / stderr_filename(
+                work.stage.value, work.attempt, retry
+            )
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(stderr, encoding="utf-8")
         except OSError:  # pragma: no cover - defensive; stderr is evidence, not control
@@ -755,9 +780,11 @@ def claude_cli_transport(
 
     root = Path(run_log_root) if run_log_root is not None else None
 
-    def _call(work: WorkItem, session_ref: str | None) -> RawResult:
+    def _call(work: WorkItem, session_ref: str | None, retry: int = 0) -> RawResult:
         # #66: with a run dir, stream `stream-json` and tee stdout as it arrives so the stage
-        # is tailable live; otherwise the single-shot `json` path. `--json-schema` +
+        # is tailable live; otherwise the single-shot `json` path. `retry` (>=1, #70) names a
+        # schema-retry sub-call's own `.retry<K>` stream so it doesn't clobber the first call's.
+        # `--json-schema` +
         # `_JSON_ONLY_POSTAMBLE` are BEST-EFFORT on `claude -p` (after multi-turn agentic work
         # the model often ends in PROSE with no `structured_output` — the headless #25 failure),
         # so both paths recover the object from `result` text and the schema-retry loop below
@@ -784,12 +811,12 @@ def claude_cli_transport(
         try:
             if streaming:
                 tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                    work.stage.value, work.attempt
+                    work.stage.value, work.attempt, retry
                 )
                 returncode, stdout, stderr = _run_teed(
                     argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
                 )
-                stream_files = _streaming_stream_files(root, work, stdout, stderr)
+                stream_files = _streaming_stream_files(root, work, stdout, stderr, retry)
             else:
                 proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
                                       timeout=work.timeout_s, cwd=work.cwd, env=proc_env)
@@ -1010,7 +1037,7 @@ def codex_cli_transport(
     the same dispatch (continuity is routing metadata; correctness never depends on it)."""
     root = Path(run_log_root) if run_log_root is not None else None
 
-    def _call(work: WorkItem, session_ref: str | None) -> RawResult:
+    def _call(work: WorkItem, session_ref: str | None, retry: int = 0) -> RawResult:
         grant = _codex_git_common_dir(work)
         proc_env = subprocess_env(work)  # #5: per-task port block for the codex subprocess
         with tempfile.TemporaryDirectory() as td:
@@ -1041,12 +1068,12 @@ def codex_cli_transport(
             try:
                 if root is not None:
                     tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                        work.stage.value, work.attempt
+                        work.stage.value, work.attempt, retry
                     )
                     returncode, stdout, stderr = _run_teed(
                         argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
                     )
-                    stream_files = _streaming_stream_files(root, work, stdout, stderr)
+                    stream_files = _streaming_stream_files(root, work, stdout, stderr, retry)
                 else:
                     proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
                                           timeout=work.timeout_s, cwd=work.cwd, env=proc_env)

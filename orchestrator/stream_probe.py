@@ -29,18 +29,24 @@ from .status_store import safe_task_dirname
 # --- stream-file naming (single source of truth) -----------------------------------------
 
 
-def stream_basename(stage_value: str, attempt: int) -> str:
-    """The per-(stage, attempt) stem shared by the ``.stream.jsonl`` and ``.stderr.log``
-    files. A retry gets its own stem so a prior attempt's evidence is never clobbered."""
-    return f"{stage_value}-attempt{attempt}"
+def stream_basename(stage_value: str, attempt: int, retry: int = 0) -> str:
+    """The per-(stage, attempt[, schema-retry sub-call]) stem shared by the ``.stream.jsonl``
+    and ``.stderr.log`` files.
+
+    A stage ATTEMPT gets its own stem (``<stage>-attempt<N>``) so a retry never clobbers a
+    prior attempt's evidence. Within one dispatch, a schema-validate-and-retry sub-call (#70)
+    gets a further ``.retry<K>`` suffix (K>=1) so each corrective sub-call's stream survives
+    too — the first call (K=0) keeps the bare name, so the 99%-no-retry case is unchanged."""
+    stem = f"{stage_value}-attempt{attempt}"
+    return f"{stem}.retry{retry}" if retry else stem
 
 
-def stream_filename(stage_value: str, attempt: int) -> str:
-    return stream_basename(stage_value, attempt) + ".stream.jsonl"
+def stream_filename(stage_value: str, attempt: int, retry: int = 0) -> str:
+    return stream_basename(stage_value, attempt, retry) + ".stream.jsonl"
 
 
-def stderr_filename(stage_value: str, attempt: int) -> str:
-    return stream_basename(stage_value, attempt) + ".stderr.log"
+def stderr_filename(stage_value: str, attempt: int, retry: int = 0) -> str:
+    return stream_basename(stage_value, attempt, retry) + ".stderr.log"
 
 
 def stages_dir(run_root: str | Path, task_id: str) -> Path:
@@ -49,35 +55,53 @@ def stages_dir(run_root: str | Path, task_id: str) -> Path:
     return Path(run_root) / "stages" / safe_task_dirname(task_id)
 
 
-def stream_relpath(task_id: str, stage_value: str, attempt: int) -> str:
+def stream_relpath(task_id: str, stage_value: str, attempt: int, retry: int = 0) -> str:
     """Stream path RELATIVE to the run root (portable if the run dir moves)."""
-    return str(Path("stages") / safe_task_dirname(task_id) / stream_filename(stage_value, attempt))
+    return str(
+        Path("stages") / safe_task_dirname(task_id) / stream_filename(stage_value, attempt, retry)
+    )
 
 
-def stderr_relpath(task_id: str, stage_value: str, attempt: int) -> str:
-    return str(Path("stages") / safe_task_dirname(task_id) / stderr_filename(stage_value, attempt))
+def stderr_relpath(task_id: str, stage_value: str, attempt: int, retry: int = 0) -> str:
+    return str(
+        Path("stages") / safe_task_dirname(task_id) / stderr_filename(stage_value, attempt, retry)
+    )
 
 
-def _attempt_of(path: Path) -> int:
-    """The attempt number encoded in ``<stage>-attemptN.stream.jsonl`` (-1 if unparseable),
-    so the newest attempt sorts last."""
+def _attempt_of(path: Path) -> tuple[int, int]:
+    """The ``(attempt, retry)`` encoded in ``<stage>-attemptN[.retryK].stream.jsonl`` — retry
+    defaults to 0 for a base (non-retry) file — so the newest sub-call sorts last: a higher
+    attempt wins, and within one attempt a higher schema-retry suffix wins (#70). ``(-1, -1)``
+    if the attempt is unparseable."""
+    name = path.name
     try:
-        return int(path.name.split("-attempt", 1)[1].split(".", 1)[0])
+        attempt = int(name.split("-attempt", 1)[1].split(".", 1)[0])
     except (IndexError, ValueError):
-        return -1
+        return (-1, -1)
+    retry = 0
+    if ".retry" in name:
+        try:
+            retry = int(name.split(".retry", 1)[1].split(".", 1)[0])
+        except (IndexError, ValueError):
+            retry = 0
+    return (attempt, retry)
 
 
 def find_current_stream(
     run_root: str | Path, task_id: str, stage_value: str | None = None
 ) -> Path | None:
-    """The stream file to probe/tail for a task: the highest-attempt file for ``stage_value``
-    when given, else the most-recently-modified ``*.stream.jsonl`` under the task's stages dir
-    (the "current, or last" stream). ``None`` when the dir/file doesn't exist — i.e. no
-    provider stream (an interactive/ENGINE lane, or nothing dispatched yet)."""
+    """The stream file to probe/tail for a task: the highest-(attempt, schema-retry) file for
+    ``stage_value`` when given — so a live schema-retry sub-call's ``.retry<K>`` stream (#70) is
+    preferred over the superseded base file — else the most-recently-modified ``*.stream.jsonl``
+    under the task's stages dir (the "current, or last" stream). ``None`` when the dir/file
+    doesn't exist — i.e. no provider stream (an interactive/ENGINE lane, or nothing dispatched
+    yet)."""
     d = stages_dir(run_root, task_id)
     if not d.is_dir():
         return None
     if stage_value is not None:
+        # The glob also matches the ``.retry<K>`` sub-call files; ``_attempt_of`` orders them
+        # after the base file so the newest live sub-call sorts last.
         cands = sorted(d.glob(f"{stage_value}-attempt*.stream.jsonl"), key=_attempt_of)
         return cands[-1] if cands else None
     cands = list(d.glob("*.stream.jsonl"))
