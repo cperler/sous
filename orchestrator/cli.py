@@ -225,6 +225,16 @@ def main(argv: list[str] | None = None) -> int:
     gc.add_argument("--run", default=argparse.SUPPRESS,
                     help="scope to one run's checkpoint tags (may also precede the subcommand)")
 
+    db = sub.add_parser("dashboard", help="cross-session board (#6): one attention-first view "
+                                          "over ALL runs under --root (runs/), not just one")
+    db.add_argument("--watch", action="store_true", help="clear-screen + reprint on a loop")
+    db.add_argument("--interval", type=int, default=30, help="--watch refresh interval seconds")
+    db.add_argument("--limit", type=int, default=20, help="max runs to show")
+    db.add_argument("--all", action="store_true",
+                    help="show every run (default: non-terminal + the 5 most-recent terminal)")
+    db.add_argument("--stale-after", type=int, default=1800,
+                    help="a task with no update for this many seconds is flagged stale")
+
     args = p.parse_args(argv)
 
     if args.cmd == "gc":
@@ -271,6 +281,36 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         for line in read_tail(path, lines=args.lines) or []:
             print(line)
+        return 0
+
+    if args.cmd == "dashboard":
+        # Cross-session board (#6): reads every runs/<id>/ store under --root. Needs --project
+        # to build the per-run read-only engine (like `status`), but NOT --run (it spans runs).
+        from .dashboard import (
+            dashboard_snapshot,
+            default_engine_factory,
+            render_dashboard,
+            render_watch,
+        )
+        from .usage_probe import read_usage
+
+        if not args.root or not args.project:
+            p.error("--root and --project are required for dashboard")
+        factory = default_engine_factory(args.project, mode=args.mode, provider=args.provider)
+        snap_kw = dict(
+            stale_after_s=args.stale_after, limit=args.limit, show_all=args.all,
+            engine_factory=factory, usage_reader=read_usage,
+        )
+        if args.watch:
+            import contextlib
+            import time
+
+            # Ctrl-C ends the loop cleanly (render_watch also swallows KeyboardInterrupt).
+            with contextlib.suppress(KeyboardInterrupt):
+                render_watch(args.root, emit=print, sleeper=time.sleep,
+                             interval=args.interval, **snap_kw)
+            return 0
+        print(render_dashboard(dashboard_snapshot(args.root, **snap_kw)))
         return 0
 
     if args.cmd == "util":
