@@ -1,6 +1,14 @@
-"""Regression tests for #81 — ``init-run``/per-run commands auto-nest the store
-under a shared ``--root`` so two runs never comingle their files flat, and the
-learnings KB lands at the shared parent (not the repo root)."""
+"""Regression tests for #81 and #91 — ``init-run``/per-run commands auto-nest the
+store under a shared ``--root`` so two runs never comingle their files flat, and the
+learnings KB lands at the shared parent (not the repo root).
+
+#91 adds ``--shared-root`` (``force_nest=True`` in ``_resolve_store_root``): the
+structural auto-detect heuristic cannot recognize a *fresh*, empty shared ``runs/``
+dir (no KB, no sibling stores exist on day one), so the very first run would land flat
+without an explicit assertion from the caller. The flag lets the skill pass its
+knowledge — "this IS the shared runs-root" — to the engine and forces the nest even
+with no markers. The established-flat guard still wins (idempotent for in-progress flat
+runs), so the flag is backward-compatible and safe to pass on every engine call."""
 
 from __future__ import annotations
 
