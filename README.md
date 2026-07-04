@@ -10,11 +10,14 @@ It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 New here? **`ARCHITECTURE.md`** is a one-page map of the whole system — the engine/adapter
 split, the six-stage pipeline, the front doors, the control loops, and where to start reading.
 
-**Status: built and live-proven.** Phases 1–5 complete plus two engine-hardening passes
-and a workflow code-review pass. 294 pytest cases green, ruff clean. Driven real GitHub
-issues to merged/draft PRs on the reference project (heysoo PRs #556–#560) with clean
-lane-attribution audits. Remaining/known-thinned scope is tracked as GitHub issues
-(label `deferred-scope`); see `DEFERRED.md` for the discipline.
+**Status: built and live-proven.** Phases 1–5 complete plus engine-hardening passes, the
+2026-07-01 review→execute cycle (context plane, per-task pipelines, session continuity,
+checkpoints, approval gate), and the 2026-07-04 burn-down (deterministic test/deliver,
+front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). 725 pytest
+cases green, ruff clean. Driven real GitHub issues to merged/draft PRs on the reference
+project (heysoo PRs #556–#560) with clean lane-attribution audits. Remaining/known-thinned
+scope is tracked as GitHub issues (label `deferred-scope`); see `DEFERRED.md` for the
+discipline.
 
 ## What it does
 
@@ -33,10 +36,10 @@ The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test
 - **The engine never calls a model.** It emits a `WorkItem` and ingests a `StageResult`
   (the contract seam in `orchestrator/schemas/work.py`). That makes execution modes
   interchangeable, runs resumable, and every model call structurally attributable.
-- **Two orthogonal axes:** `execution_mode ∈ {interactive, headless} × provider ∈
-  {claude, codex}`. Billing is a derived property of the (mode, provider) pair, not a
+- **Two orthogonal axes:** `execution_mode ∈ {interactive, headless, engine} × provider ∈
+  {claude, codex, none}`. Billing is a derived property of the (mode, provider) pair, not a
   hardcoded branch. `codex` is always headless; `codex×interactive` is an explicit empty
-  cell.
+  cell; `engine×none` is the deterministic no-model lane (intake setup, test runs, PR-open).
 - **Two adapter families:** the **execution adapter** (`adapters/execution/` — how/where a
   call runs: the interactive Workflow shim, headless `claude -p`, `codex exec`) and the
   **project-config adapter** (`adapters/project/` — what a repo plugs in: commands, test
@@ -66,7 +69,7 @@ adapters/
   project/{base,heysoo,selfhost}/   the contract + reference adapters (a NEW project's
                          adapter lives in the project's OWN repo — see below)
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
-tests/                   pytest suite (294)
+tests/                   pytest suite (725)
 docs/                    design doc, plan, and the as-built/target spec (see below)
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
@@ -236,7 +239,7 @@ reference implementations, kept in lockstep by this repo's test suite.
 ## Developing
 
 ```bash
-uv run pytest        # 294 cases
+uv run pytest        # 725 cases
 uv run ruff check .
 ```
 
