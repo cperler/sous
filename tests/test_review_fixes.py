@@ -98,6 +98,16 @@ def test_codex_usage_parser() -> None:
     assert u.input == 120 and u.output == 30
 
 
+# codex turn.completed reports cached_input_tokens (not cache_read_input_tokens):
+# both spellings must land in cache_read so codex cache reads aren't dropped
+def test_codex_usage_maps_cached_input_tokens() -> None:
+    stdout = '{"msg":{"usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":80}}}\n'
+    u = _codex_usage(stdout)
+    assert u.cache_read == 80
+    claude = '{"msg":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":7}}}\n'
+    assert _codex_usage(claude).cache_read == 7
+
+
 # #7 render_cost_summary tolerates None totals + partial by_model bucket
 def test_render_cost_summary_defensive() -> None:
     md = render_cost_summary("r", {"total_cost_usd": None, "by_model": {"m": {"invocations": 1}}})

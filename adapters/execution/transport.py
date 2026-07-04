@@ -473,7 +473,9 @@ def _usage_from(d: dict) -> TokenUsage:
     return TokenUsage(
         input=u.get("input_tokens", 0) or 0,
         output=u.get("output_tokens", 0) or 0,
-        cache_read=u.get("cache_read_input_tokens", 0) or 0,
+        # claude reports cache_read_input_tokens; codex turn.completed reports
+        # cached_input_tokens — map both so codex cache reads aren't dropped.
+        cache_read=(u.get("cache_read_input_tokens") or u.get("cached_input_tokens") or 0),
         cache_write=u.get("cache_creation_input_tokens", 0) or 0,
     )
 
