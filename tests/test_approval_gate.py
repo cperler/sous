@@ -70,8 +70,9 @@ def test_reject_closes_a_held_task_and_finalizes_the_run(tmp_path, project) -> N
     eng.add_task("r1", "t1")
     eng.hold_for_approval("r1", "t1", what="scope reported the task infeasible")
     eng.reject("r1", "t1", rejected_by="craig", reason="genuinely infeasible")
-    # the held task is now terminal-FAILED and the run finalizes (no longer open forever)
-    assert eng.store.load_task("r1", "t1").state is TaskState.FAILED
+    # the held task is now terminal-CLOSED_INFEASIBLE (distinct from FAILED, #53) and the
+    # run finalizes (no longer open forever)
+    assert eng.store.load_task("r1", "t1").state is TaskState.CLOSED_INFEASIBLE
     assert eng.dispatchable("r1") == []
     assert eng.store.load_run("r1").state is RunState.FAILED
     # the durable rejection artifact IS the gate record: who/why/when
@@ -98,6 +99,6 @@ def test_reject_cascade_blocks_a_dependent_task(tmp_path, project) -> None:
     eng.add_task("r1", "t2")  # depends on t1
     eng.hold_for_approval("r1", "t1", what="infeasible")
     eng.reject("r1", "t1", rejected_by="craig", reason="infeasible")
-    assert eng.store.load_task("r1", "t1").state is TaskState.FAILED
+    assert eng.store.load_task("r1", "t1").state is TaskState.CLOSED_INFEASIBLE
     assert eng.store.load_task("r1", "t2").state is TaskState.CASCADE_BLOCKED
     assert eng.store.load_run("r1").state is RunState.FAILED

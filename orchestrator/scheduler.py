@@ -117,6 +117,13 @@ class Scheduler:
                 break
             util = util_provider() if util_provider is not None else util_pct
             res = self.tick(run_id, runner, util_pct=util)
+            # CONSTRAINT (#53): only a genuine EXECUTION failure may advance the breaker.
+            # A human closing a task as infeasible (Engine.reject → CLOSED_INFEASIBLE) is a
+            # deliberate decision, not a system failure — and it is an OUT-OF-BAND
+            # transition that never runs through record()/tick(), so it produces no
+            # ``outcome`` here and structurally cannot increment ``consecutive_failures``.
+            # Guarded belt-and-suspenders below: only ``task_failed*`` increments, so even
+            # if a close-style outcome ever reached this loop it could not trip the breaker.
             for outcome in res.get("outcomes", []):
                 if outcome.startswith("task_failed"):
                     consecutive_failures += 1

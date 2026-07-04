@@ -74,12 +74,19 @@ class TaskState(StrEnum):
     # cascade. Exit is Engine.approve(), which writes a durable approval artifact —
     # the HARD-CHECKPOINT norm as a mechanism instead of prose.
     BLOCKED_ON_HUMAN = "blocked_on_human"
+    # Human confirmed the held task is infeasible and closed it (Engine.reject(), #53):
+    # a TERMINAL state distinct from FAILED. "a human decided this shouldn't be done" is
+    # a deliberate close, NOT an execution failure — so status/cost retrospectives can
+    # tell the two apart, and the batch circuit breaker never counts it as a failure.
+    CLOSED_INFEASIBLE = "closed_infeasible"
 
 
 # Terminal task states — the DAG/state machine treats these as "done".
 # BLOCKED_ON_HUMAN is deliberately NOT terminal: a held task keeps its run open.
+# CLOSED_INFEASIBLE IS terminal (a human closed the task): it counts for run-finalization
+# and dispatchability exactly like the other terminals, but is semantically not a failure.
 TERMINAL_TASK_STATES: frozenset[TaskState] = frozenset(
-    {TaskState.COMPLETED, TaskState.FAILED, TaskState.CASCADE_BLOCKED}
+    {TaskState.COMPLETED, TaskState.FAILED, TaskState.CASCADE_BLOCKED, TaskState.CLOSED_INFEASIBLE}
 )
 
 

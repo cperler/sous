@@ -291,13 +291,21 @@ def render_stage(payload: dict) -> str:
     return "\n".join(lines)
 
 
-def render_task_index(task: Task) -> str:
-    """Render a per-task stage index (stages/<task>/index.md)."""
+def render_task_index(task: Task, rejection_reason: str | None = None) -> str:
+    """Render a per-task stage index (stages/<task>/index.md).
+
+    ``rejection_reason`` (set only for a CLOSED_INFEASIBLE task) adds a line stating why a
+    human closed the task as infeasible — so the human-readable index explains the close,
+    not just the terminal state."""
     pr = f" — PR: {task.pr_url}" if task.pr_url else ""
     lines = [
         f"# Task {task.task_id} — {task.title or '(no title)'}",
         "",
         f"State: **{task.state.value}**{pr}",
+    ]
+    if rejection_reason:
+        lines.append(f"Closed as infeasible: _{rejection_reason}_")
+    lines += [
         "",
         "| # | Stage | Status | Model | Cost |",
         "|---:|---|---|---|---:|",
@@ -373,3 +381,24 @@ def render_completion_note(
               "findings are tracked as follow-up issues; the improvement idea is filed as an "
               "enhancement._", ""]
     return "\n".join(lines)
+
+
+def render_rejection_note(
+    task: Task, reason: str, *, rejected_by: str | None = None
+) -> str:
+    """Render the note the engine publishes back to the task source when a human closes a
+    held task as infeasible (Engine.reject → CLOSED_INFEASIBLE, #53). A deliberate close,
+    NOT an execution failure — the note says so, and carries the reason so the decision
+    outlives the run logs."""
+    by = f" by **{rejected_by}**" if rejected_by else ""
+    return "\n".join([
+        f"## Orchestration run closed — {task.task_id} (infeasible)",
+        "",
+        f"- **Task:** {task.title or '(no title)'}",
+        f"- **Outcome:** ❌ closed as infeasible{by}",
+        f"- **Reason:** {reason or '(none given)'}",
+        "",
+        "_A human reviewed this task at the approval gate and confirmed it should not be "
+        "done. This is a deliberate close, not an execution failure._",
+        "",
+    ])

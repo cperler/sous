@@ -28,6 +28,7 @@ from .render import (
     render_completion_note,
     render_cost_report,
     render_cost_summary,
+    render_rejection_note,
     render_retrospective,
     render_stage,
     render_task_index,
@@ -1087,14 +1088,21 @@ class Engine:
         """Confirm-and-close a held task the human agrees is infeasible.
 
         The symmetric counterpart to ``approve``: instead of overriding the gate and
-        proceeding, it transitions the task to the terminal FAILED state so the run can
-        actually close.  The durable ``rejection-<run>-<task>.json`` artifact IS the gate
-        record (who/when/why).
+        proceeding, it transitions the task to the terminal ``CLOSED_INFEASIBLE`` state
+        (#53 — distinct from FAILED: a deliberate human close, not an execution failure)
+        so the run can actually close. The durable ``rejection-<run>-<task>.json`` artifact
+        IS the gate record (who/when/why).
 
         As an out-of-band transition (like ``approve``/``hold_for_approval``) this method
         performs the same post-transition run-level effects that ``record()`` would: it
-        cascade-blocks any dependents of the now-FAILED task and calls
+        cascade-blocks any dependents of the now-closed task and calls
         ``_maybe_finalize_run`` so the run reaches a terminal state instead of staying open.
+
+        Evidence-out (best-effort, like ``_on_task_completed``): the human-readable task
+        index gains a rejection line, and — when the task has an issue — a rejection note
+        is published to the task source. Both surface the reason READ BACK from the
+        persisted artifact via ``load_rejection`` (proving the record round-trips, #52),
+        not just the in-hand argument.
 
         Raises ``ContractError`` if the task is not currently ``BLOCKED_ON_HUMAN``."""
 
@@ -1103,7 +1111,7 @@ class Engine:
                 raise ContractError(
                     f"task {task_id} is not held for approval (state {t.state.value})"
                 )
-            t.state = TaskState.FAILED
+            t.state = TaskState.CLOSED_INFEASIBLE
 
         task = self.store.update_task(run_id, task_id, _reject)
         self.store.write_rejection(
@@ -1111,18 +1119,62 @@ class Engine:
             {"rejected_by": rejected_by, "at": _now(), "reason": reason, "run_id": run_id,
              "task_id": task_id},
         )
-        self._set_ref_state(run_id, task_id, TaskState.FAILED)
+        self._set_ref_state(run_id, task_id, TaskState.CLOSED_INFEASIBLE)
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "rejected", "run_id": run_id, "task_id": task_id,
              "rejected_by": rejected_by, "reason": reason},
         )
+        # Evidence-out — surface the rejection reason READ BACK from the durable artifact
+        # (#52: load_rejection now has a production caller and its schema can't silently
+        # go stale). Best-effort and wrapped: a flaky task source or render must never
+        # escape reject() and skip the cascade/finalize below.
+        try:
+            self._surface_rejection(run_id, task)
+        except Exception as exc:  # noqa: BLE001 - evidence-out must never crash the close
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "rejection_evidence_failed", "run_id": run_id,
+                 "task_id": task_id, "error": str(exc)},
+            )
         # Out-of-band transition (like approve/hold, not via record()), so it must perform
         # record()'s post-transition run-level effects itself: cascade-block dependents of
-        # the now-FAILED task and finalize the run so it closes instead of staying open.
+        # the now-closed task and finalize the run so it closes instead of staying open.
         self._cascade_from(run_id, task_id)
         self._maybe_finalize_run(run_id)
         return task
+
+    def _surface_rejection(self, run_id: str, task: Task) -> None:
+        """Surface a rejection's reason in the durable human-readable artifacts, reading
+        it BACK from the persisted ``rejection-*.json`` (via ``load_rejection``) so the
+        write→read round-trip is exercised in production, not only in tests (#52)."""
+        record = self.store.load_rejection(run_id, task.task_id) or {}
+        reason = record.get("reason") or ""
+        rejected_by = record.get("rejected_by")
+        # Per-task stage index gets a rejection line under the task's (now closed) state.
+        self.store.write_task_index(
+            task.task_id, render_task_index(task, rejection_reason=reason)
+        )
+        # Publish a rejection note to the task source when there is an issue to comment on
+        # (mirrors _publish_completion_note; a no-op when the adapter lacks publish_note).
+        publish_note = getattr(self.project.task_source, "publish_note", None)
+        if not callable(publish_note) or task.issue_number is None:
+            return
+        body = render_rejection_note(task, reason, rejected_by=rejected_by)
+        try:
+            publish_note(task.task_id, body, pr_url=task.pr_url)
+        except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "rejection_note_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+        else:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "rejection_note_published", "run_id": run_id,
+                 "task_id": task.task_id},
+            )
 
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
@@ -1158,7 +1210,7 @@ class Engine:
                 age_s = max(0.0, (now - datetime.fromisoformat(task.updated_at)).total_seconds())
             except (ValueError, TypeError):
                 age_s = None
-            tasks[ref.task_id] = {
+            task_status: dict = {
                 "state": task.state.value,
                 "current_stage": task.current_stage.value if task.current_stage else None,
                 "stages": {s.value: r.status.value for s, r in task.stages.items()},
@@ -1171,6 +1223,13 @@ class Engine:
                     and task.state is not TaskState.BLOCKED_ON_HUMAN
                 ),
             }
+            # A human-closed-infeasible task surfaces WHY it was closed — read back from the
+            # durable rejection artifact (#52), so status output is self-explanatory.
+            if task.state is TaskState.CLOSED_INFEASIBLE:
+                record = self.store.load_rejection(run_id, ref.task_id)
+                if record:
+                    task_status["rejection_reason"] = record.get("reason")
+            tasks[ref.task_id] = task_status
         # One ledger read shared by the summary, the audit, and the cost-summary.md
         # refresh (status() used to read the ledger twice).
         rows = self.ledger.rows()
@@ -1405,10 +1464,16 @@ class Engine:
         run = self.store.load_run(run_id)
         if not run.task_refs or not all(r.state in TERMINAL_TASK_STATES for r in run.task_refs):
             return
-        any_failed = any(
-            r.state in (TaskState.FAILED, TaskState.CASCADE_BLOCKED) for r in run.task_refs
+        # A run whose tasks are all terminal but at least one did NOT complete cleanly is
+        # finalized FAILED at the run level — there is no distinct run state for "closed as
+        # infeasible", and marking such a run COMPLETED would falsely read as "all shipped".
+        # The TASK state still distinguishes CLOSED_INFEASIBLE (a deliberate human close)
+        # from FAILED (an execution failure); this is only the coarse run-level rollup.
+        any_not_completed = any(
+            r.state in (TaskState.FAILED, TaskState.CASCADE_BLOCKED, TaskState.CLOSED_INFEASIBLE)
+            for r in run.task_refs
         )
-        new_state = RunState.FAILED if any_failed else RunState.COMPLETED
+        new_state = RunState.FAILED if any_not_completed else RunState.COMPLETED
         if run.state is not new_state:
             self.store.update_run(run_id, lambda r: setattr(r, "state", new_state))
             self.store.append_event(

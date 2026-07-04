@@ -172,6 +172,7 @@ class Progress(BaseModel):
     completed: int = 0
     failed: int = 0
     blocked_on_human: int = 0
+    closed_infeasible: int = 0
 
 
 class Run(BaseModel):
@@ -203,6 +204,7 @@ class Run(BaseModel):
             TaskState.COMPLETED: "completed",
             TaskState.FAILED: "failed",
             TaskState.BLOCKED_ON_HUMAN: "blocked_on_human",
+            TaskState.CLOSED_INFEASIBLE: "closed_infeasible",
         }
         for ref in self.task_refs:
             field = bucket[ref.state]
