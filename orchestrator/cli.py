@@ -89,6 +89,13 @@ def main(argv: list[str] | None = None) -> int:
                          "next dispatch to the equivalent claude lane instead of failing. "
                          "One-way, once per stage; the flag is blanket consent (even a "
                          ":codex-pinned task falls through). Default off")
+    ir.add_argument("--warm-retry", action="store_true",
+                    help="reuse a failed attempt's session on the retry (#8) when the failure "
+                         "was mechanical (timeout / rate-limit / infra), same-provider, and the "
+                         "worktree still matches the session (salvage kept the work, or a "
+                         "non-git stage). A content failure (schema violation, real test "
+                         "failure, review rejection) always retries cold. Default off (the "
+                         "design-pass §2 fresh-after-failure default) — this is the opt-in")
     ir.add_argument("--progress-comments", action="store_true",
                     help="post mid-run progress commentary to the driving issue/PR (#64): "
                          "an upserted living comment/PR-body section at each stage boundary "
@@ -466,11 +473,13 @@ def main(argv: list[str] | None = None) -> int:
                              budget_usd=args.budget_usd, route_by_cost=args.route_by_cost,
                              route_by_capacity=args.route_by_capacity,
                              cross_provider_fallback=args.cross_provider_fallback,
+                             warm_retry=args.warm_retry,
                              progress_comments=args.progress_comments)
         _emit({"created_run": run.run_id, "lane": run.lane.value,
                "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
                "route_by_capacity": run.route_by_capacity,
                "cross_provider_fallback": run.cross_provider_fallback,
+               "warm_retry": run.warm_retry,
                "progress_comments": run.progress_comments})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage

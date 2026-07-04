@@ -253,6 +253,17 @@ class Run(BaseModel):
     # this flag. DISTINCT from the within-provider model-chain/rate-limit fallback, which is
     # always on. Additive field: pre-#7 run docs load with the default. Default OFF.
     cross_provider_fallback: bool = False
+    # Warm-retry session policy (#8): when True, a failed attempt's provider session is
+    # REUSED on the retry instead of being discarded. Deliberately narrow — kept ONLY for a
+    # mechanical/environmental failure (timeout / rate-limit / infra-classified), on the SAME
+    # provider, and ONLY when the worktree state still matches the session (salvage kept the
+    # committed work, OR the stage does no checkpoint reset). A content failure (schema
+    # violation, real test failure, review rejection) always retries COLD — its context is as
+    # likely poisoned as useful. Default OFF: the 2026-07-01 design pass (§2) decided
+    # fresh-after-failure is the safe default; this flag is the explicit, bounded opt-in that
+    # trades that safety for cost/latency on shallow failures. Additive field: pre-#8 run docs
+    # load with the default, no SCHEMA_VERSION bump.
+    warm_retry: bool = False
     # Mid-run progress commentary (#64): when True, the engine upserts a living progress
     # comment/PR-body section on the driving issue/PR at each stage boundary (throttled),
     # so a human can follow a long run from GitHub. Outward-facing, so default OFF — a run

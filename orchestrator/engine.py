@@ -189,6 +189,7 @@ class Engine:
         route_by_cost: bool = False,
         route_by_capacity: bool = False,
         cross_provider_fallback: bool = False,
+        warm_retry: bool = False,
         progress_comments: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
@@ -197,14 +198,18 @@ class Engine:
         capacity-aware model downgrade of fresh dispatches under high utilization (#12);
         ``cross_provider_fallback`` enables codex→claude fallthrough when the codex provider is
         persistently out (#7 — the flag is the human's blanket consent, so even a :codex-pinned
-        task falls through under it); ``progress_comments`` opts into mid-run progress
-        commentary on the driving issue/PR (#64 — outward-facing, so default off). All default
-        off; the routers are DISTINCT levers (USD vs rate-limit headroom vs provider outage)."""
+        task falls through under it); ``warm_retry`` opts a failed attempt's session into being
+        REUSED on the retry when the failure was mechanical (#8 — off by design per the
+        2026-07-01 design pass §2, so this is the explicit, bounded opt-in); ``progress_comments``
+        opts into mid-run progress commentary on the driving issue/PR (#64 — outward-facing, so
+        default off). All default off; the routers are DISTINCT levers (USD vs rate-limit
+        headroom vs provider outage vs failed-session reuse)."""
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
             route_by_capacity=route_by_capacity,
             cross_provider_fallback=cross_provider_fallback,
+            warm_retry=warm_retry,
             progress_comments=progress_comments,
         )
         self.store.save_run(run)
@@ -766,11 +771,12 @@ class Engine:
                     task.state = TaskState.RUNNING
                     outcome = "stage_completed"
             else:
-                # Warm retry is deliberately OFF: a failed attempt's session is as
-                # likely poisoned as useful; learnings carry the distilled failure.
-                task.session_ref = None
-                task.session_provider = None
-                outcome = self._handle_failure(task, effective)
+                # Session fate on a failure is decided inside _handle_failure (it has the
+                # infra classification + the salvage decision the warm-retry policy needs).
+                # Default: clear (design pass §2 fresh-after-failure). Warm retry (#8) keeps
+                # it only when the run opted in AND the failure was mechanical AND the
+                # worktree still matches the session — see _settle_failed_session.
+                outcome = self._handle_failure(task, effective, run=run)
 
         # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
         task.stage_counter += 1
@@ -1200,7 +1206,7 @@ class Engine:
         commits = list((salvage or {}).get("commits") or [])
         if not commits:
             return  # nothing committed past the checkpoint — plain reset, no salvage noise
-        salvageable = result.status in SALVAGEABLE_FAILURE_STATUSES or infra_only
+        salvageable = self._work_not_implicated(result, infra_only=infra_only)
         shas = [str(c.get("sha", ""))[:9] for c in commits]
         total = int(salvage.get("count") or len(commits))
         if salvageable and task.salvage_count < self.max_salvage_keeps:
@@ -1241,7 +1247,106 @@ class Engine:
                  "keeps_budget": self.max_salvage_keeps},
             )
 
-    def _handle_failure(self, task: Task, result: StageResult) -> str:
+    @staticmethod
+    def _work_not_implicated(result: StageResult, *, infra_only: bool) -> bool:
+        """Shared #59/#8 predicate: does the failure KIND leave the prior attempt's
+        artifacts trustworthy? True for a mechanical/environmental failure — a TIMEOUT or
+        RATE_LIMITED (``SALVAGEABLE_FAILURE_STATUSES``) or an infra-classified one — where
+        the WORK wasn't the problem; False for a content failure (SCHEMA_VIOLATION, a real
+        test FAILURE, a review rejection) where the produced code/context may BE the defect.
+        Salvage (keep the commits, #59) and warm retry (keep the session, #8) both hang off
+        this one question, so the kind-set lives in exactly one place."""
+        return result.status in SALVAGEABLE_FAILURE_STATUSES or infra_only
+
+    def _settle_failed_session(
+        self, task: Task, result: StageResult, *, run: Run, infra_only: bool, retrying: bool
+    ) -> None:
+        """Decide the fate of a failed attempt's provider session (warm-retry policy #8).
+
+        DEFAULT is to clear it — the 2026-07-01 design pass (§2) decided fresh-after-failure
+        because a failed attempt's context is as likely poisoned as useful, and the learnings
+        already carry the distilled failure forward. Warm retry is the explicit, conservative
+        opt-in: KEEP the session only when ALL of
+
+          (a) the run opted in (``run.warm_retry``);
+          (b) a retry actually follows (``retrying`` — a terminal fail-out reuses nothing);
+          (c) the failure is mechanical/not-content (``_work_not_implicated`` — TIMEOUT,
+              RATE_LIMITED, infra — never a SCHEMA_VIOLATION or a genuine test/review FAILURE);
+          (d) the session's provider matches the provider the retry will route to (no
+              cross-provider warmth — a #7 fallthrough re-routes the stage, so its session
+              won't match and the retry is cold, composing correctly);
+          (e) the WORKTREE still matches what the session remembers — see below.
+
+        The crux (e), worktree/session coupling: a git (checkpoint) stage hard-resets the
+        worktree to the last good checkpoint on retry UNLESS salvage kept the committed work.
+        A warm session WITHOUT that salvage is a trap — the model's conversation remembers
+        edits the reset just threw away. So on a checkpoint stage we keep the session only
+        when salvage kept the work (``task.salvage_in_place``); a non-checkpoint stage (SCOPE
+        / REVIEW — never resets the tree) is always safe. Net: warm session composes WITH
+        salvage on git stages, and stands alone only where no reset can diverge them.
+
+        The transports' session-lost fallback (a stale/gc'd id cold-starts a fresh call inside
+        the same dispatch) remains the safety net if the kept id has since expired."""
+        keep = (
+            retrying
+            and run.warm_retry
+            # There must actually BE a session to carry — else "keep" is a no-op that would
+            # emit a misleading warm_retry_used event (e.g. a deterministic/first stage).
+            and bool(result.session_ref or task.session_ref)
+            and self._work_not_implicated(result, infra_only=infra_only)
+            and self._warm_session_provider_ok(task, result)
+            and self._warm_worktree_ok(task, result)
+        )
+        if not keep:
+            task.session_ref = None
+            task.session_provider = None
+            return
+        # Keep warm. Prefer the failed dispatch's OWN reported ref (the same-stage session it
+        # was mid-work in); if the runner reported none, leave the threaded-in ref in place
+        # (same "no ref reported keeps the prior one" rule as the success path).
+        if result.session_ref:
+            task.session_ref = result.session_ref
+            task.session_provider = result.lane_used.provider
+        kind = result.status.value
+        task.learnings.append(
+            f"{result.stage.value} (attempt {result.attempt}): WARM RETRY — you are resuming "
+            f"the failed attempt's own session, so its conversation context is intact. The "
+            f"failure was {kind} (mechanical, not a content problem), NOT a rejection of the "
+            f"work. Re-verify the prior work already in your worktree before continuing; if the "
+            f"session has expired the tools will simply start fresh."
+        )
+        self.store.append_event(
+            task.run_id,
+            {"ts": _now(), "type": "warm_retry_used", "run_id": task.run_id,
+             "task_id": task.task_id, "stage": result.stage.value, "kind": kind,
+             "attempt": result.attempt,
+             "session_provider": (
+                 task.session_provider.value if task.session_provider else None
+             ),
+             "session_ref": task.session_ref},
+        )
+
+    def _warm_session_provider_ok(self, task: Task, result: StageResult) -> bool:
+        """(d): the session to reuse must be resumable by the retry's lane. The session was
+        produced on ``result.lane_used`` (when the dispatch reported a ref) or carried over
+        from a prior success (``task.session_provider``); the retry routes via the Router
+        (which reflects any #7 fallthrough already recorded). Mirrors next_work's provider
+        gate so the ``warm_retry_used`` event never claims warmth next_work would then drop."""
+        retry_provider = self.router.lane_for(result.stage, task).provider
+        sess_provider = result.lane_used.provider if result.session_ref else task.session_provider
+        return sess_provider in (None, Provider.NONE, retry_provider)
+
+    @staticmethod
+    def _warm_worktree_ok(task: Task, result: StageResult) -> bool:
+        """(e): keep the session only when the retry's worktree will still match it. A
+        checkpoint (git-affecting) stage resets the tree to the last good checkpoint on
+        retry unless salvage kept the work — so require ``salvage_in_place`` there. A
+        non-checkpoint stage never resets the tree, so the session can't have diverged."""
+        if not STAGE_SPECS[result.stage].checkpoint:
+            return True
+        return task.salvage_in_place
+
+    def _handle_failure(self, task: Task, result: StageResult, *, run: Run) -> str:
         failures = None
         if result.structured_output:
             failures = result.structured_output.get("failures")
@@ -1299,6 +1404,7 @@ class Engine:
                  "reset_result": reset_note, "resets_used": task.infra_resets,
                  "resets_budget": self.max_infra_resets},
             )
+            self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
             return "stage_infra_reset_retry"
 
         # Reuse the tested CircuitBreaker over the persisted signature streak.
@@ -1311,8 +1417,11 @@ class Engine:
         if attempts_done >= task.max_attempts or breaker.tripped:
             task.state = TaskState.FAILED
             task.error_signatures = []  # don't carry a poisoned streak into a re-queue
+            # Terminal: no retry follows, so the session is always cleared (retrying=False).
+            self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=False)
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
         task.state = TaskState.RETRYING
+        self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
         return "stage_failed_will_retry"
 
     def _run_infra_reset(self, task: Task) -> str:
