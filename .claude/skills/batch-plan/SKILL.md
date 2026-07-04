@@ -36,6 +36,9 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      `deterministic_stages` — a docs change needs no model test/PR-writing); small mechanical /
      localized → `lite`; risky, cross-cutting, or ambiguous → `full`.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
+   - **Model tier**: for an architecture-heavy / brainstorming-shaped task, suggest pinning the
+     Mythos tier at apply time — `add-task --model fable` (claude-fable-5) — so the design work
+     runs above Opus (#84); leave routine tasks on the role default.
 3. **Write the plan JSON** to a file (schema: `orchestrator/schemas/batch_plan.json`):
    ```json
    {

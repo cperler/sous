@@ -116,6 +116,12 @@ def main(argv: list[str] | None = None) -> int:
     at.add_argument("--estimate", default=None,
                     help="rough size hint (small/medium/large or a USD number) — feeds "
                          "cost-aware lane routing on a route-by-cost run (#34)")
+    at.add_argument("--model", default=None,
+                    help="per-task model pin: a friendly alias (fable/opus/sonnet/haiku) or an "
+                         "exact table id (e.g. gpt-5.5). Overrides the role default on model-lane "
+                         "stages so a heavy-architecture task runs on a higher tier, e.g. "
+                         "'--model fable' (claude-fable-5). Validated against the task's provider "
+                         "at add time (#84)")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -657,12 +663,14 @@ def main(argv: list[str] | None = None) -> int:
         )
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,
-                            deterministic_stages=det, estimate=args.estimate)
+                            deterministic_stages=det, estimate=args.estimate,
+                            model=args.model)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
                "execution_lane": task.execution_lane.value,
-               "depends_on": task.depends_on, "provider_tag": task.provider_tag})
+               "depends_on": task.depends_on, "provider_tag": task.provider_tag,
+               "model_pin": task.model_pin})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
         # the ENGINE lane — #33) run in-process — drain them here so the interactive

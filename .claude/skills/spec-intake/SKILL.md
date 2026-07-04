@@ -38,6 +38,10 @@ the human confirms the plan before anything is created.**
    `id` is a **local** id (t1, t2, …), used only to express `depends_on`; `spec file`
    swaps them for real issue refs. Put full scope + acceptance + out-of-scope in `body` —
    that becomes the issue.
+   - **Model tier is not a spec field.** The spec files issues; a per-task model pin is applied
+     later at `add-task --model fable` (claude-fable-5, #84) when a heavy-architecture task is
+     scheduled onto a run. If a task is design-heavy, note that in its body so the batch step
+     knows to pin the Mythos tier.
    - **Body headings are a contract, not decoration.** Author each task body with markdown
      `##` sections, and give the acceptance criteria their own **`## Acceptance criteria`**
      heading with one bullet per criterion. The conformance gate (step 8) parses that exact

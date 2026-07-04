@@ -9,9 +9,16 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.model_table import DEFAULT_MODEL_TABLE, Role
+from orchestrator.model_table import (
+    DEFAULT_MODEL_TABLE,
+    Role,
+    provider_for_model,
+    resolve_model_alias,
+)
 from orchestrator.routing import Router
 from orchestrator.schemas.enums import ExecutionLane, ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
@@ -82,6 +89,59 @@ def test_ledger_record_prices_known_codex_model(tmp_path: Path) -> None:
     row = ledger.record(_result("gpt-5-codex"))
     assert row["priced"] is True
     assert row["cost_usd"] > 0.0
+
+
+# --- per-task model pin: table-level surface (#84) -----------------------------
+
+def test_fable_row_is_priced_at_the_published_rate() -> None:
+    t = DEFAULT_MODEL_TABLE
+    usage = TokenUsage(input=1_000_000, output=0)
+    assert t.cost_usd("claude-fable-5", usage) == 10.0  # $10/input MTok (2x opus)
+    assert t.cost_usd("claude-fable-5", TokenUsage(input=0, output=1_000_000)) == 50.0
+
+
+def test_fable_is_head_of_the_claude_chain() -> None:
+    t = DEFAULT_MODEL_TABLE
+    # a rate-limited fable dispatch degrades to opus, then down the existing chain
+    assert t.fallback_after("claude-fable-5") == "claude-opus-4-8"
+    assert t.fallback_after("claude-opus-4-8") == "claude-sonnet-4-6"
+
+
+def test_role_defaults_unchanged_by_fable_addition() -> None:
+    t = DEFAULT_MODEL_TABLE
+    # nothing dispatches chain[0] (fable) by default — role defaults stay opus/sonnet/haiku
+    assert t.model_for_role(Role.DEEP_REASON) == "claude-opus-4-8"
+    assert t.model_for_role(Role.REVIEW) == "claude-sonnet-4-6"
+    assert t.model_for_role(Role.CHEAP_SHELL) == "claude-haiku-4-5"
+
+
+def test_resolve_model_alias_maps_friendly_names() -> None:
+    assert resolve_model_alias("fable") == "claude-fable-5"
+    assert resolve_model_alias("opus") == "claude-opus-4-8"
+    assert resolve_model_alias("sonnet") == "claude-sonnet-4-6"
+    assert resolve_model_alias("haiku") == "claude-haiku-4-5"
+    # exact table ids pass through (incl. codex)
+    assert resolve_model_alias("claude-fable-5") == "claude-fable-5"
+    assert resolve_model_alias("gpt-5.5") == "gpt-5.5"
+
+
+def test_resolve_model_alias_unknown_raises_listing_valid_names() -> None:
+    with pytest.raises(ValueError, match="unknown model") as ei:
+        resolve_model_alias("gpt-9000")
+    msg = str(ei.value)
+    assert "fable" in msg and "claude-fable-5" in msg and "gpt-5.5" in msg
+    # the ENGINE sentinel is never a valid pin target
+    assert "engine" not in resolve_model_alias.__doc__  # sanity: doc doesn't advertise it
+    with pytest.raises(ValueError):
+        resolve_model_alias("engine")
+
+
+def test_provider_for_model_classifies_both_providers() -> None:
+    assert provider_for_model("claude-fable-5") is Provider.CLAUDE
+    assert provider_for_model("claude-opus-4-8") is Provider.CLAUDE
+    assert provider_for_model("gpt-5.5") is Provider.CODEX
+    with pytest.raises(ValueError):
+        provider_for_model("mystery-model")
 
 
 def test_next_work_routes_codex_stage_to_codex_model(tmp_path: Path, project) -> None:

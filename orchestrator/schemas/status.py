@@ -71,6 +71,14 @@ class Task(BaseModel):
     title: str = ""
     body: str = ""  # task-source description (e.g. the GitHub issue body) — feeds prompts
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
+    # Per-task model pin (#84): a canonical model id (e.g. "claude-fable-5") that overrides the
+    # role default on a model-lane stage so a brainstorm/heavy-architecture task runs on a higher
+    # tier. Resolved + provider-validated at add_task (an alias like "fable" is normalized to the
+    # id; a codex-tagged task may only pin a codex id, and vice versa). A pin is a STARTING tier,
+    # not an anti-fallback lock — the rate-limit chain still degrades down from it (fable→opus→…)
+    # when the lane allows, and a queued pending_fallback_model takes precedence for that dispatch.
+    # Additive field: pre-#84 task docs load with None, so no SCHEMA_VERSION bump is needed.
+    model_pin: str | None = None
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     # Provenance: the lane preset this task was added under. Sequencing reads

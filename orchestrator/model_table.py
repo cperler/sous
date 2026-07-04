@@ -47,6 +47,11 @@ class Role:
 # on a provider price change the same as the claude rows.
 _MODELS: dict[str, ModelInfo] = {
     # claude
+    # Mythos-tier, above Opus — reachable ONLY via an explicit per-task pin (#84), never a
+    # role default. Price is the published Anthropic API rate ($10/$50 per Mtok, 2x Opus 4.8),
+    # source: platform.claude.com/docs/en/about-claude/models/overview (Claude Fable 5 row,
+    # fetched 2026-07-04).
+    "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0),
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
@@ -85,7 +90,12 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 # cross-provider fallthrough (codex -> claude, #7) lives in the engine, not this table: it is
 # a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
-    Provider.CLAUDE: ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    # fable sits at the HEAD (above opus) so a rate-limited fable pin degrades to opus
+    # naturally (fallback_after('claude-fable-5') == 'claude-opus-4-8'). Nothing dispatches
+    # chain[0] by default — the role defaults below stay opus/sonnet/haiku, and both the
+    # capacity downgrade and rate-limit fallback only walk DOWN the chain, never up into
+    # fable — so fable is reachable only through the per-task model pin (#84).
+    Provider.CLAUDE: ("claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
     # Single-entry chain: no cheaper supported codex tier to degrade to on this plan. A
     # floor rate-limit therefore goes straight to cooldown (or #7 fallthrough if enabled).
     Provider.CODEX: ("gpt-5.5",),
@@ -139,6 +149,42 @@ class ModelTable:
                 continue
             return chain[idx + 1] if idx + 1 < len(chain) else None
         return None
+
+
+# Friendly aliases for the per-task model pin (#84): the human types `--model fable`, not the
+# full table id. Only the claude tiers get short names; codex ids have no alias (a single
+# supported tier) and pass through by their exact id.
+_MODEL_ALIASES: dict[str, str] = {
+    "fable": "claude-fable-5",
+    "opus": "claude-opus-4-8",
+    "sonnet": "claude-sonnet-4-6",
+    "haiku": "claude-haiku-4-5",
+}
+
+
+def provider_for_model(model_id: str) -> Provider:
+    """The provider a resolved model id belongs to — the seam add_task uses to validate a
+    per-task pin against the task's provider tag (a codex-tagged task can't pin a claude id
+    and vice versa, #84). Claude ids are `claude-*`, codex ids are `gpt-*`, ENGINE is NONE."""
+    if model_id.startswith("claude-"):
+        return Provider.CLAUDE
+    if model_id.startswith("gpt-"):
+        return Provider.CODEX
+    if model_id == ENGINE_MODEL:
+        return Provider.NONE
+    raise ValueError(f"cannot classify provider for model id {model_id!r}")
+
+
+def resolve_model_alias(name: str) -> str:
+    """Resolve a friendly alias (`fable`/`opus`/`sonnet`/`haiku`) OR an exact table id (incl.
+    `gpt-5.5`) to a canonical model id. Unknown names raise a ValueError listing every valid
+    name — the single place `--model` input is normalized before it lands on a Task pin."""
+    if name in _MODEL_ALIASES:
+        return _MODEL_ALIASES[name]
+    if name in _MODELS and name != ENGINE_MODEL:
+        return name
+    valid = sorted(set(_MODEL_ALIASES) | (set(_MODELS) - {ENGINE_MODEL}))
+    raise ValueError(f"unknown model {name!r}; valid names: {', '.join(valid)}")
 
 
 DEFAULT_MODEL_TABLE = ModelTable()

@@ -37,7 +37,13 @@ from .learnings_kb import (
 from .learnings_kb import (
     tokenize as _kb_tokenize,
 )
-from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
+from .model_table import (
+    DEFAULT_MODEL_TABLE,
+    ENGINE_MODEL,
+    ModelTable,
+    provider_for_model,
+    resolve_model_alias,
+)
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -244,6 +250,7 @@ class Engine:
         provider_tag: str | None = None,
         deterministic_stages: tuple[Stage, ...] | list[Stage] | None = None,
         estimate: str | float | None = None,
+        model: str | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -265,6 +272,21 @@ class Engine:
         spec = self.project.task_source.resolve(task_id)
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
+        # Per-task model pin (#84): resolve the alias/id, then validate it against the task's
+        # provider BEFORE any state is written — a codex-tagged task may only pin a codex id and
+        # a claude task only a claude id (a mismatched pin would never dispatch). The task's
+        # provider is codex only when tagged so; every other task is claude (the home provider).
+        model_pin: str | None = None
+        if model is not None:
+            model_pin = resolve_model_alias(model)
+            pin_provider = provider_for_model(model_pin)
+            task_provider = Provider.CODEX if tag == "codex" else Provider.CLAUDE
+            if pin_provider is not task_provider:
+                raise ContractError(
+                    f"model pin {model_pin!r} is a {pin_provider.value} model but task "
+                    f"{task_id} is {task_provider.value}-provider "
+                    f"(provider_tag={tag!r}) — pin a {task_provider.value} model instead"
+                )
         run = self.store.load_run(run_id)
         # Cost-aware lane routing (#34): only for an UN-pinned task on a route_by_cost run.
         # An explicit pipeline pin is always honored (never overridden). The decision is
@@ -301,6 +323,7 @@ class Engine:
             title=spec.title,
             body=spec.body,
             provider_tag=tag,
+            model_pin=model_pin,
             issue_number=spec.issue_number,
             depends_on=deps,
             execution_lane=effective_lane,
@@ -434,11 +457,18 @@ class Engine:
             model = ENGINE_MODEL
         else:
             lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
-            # Graceful model fallback: a queued fallback model (set when a prior dispatch of
-            # this stage was rate-limited) overrides the role default so the retry runs on a
-            # cheaper model. Consumed in the commit below.
-            model = task.pending_fallback_model or self.models.model_for_role(
-                spec.model_role, lane.provider
+            # Model resolution precedence for a model-lane stage (highest first):
+            #   1. pending_fallback_model — a rate-limit re-queue already picked the cheaper
+            #      model; it MUST win so the degrade is never undone (fable→opus stays opus).
+            #   2. task.model_pin (#84) — an explicit per-task pin overrides the role default so
+            #      a heavy-architecture task runs on its pinned tier (e.g. claude-fable-5). The
+            #      pin is a STARTING tier, not an anti-fallback lock — the rate-limit chain still
+            #      degrades down from it (fable→opus→…) when lane.allow_fallback permits.
+            #   3. the role default for this provider (opus/sonnet/haiku).
+            model = (
+                task.pending_fallback_model
+                or task.model_pin
+                or self.models.model_for_role(spec.model_role, lane.provider)
             )
             # Capacity-aware downgrade (#12): on a route_by_capacity run, when CURRENT util
             # is in the high band (>= downgrade_threshold, and < the per-call gate that
@@ -446,11 +476,14 @@ class Engine:
             # keep progressing under load. DISTINCT from cost routing (headroom, not USD).
             # Skipped for a rate-limit re-queue (``pending_fallback_model`` already picked
             # the cheaper model — never double-drop; the rate-limit floor/cooldown logic
-            # stays intact) and when the lane disallows fallback (an explicit pin honored).
+            # stays intact), when the lane disallows fallback (an explicit pin honored), and
+            # for a per-task model pin (#84 — an explicit tier choice is honored, same rule as
+            # a pipeline/lane pin; the rate-limit chain may still degrade it, capacity may not).
             # Never silent: every applied downgrade emits ``model_downgraded``.
             if (
                 run.route_by_capacity
                 and task.pending_fallback_model is None
+                and task.model_pin is None
                 and lane.allow_fallback
                 and self.capacity.dispatch_band(util_pct) is DispatchBand.DOWNGRADE
             ):
