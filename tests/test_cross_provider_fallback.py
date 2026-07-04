@@ -93,7 +93,7 @@ def test_codex_runner_maps_provider_unavailable(monkeypatch) -> None:
 def test_provider_unavailable_falls_through_to_claude(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     w = _advance_codex_task_to(eng, Stage.IMPLEMENT)
-    assert w.lane_policy.provider is Provider.CODEX and w.model == "gpt-5-codex"
+    assert w.lane_policy.provider is Provider.CODEX and w.model == "gpt-5.5"
 
     out = eng.record("r1", _codex_result(
         w, status=ResultStatus.PROVIDER_UNAVAILABLE, structured_output={},
@@ -197,19 +197,13 @@ def test_genuine_codex_failure_retries_codex_not_claude(tmp_path, project) -> No
 # --- floor rate-limit with the wait budget exhausted -> fallthrough ----------
 
 def test_rate_limit_floor_exhausted_falls_through(tmp_path, project) -> None:
-    """Walk the codex chain down to its floor via rate-limits, then a floor rate-limit with
-    no wait budget re-routes to claude (same-provider options exhausted)."""
+    """The codex chain is single-entry (gpt-5.5 is head AND floor on the ChatGPT plan), so
+    a floor rate-limit with no wait budget re-routes to claude immediately (same-provider
+    options exhausted on the first rate-limit)."""
     eng = _engine(tmp_path, project, max_rate_limit_waits=0, breaker_threshold=9)
     w = _advance_codex_task_to(eng, Stage.IMPLEMENT)
-    assert w.model == "gpt-5-codex"
-    # rate-limit down the codex chain: gpt-5-codex -> gpt-5 -> gpt-5-mini (within-provider first)
-    for expect in ("gpt-5", "gpt-5-mini"):
-        out = eng.record("r1", _codex_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
-        assert out["outcome"] == "stage_rate_limited_fallback"
-        assert _fallthrough_events(eng) == []          # not yet — still same-provider options
-        w = eng.next_work("r1", "t1")
-        assert w.model == expect and w.lane_policy.provider is Provider.CODEX
-    # at the codex floor (gpt-5-mini) with waits exhausted -> cross-provider fallthrough
+    assert w.model == "gpt-5.5"
+    # at the codex floor (gpt-5.5, single-entry chain) with waits exhausted -> fallthrough
     out = eng.record("r1", _codex_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "provider_fallthrough"
     ev = _fallthrough_events(eng)

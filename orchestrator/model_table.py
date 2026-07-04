@@ -50,7 +50,11 @@ _MODELS: dict[str, ModelInfo] = {
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
     "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
-    # codex (OpenAI) — the ids passed to `codex exec -m`.
+    # codex (OpenAI) — the ids passed to `codex exec -m`. On a ChatGPT-plan account only
+    # gpt-5.5 is accepted (probed live 2026-07-04: gpt-5-codex/gpt-5/gpt-5.5-mini all 400
+    # "not supported when using Codex with a ChatGPT account"). Older ids are kept below
+    # for pricing historical ledger rows, not for dispatch.
+    "gpt-5.5": ModelInfo(id="gpt-5.5", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0),
@@ -67,10 +71,12 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
         Role.REVIEW: "claude-sonnet-4-6",
         Role.CHEAP_SHELL: "claude-haiku-4-5",
     },
+    # Single supported model on the ChatGPT plan (see _MODELS note) — every role pins to
+    # it. Re-tier when the plan (or an API key) exposes distinct codex tiers again.
     Provider.CODEX: {
-        Role.DEEP_REASON: "gpt-5-codex",
-        Role.REVIEW: "gpt-5",
-        Role.CHEAP_SHELL: "gpt-5-mini",
+        Role.DEEP_REASON: "gpt-5.5",
+        Role.REVIEW: "gpt-5.5",
+        Role.CHEAP_SHELL: "gpt-5.5",
     },
 }
 
@@ -80,7 +86,9 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 # a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
     Provider.CLAUDE: ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
-    Provider.CODEX: ("gpt-5-codex", "gpt-5", "gpt-5-mini"),
+    # Single-entry chain: no cheaper supported codex tier to degrade to on this plan. A
+    # floor rate-limit therefore goes straight to cooldown (or #7 fallthrough if enabled).
+    Provider.CODEX: ("gpt-5.5",),
 }
 
 # Back-compat alias: the claude chain (the default lane). fallback_after searches all
