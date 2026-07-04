@@ -81,7 +81,7 @@ def _engine(args: argparse.Namespace) -> Engine:
 
     root = _resolve_store_root(Path(args.root), getattr(args, "run", None))
     root.mkdir(parents=True, exist_ok=True)
-    if str(root) != str(args.root):
+    if root != Path(args.root):
         # Never silent: state the nesting so the operator sees where the store landed.
         print(
             f"note: --root {args.root!s} is a shared runs-root; nesting this run's "
