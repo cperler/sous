@@ -28,10 +28,16 @@ process CWD (``.``) when absent (#42: don't bind git to the orchestrator's CWD).
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
 
+from orchestrator.port_registry import (
+    port_env_for,
+    project_needs_ports,
+    registry_for_project,
+)
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
@@ -80,6 +86,11 @@ class DeterministicSetupRunner:
             from .deterministic_deliver import DeterministicDeliverRunner
 
             return DeterministicDeliverRunner(self._project).dispatch(work)
+        # #5: allocate this task's per-task port block AT INTAKE (where the worktree is
+        # created), so every later stage's dev/test server binds a slice unique to the task.
+        # Best-effort and opt-in: a project without port needs (no port_env/needs_ports)
+        # gets None and nothing is recorded — a clean no-op.
+        ports = self._allocate_ports(work)
         override = getattr(self._project, "setup_task", None)
         try:
             if callable(override):
@@ -91,7 +102,9 @@ class DeterministicSetupRunner:
                     else None
                 )
             else:
-                out, checkpoint = self._git_setup(work)
+                out, checkpoint = self._git_setup(work, ports)
+            if ports is not None:
+                out["port_base"], out["port_count"] = ports
         except Exception as exc:  # noqa: BLE001 - every dispatch MUST yield a StageResult,
             # never an escaped exception (a _git timeout / stale index.lock, or a raising
             # project setup_task, would otherwise leave the dispatch lease held with no CLI
@@ -103,7 +116,22 @@ class DeterministicSetupRunner:
         return to_stage_result(work, raw, ResultStatus.SUCCESS,
                                mode=ExecutionMode.ENGINE, provider=Provider.NONE)
 
-    def _git_setup(self, work: WorkItem) -> tuple[dict, dict | None]:
+    def _allocate_ports(self, work: WorkItem) -> tuple[int, int] | None:
+        """Reserve this task's contiguous port block (#5), returning ``(base, count)`` or
+        None. No-op + None when the project doesn't opt in (``project_needs_ports``), the
+        range is exhausted, or anything raises — port allocation must never break intake."""
+        if not project_needs_ports(self._project):
+            return None
+        try:
+            reg = registry_for_project(self._project)
+            base = reg.allocate(work.run_id, work.task_id, pid=os.getpid())
+        except Exception:  # noqa: BLE001 - allocation is best-effort; never fail setup
+            return None
+        return (base, reg.block_size) if base is not None else None
+
+    def _git_setup(
+        self, work: WorkItem, ports: tuple[int, int] | None = None
+    ) -> tuple[dict, dict | None]:
         # #42: discover the project repo from an EXPLICIT path the project supplies
         # (``ProjectConfig.repo_root`` — optional, duck-typed), not process CWD. The
         # documented fallback is "." (process CWD) so existing callers that run the
@@ -134,7 +162,10 @@ class DeterministicSetupRunner:
         # separate regressions-you-introduced from inherited red — deterministically,
         # not by model judgment. baseline_captured is honest: True only when the test
         # command really ran to completion here.
-        baseline = self._capture_baseline(worktree)
+        # #5: capture the baseline with the task's port block exported, so a suite that boots
+        # a server binds this task's ports even at the intake baseline run.
+        port_env = port_env_for(self._project, *ports) if ports else None
+        baseline = self._capture_baseline(worktree, port_env)
         out = {
             "branch": branch,
             "worktree": str(worktree),
@@ -198,11 +229,12 @@ class DeterministicSetupRunner:
             return None
         return Path(gd.stdout.strip()) / install_cache.MARKER_NAME
 
-    def _capture_baseline(self, worktree: Path) -> dict:
+    def _capture_baseline(self, worktree: Path, port_env: dict[str, str] | None = None) -> dict:
         """Run ``test_unit_cmd`` at base and classify the failures (via the project's
         classifier when present). Never fatal: a missing/no-op command, a timeout, or an
         unrunnable suite yields ``captured: False`` with the reason in the note — an
-        HONEST miss, never a fabricated baseline."""
+        HONEST miss, never a fabricated baseline. ``port_env`` (#5) is merged over the
+        process env so the baseline run uses the task's port block."""
         getter = getattr(self._project, "test_unit_cmd", None)
         try:
             argv = getter() if callable(getter) else None
@@ -210,9 +242,10 @@ class DeterministicSetupRunner:
             argv = None
         if not argv or argv == ["true"]:  # the no-op sentinel
             return {"captured": False, "failures": [], "note": "n/a (no unit-test command)"}
+        env = {**os.environ, **port_env} if port_env else None
         try:
             proc = subprocess.run(  # noqa: S603
-                argv, cwd=worktree, capture_output=True, text=True, timeout=900
+                argv, cwd=worktree, capture_output=True, text=True, timeout=900, env=env
             )
         except subprocess.TimeoutExpired:
             return {"captured": False, "failures": [], "note": "baseline run timed out (900s)"}

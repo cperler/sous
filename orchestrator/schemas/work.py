@@ -129,6 +129,14 @@ class WorkItem(BaseModel):
     # otherwise. NEVER a channel for correctness the prompt lacks — a convenience so a
     # script doesn't have to re-parse its own rendered prompt.
     context: dict | None = None
+    # Extra environment variables to export into the stage's subprocess (#5: per-task port
+    # block — ORCHESTRATOR_PORT_BASE/COUNT/PORT + any project-specific names). The runner
+    # merges these OVER the inherited process env when it shells the model CLI / test
+    # commands, so parallel worktrees don't collide on fixed dev/test-server ports. Engine-
+    # derived from the same durable task context the prompt is (the folded port_base), so —
+    # like cwd/context — it is excluded from content_hash: it never changes a dispatch's
+    # identity. None (the default) means "inherit the process env unchanged".
+    env: dict[str, str] | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -153,6 +161,7 @@ class WorkItem(BaseModel):
         reset_to: str | None = None,
         salvage_anchor: str | None = None,
         context: dict | None = None,
+        env: dict[str, str] | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -182,6 +191,7 @@ class WorkItem(BaseModel):
             reset_to=reset_to,
             salvage_anchor=salvage_anchor,
             context=context,
+            env=env,
             created_at=created_at,
         )
 

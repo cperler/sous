@@ -29,7 +29,7 @@ from pathlib import PurePosixPath
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from .transport import RawResult, _git, _tag_head, to_stage_result
+from .transport import RawResult, _git, _tag_head, subprocess_env, to_stage_result
 
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
 
@@ -118,6 +118,9 @@ class DeterministicTestRunner:
         caused_kinds: set[str] = set()
         inherited_count = 0
         notes: list[str] = []
+        # #5: export the task's per-task port block into the test subprocess so a suite that
+        # boots a dev/test server binds THIS task's ports, never a sibling worktree's.
+        proc_env = subprocess_env(work)
 
         # #41: classify the change deterministically (git diff of base_sha..worktree). A
         # docs-only change has no behavioral surface, so a full test run is wasted effort —
@@ -157,7 +160,8 @@ class DeterministicTestRunner:
         for label, argv in commands:
             try:
                 proc = subprocess.run(  # noqa: S603
-                    argv, cwd=work.cwd, capture_output=True, text=True, timeout=self._timeout_s
+                    argv, cwd=work.cwd, capture_output=True, text=True,
+                    timeout=self._timeout_s, env=proc_env,
                 )
             except subprocess.TimeoutExpired:
                 caused.append(f"<{label} timeout>")

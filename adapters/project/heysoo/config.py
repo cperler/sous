@@ -83,6 +83,20 @@ class HeysooConfig:
             return _ROSTER[role]
         return None
 
+    # --- per-task port block (#5) ----------------------------------------------
+    def port_env(self, base: int, count: int) -> dict[str, str]:
+        """Reference port-injection hook (#5): the presence of this method is heysoo's
+        opt-IN. Maps the engine's per-task port BLOCK onto the env vars the reference
+        e2e-smoke.sh consumes — ``REACT_PORT`` (the Vite dev server ``npx vite --port``)
+        and ``HEYSOO_REACT_URL`` (the Playwright ``baseURL``) — so two tasks running the
+        e2e suite in parallel worktrees each drive their own Vite instead of colliding on
+        :5173. The block base is the dev-server port; the rest of the block is headroom for
+        additional servers a spec might boot."""
+        return {
+            "REACT_PORT": str(base),
+            "HEYSOO_REACT_URL": f"http://localhost:{base}",
+        }
+
     def schema_for(self, ref: str) -> dict | None:
         # Inherit the engine's canonical stage-output contracts (gives codex full-validation).
         return resolve_stage_schema(ref)

@@ -253,8 +253,9 @@ def test_claude_streaming_path_uses_stream_json_and_parses_result_event(
 ) -> None:
     seen: dict = {}
 
-    def fake_run_teed(argv, *, timeout, cwd, tee_path):
+    def fake_run_teed(argv, *, timeout, cwd, tee_path, env=None):
         seen["argv"] = argv
+        seen["env"] = env
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(_STREAM_JSON, encoding="utf-8")
         return 0, _STREAM_JSON, ""
@@ -272,7 +273,7 @@ def test_claude_streaming_path_uses_stream_json_and_parses_result_event(
 def test_claude_streaming_path_no_result_event_is_a_transport_error(tmp_path, monkeypatch) -> None:
     partial = _ASSISTANT_BASH + "\n"  # a killed stream: assistant turns but no result event
 
-    def fake_run_teed(argv, *, timeout, cwd, tee_path):
+    def fake_run_teed(argv, *, timeout, cwd, tee_path, env=None):
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(partial, encoding="utf-8")
         return 0, partial, ""

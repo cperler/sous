@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 import tempfile
 import threading
@@ -305,7 +306,8 @@ def stream_teeing_transport(inner: Transport, run_log_root: str | Path | None) -
 
 
 def _run_teed(
-    argv: list[str], *, timeout: float | None, cwd: str | None, tee_path: Path
+    argv: list[str], *, timeout: float | None, cwd: str | None, tee_path: Path,
+    env: dict[str, str] | None = None,
 ) -> tuple[int, str, str]:
     """Run ``argv`` (Popen), teeing stdout to ``tee_path`` as it streams in. Returns
     ``(returncode, full_stdout, full_stderr)``. Raises ``subprocess.TimeoutExpired`` on
@@ -319,7 +321,7 @@ def _run_teed(
         tee = None
     # Popen raises FileNotFoundError here for a missing binary (as subprocess.run does).
     proc = subprocess.Popen(  # noqa: S603
-        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd
+        argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env
     )
     stderr_box: dict[str, str] = {"data": ""}
 
@@ -454,6 +456,16 @@ def _codex_usage(events_stdout: str) -> TokenUsage:
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,  # noqa: S603, S607
                           text=True, timeout=60)
+
+
+def subprocess_env(work: WorkItem) -> dict[str, str] | None:
+    """The environment a stage's subprocess runs with: the inherited process env with the
+    WorkItem's per-task ``env`` merged OVER it (#5 port injection), or ``None`` to inherit
+    unchanged when the WorkItem carries no extra env (the common, no-ports case)."""
+    extra = getattr(work, "env", None)
+    if not extra:
+        return None
+    return {**os.environ, **extra}
 
 
 def _reset_worktree(cwd: str | None, ref: str) -> str | None:
@@ -658,6 +670,9 @@ def claude_cli_transport(
                       + (f" --agent {work.agent}" if work.agent else "")
                       + (f" --resume {session_ref}" if session_ref else ""))
 
+        # #5: per-task port block injected into the CLI subprocess (the model runs the
+        # project's tests, which boot dev/test servers), so parallel worktrees don't collide.
+        proc_env = subprocess_env(work)
         stream_files: dict | None = None
         try:
             if streaming:
@@ -665,12 +680,12 @@ def claude_cli_transport(
                     work.stage.value, work.attempt
                 )
                 returncode, stdout, stderr = _run_teed(
-                    argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path
+                    argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
                 )
                 stream_files = _streaming_stream_files(root, work, stdout, stderr)
             else:
                 proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
-                                      timeout=work.timeout_s, cwd=work.cwd)
+                                      timeout=work.timeout_s, cwd=work.cwd, env=proc_env)
                 returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except FileNotFoundError as exc:  # pragma: no cover - env dependent
             return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
@@ -777,6 +792,7 @@ def codex_cli_transport(*, run_log_root: str | Path | None = None) -> Transport:
             argv = ["codex", "exec", "-m", work.model, "--full-auto", "--skip-git-repo-check",
                     *add_dir, "--json", "--output-last-message", str(last), work.prompt]
             invocation = f"codex exec --json (model {work.model})"
+            proc_env = subprocess_env(work)  # #5: per-task port block for the codex subprocess
             stream_files: dict | None = None
             try:
                 if root is not None:
@@ -784,12 +800,12 @@ def codex_cli_transport(*, run_log_root: str | Path | None = None) -> Transport:
                         work.stage.value, work.attempt
                     )
                     returncode, stdout, stderr = _run_teed(
-                        argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path
+                        argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
                     )
                     stream_files = _streaming_stream_files(root, work, stdout, stderr)
                 else:
                     proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
-                                          timeout=work.timeout_s, cwd=work.cwd)
+                                          timeout=work.timeout_s, cwd=work.cwd, env=proc_env)
                     returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
             except FileNotFoundError as exc:  # pragma: no cover - env dependent
                 return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)

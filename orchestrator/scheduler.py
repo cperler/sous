@@ -108,6 +108,10 @@ class Scheduler:
         """
         consecutive_failures = 0
         stale_sent: set[str] = set()
+        # #5: reclaim any port blocks left behind by crashed/terminal runs before we start
+        # dispatching, so this batch doesn't starve on ports a dead run never released.
+        # Best-effort + opt-in (a no-op for projects without port needs).
+        self.engine.reclaim_stale_ports(run_id)
         for _ in range(max_ticks):
             if self.engine.store.load_run(run_id).state.value == "paused":
                 break  # human-gated: unpause first

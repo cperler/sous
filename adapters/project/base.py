@@ -107,6 +107,24 @@ class ProjectConfig(Protocol):
     # pins deps in a file that list misses. A ``list[str]`` or a zero-arg callable → list.
     #   lockfiles: list[str]
 
+    # Optional (duck-typed, no CONTRACT_VERSION bump), same pattern as repo_root/lockfiles:
+    # per-task PORT injection (#5). Parallel tasks run in isolated worktrees but collide on
+    # fixed dev/test-server ports; the engine allocates each task a contiguous port BLOCK
+    # (orchestrator.port_registry) and exports it into every stage subprocess. Opt IN either
+    # way:
+    #   port_env(base: int, count: int) -> dict[str, str]
+    #       Translate the block into THIS project's server env vars (e.g. heysoo maps base →
+    #       REACT_PORT + HEYSOO_REACT_URL). Merged OVER the generic vars the engine always
+    #       exports (ORCHESTRATOR_PORT_BASE / ORCHESTRATOR_PORT_COUNT / PORT). Its mere
+    #       presence is the opt-in.
+    #   needs_ports: bool
+    #       A truthy attribute opts in WITHOUT a translation hook — the task then sees only
+    #       the generic ORCHESTRATOR_PORT_* / PORT vars.
+    # Absent both, port allocation is a clean no-op for that project (no registry file, no
+    # events, no env). Further optional knobs, if the defaults (range 42000-42999, block 10,
+    # host-shared temp file) don't fit: ``port_range: tuple[int, int]``,
+    # ``port_block_size: int``, ``port_registry_path: str``. Same-host scope only.
+
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]: ...

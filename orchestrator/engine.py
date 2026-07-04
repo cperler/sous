@@ -9,6 +9,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 
 from __future__ import annotations
 
+import contextlib
 import re
 import subprocess
 import time
@@ -25,6 +26,11 @@ from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
+from .port_registry import (
+    port_env_for,
+    project_needs_ports,
+    registry_for_project,
+)
 from .render import (
     format_review_issue,
     render_completion_note,
@@ -501,6 +507,12 @@ class Engine:
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
             context=self._deterministic_context(task) if deterministic else None,
+            # #5: the task's per-task port block, exported into the stage subprocess (BOTH
+            # the model CLI and the deterministic test runner) so parallel worktrees don't
+            # collide on dev/test-server ports. None until intake has allocated a block (and
+            # for projects that don't opt in) — a clean no-op there. Hash-excluded: derived
+            # from the same durable context (port_base) the prompt is.
+            env=self._port_env_for_task(task),
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -825,12 +837,30 @@ class Engine:
                  "stage": result.stage.value,
                  "reason": scope_blocked_reason or task.last_error or outcome},
             )
+        # #5: audit the port block intake just allocated (it folded port_base into the
+        # context plane via CONTEXT_KEYS[INTAKE]); the engine is the event authority, the
+        # adapter does the allocation. Only on a fresh INTAKE success that carries a block.
+        if (
+            result.stage is Stage.INTAKE
+            and effective.status is ResultStatus.SUCCESS
+            and (pb := task.context.get("port_base")) is not None
+        ):
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "ports_allocated", "run_id": run_id,
+                 "task_id": result.task_id, "port_base": pb,
+                 "port_count": task.context.get("port_count")},
+            )
         # Post-transition run-level effects: cascade-block dependents of a failed task,
         # mark_complete + finalize the run when everything is terminal.
         if task.state is TaskState.FAILED:
             self._cascade_from(run_id, result.task_id)
         if task.state is TaskState.COMPLETED:
             self._on_task_completed(run_id, task)
+        # #5: a terminal task's worktree is done with its ports — release the block so a
+        # later task can reuse it. Best-effort (wrapped in the helper); never breaks finalize.
+        if task.state in TERMINAL_TASK_STATES:
+            self._release_ports(run_id, task)
         self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
@@ -1548,8 +1578,10 @@ class Engine:
             )
         # Out-of-band transition (like approve/hold, not via record()), so it must perform
         # record()'s post-transition run-level effects itself: cascade-block dependents of
-        # the now-closed task and finalize the run so it closes instead of staying open.
+        # the now-closed task, release its port block (#5, best-effort), and finalize the run
+        # so it closes instead of staying open.
         self._cascade_from(run_id, task_id)
+        self._release_ports(run_id, task)
         self._maybe_finalize_run(run_id)
         return task
 
@@ -1751,6 +1783,70 @@ class Engine:
         if task.pr_number is not None:
             ctx.setdefault("pr_number", task.pr_number)
         return ctx
+
+    def _port_env_for_task(self, task: Task) -> dict[str, str] | None:
+        """The per-task port env (#5) to export into this task's stage subprocess, or None.
+        Sourced from the intake-folded ``port_base``/``port_count`` context keys; a clean
+        None before intake allocates OR when the project doesn't opt into ports."""
+        base = (task.context or {}).get("port_base")
+        if base is None or not project_needs_ports(self.project):
+            return None
+        try:
+            count = int((task.context or {}).get("port_count") or 0)
+            return port_env_for(self.project, int(base), count)
+        except (TypeError, ValueError):
+            return None
+
+    def _release_ports(self, run_id: str, task: Task) -> None:
+        """Best-effort release of a terminal task's port block (#5). Guarded on the task
+        actually holding one (``port_base`` in context) so a no-op project never touches the
+        registry, and fully wrapped: releasing ports must NEVER break task finalize."""
+        if (task.context or {}).get("port_base") is None:
+            return
+        try:
+            registry_for_project(self.project).release(run_id, task.task_id)
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "ports_released", "run_id": run_id,
+                 "task_id": task.task_id, "port_base": task.context.get("port_base")},
+            )
+        except Exception as exc:  # noqa: BLE001 - release is best-effort; never break finalize
+            with contextlib.suppress(Exception):
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "ports_release_failed", "run_id": run_id,
+                     "task_id": task.task_id, "error": str(exc)},
+                )
+
+    def reclaim_stale_ports(self, run_id: str | None = None) -> int:
+        """Free port blocks left by crashed/terminal runs (#5) — called at scheduler
+        startup. Host-wide (it prunes EVERY run's stale blocks, not just ``run_id``): a
+        block is stale when its task is terminal in its status store, its owning pid is
+        gone, or it has aged past the registry TTL. Opt-in + best-effort: a no-op for a
+        project without port needs, and a swallowed error for anything that raises."""
+        if not project_needs_ports(self.project):
+            return 0
+
+        def _is_terminal(rid: str, tid: str) -> bool:
+            try:
+                return self.store.load_task(rid, tid).state in TERMINAL_TASK_STATES
+            except Exception:  # noqa: BLE001 - an unloadable run is left to pid/TTL to reclaim
+                return False
+
+        try:
+            freed = registry_for_project(self.project).reclaim_stale(_is_terminal)
+        except Exception:  # noqa: BLE001 - reclaim is best-effort startup hygiene
+            return 0
+        if freed and run_id is not None:
+            with contextlib.suppress(Exception):
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "ports_reclaimed", "run_id": run_id,
+                     "count": len(freed),
+                     "blocks": [{"run_id": a.run_id, "task_id": a.task_id, "base": a.base}
+                                for a in freed[:20]]},
+                )
+        return len(freed)
 
     def _project_commands(self) -> dict[str, str]:
         """The project's stable shell commands, folded into the prompt's cache-stable
