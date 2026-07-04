@@ -174,14 +174,25 @@ def watch_statusline(
 ) -> None:
     """Clear-screen + reprint the statusline every ``interval`` seconds until interrupted (#79).
 
-    For supervising a batch run from a standalone terminal: a 30-60s poll amortizes over the
-    2-min usage cache (``read_usage`` serves the cached value between probes) while keeping the
-    display fresh. Mirrors ``dashboard.render_watch``'s injected-sleeper pattern so it is drivable
-    without real sleeping: ``sleeper`` is ``time.sleep`` in production and a stub in tests, and a
-    ``KeyboardInterrupt`` from anywhere (Ctrl-C, or a test sleeper that raises to stop) ends the
-    loop cleanly. ``max_iters`` bounds it for tests; ``clear`` defaults to an ANSI clear. On a probe
-    miss the line is a quiet placeholder rather than an empty screen, so the terminal still shows
-    the poll is live."""
+    Intended for supervising a batch run from a standalone terminal: a 30-60s poll amortizes over
+    the 2-min usage cache (``read_usage`` serves the cached value between probes) while keeping the
+    display fresh.
+
+    Mirrors ``dashboard.render_watch``'s injected-sleeper pattern so every dependency is
+    drivable in tests without real I/O:
+
+    - ``emit`` — output sink; ``print`` in production, a list-appending stub in tests.
+    - ``sleeper`` — ``time.sleep`` in production; a stub (or one that raises ``KeyboardInterrupt``
+      to stop the loop) in tests.
+    - ``reader`` — resolved at call time (not bound as a default) so the CLI path is
+      monkeypatchable; defaults to ``read_usage``.
+    - ``clear`` — defaults to emitting an ANSI full-clear escape; supply a no-op in tests.
+    - ``max_iters`` — bounds the loop for tests; ``None`` means run until interrupted.
+
+    A ``KeyboardInterrupt`` from any injected callable (Ctrl-C in production, or a test sleeper
+    that raises to stop) ends the loop cleanly — the exception is swallowed, not propagated. On a
+    probe miss the line is a quiet placeholder rather than a blank screen, so the terminal still
+    shows the poll is alive."""
     if reader is None:
         reader = read_usage
     if clear is None:
