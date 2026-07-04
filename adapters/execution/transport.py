@@ -99,19 +99,29 @@ def is_rate_limited(raw: RawResult) -> bool:
 # (FileNotFoundError, mapped by the transports). Kept narrow + auth-specific on purpose:
 # these markers appear in the CLI's own stderr, never in a task's test output, so they can't
 # reclassify a genuine failure. Case-insensitive.
+#
+# The trailing block is model-availability / plan-mismatch phrasing (#80): a provider that
+# refuses the CONFIGURED model outright — e.g. codex's 400 "The 'gpt-5-codex' model is not
+# supported when using Codex with a ChatGPT account". Like the auth markers, this is a
+# provider/config-level refusal the task's content can't influence, so falling through to
+# claude is exactly right; it's kept narrow to the "model … not supported" wording (not a bare
+# "invalid_request_error", which could ride a genuine bad request) so a real failure is never
+# reclassified.
 _PROVIDER_UNAVAILABLE_MARKERS = (
     "not logged in", "not authenticated", "unauthorized", "401 unauthorized",
     "authentication failed", "authentication error", "invalid api key", "missing api key",
     "no api key", "expired token", "token expired", "please log in", "please login",
     "run `codex login`", "codex login", "openai_api_key",
+    "model is not supported", "is not supported when using",
 )
 
 
 def is_provider_unavailable(raw: RawResult) -> bool:
-    """True if a RawResult signals the PROVIDER is out (CLI binary missing → exit 127, or an
-    auth/login failure in stderr) rather than the task itself failing. The engine treats this
-    as ``PROVIDER_UNAVAILABLE`` and — on an opted-in run — cross-provider-falls-through to
-    claude (#7). Deliberately narrow so a real task failure is never reclassified."""
+    """True if a RawResult signals the PROVIDER is out (CLI binary missing → exit 127, an
+    auth/login failure, or a configured-model-not-available refusal in the error) rather than
+    the task itself failing. The engine treats this as ``PROVIDER_UNAVAILABLE`` and — on an
+    opted-in run — cross-provider-falls-through to claude (#7). Deliberately narrow so a real
+    task failure is never reclassified."""
     if raw.exit_code == 127:  # FileNotFoundError: the CLI binary isn't installed
         return True
     text = (raw.error or "").lower()
@@ -642,6 +652,35 @@ def _codex_schema_rejected(raw: RawResult) -> bool:
     return any(m in text for m in _SCHEMA_REJECTED_MARKERS)
 
 
+def _codex_failure_cause(events_stdout: str) -> str | None:
+    """The real failure cause from a codex ``--json`` event stream — the ``turn.failed`` event's
+    ``error.message`` (or a top-level ``{"type":"error", "message": …}`` event). codex reports a
+    provider-side refusal (e.g. an HTTP 400 "model is not supported when using Codex with a
+    ChatGPT account") ONLY on this stdout event stream; stderr carries just banners/warnings (the
+    ``--full-auto`` deprecation notice). Surfacing this into ``RawResult.error`` lets the verdict's
+    rate-limit / provider-unavailable classification (and the ledger) see the actual cause instead
+    of an innocuous stderr excerpt (#80). Returns the LAST such message seen, or None when the
+    stream reported no failure event."""
+    cause: str | None = None
+    for line in events_stdout.splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        if ev.get("type") == "turn.failed":
+            err = ev.get("error")
+            if isinstance(err, dict) and isinstance(err.get("message"), str) and err["message"]:
+                cause = err["message"]
+        elif ev.get("type") == "error" and isinstance(ev.get("message"), str) and ev["message"]:
+            cause = ev["message"]
+    return cause
+
+
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,  # noqa: S603, S607
                           text=True, timeout=60)
@@ -1152,9 +1191,18 @@ def codex_cli_transport(
                     structured = json.loads(txt)
                 except json.JSONDecodeError:
                     structured = None
+            error = None
+            if returncode:
+                # Prefer the event stream's failure cause (the real provider refusal — e.g. a 400
+                # "model is not supported") over the stderr excerpt, which is often just a banner
+                # (the `--full-auto` deprecation warning). This is what the verdict classifies on
+                # and what lands on the ledger (#80).
+                error = (_codex_failure_cause(stdout) or stderr.strip() or None)
+                if error:
+                    error = error[:500]
             return RawResult(structured, usage=_codex_usage(stdout), raw_output=stdout,
                              raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
-                             error=(stderr.strip()[:500] or None) if returncode else None,
+                             error=error,
                              invocation=invocation, session_ref=_codex_session_id(stdout))
 
     def run(work: WorkItem) -> RawResult:

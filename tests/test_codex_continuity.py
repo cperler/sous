@@ -13,7 +13,12 @@ import json
 import subprocess
 from pathlib import Path
 
-from adapters.execution.transport import RawResult, codex_cli_transport, to_stage_result
+from adapters.execution.transport import (
+    RawResult,
+    codex_cli_transport,
+    is_provider_unavailable,
+    to_stage_result,
+)
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import (
@@ -121,6 +126,64 @@ def test_non_session_resume_error_fails_normally(monkeypatch) -> None:
 
     assert len(calls) == 1  # a non-session error is NOT retried cold (mirrors the claude path)
     assert raw.exit_code == 1 and "model not available" in raw.error
+
+
+# --- #80: the real provider refusal lives on the stdout event stream, not stderr ---------
+
+# The exact live-20260704 codex stream for task #68: a 400 "model is not supported" that codex
+# reports ONLY via the `error`/`turn.failed` events; stderr carried just the deprecation banner.
+_MODEL_UNSUPPORTED_400 = json.dumps({
+    "type": "error", "status": 400,
+    "error": {"type": "invalid_request_error",
+              "message": "The 'gpt-5-codex' model is not supported when using Codex "
+                         "with a ChatGPT account."},
+})
+_LIVE_UNSUPPORTED_STREAM = "\n".join([
+    json.dumps({"type": "thread.started", "thread_id": "019f2d7f-f83d"}),
+    json.dumps({"type": "item.completed", "item": {
+        "id": "item_0", "type": "error",
+        "message": "Model metadata for `gpt-5-codex` not found. Defaulting to fallback metadata; "
+                   "this can degrade performance and cause issues."}}),
+    json.dumps({"type": "turn.started"}),
+    json.dumps({"type": "error", "message": _MODEL_UNSUPPORTED_400}),
+    json.dumps({"type": "turn.failed", "error": {"message": _MODEL_UNSUPPORTED_400}}),
+])
+_LIVE_UNSUPPORTED_STDERR = ("warning: `--full-auto` is deprecated; use `--sandbox "
+                            "workspace-write` instead.\nReading additional input from stdin...")
+
+
+def test_codex_surfaces_stream_failure_cause_into_error(monkeypatch) -> None:
+    """The 400 'model is not supported' lands on the event stream; the innocuous deprecation
+    warning is all stderr carries. The transport must surface the STREAM cause onto
+    ``RawResult.error`` so the verdict/ledger see the real refusal (#80)."""
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _queue_codex_fake(calls, [{
+        "structured": None, "returncode": 1,
+        "stdout": _LIVE_UNSUPPORTED_STREAM, "stderr": _LIVE_UNSUPPORTED_STDERR,
+    }]))
+
+    raw = codex_cli_transport()(_work())
+
+    assert raw.exit_code == 1
+    # the real cause is surfaced, NOT the deprecation banner
+    assert "model is not supported" in raw.error
+    assert "--full-auto" not in raw.error
+    # and it classifies as the provider being out, not a task failure
+    assert is_provider_unavailable(raw)
+
+
+def test_codex_error_falls_back_to_stderr_without_a_stream_cause(monkeypatch) -> None:
+    """When the stream carries no failure event, the stderr excerpt is still used (unchanged
+    behavior) — the stream-cause preference only kicks in when there IS a cause to prefer."""
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _queue_codex_fake(calls, [{
+        "structured": None, "returncode": 1, "stdout": "", "stderr": "boom: tests failed",
+    }]))
+
+    raw = codex_cli_transport()(_work())
+
+    assert raw.exit_code == 1 and raw.error == "boom: tests failed"
+    assert not is_provider_unavailable(raw)
 
 
 # --- provider-tagging: a claude ref is never fed to codex --------------------------------
