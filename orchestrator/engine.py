@@ -38,6 +38,7 @@ from .retry import CircuitBreaker, error_signature
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
     LANE_STAGES,
+    TERMINAL_RUN_STATES,
     TERMINAL_TASK_STATES,
     ExecutionLane,
     ExecutionMode,
@@ -1266,7 +1267,17 @@ class Engine:
         tasks = [self.store.load_task(run_id, ref.task_id) for ref in run.task_refs]
         events = self.store.read_events(run_id)
         stage_logs = {t.task_id: self.store.read_stage_logs(t.task_id) for t in tasks}
-        return build_retrospective(run, tasks, events, stage_logs)
+        # #67: annotate any deliberately-closed (CLOSED_INFEASIBLE) tasks with the reason
+        # read BACK from the durable rejection artifact, so a mixed failure+rejection run's
+        # retrospective separates human closes from execution failures instead of ignoring
+        # them. Rejection-only runs never reach here (they finalize COMPLETED_WITH_REJECTIONS,
+        # which does not emit a retrospective) — this only enriches genuinely-failed runs.
+        rejections = {}
+        for t in tasks:
+            if t.state is TaskState.CLOSED_INFEASIBLE:
+                record = self.store.load_rejection(run_id, t.task_id) or {}
+                rejections[t.task_id] = {"title": t.title, "reason": record.get("reason")}
+        return build_retrospective(run, tasks, events, stage_logs, rejections=rejections)
 
     def status(self, run_id: str, *, stale_after_s: int = 1800) -> dict:
         run = self.store.load_run(run_id)
@@ -1314,7 +1325,7 @@ class Engine:
         # ledger. It is produced at run finalize and on demand via the `cost-report` CLI.
         # A poll of an already-terminal run just recreated a cost-artifact lock; sweep it
         # (safe only because the run is terminal — a mid-run poll leaves live locks alone).
-        if run.state in (RunState.COMPLETED, RunState.FAILED):
+        if run.state in TERMINAL_RUN_STATES:
             self.store.sweep_locks()
         return {
             "run_id": run_id,
@@ -1560,16 +1571,23 @@ class Engine:
         run = self.store.load_run(run_id)
         if not run.task_refs or not all(r.state in TERMINAL_TASK_STATES for r in run.task_refs):
             return
-        # A run whose tasks are all terminal but at least one did NOT complete cleanly is
-        # finalized FAILED at the run level — there is no distinct run state for "closed as
-        # infeasible", and marking such a run COMPLETED would falsely read as "all shipped".
-        # The TASK state still distinguishes CLOSED_INFEASIBLE (a deliberate human close)
-        # from FAILED (an execution failure); this is only the coarse run-level rollup.
-        any_not_completed = any(
-            r.state in (TaskState.FAILED, TaskState.CASCADE_BLOCKED, TaskState.CLOSED_INFEASIBLE)
-            for r in run.task_refs
+        # Honest three-way run-level rollup (#67). An execution failure (FAILED or
+        # CASCADE_BLOCKED) on ANY task dominates → the run is FAILED, even if other tasks
+        # were also rejected (a mixed run must not be softened to a non-failure). With NO
+        # execution failure but at least one deliberate human close (CLOSED_INFEASIBLE), the
+        # run is COMPLETED_WITH_REJECTIONS: done, nothing broke, but not everything shipped —
+        # neither the false-alarm FAILED nor the "all delivered" COMPLETED. Otherwise every
+        # task completed cleanly → COMPLETED.
+        any_failed = any(
+            r.state in (TaskState.FAILED, TaskState.CASCADE_BLOCKED) for r in run.task_refs
         )
-        new_state = RunState.FAILED if any_not_completed else RunState.COMPLETED
+        any_rejected = any(r.state is TaskState.CLOSED_INFEASIBLE for r in run.task_refs)
+        if any_failed:
+            new_state = RunState.FAILED
+        elif any_rejected:
+            new_state = RunState.COMPLETED_WITH_REJECTIONS
+        else:
+            new_state = RunState.COMPLETED
         if run.state is not new_state:
             self.store.update_run(run_id, lambda r: setattr(r, "state", new_state))
             self.store.append_event(

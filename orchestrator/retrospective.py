@@ -111,12 +111,22 @@ def _failing_stage(task: Task) -> Stage | None:
 
 
 def build_retrospective(
-    run: Run, tasks: list[Task], events: list[dict], stage_logs_by_task: dict[str, list[dict]]
+    run: Run,
+    tasks: list[Task],
+    events: list[dict],
+    stage_logs_by_task: dict[str, list[dict]],
+    rejections: dict[str, dict] | None = None,
 ) -> dict:
-    """Assemble the structured failure retrospective for a finished run."""
+    """Assemble the structured failure retrospective for a finished run.
+
+    ``rejections`` (#67) maps a CLOSED_INFEASIBLE task_id -> {title, reason} so a mixed
+    failure+rejection run's retrospective lists the deliberately-closed tasks distinctly
+    from the execution failures (a human close is not "No failures recorded")."""
     failed = [t for t in tasks if t.state is TaskState.FAILED]
     cascaded = [t for t in tasks if t.state is TaskState.CASCADE_BLOCKED]
     completed = [t for t in tasks if t.state is TaskState.COMPLETED]
+    rejected = [t for t in tasks if t.state is TaskState.CLOSED_INFEASIBLE]
+    rejections = rejections or {}
 
     # cascade map: failed task -> dependents it blocked (from cascade_blocked events).
     cascade_map: dict[str, list[str]] = defaultdict(list)
@@ -149,8 +159,17 @@ def build_retrospective(
             "completed": len(completed),
             "failed": len(failed),
             "cascade_blocked": len(cascaded),
+            "closed_infeasible": len(rejected),
         },
         "failed_tasks": task_reports,
         "cascade_blocked_tasks": [t.task_id for t in cascaded],
+        "rejected_tasks": [
+            {
+                "task_id": t.task_id,
+                "title": rejections.get(t.task_id, {}).get("title") or t.title,
+                "reason": rejections.get(t.task_id, {}).get("reason"),
+            }
+            for t in rejected
+        ],
         "patterns": detect_failure_patterns(stage_logs_by_task),
     }

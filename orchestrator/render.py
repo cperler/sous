@@ -126,7 +126,8 @@ def render_retrospective(retro: dict) -> str:
         "",
         f"Run state: **{retro.get('run_state', '?')}** — "
         f"{t.get('completed', 0)} completed · {t.get('failed', 0)} failed · "
-        f"{t.get('cascade_blocked', 0)} cascade-blocked of {t.get('total', 0)} tasks.",
+        f"{t.get('cascade_blocked', 0)} cascade-blocked · "
+        f"{t.get('closed_infeasible', 0)} closed-infeasible of {t.get('total', 0)} tasks.",
     ]
 
     failed = retro.get("failed_tasks", [])
@@ -155,6 +156,16 @@ def render_retrospective(retro: dict) -> str:
     if retro.get("cascade_blocked_tasks"):
         blocked = ", ".join(f"`{t}`" for t in retro["cascade_blocked_tasks"])
         lines += [f"## Cascade-blocked (never ran): {blocked}", ""]
+
+    # #67: deliberately-closed tasks are NOT failures — surface them separately (with the
+    # human's reason) so a mixed run's retrospective doesn't silently drop them.
+    rejected = retro.get("rejected_tasks", [])
+    if rejected:
+        lines += ["## Closed as infeasible (human-rejected, not failures)", ""]
+        for r in rejected:
+            reason = r.get("reason") or "(no reason recorded)"
+            lines.append(f"- `{r['task_id']}` — {r.get('title') or '(no title)'}: _{reason}_")
+        lines.append("")
 
     patterns = retro.get("patterns", [])
     if patterns:

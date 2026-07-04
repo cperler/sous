@@ -50,8 +50,9 @@ def test_reject_lands_in_closed_infeasible_terminal_state(tmp_path, project) -> 
     # Terminal ⇒ not dispatchable and no further work is emitted.
     assert eng.dispatchable("r1") == []
     assert eng.next_work("r1", "t1") is None
-    # The run finalizes (does not stay open forever).
-    assert eng.store.load_run("r1").state is RunState.FAILED
+    # The run finalizes (does not stay open forever). A rejection-ONLY run (no execution
+    # failure) rolls up to the honest COMPLETED_WITH_REJECTIONS, not FAILED (#67).
+    assert eng.store.load_run("r1").state is RunState.COMPLETED_WITH_REJECTIONS
     assert eng.store.load_run("r1").progress().closed_infeasible == 1
 
 

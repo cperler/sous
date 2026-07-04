@@ -74,7 +74,8 @@ def test_reject_closes_a_held_task_and_finalizes_the_run(tmp_path, project) -> N
     # run finalizes (no longer open forever)
     assert eng.store.load_task("r1", "t1").state is TaskState.CLOSED_INFEASIBLE
     assert eng.dispatchable("r1") == []
-    assert eng.store.load_run("r1").state is RunState.FAILED
+    # rejection-only run → honest non-failure rollup (#67), not FAILED
+    assert eng.store.load_run("r1").state is RunState.COMPLETED_WITH_REJECTIONS
     # the durable rejection artifact IS the gate record: who/why/when
     artifact = eng.store.load_rejection("r1", "t1")
     assert artifact["rejected_by"] == "craig"

@@ -89,6 +89,14 @@ class ProjectConfig(Protocol):
     # property) to decouple intake from the orchestrator's working directory.
     #   repo_root: str
 
+    # Optional (duck-typed, no CONTRACT_VERSION bump), same pattern as repo_root: extra
+    # lockfile names to fold into the intake install-cache hash (#63). Intake already
+    # detects the common ones generically (uv.lock, package-lock.json, pnpm-lock.yaml,
+    # yarn.lock, poetry.lock, Cargo.lock, composer.lock, Gemfile.lock, go.sum — see
+    # adapters/execution/install_cache.DEFAULT_LOCKFILES); expose this ONLY when the repo
+    # pins deps in a file that list misses. A ``list[str]`` or a zero-arg callable → list.
+    #   lockfiles: list[str]
+
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]: ...

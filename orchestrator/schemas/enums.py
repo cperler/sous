@@ -94,8 +94,19 @@ class RunState(StrEnum):
     PENDING = "pending"
     RUNNING = "running"
     COMPLETED = "completed"
+    # #67: every task terminal, NONE failed by execution, but at least one was deliberately
+    # closed-infeasible by a human (reject → CLOSED_INFEASIBLE). Honest middle rollup: the
+    # run is DONE and nothing broke (so not FAILED), but not everything shipped (so not
+    # COMPLETED, which reads as "all delivered"). A terminal, non-failure end state.
+    COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
     FAILED = "failed"
     PAUSED = "paused"
+
+
+# Terminal run states: the run has finalized and no task will move again.
+TERMINAL_RUN_STATES: frozenset[RunState] = frozenset(
+    {RunState.COMPLETED, RunState.COMPLETED_WITH_REJECTIONS, RunState.FAILED}
+)
 
 
 class ResultStatus(StrEnum):

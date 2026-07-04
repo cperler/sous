@@ -35,6 +35,7 @@ from pathlib import Path
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
+from . import install_cache
 from .base import SUPPORTED, CapabilityDescriptor
 from .transport import RawResult, _git, _tag_head, to_stage_result
 
@@ -119,8 +120,9 @@ class DeterministicSetupRunner:
         self._ensure_worktree(repo_root, worktree, branch)
 
         # Best-effort dependency install (never fatal — a later stage's `uv run`/`npm`
-        # re-syncs; a broken install shouldn't block worktree readiness).
-        install_note = self._run_project(self._project.install_cmd, worktree)
+        # re-syncs; a broken install shouldn't block worktree readiness). #63: skip it
+        # when this worktree already holds a successful install of the same lockfiles.
+        install_note, install_meta = self._install(worktree)
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         head = _git(str(worktree), "rev-parse", "HEAD")
@@ -141,8 +143,55 @@ class DeterministicSetupRunner:
                 f"isolated worktree off {base_sha}; install: {install_note}; "
                 f"tests: {baseline['note']}"
             ),
+            **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
         }
         return out, checkpoint
+
+    def _install(self, worktree: Path) -> tuple[str, dict]:
+        """Run (or skip) the project's dependency install, keyed per-worktree on the
+        lockfile hash (#63). Returns a short human note plus the honest structured-output
+        fields (``install_skipped`` / ``install_reason`` / ``install_lockfiles``) so the
+        decision is visible in the intake log and events — never silent."""
+        names = install_cache.project_lockfiles(self._project)
+        present = install_cache.discover(worktree, names)
+        digest = install_cache.compute_hash(present)
+        lockfiles = [p.name for p in present]
+        marker = self._install_marker(worktree)
+        if install_cache.should_skip(marker, digest):
+            return "skipped (lockfile-hash-match)", {
+                "install_skipped": True,
+                "install_reason": "lockfile-hash-match",
+                "install_lockfiles": lockfiles,
+            }
+        # Full install. Any doubt lands here; record WHY for the audit trail.
+        note = self._run_project(self._project.install_cmd, worktree)
+        success = note == "ok"
+        if install_cache.cache_disabled():
+            reason = "cache-disabled"
+        elif digest is None:
+            reason = "no-lockfiles"
+        elif not success:
+            reason = "install-failed"
+        else:
+            reason = "installed"
+        # Only cache when there is a lockfile basis AND somewhere to record it. Persist the
+        # outcome (success flag included) so a subsequent FAILED install correctly forces a
+        # reinstall next time rather than skipping on a stale success.
+        if digest is not None and marker is not None:
+            install_cache.save_marker(marker, digest=digest, lockfiles=lockfiles, success=success)
+        return note, {
+            "install_skipped": False,
+            "install_reason": reason,
+            "install_lockfiles": lockfiles,
+        }
+
+    def _install_marker(self, worktree: Path) -> Path | None:
+        """The per-worktree cache marker path (inside this worktree's private git dir), or
+        None when it can't be resolved (a non-git worktree => never cache => always install)."""
+        gd = _git(str(worktree), "rev-parse", "--absolute-git-dir")
+        if gd.returncode != 0 or not gd.stdout.strip():
+            return None
+        return Path(gd.stdout.strip()) / install_cache.MARKER_NAME
 
     def _capture_baseline(self, worktree: Path) -> dict:
         """Run ``test_unit_cmd`` at base and classify the failures (via the project's

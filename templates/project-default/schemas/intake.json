@@ -13,7 +13,10 @@
       "items": {"type": "string"},
       "description": "test ids already failing at base — inherited, not regressions; the TEST stage and the engine's regression split exclude them"
     },
-    "baseline": {"type": "string", "description": "optional human note about the captured baseline"}
+    "baseline": {"type": "string", "description": "optional human note about the captured baseline"},
+    "install_skipped": {"type": "boolean", "description": "#63: true when the dependency install was skipped because this worktree already holds a successful install of the same lockfiles"},
+    "install_reason": {"type": "string", "description": "#63: why install ran or was skipped (lockfile-hash-match | installed | no-lockfiles | install-failed | cache-disabled)"},
+    "install_lockfiles": {"type": "array", "items": {"type": "string"}, "description": "#63: lockfile names hashed for the install-cache decision"}
   },
   "additionalProperties": true
 }

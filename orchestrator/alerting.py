@@ -33,7 +33,8 @@ NOTIFY_RUN_FINALIZED = "run_finalized"
 
 # Run states that end a watch (mirror RunState terminal values without importing the
 # enum — this module works off the JSON status snapshot, not engine objects).
-_TERMINAL_RUN_STATES = frozenset({"completed", "failed"})
+# Includes completed_with_rejections (#67) so a rejection-only run's watch terminates.
+_TERMINAL_RUN_STATES = frozenset({"completed", "completed_with_rejections", "failed"})
 
 
 def stale_notifications(

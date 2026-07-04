@@ -36,7 +36,9 @@ def test_max_attempts_failure_retrospective(tmp_path, project) -> None:
 
     retro = eng.retrospective("r1")
     assert retro["run_state"] == "failed"
-    assert retro["totals"] == {"total": 1, "completed": 0, "failed": 1, "cascade_blocked": 0}
+    assert retro["totals"] == {
+        "total": 1, "completed": 0, "failed": 1, "cascade_blocked": 0, "closed_infeasible": 0,
+    }
     ft = retro["failed_tasks"][0]
     assert ft["task_id"] == "t1"
     assert ft["failing_stage"] == "implement"
