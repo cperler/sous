@@ -70,7 +70,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="global provider override (ORCHESTRATOR_PROVIDER)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("init-run").add_argument("--lane", default="full")
+    ir = sub.add_parser("init-run")
+    ir.add_argument("--lane", default="full")
+    ir.add_argument("--budget-usd", type=float, default=None,
+                    help="per-run metered-spend budget in USD (#34): a soft warning at "
+                         "80%%, a hard PAUSE at/after the budget")
+    ir.add_argument("--route-by-cost", action="store_true",
+                    help="enable cost-aware lane routing: un-pinned tasks get a cheaper "
+                         "lane preset as the remaining budget thins")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
@@ -84,6 +91,9 @@ def main(argv: list[str] | None = None) -> int:
     at.add_argument("--deterministic-stages", default=None,
                     help="comma-separated stages to run on the $0 ENGINE lane instead of a "
                          "model (e.g. 'test,deliver'); intake is always deterministic (#33)")
+    at.add_argument("--estimate", default=None,
+                    help="rough size hint (small/medium/large or a USD number) — feeds "
+                         "cost-aware lane routing on a route-by-cost run (#34)")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -110,8 +120,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--task", required=True)
     ap.add_argument("--by", required=True, help="who is approving")
     ap.add_argument("--note", default="", help="what is being approved")
-    sub.add_parser("unpause", help="release a PAUSED run (e.g. after the batch circuit "
-                                   "breaker tripped and the systemic cause is fixed)")
+    up = sub.add_parser("unpause", help="release a PAUSED run (e.g. after the batch circuit "
+                                        "breaker tripped and the systemic cause is fixed)")
+    up.add_argument("--raise-budget", type=float, default=None,
+                    help="on a budget-exhausted pause (#34): resume with this NEW budget "
+                         "ceiling (re-arms the soft warning). Omit to drop the cap entirely")
     rj = sub.add_parser("reject", help="confirm-and-close a held infeasible task (writes the rejection artifact)")
     rj.add_argument("--task", required=True)
     rj.add_argument("--by", required=True, help="who is rejecting")
@@ -133,10 +146,20 @@ def main(argv: list[str] | None = None) -> int:
     spv.add_argument("file", help="spec JSON file")
     spp = spsub.add_parser("plan", help="print the ordered filing plan (no writes)")
     spp.add_argument("file", help="spec JSON file")
+    spp.add_argument("--budget-usd", type=float, default=None,
+                     help="a-priori check (#34): print the tasks' estimated total vs this "
+                          "budget from their `estimate` hints (advisory)")
+    spp.add_argument("--strict", action="store_true",
+                     help="with --budget-usd: exit non-zero if the estimate overruns")
     spf = spsub.add_parser("file", help="file each task as an issue in dependency order")
     spf.add_argument("file", help="spec JSON file")
     spf.add_argument("--dry-run", action="store_true",
                      help="print exactly what would be created; file nothing")
+    spf.add_argument("--budget-usd", type=float, default=None,
+                     help="a-priori check (#34): with --strict, refuse to file if the "
+                          "tasks' estimated total overruns this budget")
+    spf.add_argument("--strict", action="store_true",
+                     help="with --budget-usd: refuse to file (exit non-zero) on overrun")
     # Accept --project after the subcommand too (SUPPRESS: don't clobber the global one).
     spf.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also precede 'spec')")
@@ -198,7 +221,14 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "spec":
         # The front door (#18). validate/plan are pure (no project); file needs a task
         # source. load_spec raises SpecError (a clear message) on any bad input.
-        from .spec_intake import SpecError, file_spec, load_spec, topological_order
+        from .spec_intake import (
+            SpecError,
+            estimate_budget,
+            file_spec,
+            load_spec,
+            render_estimate,
+            topological_order,
+        )
         from .spec_intake import plan as spec_plan
 
         try:
@@ -212,10 +242,25 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.spec_cmd == "plan":
             sys.stdout.write(spec_plan(spec) + "\n")
+            # A-priori cost estimate (#34): only when a budget is given (advisory math).
+            if args.budget_usd is not None:
+                est = estimate_budget(spec, budget_usd=args.budget_usd)
+                sys.stdout.write("\n" + render_estimate(est) + "\n")
+                if est["overrun"] and args.strict:
+                    return 1
             return 0
         # spec file — needs the project's task source.
         if not args.project:
             p.error("--project is required for `spec file`")
+        # A-priori gate (#34): with --strict, an estimate overrun refuses to file.
+        if args.budget_usd is not None:
+            est = estimate_budget(spec, budget_usd=args.budget_usd)
+            sys.stderr.write(render_estimate(est) + "\n")
+            if est["overrun"] and args.strict:
+                _emit({"ok": False, "error": "a-priori estimate overruns the budget "
+                       f"(${est['total_estimate_usd']:.2f} > ${args.budget_usd:.2f}); "
+                       "raise --budget-usd or drop --strict to file anyway"})
+                return 1
         source = load_project(args.project).task_source
         try:
             _emit(file_spec(spec, source, dry_run=args.dry_run))
@@ -237,8 +282,10 @@ def main(argv: list[str] | None = None) -> int:
         util_pct, _ = resolve_util(args.util)
 
     if args.cmd == "init-run":
-        run = eng.create_run(args.run, ExecutionLane(args.lane))
-        _emit({"created_run": run.run_id, "lane": run.lane.value})
+        run = eng.create_run(args.run, ExecutionLane(args.lane),
+                             budget_usd=args.budget_usd, route_by_cost=args.route_by_cost)
+        _emit({"created_run": run.run_id, "lane": run.lane.value,
+               "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage
 
@@ -256,10 +303,11 @@ def main(argv: list[str] | None = None) -> int:
         )
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,
-                            deterministic_stages=det)
+                            deterministic_stages=det, estimate=args.estimate)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
+               "execution_lane": task.execution_lane.value,
                "depends_on": task.depends_on, "provider_tag": task.provider_tag})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
@@ -317,8 +365,9 @@ def main(argv: list[str] | None = None) -> int:
         task = eng.approve(args.run, args.task, approved_by=args.by, what=args.note)
         _emit({"approved": task.task_id, "state": task.state.value, "by": args.by})
     elif args.cmd == "unpause":
-        run = eng.unpause_run(args.run)
-        _emit({"unpaused": run.run_id, "state": run.state.value})
+        run = eng.unpause_run(args.run, raise_budget_to=args.raise_budget)
+        _emit({"unpaused": run.run_id, "state": run.state.value,
+               "budget_usd": run.budget_usd})
     elif args.cmd == "reject":
         task = eng.reject(args.run, args.task, rejected_by=args.by, reason=args.reason)
         _emit({"rejected": task.task_id, "state": task.state.value, "by": args.by})

@@ -209,6 +209,20 @@ class Run(BaseModel):
     task_refs: list[TaskRef] = Field(default_factory=list)
     dependency_graph: dict[str, list[str]] = Field(default_factory=dict)
     metadata: dict = Field(default_factory=dict)
+    # Per-run cost budget (#34). A soft warning fires once at budget_soft_fraction of
+    # metered spend; a hard stop PAUSES the run (reusing the PAUSED/unpause machinery)
+    # at/after the budget. None = no budget (default off). ONLY metered rows count —
+    # unmetered interactive rows are $0 anyway. Additive fields: pre-#34 run docs load
+    # with the defaults, so no SCHEMA_VERSION bump is needed.
+    budget_usd: float | None = None
+    # Once-only dedupe for the soft budget warning (mirrors the stale-alert dedupe): set
+    # True when the warning fires, reset by `unpause --raise-budget` so a new ceiling
+    # re-arms it.
+    budget_warning_sent: bool = False
+    # Cost-aware lane routing (#34): when True, add_task routes an un-pinned task to a
+    # cheaper lane preset as the remaining budget thins (deterministic band table).
+    # Explicit per-task pipeline pins are always honored. Default off.
+    route_by_cost: bool = False
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""

@@ -26,6 +26,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from jsonschema import Draft202012Validator
 
+from .cost_policy import estimate_to_usd
 from .errors import OrchestratorError
 
 _SCHEMA_PATH = Path(__file__).parent / "schemas" / "spec.json"
@@ -191,6 +192,63 @@ def plan(spec: dict) -> str:
             extras.append(f"estimate={t['estimate']}")
         if extras:
             lines.append(f"     {'  '.join(extras)}")
+    return "\n".join(lines)
+
+
+def estimate_budget(spec: dict, budget_usd: float | None = None) -> dict:
+    """A-priori cost estimate for a spec's tasks (Roadmap-B / #18 bullet, now #34).
+
+    Sums each task's ``estimate`` hint through the rough ``ESTIMATE_USD`` table (advisory
+    math, NO model). Returns the per-task breakdown, the total, the count of tasks with no
+    usable estimate (the total is a FLOOR when any are unestimated), and — when
+    ``budget_usd`` is given — whether the estimate overruns it. Purely informational; the
+    caller decides whether an overrun is a warning or (``--strict``) an error."""
+    tasks = spec["tasks"]
+    per_task: list[dict] = []
+    total = 0.0
+    unestimated = 0
+    for t in tasks:
+        usd = estimate_to_usd(t.get("estimate"))
+        if usd is None:
+            unestimated += 1
+        else:
+            total += usd
+        per_task.append(
+            {"id": t["id"], "title": t["title"],
+             "estimate": t.get("estimate"), "estimate_usd": usd}
+        )
+    out: dict[str, Any] = {
+        "total_estimate_usd": round(total, 4),
+        "tasks": per_task,
+        "unestimated": unestimated,
+        "task_count": len(tasks),
+    }
+    if budget_usd is not None:
+        out["budget_usd"] = budget_usd
+        out["overrun"] = total > budget_usd
+        out["remaining_usd"] = round(budget_usd - total, 4)
+    return out
+
+
+def render_estimate(est: dict) -> str:
+    """Human-readable rendering of ``estimate_budget`` output for the ``spec plan`` CLI."""
+    lines = [f"A-priori cost estimate ({est['task_count']} task(s), ROUGH — advisory only):"]
+    for t in est["tasks"]:
+        usd = t["estimate_usd"]
+        shown = f"${usd:.2f}" if usd is not None else "unestimated"
+        hint = t["estimate"] if t["estimate"] not in (None, "") else "—"
+        lines.append(f"  - [{t['id']}] {t['title']}: {hint} -> {shown}")
+    lines.append(f"Total estimated: ${est['total_estimate_usd']:.2f}")
+    if est.get("unestimated"):
+        lines.append(
+            f"  (note: {est['unestimated']} task(s) had no usable estimate — the total is a FLOOR)"
+        )
+    if "budget_usd" in est:
+        verdict = "OVER budget" if est["overrun"] else "within budget"
+        lines.append(
+            f"Budget: ${est['budget_usd']:.2f} — {verdict} "
+            f"(${est['remaining_usd']:.2f} remaining)"
+        )
     return "\n".join(lines)
 
 

@@ -20,6 +20,7 @@ from adapters.project.base import ProjectConfig
 
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy
 from .cost_ledger import CostLedger
+from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
 from .errors import CapacityExhausted, ContractError
 from .model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, ModelTable
@@ -110,6 +111,8 @@ class Engine:
         model_table: ModelTable = DEFAULT_MODEL_TABLE,
         capacity: CapacityPolicy = DEFAULT_CAPACITY,
         router: Router = DEFAULT_ROUTER,
+        cost_router: CostRouter = DEFAULT_COST_ROUTER,
+        budget_soft_fraction: float = BUDGET_SOFT_FRACTION,
         registry: Registry | None = None,
         max_attempts: int = 3,
         breaker_threshold: int = 2,
@@ -128,6 +131,13 @@ class Engine:
         self.ledger.model_table = model_table
         self.capacity = capacity
         self.router = router
+        # Cost-aware lane routing (#34): deterministic budget-fraction -> lane-preset map,
+        # consulted at add_task when the run enables route_by_cost. Default = the stock
+        # band table; a project can inject its own.
+        self.cost_router = cost_router
+        # Soft budget-warning threshold: fraction of the per-run budget at which the
+        # once-only budget_warning notification fires (the hard stop is at 1.0).
+        self.budget_soft_fraction = budget_soft_fraction
         # The registry defines which (mode, provider) cells are sanctioned (for the
         # lane audit). Default = interactive×claude (3a/3b).
         self.registry = registry if registry is not None else default_registry()
@@ -153,8 +163,21 @@ class Engine:
         self.max_salvage_keeps = max_salvage_keeps
 
     # --- run/task setup -------------------------------------------------------
-    def create_run(self, run_id: str, lane: ExecutionLane = ExecutionLane.FULL) -> Run:
-        run = Run(run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane, state=RunState.RUNNING)
+    def create_run(
+        self,
+        run_id: str,
+        lane: ExecutionLane = ExecutionLane.FULL,
+        *,
+        budget_usd: float | None = None,
+        route_by_cost: bool = False,
+    ) -> Run:
+        """Create a run. ``budget_usd`` caps metered spend (soft warning at
+        ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
+        enables cost-aware lane routing for un-pinned tasks. Both default off."""
+        run = Run(
+            run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
+            state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
+        )
         self.store.save_run(run)
         return run
 
@@ -168,6 +191,7 @@ class Engine:
         depends_on: list[str] | None = None,
         provider_tag: str | None = None,
         deterministic_stages: tuple[Stage, ...] | list[Stage] | None = None,
+        estimate: str | float | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -178,11 +202,31 @@ class Engine:
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
         ``82:codex`` tag / ralph dependency analysis, human-supplied). Validation
-        (non-empty, duplicate-free) is the Task model's."""
+        (non-empty, duplicate-free) is the Task model's.
+
+        Cost-aware lane routing (#34): when the run enables ``route_by_cost`` AND no
+        ``pipeline`` is explicitly pinned, the deterministic ``cost_router`` picks the
+        lane preset from the run's remaining budget fraction (refined by ``estimate`` /
+        the task's ``size:``/``estimate:`` labels) and prefers $0 deterministic
+        TEST/DELIVER — every such decision is emitted as a ``lane_routed`` event (never
+        silent). An explicit ``pipeline`` is always honored."""
         spec = self.project.task_source.resolve(task_id)
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
         run = self.store.load_run(run_id)
+        # Cost-aware lane routing (#34): only for an UN-pinned task on a route_by_cost run.
+        # An explicit pipeline pin is always honored (never overridden). The decision is
+        # deterministic (band table over the remaining budget fraction) and evented below.
+        route_reason: dict | None = None
+        effective_lane = lane or run.lane
+        if pipeline is None and run.route_by_cost:
+            est = estimate if estimate is not None else self._estimate_from_labels(spec.labels)
+            decision = self.cost_router.route(self._remaining_budget_fraction(run), est)
+            effective_lane = decision.lane if lane is None else effective_lane
+            pipeline = LANE_STAGES[decision.lane]
+            if deterministic_stages is None:
+                deterministic_stages = decision.deterministic_stages
+            route_reason = decision.reason
         # Register the task ref + dependency edge as a locked read-modify-write so a
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
         # Done BEFORE writing the task doc so a duplicate never clobbers an existing
@@ -207,12 +251,20 @@ class Engine:
             provider_tag=tag,
             issue_number=spec.issue_number,
             depends_on=deps,
-            execution_lane=lane or run.lane,
-            pipeline=tuple(pipeline) if pipeline else LANE_STAGES[lane or run.lane],
+            execution_lane=effective_lane,
+            pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
             deterministic_stages=tuple(deterministic_stages or ()),
             max_attempts=self.max_attempts,
         )
         self.store.save_task(task)
+        if route_reason is not None:
+            # Routing is never silent (#34): record WHY this un-pinned task got its preset
+            # (remaining budget fraction, estimate) so a downgraded run explains itself.
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "lane_routed", "run_id": run_id,
+                 "task_id": task_id, **route_reason},
+            )
         return task
 
     # --- dispatchable (DAG + lease) ------------------------------------------
@@ -259,9 +311,18 @@ class Engine:
     def next_work(
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
     ) -> WorkItem | None:
-        # Capacity backpressure first: at the per-call gate, no new dispatch (the
-        # caller waits). This gates EVERY path — including a rate-limit re-queue — so
-        # graceful fallback never over-subscribes an already-saturated API.
+        # Budget backpressure (#34): consult the run's metered spend against its budget at
+        # this dispatch point. Once spend >= budget, do NOT dispatch new work — PAUSE the
+        # run (reusing the PAUSED/unpause machinery) and return None; in-flight recorded
+        # state is untouched. Gated on a budget being set (default off) and skipped on a
+        # resume (that recovers an ALREADY-dispatched, already-charged lease). Placed HERE,
+        # at the single dispatch point, so it catches BOTH the scheduler loop AND the
+        # single-task engine-lane drain (mirrors the alerting seam's one-layer rationale).
+        if not resume and self._budget_hard_stop(run_id):
+            return None
+        # Capacity backpressure: at the per-call gate, no new dispatch (the caller waits).
+        # This gates EVERY path — including a rate-limit re-queue — so graceful fallback
+        # never over-subscribes an already-saturated API.
         if self.capacity.at_capacity(util_pct):
             raise CapacityExhausted(f"at capacity ({util_pct}% >= per-call gate)")
         task = self.store.load_task(run_id, task_id)
@@ -1256,16 +1317,120 @@ class Engine:
             {"ts": _now(), "type": "run_paused", "run_id": run_id, "reason": reason},
         )
 
-    def unpause_run(self, run_id: str) -> Run:
-        """Release a paused run back to RUNNING (the human fixed the systemic cause)."""
+    def unpause_run(self, run_id: str, *, raise_budget_to: float | None = None) -> Run:
+        """Release a paused run back to RUNNING (the human fixed the systemic cause).
+
+        Budget-pause override (#34): a plain unpause of a run PAUSED because its budget was
+        exhausted would immediately re-pause at the next dispatch (spend is still over the
+        cap). So when the run is currently over budget, an unpause resolves it honestly:
+          - ``raise_budget_to=X`` sets a NEW, higher ceiling and re-arms the soft warning
+            (the human granted more budget — proceed until the new cap);
+          - otherwise the human is explicitly overriding the cap, so it is REMOVED
+            (``budget_usd=None``) — no further hard stops this run.
+        A breaker/other pause (not over budget) leaves the budget untouched, unless
+        ``raise_budget_to`` is given explicitly."""
         run = self.store.load_run(run_id)
         if run.state is not RunState.PAUSED:
             raise ContractError(f"run {run_id} is not paused (state {run.state.value})")
-        self.store.update_run(run_id, lambda r: setattr(r, "state", RunState.RUNNING))
+        over_budget = (
+            run.budget_usd is not None and self.ledger.metered_spend() >= run.budget_usd
+        )
+
+        def _mut(r: Run) -> None:
+            r.state = RunState.RUNNING
+            if raise_budget_to is not None:
+                r.budget_usd = raise_budget_to
+                r.budget_warning_sent = False  # re-arm the soft warning against the new cap
+            elif over_budget:
+                r.budget_usd = None  # explicit human override — drop the cap
+
+        self.store.update_run(run_id, _mut)
         self.store.append_event(
-            run_id, {"ts": _now(), "type": "run_unpaused", "run_id": run_id}
+            run_id,
+            {"ts": _now(), "type": "run_unpaused", "run_id": run_id,
+             "raised_budget_to": raise_budget_to,
+             "budget_overridden": raise_budget_to is None and over_budget},
         )
         return self.store.load_run(run_id)
+
+    # --- per-run cost budget (#34) ---------------------------------------------
+    def _remaining_budget_fraction(self, run: Run) -> float:
+        """Fraction of the run's budget still unspent (metered), clamped to [0, 1].
+        1.0 when no budget is set (cost routing then always picks the top band)."""
+        if not run.budget_usd:
+            return 1.0
+        spent = self.ledger.metered_spend()
+        return max(0.0, min(1.0, (run.budget_usd - spent) / run.budget_usd))
+
+    def _estimate_from_labels(self, labels: list[str] | None) -> str | None:
+        """Pull a size hint off a task's labels for cost routing: a ``size:``/``estimate:``
+        prefixed label, or a bare size word (small/medium/large). None when absent."""
+        for raw in labels or []:
+            low = str(raw).strip().lower()
+            for prefix in ("estimate:", "size:"):
+                if low.startswith(prefix):
+                    return low[len(prefix):].strip() or None
+            if low in {"small", "medium", "large"}:
+                return low
+        return None
+
+    def _budget_hard_stop(self, run_id: str) -> bool:
+        """Budget gate consulted at each dispatch (#34). Emits the soft ``budget_warning``
+        ONCE at ``budget_soft_fraction`` of metered spend, and on hard exhaustion PAUSES
+        the run (distinct reason ``budget_exhausted``) and returns True so no new work is
+        dispatched. No budget set -> always False. Idempotent: it won't re-pause an
+        already-PAUSED run, so repeated calls across a tick emit at most one pause."""
+        run = self.store.load_run(run_id)
+        budget = run.budget_usd
+        if budget is None:
+            return False
+        spent = self.ledger.metered_spend()
+        if spent >= self.budget_soft_fraction * budget and not run.budget_warning_sent:
+            self.store.update_run(
+                run_id, lambda r: setattr(r, "budget_warning_sent", True)
+            )
+            self.emit_notification(
+                run_id, "budget_warning",
+                {"run_id": run_id, "kind": "budget_warning",
+                 "spent_usd": round(spent, 4), "budget_usd": budget,
+                 "fraction": round(spent / budget, 4),
+                 "summary": f"run {run_id} budget at {spent / budget * 100:.0f}% — "
+                            f"metered spend ${spent:.4f} of ${budget:.4f} "
+                            f"(soft threshold {self.budget_soft_fraction * 100:.0f}%)"},
+            )
+        if spent >= budget:
+            if run.state is not RunState.PAUSED:
+                reason = (
+                    f"budget_exhausted: metered spend ${spent:.4f} >= budget ${budget:.4f}"
+                )
+                self.pause_run(run_id, reason)
+                self.emit_notification(
+                    run_id, "run_paused",
+                    {"run_id": run_id, "kind": "run_paused", "reason": reason,
+                     "summary": f"run {run_id} PAUSED — budget exhausted "
+                                f"(${spent:.4f} of ${budget:.4f} metered); "
+                                f"`orchestrator unpause` (optionally --raise-budget) to resume"},
+                )
+            return True
+        return False
+
+    def _budget_status(self, run: Run, rows: list[dict] | None = None) -> dict | None:
+        """The budget block for ``status`` output (None when no budget is set): metered
+        spend vs. budget, the remaining fraction, and the routing/warning flags."""
+        if run.budget_usd is None:
+            return None
+        budget = run.budget_usd
+        spent = self.ledger.metered_spend(rows=rows)
+        return {
+            "budget_usd": budget,
+            "spent_usd": round(spent, 4),
+            "remaining_usd": round(budget - spent, 4),
+            "fraction": round(spent / budget, 4) if budget else None,
+            "soft_threshold": self.budget_soft_fraction,
+            "route_by_cost": run.route_by_cost,
+            "warning_sent": run.budget_warning_sent,
+            "exhausted": spent >= budget,
+        }
 
     def reject(self, run_id: str, task_id: str, *, rejected_by: str, reason: str) -> Task:
         """Confirm-and-close a held task the human agrees is infeasible.
@@ -1427,7 +1592,10 @@ class Engine:
         # refresh (status() used to read the ledger twice).
         rows = self.ledger.rows()
         summary = self.ledger.summary(rows=rows)
-        self.store.write_run_artifact("cost-summary.md", render_cost_summary(run_id, summary))
+        budget = self._budget_status(run, rows)  # #34: None unless a budget is set
+        self.store.write_run_artifact(
+            "cost-summary.md", render_cost_summary(run_id, summary, budget=budget)
+        )
         # cost-report.md (the richer per-stage/-task + session-reuse breakdown) is NOT
         # written here: status() is the cheap poll path and analysis() re-scans the whole
         # ledger. It is produced at run finalize and on demand via the `cost-report` CLI.
@@ -1441,6 +1609,7 @@ class Engine:
             "progress": progress.model_dump(),
             "tasks": tasks,
             "cost": summary,
+            "budget": budget,  # #34: metered spend vs. budget (None when no budget set)
             "lane_audit": self.lane_audit(run_id, rows=rows),
         }
 
@@ -1716,7 +1885,11 @@ class Engine:
         # Final cost artifacts (the per-record write was removed for O(N^2)).
         rows = self.ledger.rows()
         self.store.write_run_artifact(
-            "cost-summary.md", render_cost_summary(run_id, self.ledger.summary(rows=rows))
+            "cost-summary.md",
+            render_cost_summary(
+                run_id, self.ledger.summary(rows=rows),
+                budget=self._budget_status(run, rows),  # #34
+            ),
         )
         self.store.write_run_artifact(
             "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))

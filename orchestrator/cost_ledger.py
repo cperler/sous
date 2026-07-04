@@ -123,6 +123,20 @@ class CostLedger:
         """Convenience: total cost attributed across the whole ledger."""
         return self.summary()["total_cost_usd"]
 
+    def metered_spend(self, rows: list[dict] | None = None) -> float:
+        """USD spent on METERED rows only — the honest figure a budget gate checks (#34).
+
+        Unmetered interactive rows record $0 (they carry no per-call usage), so they add
+        nothing anyway; excluding them explicitly keeps the budget semantics honest — a
+        run billed to a subscription can't accidentally count as spend. Accepts pre-read
+        ``rows`` so a caller (status) reads the JSONL once and shares it."""
+        total = 0.0
+        for row in (self.rows() if rows is None else rows):
+            if row.get("metered") is False:
+                continue
+            total += row.get("cost_usd") or 0.0
+        return round(total, 6)
+
     def analysis(self, rows: list[dict] | None = None) -> dict:
         """Rich cost report: per-stage + per-task breakdowns and the session-reuse win.
 

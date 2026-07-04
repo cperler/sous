@@ -21,8 +21,11 @@ def _cost_cell(rec: StageRecord) -> str:
     return f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
 
 
-def render_cost_summary(run_id: str, summary: dict) -> str:
-    """Render `ledger.summary()` into cost-summary.md."""
+def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) -> str:
+    """Render `ledger.summary()` into cost-summary.md.
+
+    ``budget`` (the engine's per-run budget block, #34) adds a spent/budget/remaining line
+    when a budget is set — so the cost artifact surfaces the cap, not just the raw total."""
     # Defensive: a present-but-None value or a partial by_model bucket must not crash
     # the render (it runs at run finalization).
     total_cost = summary.get("total_cost_usd") or 0.0
@@ -45,6 +48,15 @@ def render_cost_summary(run_id: str, summary: dict) -> str:
         f"- Invocations: **{invocations}**",
         cost_line,
     ]
+    if budget:
+        b = budget.get("budget_usd") or 0.0
+        spent = budget.get("spent_usd") or 0.0
+        frac = budget.get("fraction") or 0.0
+        state = "⛔ EXHAUSTED" if budget.get("exhausted") else "within budget"
+        lines.append(
+            f"- Budget (metered): **${spent:.4f} / ${b:.4f}** "
+            f"({frac * 100:.0f}% used — {state}; ${budget.get('remaining_usd') or 0.0:.4f} remaining)"
+        )
     wall_s = summary.get("total_wall_s") or 0.0
     if wall_s:
         lines.append(f"- Wall time (in model calls): **{wall_s / 60.0:.1f} min**")
