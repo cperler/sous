@@ -56,6 +56,27 @@ def test_docstring_agent_is_generic_not_phpdoc() -> None:
     assert agent != "phpdoc-writer"  # fix D13
 
 
+def test_design_roster_routes_frontend_and_design_roles() -> None:
+    # #62: the design content drop-in — the frontend implement roles and the design review
+    # role resolve to heysoo's design agent (its design-system knowledge lives in that
+    # agent file in the product repo, resolved cwd-relative by the runner).
+    cfg = get_config()
+    design = "bulletproof-frontend-developer"
+    assert cfg.agent_for(Stage.IMPLEMENT, role="frontend") == design
+    assert cfg.agent_for(Stage.IMPLEMENT, role="design") == design
+    assert cfg.agent_for(Stage.REVIEW, role="design") == design
+
+
+def test_default_stage_roles_still_fall_through_to_bare_agents() -> None:
+    # Stage-qualified keys must not shadow the default bare roles the engine passes.
+    cfg = get_config()
+    assert cfg.agent_for(Stage.IMPLEMENT, role="implement") == "python-backend-developer"
+    assert cfg.agent_for(Stage.REVIEW, role="review") == "code-reviewer"
+    assert cfg.agent_for(Stage.REVIEW, role="spec") == "spec-reviewer"
+    assert cfg.agent_for(Stage.IMPLEMENT, role=None) is None
+    assert cfg.agent_for(Stage.REVIEW, role="nonexistent") is None
+
+
 def test_github_task_source_resolve_with_fake_gh() -> None:
     captured: list[list[str]] = []
 

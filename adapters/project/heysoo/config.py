@@ -19,14 +19,25 @@ from orchestrator.schemas.stage_schemas import resolve_stage_schema
 from .classifier import HeysooClassifier
 from .task_source import GitHubIssuesSource
 
-# Roster (ports the agent names; review/spec stay generic, frontend/backend are
+# Roster (ports the agent names; review/spec stay generic, frontend/backend/design are
 # product-specific drop-ins). docstring -> a GENERIC docstring agent (fix D13).
+#
+# Design content drop-in (#62 / target.md:128): heysoo's accumulated frontend-design
+# judgment lives in the `bulletproof-frontend-developer` agent (its design-system tokens —
+# ADR-053 light-only theme, monochrome baseline, component conventions — plus the linked
+# `ui-design-fundamentals` skill). agent_for returns only the agent NAME; the runner
+# resolves it cwd-relative against the product repo's `.claude/agents/<name>.md`, so the
+# rich content stays in `heysoo/.claude/agents/bulletproof-frontend-developer.md`
+# (read-only, NOT copied here). Both the frontend IMPLEMENT roles and the design REVIEW
+# role point at it, so a design-tagged stage draws on the same design-system knowledge.
 _ROSTER: dict[str, str] = {
     "implement": "python-backend-developer",
     "implement:frontend": "bulletproof-frontend-developer",
+    "implement:design": "bulletproof-frontend-developer",
     "test": "python-backend-developer",
     "review": "code-reviewer",
     "review:spec": "spec-reviewer",
+    "review:design": "bulletproof-frontend-developer",
     "docstring": "docstring-writer",  # generic; NOT phpdoc-writer
 }
 
@@ -79,9 +90,17 @@ class HeysooConfig:
         return self._task_source
 
     def agent_for(self, stage: Stage, role: str | None = None) -> str | None:
-        if role and role in _ROSTER:
-            return _ROSTER[role]
-        return None
+        """Resolve a (stage, sub-role) to an agent name. A stage-qualified key
+        (``"<stage>:<role>"``) wins over the bare role, so a task can opt a stage into a
+        specialized agent by passing a bare sub-role: ``agent_for(REVIEW, "design")`` and
+        ``agent_for(IMPLEMENT, "frontend"|"design")`` return the design agent, while the
+        default stage roles (``"implement"``/``"review"``/…) fall through to the bare-key
+        backend/review agents. A pipeline opts into the design role by pinning the stage's
+        ``agent_role`` to ``"design"``; independently, the engine's REVIEW template appends
+        the project-agnostic design-review lens whenever the change touches frontend files."""
+        if not role:
+            return None
+        return _ROSTER.get(f"{stage.value}:{role}") or _ROSTER.get(role)
 
     # --- per-task port block (#5) ----------------------------------------------
     def port_env(self, base: int, count: int) -> dict[str, str]:

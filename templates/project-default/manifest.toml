@@ -34,6 +34,9 @@ tags = ["python"]
 [agents.typescript-frontend-developer]
 roles = ["implement:frontend"]
 tags = ["typescript"]
+[agents.design-reviewer]
+roles = ["review:design"]                # design-craft lens for frontend review
+tags = ["typescript"]                    # rides the frontend stack (the kit's UI language)
 
 # ── Hooks: .claude hooks the bootstrap merges into the project's settings.json.
 #    Empty tags = always seeded (the safety guards); language tags = per-stack. ──

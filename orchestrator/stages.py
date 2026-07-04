@@ -150,6 +150,49 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
 }
 
 
+# Frontend-file signals for the design-review lens (#62). Any changed path with one of
+# these suffixes, or living under a ``frontend/`` segment, marks the change as user-facing.
+# Framework-neutral so the lens fires for React/Vue/Svelte/plain-CSS projects alike.
+_FRONTEND_SUFFIXES: tuple[str, ...] = (
+    ".tsx", ".jsx", ".vue", ".svelte", ".css", ".scss", ".sass", ".less",
+)
+
+
+def _has_frontend_change(files_changed: object) -> bool:
+    """True if any changed file looks user-facing (a design surface). Deterministic and
+    engine-template-side: a pure function of ``files_changed``, so the same context always
+    yields the same lens. Unlike the #41 docs-only tag this need not be ENGINE-lane-trusted
+    — the lens only ADDS review scrutiny, so a model over- or under-reporting files can't
+    exploit it to skip work (the safe direction)."""
+    if not isinstance(files_changed, list):
+        return False
+    for f in files_changed:
+        p = str(f).lower()
+        if p.endswith(_FRONTEND_SUFFIXES) or "frontend/" in p:
+            return True
+    return False
+
+
+# Project-agnostic design-review criteria injected into the REVIEW prompt when the change
+# touches frontend files (#62). The heysoo-specific design-system tokens (visual language,
+# component library, theme rules) stay in the adapter's design agent — this block is the
+# reusable craft lens only.
+_DESIGN_REVIEW_LENS = (
+    "\n\n## Frontend change: apply the design-review lens\n"
+    "This change touches user-facing files (per files_changed above). Beyond correctness, "
+    "review the design craft:\n"
+    "- Visual hierarchy: size/weight/spacing guide attention; the primary element reads first.\n"
+    "- Spacing & alignment: a consistent scale (e.g. an 8pt grid), no arbitrary one-off values.\n"
+    "- Consistency & reuse: reuse existing components/patterns/tokens over reinventing them.\n"
+    "- Accessibility: sufficient contrast, keyboard operability, visible focus, labels/roles, "
+    "adequate tap targets; never rely on color alone.\n"
+    "- Responsive behavior: works across viewport sizes and larger text; no fixed heights on "
+    "text containers; graceful with more/less content.\n"
+    "Treat these as review criteria — blocking only when a change materially harms usability "
+    "or accessibility; otherwise record them as non-blocking polish."
+)
+
+
 def _render_value(v: object) -> str:
     """One folded context value → a compact one-line-ish string for the prompt."""
     if isinstance(v, list):
@@ -226,6 +269,11 @@ def render_prompt(
             "or hold this change for lacking new/updated tests. Judge it on documentation "
             "correctness and clarity instead."
         )
+    # #62: a frontend change (deterministic signal on files_changed folded from IMPLEMENT)
+    # gets the design-review criteria block appended to the REVIEW prompt. Project-agnostic
+    # wording; the heysoo-specific design tokens live in the adapter's design agent.
+    if stage is Stage.REVIEW and _has_frontend_change((context or {}).get("files_changed")):
+        instruction += _DESIGN_REVIEW_LENS
     if learnings:
         instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
     parts.append(instruction)

@@ -58,6 +58,17 @@ def test_profile_selects_stack_agents_and_commands() -> None:
                                 "guard-deploy", "guard-sensitive-files"}  # guards always ride
 
 
+def test_design_reviewer_seeds_with_the_frontend_stack_only() -> None:
+    # #62: the generic design-review lens agent rides the frontend (typescript) stack, and
+    # claims the review:design sub-role — a pure-python project doesn't get it.
+    ts = profile_from_languages("svc", ["typescript"], MANIFEST)
+    assert "design-reviewer" in ts.seed["agents"]
+    assert ts.roster["review:design"] == "design-reviewer"
+    py = profile_from_languages("svc", ["python"], MANIFEST)
+    assert "design-reviewer" not in py.seed["agents"]
+    assert "review:design" not in py.roster
+
+
 def test_no_language_profile_is_generic() -> None:
     p = profile_from_languages("svc", [], MANIFEST)
     assert p.roster["implement"] == "generic-implementer"
@@ -120,6 +131,7 @@ def test_rerun_adds_language_without_clobbering_handedits(tmp_path) -> None:
     assert rp.roster["implement:frontend"] == "typescript-frontend-developer"  # added
     assert "# HAND-EDITED" in classifier.read_text()                     # not clobbered
     assert (proj / ".claude" / "agents" / "typescript-frontend-developer.md").exists()  # newly seeded
+    assert (proj / ".claude" / "agents" / "design-reviewer.md").exists()  # #62: design lens rides ts
 
 
 # --- stack detection (Phase 3 Part A) ----------------------------------------
