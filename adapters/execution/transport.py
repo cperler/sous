@@ -585,6 +585,63 @@ def _codex_session_id(events_stdout: str) -> str | None:
     return None
 
 
+# Object-schema children to recurse into when strict-transforming for codex. Covers the
+# shapes the stage schemas actually use (properties/items/combinators/$defs).
+_SCHEMA_CHILD_KEYS = ("properties", "$defs", "definitions")
+_SCHEMA_LIST_KEYS = ("anyOf", "allOf", "oneOf", "prefixItems")
+
+
+def _codex_strict_schema(schema_json: str) -> str:
+    """A strict-transformed COPY of a stage schema for codex's ``--output-schema``.
+
+    OpenAI's structured-output validator requires ``additionalProperties: false`` on every
+    object node (live 400 ``invalid_json_schema``: "'additionalProperties' is required to be
+    supplied and to be false", run live-20260704-2 #68). Recursively stamps it onto every
+    object-shaped node. Only the codex NUDGE sees this copy — engine-side validation and the
+    schema-retry loop keep the original, so task semantics are unchanged. Unparseable input
+    is returned as-is (the call then degrades via ``_codex_schema_rejected``)."""
+    try:
+        root = json.loads(schema_json)
+    except json.JSONDecodeError:
+        return schema_json
+
+    def walk(node: object) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object" or "properties" in node:
+            node["additionalProperties"] = False
+        for key in _SCHEMA_CHILD_KEYS:
+            if isinstance(node.get(key), dict):
+                for child in node[key].values():
+                    walk(child)
+        for key in _SCHEMA_LIST_KEYS:
+            if isinstance(node.get(key), list):
+                walk(node[key])
+        if isinstance(node.get("items"), dict | list):
+            walk(node["items"])
+
+    walk(root)
+    return json.dumps(root)
+
+
+# Markers of codex rejecting the `--output-schema` FILE itself (a 400 before any work runs) —
+# our nudge's problem, never the task's. Appears in the `--json` event stream (stdout), not
+# stderr. Deliberately narrow: `invalid_json_schema` is the API's error code for exactly this.
+_SCHEMA_REJECTED_MARKERS = ("invalid_json_schema", "invalid schema for response_format")
+
+
+def _codex_schema_rejected(raw: RawResult) -> bool:
+    """True when a codex call failed because the strict validator refused our schema nudge."""
+    if raw.exit_code == 0:
+        return False
+    text = f"{raw.raw_output or ''} {raw.error or ''}".lower()
+    return any(m in text for m in _SCHEMA_REJECTED_MARKERS)
+
+
 def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], cwd=cwd, capture_output=True,  # noqa: S603, S607
                           text=True, timeout=60)
@@ -1037,17 +1094,22 @@ def codex_cli_transport(
     the same dispatch (continuity is routing metadata; correctness never depends on it)."""
     root = Path(run_log_root) if run_log_root is not None else None
 
-    def _call(work: WorkItem, session_ref: str | None, retry: int = 0) -> RawResult:
+    def _call(work: WorkItem, session_ref: str | None, retry: int = 0,
+              use_schema: bool = True) -> RawResult:
         grant = _codex_git_common_dir(work)
         proc_env = subprocess_env(work)  # #5: per-task port block for the codex subprocess
         with tempfile.TemporaryDirectory() as td:
             last = Path(td) / "last.json"
             schema_flags: list[str] = []
-            if schema_json_for and (schema := schema_json_for(work.schema_ref)):
+            if use_schema and schema_json_for and (schema := schema_json_for(work.schema_ref)):
                 # `--output-schema` takes a FILE — the codex analog of claude's inline
                 # `--json-schema`. Preventive first-call nudge; the retry loop is the guarantee.
+                # OpenAI's strict validator requires `additionalProperties: false` on every
+                # object node (live 400 `invalid_json_schema`, run live-20260704-2 #68), so the
+                # nudge gets a strict-transformed COPY — engine-side validation keeps the
+                # original schema.
                 schema_file = Path(td) / "schema.json"
-                schema_file.write_text(schema, encoding="utf-8")
+                schema_file.write_text(_codex_strict_schema(schema), encoding="utf-8")
                 schema_flags = ["--output-schema", str(schema_file)]
             tail = ["-m", work.model, "--skip-git-repo-check", *schema_flags,
                     "--json", "--output-last-message", str(last), work.prompt]
@@ -1109,8 +1171,17 @@ def codex_cli_transport(
             raw = _call(work, None)
         # Without a schema wired there's nothing to validate — keep validate-at-runner behavior.
         schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
+        call = _call
+        # The schema nudge must never be the reason a call fails: if codex's strict validator
+        # rejects even the transformed schema (a future strictness rule we don't cover), drop
+        # the `--output-schema` flag for this dispatch — postamble + retry loop remain the
+        # guarantee — instead of burning attempts on a 400 that no retry can fix.
+        if schema_json and _codex_schema_rejected(raw):
+            def call(w: WorkItem, s: str | None, retry: int = 0) -> RawResult:  # noqa: E306
+                return _call(w, s, retry, use_schema=False)
+            raw = call(work, work.session_ref)
         if schema_json:
-            raw = _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
+            raw = _schema_retry_loop(raw, work, schema_json, max_schema_retries, call)
         return replace(raw, persona_injected=persona) if persona is not None else raw
 
     return run
