@@ -2252,10 +2252,12 @@ class Engine:
         """The structured task context a deterministic ENGINE-lane runner reads — the
         SAME facts the model lanes receive through the rendered prompt: the engine-owned
         folded context plane (branch/worktree/baseline_failures/pr_url/…) plus the task
-        fields the TEST/DELIVER runners need (issue_number/title/body/task_id). Purely
-        engine-derived, so no project-specific logic reaches a model call and it stays
-        reconstructible on replay. ``setdefault`` lets a folded value win over the task
-        field (e.g. a deliver-folded pr_url) without clobbering it."""
+        fields the TEST/DELIVER runners need (issue_number/title/body/task_id). Includes
+        ``review_cycles`` when set (#68): the deterministic DELIVER runner uses it to
+        annotate a reused PR's advisory comment with which fix cycle re-pushed the branch.
+        Purely engine-derived, so no project-specific logic reaches a model call and it
+        stays reconstructible on replay. ``setdefault`` lets a folded value win over the
+        task field (e.g. a deliver-folded pr_url) without clobbering it."""
         ctx = dict(task.context)
         ctx.setdefault("task_id", task.task_id)
         if task.title:
