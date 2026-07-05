@@ -275,7 +275,14 @@ def main(argv: list[str] | None = None) -> int:
                         "holding the dispatch lease (bypasses the lease/cooldown guard so a "
                         "crashed supervisor recovers its item without hand-editing state; #50)")
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
-    d = sub.add_parser("dispatchable")
+    d = sub.add_parser(
+        "dispatchable",
+        help="list DAG-ready tasks and in-flight capacity state (#97): "
+             "'dispatchable' = unleased tasks whose deps are met; "
+             "'in_flight'/'in_flight_count' = tasks with a live dispatch lease right now. "
+             "Remaining headroom = limit - in_flight_count. Re-check before every "
+             "follow-on dispatch so the cap binds across concurrent background invocations.",
+    )
     d.add_argument("--util", default="0", help=util_help)
     d.add_argument("--max-concurrent", type=int, default=3)
     rh = sub.add_parser("run-headless", help="drive the whole run in-process (headless mode)")
