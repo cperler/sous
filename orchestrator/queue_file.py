@@ -9,10 +9,14 @@ existing, already-resumable ``Scheduler.run``.
 
 Two halves live here:
 
-* ``QueueFile`` — a thin, project-agnostic abstraction over the queue JSON. Append is
-  lock-free (append-only, atomic temp-file + ``os.replace``, matching §1.8's rationale
-  that a bare append needs no lock); ``pop_head`` / ``requeue_head`` are the single
-  consumer's dequeue and its undo. Malformed content raises the typed ``QueueError``.
+* ``QueueFile`` — a thin, project-agnostic abstraction over the queue JSON. Every
+  mutation (``append`` at the tail, the single consumer's ``pop_head`` / ``requeue_head``)
+  is a read-modify-write of the whole array, so each is guarded by an exclusive advisory
+  lock (``fcntl.flock``, mkdir-spin fallback) and finished with an atomic temp-file +
+  ``os.replace``. The lock is what makes concurrent producers safe: §1.8's bare append
+  assumed a single enqueuer, but two parallel cron ``--enqueue`` invocations would
+  otherwise both read the old array and one entry would be lost — the lock serializes
+  them instead. Malformed content raises the typed ``QueueError``.
 * ``drive_queue`` — the unattended loop. It pops the head batch, derives a STABLE run id
   from ``enqueued_at`` (so a crashed-then-restarted driver reuses the same run rather than
   forking a duplicate), creates-or-reuses that run, adds each task in listed order, then
@@ -32,7 +36,9 @@ import json
 import os
 import re
 import tempfile
-from collections.abc import Callable
+import time
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -41,6 +47,14 @@ from .engine import Engine
 from .errors import OrchestratorError, StatusStoreError
 from .scheduler import Runner, Scheduler
 from .schemas.enums import ExecutionLane
+
+try:  # fcntl is POSIX-only; the mkdir-spin fallback covers the rest (e.g. Windows).
+    import fcntl
+
+    _HAVE_FCNTL = True
+except ImportError:  # pragma: no cover - platform dependent
+    fcntl = None  # type: ignore[assignment]
+    _HAVE_FCNTL = False
 
 
 class QueueError(OrchestratorError):
@@ -87,13 +101,52 @@ class QueueFile:
     """A ``ralph-queue.json``-style queue of batch entries backed by a JSON array file.
 
     A missing file reads as an empty queue. Every write is atomic (temp-file in the same
-    directory + ``os.replace``) so a crash mid-write can never corrupt the queue. Append is
-    deliberately lock-free per §1.8 (append-only); the single unattended consumer owns
-    ``pop_head`` / ``requeue_head``.
+    directory + ``os.replace``) so a crash mid-write can never corrupt the queue. Every
+    mutation is a whole-array read-modify-write, so each holds an exclusive advisory lock
+    (``.lock`` sentinel next to the queue) for its full read→write span: this is what keeps
+    concurrent enqueuers safe. §1.8 originally called ``append`` "lock-free" on a
+    single-producer assumption, but two parallel cron ``--enqueue`` runs would each read
+    the old array and lose one entry without the lock. ``pop_head`` / ``requeue_head`` are
+    the single unattended consumer's dequeue and its undo; they take the same lock so they
+    never race a producer either.
     """
 
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
+
+    @contextmanager
+    def _with_lock(self) -> Iterator[None]:
+        """Hold an exclusive advisory lock over the queue for one read-modify-write span,
+        so concurrent producers/consumers serialize instead of clobbering each other. Ports
+        the status-store contract: ``fcntl.flock(LOCK_EX)`` on a ``<name>.lock`` sentinel,
+        with an ``os.mkdir``-spin fallback where fcntl is unavailable. The sentinel is left
+        in place on release (deleting it would race two writers onto different inodes and
+        break mutual exclusion) — it is a tiny, harmless companion to the queue file."""
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if _HAVE_FCNTL:
+            lock_file = self.path.with_name(f"{self.path.name}.lock")
+            fh = open(lock_file, "w")  # noqa: SIM115 - held across the yield
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+                yield
+            finally:
+                try:
+                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+                finally:
+                    fh.close()
+        else:  # pragma: no cover - exercised only without fcntl
+            lock_dir = self.path.with_name(f"{self.path.name}.lockdir")
+            while True:
+                try:
+                    os.mkdir(lock_dir)
+                    break
+                except FileExistsError:
+                    time.sleep(0.01)
+            try:
+                yield
+            finally:
+                with contextlib.suppress(OSError):
+                    os.rmdir(lock_dir)
 
     def read(self) -> list[dict]:
         """Return the queue as a list of validated entries. Missing file → ``[]``. Raises
@@ -128,10 +181,12 @@ class QueueFile:
             raise
 
     def append(self, entry: dict) -> dict:
-        """Atomically append one validated batch entry to the tail and return it. Lock-free
-        (append-only) per §1.8: read current, add, atomic-replace."""
+        """Append one validated batch entry to the tail and return it. The read→add→write
+        is a single unit under ``_with_lock`` so concurrent enqueuers can't each read the
+        old array and drop one entry (§1.8's single-producer assumption made explicit)."""
         _validate_entry(entry, "appended entry")
-        self._write([*self.read(), entry])
+        with self._with_lock():
+            self._write([*self.read(), entry])
         return entry
 
     def peek_head(self) -> dict | None:
@@ -140,19 +195,23 @@ class QueueFile:
         return entries[0] if entries else None
 
     def pop_head(self) -> dict | None:
-        """Remove and return the head batch (FIFO dequeue), or ``None`` when empty."""
-        entries = self.read()
-        if not entries:
-            return None
-        head, rest = entries[0], entries[1:]
-        self._write(rest)
+        """Remove and return the head batch (FIFO dequeue), or ``None`` when empty. Takes
+        ``_with_lock`` so the read→write can't race a concurrent producer's append."""
+        with self._with_lock():
+            entries = self.read()
+            if not entries:
+                return None
+            head, rest = entries[0], entries[1:]
+            self._write(rest)
         return head
 
     def requeue_head(self, entry: dict) -> None:
         """Re-prepend ``entry`` to the front of the queue (the ingest-failure undo, so a
-        popped-then-unprocessable batch is retried first, not dropped)."""
+        popped-then-unprocessable batch is retried first, not dropped). Locked so the
+        read→write can't race a concurrent producer's append."""
         _validate_entry(entry, "requeued entry")
-        self._write([entry, *self.read()])
+        with self._with_lock():
+            self._write([entry, *self.read()])
 
 
 def run_id_for(entry: dict, *, prefix: str = "queue") -> str:

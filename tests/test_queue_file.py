@@ -12,6 +12,7 @@ Covers the two halves of ``orchestrator.queue_file``:
 from __future__ import annotations
 
 import json
+import threading
 
 import pytest
 
@@ -58,6 +59,39 @@ def test_append_is_atomic_on_disk(tmp_path) -> None:
     ]
     # no stray temp files left behind in the dir
     assert not list(tmp_path.glob(".queue-*.tmp"))
+
+
+def test_concurrent_producers_do_not_lose_entries(tmp_path) -> None:
+    # #113 / #115 regression: append() is a whole-array read-modify-write, so two parallel
+    # cron `--enqueue` producers could both read the old array and clobber one entry (a lost
+    # update). The exclusive `_with_lock` serializes the read→write, so EVERY producer's
+    # entry must survive — including a pre-existing head that none may drop. A barrier fans
+    # the writers in together to force maximum contention; flock serializes them across the
+    # separate fds each append opens (real mutual exclusion even within one process).
+    path = tmp_path / "queue.json"
+    QueueFile(path).append(make_entry(["seed"]))  # a head every writer must preserve
+
+    n = 16
+    barrier = threading.Barrier(n)
+    errors: list[Exception] = []
+
+    def worker(task_id: str) -> None:
+        try:
+            barrier.wait(timeout=30)
+            QueueFile(path).append(make_entry([task_id]))
+        except (QueueError, threading.BrokenBarrierError) as exc:  # pragma: no cover
+            errors.append(exc)
+
+    threads = [threading.Thread(target=worker, args=(f"t{i}",)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+
+    assert not errors, errors
+    tasks = [e["tasks"][0] for e in QueueFile(path).read()]
+    assert tasks[0] == "seed"  # the pre-existing entry is never lost
+    assert sorted(tasks[1:]) == sorted(f"t{i}" for i in range(n))  # all N producers survived
 
 
 # --- QueueFile: malformed input → typed QueueError --------------------------------
