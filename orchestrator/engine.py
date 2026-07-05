@@ -1869,28 +1869,14 @@ class Engine:
             {"ts": _now(), "type": "rejected", "run_id": run_id, "task_id": task_id,
              "rejected_by": rejected_by, "reason": reason},
         )
-        # Evidence-out — surface the rejection reason READ BACK from the durable artifact
-        # (#52: load_rejection now has a production caller and its schema can't silently
-        # go stale). Best-effort and wrapped: a flaky task source or render must never
-        # escape reject() and skip the cascade/finalize below.
-        try:
-            self._surface_rejection(run_id, task)
-        except Exception as exc:  # noqa: BLE001 - evidence-out must never crash the close
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "rejection_evidence_failed", "run_id": run_id,
-                 "task_id": task_id, "error": str(exc)},
-            )
         # Out-of-band transition (like approve/hold, not via record()), so it must perform
-        # record()'s post-transition run-level effects itself: cascade-block dependents of
-        # the now-closed task, release its port block (#5, best-effort), and finalize the run
-        # so it closes instead of staying open.
-        self._cascade_from(run_id, task_id)
-        self._release_ports(run_id, task)
-        # #72: a rejected task often carries the learnings that PROVED it infeasible (review
-        # rejections, failed attempts) — harvest them so a later run inherits that verdict.
-        self._harvest_task_learnings(run_id, task)
-        self._maybe_finalize_run(run_id)
+        # record()'s post-transition run-level effects itself. All of them — the rejection
+        # evidence-out (#52), cascade, port release (#5), learnings harvest (#72), and
+        # finalize — live in the shared helper so every operator finalize path (reject /
+        # abandon / future) stays consistent (#110). disposition='rejected' ⇒ the helper
+        # surfaces the rejection and emits NO task_failed notification (a deliberate human
+        # close is not an execution failure — reject's existing silence is preserved).
+        self._finalize_task_terminal(run_id, task, disposition="rejected", reason=reason)
         return task
 
     def _surface_rejection(self, run_id: str, task: Task) -> None:
@@ -1925,6 +1911,64 @@ class Engine:
                  "task_id": task.task_id},
             )
 
+    def _finalize_task_terminal(
+        self, run_id: str, task: Task, *, disposition: str, reason: str
+    ) -> None:
+        """Run the shared post-transition run-level effects every operator-invoked
+        finalize path (``reject``, ``abandon``, and future ones like ``force_complete``)
+        must perform after transitioning a task DIRECTLY to a terminal state out of band
+        (i.e. not through ``record``, which carries these effects itself).
+
+        These effects were previously re-implemented inline in each caller, so each new
+        operator path was an opportunity to miss one (#110 — ``abandon`` originally missed
+        the ``emit_notification`` and ``_surface_rejection`` that ``reject``/``record``
+        carry). Centralising them makes the paths consistent and future ones correct by
+        construction. In the SAME order the peer methods use:
+
+          1. ``disposition == 'rejected'`` — surface the rejection reason (read back from
+             the durable artifact) in the task index + task-source note, wrapped in the
+             best-effort try/except that events ``rejection_evidence_failed`` so a flaky
+             task source never escapes and skips the cascade/finalize below (#109);
+          2. cascade-block dependents of the now-terminal task;
+          3. release its port block (#5, best-effort);
+          4. harvest any learnings it accrued into the cross-run KB (#72, best-effort);
+          5. ``disposition == 'failed'`` — emit the ``task_failed`` alerting notification
+             that ``record``'s terminal-failure path emits (#107). A ``rejected``
+             disposition emits NO ``task_failed`` (a deliberate human close is not an
+             execution failure — this preserves ``reject``'s existing silence);
+          6. finalize the run so it reaches a terminal state instead of hanging open.
+        """
+        if disposition == "rejected":
+            # Evidence-out — surface the rejection reason READ BACK from the durable
+            # artifact (#52). Best-effort and wrapped: a flaky task source or render must
+            # never escape and skip the cascade/finalize below.
+            try:
+                self._surface_rejection(run_id, task)
+            except Exception as exc:  # noqa: BLE001 - evidence-out must never crash the close
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "rejection_evidence_failed", "run_id": run_id,
+                     "task_id": task.task_id, "error": str(exc)},
+                )
+        self._cascade_from(run_id, task.task_id)
+        self._release_ports(run_id, task)
+        self._harvest_task_learnings(run_id, task)
+        if disposition == "failed":
+            # Same alerting record()'s terminal-failure path fires (#55/#107): a task that
+            # died is exactly the unattended-run event the old monitor alerted on. Always
+            # appends the notification audit row even when no notify hook is installed.
+            stage = task.current_stage
+            self.emit_notification(
+                run_id, "task_failed",
+                {"run_id": run_id, "task_id": task.task_id, "kind": "task_failed",
+                 "summary": f"task {task.task_id} FAILED"
+                            + (f" at {stage.value}" if stage else "")
+                            + f": {reason}",
+                 "stage": stage.value if stage else None,
+                 "reason": task.last_error or reason},
+            )
+        self._maybe_finalize_run(run_id)
+
     def abandon(
         self,
         run_id: str,
@@ -1950,9 +1994,13 @@ class Engine:
         ``record``'s retry/fallback machinery, clears the lease, bumps the stage counter, and
         transitions the task DIRECTLY to a terminal state — FAILED (``disposition='failed'``)
         or CLOSED_INFEASIBLE (``disposition='rejected'``, writing the same durable rejection
-        artifact ``reject`` does). It then runs the SAME post-transition run-level effects
-        ``reject`` performs (cascade-block dependents, release ports, harvest learnings,
-        finalize the run) so the run actually reaches terminal instead of hanging open.
+        artifact ``reject`` does). The task-doc mutation is applied under the per-task lock
+        via ``update_task`` (#108). It then runs the SAME post-transition run-level effects
+        the other operator finalize paths do, via the shared ``_finalize_task_terminal``
+        helper (#110): on ``rejected`` it surfaces the rejection (publishes a note + renders
+        the read-back reason, #109); on ``failed`` it emits the ``task_failed`` alert
+        ``record`` fires (#107); both cascade-block dependents, release ports, harvest
+        learnings, and finalize the run so it reaches terminal instead of hanging open.
 
         Guards (all ``ContractError``):
           - nothing to abandon: the task has no outstanding dispatch;
@@ -2038,23 +2086,31 @@ class Engine:
 
         # Clear the lease and fold the abandonment into the stage record + task state DIRECTLY
         # (not via apply_result / record — an abandoned dispatch never converges, so none of
-        # the retry/salvage/fallback machinery applies).
-        task.pending_work_item_id = None
-        task.pending_content_hash = None
-        task.pending_fallback_model = None
-        dispatched.status = StageStatus.FAILED
-        dispatched.completed_at = completed_at
-        dispatched.error = f"dispatch_abandoned: {reason}"
-        dispatched.provider = lane.provider
-        dispatched.lane = lane.execution_mode
-        dispatched.cost_usd = cost
-        task.last_error = f"dispatch_abandoned: {reason}"
-        task.state = (
-            TaskState.CLOSED_INFEASIBLE if disposition == "rejected" else TaskState.FAILED
-        )
-        task.updated_at = _now()
+        # the retry/salvage/fallback machinery applies). #108: apply the mutation under the
+        # per-task lock via update_task (a read-modify-write on the FRESH doc) so a concurrent
+        # writer can't clobber the transition — the side-effecting reads/computation above
+        # (probe, synthetic result, ledger row, lane) already ran outside the lock.
+        error = f"dispatch_abandoned: {reason}"
 
-        task.stage_counter += 1
+        def _abandon(t: Task) -> None:
+            t.pending_work_item_id = None
+            t.pending_content_hash = None
+            t.pending_fallback_model = None
+            d = t.stages[stage]
+            d.status = StageStatus.FAILED
+            d.completed_at = completed_at
+            d.error = error
+            d.provider = lane.provider
+            d.lane = lane.execution_mode
+            d.cost_usd = cost
+            t.last_error = error
+            t.state = (
+                TaskState.CLOSED_INFEASIBLE if disposition == "rejected"
+                else TaskState.FAILED
+            )
+            t.stage_counter += 1
+
+        task = self.store.update_task(run_id, task_id, _abandon)
         seq = task.stage_counter
         payload = {
             "work_item_id": work_item_id,
@@ -2082,7 +2138,9 @@ class Engine:
                 {"rejected_by": "abandon", "at": completed_at, "reason": reason,
                  "run_id": run_id, "task_id": task_id},
             )
-        self.store.save_task(task)
+        # The task doc is already persisted by update_task above; the index/ref-state below
+        # are derived artifacts (a failed abandon renders here; a rejected one is re-rendered
+        # from the read-back artifact by _surface_rejection inside the finalize helper).
         self.store.write_task_index(
             task_id, render_task_index(task, rejection_reason=rejection_reason)
         )
@@ -2094,13 +2152,12 @@ class Engine:
              "reason": reason, "disposition": disposition,
              "stream_last_grew": stream_last_grew, "forced": force},
         )
-        # Same out-of-band post-transition run-level effects reject() performs: cascade-block
-        # dependents of the now-terminal task, release its port block (best-effort), harvest
-        # any learnings it accrued, and finalize the run so it closes instead of hanging open.
-        self._cascade_from(run_id, task_id)
-        self._release_ports(run_id, task)
-        self._harvest_task_learnings(run_id, task)
-        self._maybe_finalize_run(run_id)
+        # Shared out-of-band post-transition run-level effects (#110): the rejection
+        # evidence-out (#109 — publishes a note + re-renders the index from the read-back
+        # artifact), cascade-block, port release, learnings harvest, the task_failed alert
+        # on the FAILED path (#107), and run finalize. Delegated so this path can never drift
+        # from reject()'s (each new operator finalize path stays correct by construction).
+        self._finalize_task_terminal(run_id, task, disposition=disposition, reason=reason)
         return task
 
     # --- resume / status ------------------------------------------------------
