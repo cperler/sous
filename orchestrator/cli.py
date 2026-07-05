@@ -148,6 +148,23 @@ def _emit(obj) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Parse ``argv`` (or ``sys.argv[1:]``) and dispatch to the matching subcommand.
+
+    Returns the process exit code (0 = success, 1 = any handled error).
+
+    Subcommands fall into three groups:
+
+    * **Engine commands** (``init-run``, ``add-task``, ``next``, ``record``, ``run-headless``,
+      ``batch-plan``, …) — all route through ``_engine()`` which resolves ``--root``/``--run``
+      to a per-run store directory, builds an ``Engine``, and delegates.
+    * **Read-only board** (``dashboard``) — reads every store under ``--root`` via
+      ``dashboard_snapshot`` and renders to the terminal.  Two non-default modes are available:
+      ``--watch`` (clear-screen polling loop) and ``--serve`` (HTTP server mode added by #94).
+      ``--serve`` binds ``web_dashboard.serve`` on ``--host``/``--port`` and forwards
+      ``--limit``/``--all``/``--stale-after`` as ``snap_kwargs``; the call blocks until Ctrl-C.
+    * **Cross-run learnings KB** (``kb show``/``kb add``) — reads/appends
+      ``<runs-root>/learnings-kb.jsonl``.
+    """
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root",
                    help="runs-root or per-run store dir (not needed for validate). Per-run "
