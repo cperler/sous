@@ -62,6 +62,7 @@ function toStageResult(wi, agentResult) {
     stage: wi.stage,
     attempt: wi.attempt || 0,
     model: wi.model,
+    effort: wi.effort || null, // #96: echoed for the ledger row / stage events (audit)
     status: agentResult && agentResult.error ? 'failure' : (out ? 'success' : 'schema_violation'),
     structured_output: out,
     raw_output: (agentResult && agentResult.raw) || null,
@@ -83,6 +84,7 @@ const thunks = items.map((wi) => async () => {
   try {
     const res = await agent(wi.prompt, {
       model: wi.model,
+      effort: wi.effort || undefined, // #96: per-stage reasoning effort (low/medium/high)
       agentType: wi.agent || undefined, // persona from the project roster
       schema: A.schemas ? sanitizeSchema(A.schemas[wi.schema_ref]) : undefined,
       label: `${wi.stage}:${wi.task_id}`,

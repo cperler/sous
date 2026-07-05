@@ -11,7 +11,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .model_table import Role
-from .schemas.enums import STAGE_ORDER, Stage
+from .schemas.enums import STAGE_ORDER, Effort, Stage
 
 
 @dataclass(frozen=True)
@@ -33,6 +33,12 @@ class StageSpec:
     # non-model ENGINE lane — NEVER a model call (heysoo #227: don't ask an LLM to run
     # `git worktree add`). Routes to (ExecutionMode.ENGINE, Provider.NONE); $0.
     deterministic: bool = False
+    # Default reasoning effort for a model-lane dispatch of this stage (#96): hard
+    # reasoning stages (scope/implement) run high, judgment stages (test/review) medium,
+    # mechanical prose (deliver) low. None = provider default (and always None on a
+    # deterministic stage — the ENGINE lane has no model to throttle). A per-task
+    # effort pin overrides this, mirroring how model_pin overrides model_role.
+    effort: Effort | None = None
 
 
 # The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
@@ -58,6 +64,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="scope",
         agent_role="scope",
         timeout_s=600,  # deep reasoning, no file edits
+        effort=Effort.HIGH,  # feasibility + planning is a hard-reasoning stage (#96)
         template=(
             "Understand the change, decide feasibility, and produce a minimal task "
             "plan. If genuinely blocked, say so.\n"
@@ -71,6 +78,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="implement",
         timeout_s=1800,  # the heavy stage: multi-file edits + commits
         checkpoint=True,
+        effort=Effort.HIGH,  # the heavy reasoning stage (#96)
         template=(
             "Implement the change and commit it. Follow the scope plan in the context "
             "above if present; if none (lite/micro), implement the task spec directly "
@@ -85,6 +93,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="test",
         timeout_s=1200,  # test/fix iterate-until-green loop
         checkpoint=True,
+        effort=Effort.MEDIUM,  # judgment (meaningfulness) but mostly mechanical loops (#96)
         template=(
             "Run the project's tests for the changed files, fix regressions you "
             "introduced, and re-run until green or no progress. Tests listed under "
@@ -105,6 +114,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
         timeout_s=600,  # docstrings + open a PR
         checkpoint=True,
+        effort=Effort.LOW,  # mechanical prose + `gh pr create` — the cheap stage (#96)
         template=(
             "Add/refresh docstrings for changed source, then open a pull request for "
             "the task branch. If the task is a GitHub issue (#N), include 'Closes #N' "
@@ -120,6 +130,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         schema_ref="review",
         agent_role="review",
         timeout_s=600,  # read the PR + judge
+        effort=Effort.MEDIUM,  # careful judgment over a bounded diff (#96)
         template=(
             "Review the PR (see pr_url in the context above) against the task goal and "
             "code quality. Assess the goal criterion-by-criterion and check for "

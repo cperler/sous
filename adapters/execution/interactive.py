@@ -50,6 +50,7 @@ def build_stage_result(
         stage=work_item.stage,
         attempt=work_item.attempt,
         model=work_item.model,
+        effort=work_item.effort,  # #96: echoed for the ledger row / stage events (audit)
         status=status,
         structured_output=structured_output,
         raw_output=raw_output,

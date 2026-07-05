@@ -60,16 +60,25 @@ def compute_content_hash(
     model: str,
     lane_policy: LanePolicy,
     attempt: int,
+    effort: str | None = None,
 ) -> str:
     """Idempotency key for a dispatch.
 
     Includes ``attempt`` so a retry (which mutates the prompt by appending
     learnings) never collides with the prior attempt's key, even in the
     degenerate case where the rendered prompt is byte-identical (target.md §4).
+
+    ``effort`` (#96) is part of a dispatch's identity exactly like ``model`` — the same
+    prompt at a different reasoning effort is a different call. It is appended ONLY when
+    set, so an effort-less dispatch hashes byte-identically to the pre-#96 formula and an
+    in-flight pre-#96 lease still verifies on record.
     """
 
     lane = f"{lane_policy.execution_mode.value}:{lane_policy.provider.value}"
-    blob = "\x1f".join([stage.value, prompt, schema_ref, model, lane, str(attempt)])
+    parts = [stage.value, prompt, schema_ref, model, lane, str(attempt)]
+    if effort is not None:
+        parts.append(effort)
+    blob = "\x1f".join(parts)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
 
@@ -88,6 +97,12 @@ class WorkItem(BaseModel):
     prompt: str  # fully rendered by the engine
     schema_ref: str  # key/path the runner fetches; the engine does not interpret it
     model: str
+    # Reasoning effort this dispatch runs at (#96): an Effort value ("low"/"medium"/"high"),
+    # or None for the provider default (every pre-#96 dispatch). Routing CONTENT like
+    # ``model`` — it is folded into content_hash — translated per execution adapter
+    # (claude ``--effort``, codex ``model_reasoning_effort``); deterministic ENGINE-lane
+    # stages never carry one.
+    effort: str | None = None
     agent: str | None = None  # persona the runner dispatches (from the project roster)
     lane_policy: LanePolicy
     timeout_s: int | None = None
@@ -152,6 +167,7 @@ class WorkItem(BaseModel):
         model: str,
         lane_policy: LanePolicy,
         created_at: str,
+        effort: str | None = None,
         agent: str | None = None,
         attempt: int = 0,
         timeout_s: int | None = None,
@@ -174,7 +190,9 @@ class WorkItem(BaseModel):
                 model=model,
                 lane_policy=lane_policy,
                 attempt=attempt,
+                effort=effort,
             ),
+            effort=effort,
             agent=agent,
             run_id=run_id,
             task_id=task_id,
@@ -209,6 +227,11 @@ class StageResult(BaseModel):
     stage: Stage
     attempt: int = 0
     model: str  # the model id the runner used — priced by the single model_table
+    # The reasoning effort the dispatch ran at (#96), echoed from the WorkItem so the
+    # cost-ledger row and stage events can attribute effort alongside model. Pure audit
+    # metadata — it never feeds a verdict or a transition. None on effort-less dispatches
+    # (every pre-#96 result) and the deterministic ENGINE lane.
+    effort: str | None = None
     status: ResultStatus
     structured_output: dict | None = None
     raw_output: str | None = None

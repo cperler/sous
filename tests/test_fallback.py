@@ -70,47 +70,73 @@ def test_rate_limit_fallback_respects_capacity_gate(tmp_path, project) -> None:
     assert nxt.model == "claude-sonnet-4-6"  # the queued fallback, not lost
 
 
-# --- capacity-aware model downgrade (#12) ------------------------------------
+# --- capacity-aware downgrade (#12, effort-first ordering #96) ----------------
 
 def _downgrade_events(eng, run_id="r1"):
     return [e for e in eng.store.read_events(run_id) if e.get("type") == "model_downgraded"]
 
 
+def _effort_events(eng, run_id="r1"):
+    return [e for e in eng.store.read_events(run_id) if e.get("type") == "effort_downgraded"]
+
+
 def test_capacity_downgrade_opt_in_required(tmp_path, project) -> None:
-    """OFF by default: a high-util fresh dispatch still runs the role default, no event."""
+    """OFF by default: a high-util fresh dispatch still runs the role default at the
+    stage-spec effort, no event on either lever."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")  # route_by_capacity defaults False
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)  # high band, but opt-in is off
     assert w.stage is Stage.SCOPE and w.model == "claude-opus-4-8"
-    assert _downgrade_events(eng) == []
+    assert w.effort == "high"  # the scope spec default, untouched
+    assert _downgrade_events(eng) == [] and _effort_events(eng) == []
 
 
-def test_capacity_downgrade_when_opted_in(tmp_path, project) -> None:
-    """route_by_capacity + high util -> a FRESH dispatch drops one tier, with an event."""
+def test_capacity_downgrade_when_opted_in_drops_effort_first(tmp_path, project) -> None:
+    """route_by_capacity + high util -> a FRESH dispatch downshifts EFFORT one step (#96:
+    the cheaper lever) and KEEPS the role-default model, with an effort_downgraded event."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", route_by_capacity=True)
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)
+    assert w.stage is Stage.SCOPE and w.model == "claude-opus-4-8"  # model held
+    assert w.effort == "medium"  # high -> medium, one step
+    ev = _effort_events(eng)
+    assert len(ev) == 1
+    assert ev[0]["from"] == "high" and ev[0]["to"] == "medium"
+    assert ev[0]["util_pct"] == 75 and ev[0]["stage"] == "scope"
+    assert _downgrade_events(eng) == []  # the model lever was never touched
+
+
+def test_capacity_downgrade_model_only_when_effort_at_floor(tmp_path, project) -> None:
+    """The MODEL downgrades only when the effort lever is unavailable: a task pinned to
+    the low-effort floor drops opus -> sonnet exactly as pre-#96, with the model event."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", route_by_capacity=True)
+    eng.add_task("r1", "t1", effort="low")  # effort pinned at the floor
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    w = eng.next_work("r1", "t1", util_pct=75)
     assert w.stage is Stage.SCOPE and w.model == "claude-sonnet-4-6"  # opus -> sonnet
+    assert w.effort == "low"  # the pin held
     ev = _downgrade_events(eng)
     assert len(ev) == 1
     assert ev[0]["from"] == "claude-opus-4-8" and ev[0]["to"] == "claude-sonnet-4-6"
-    assert ev[0]["util_pct"] == 75 and ev[0]["stage"] == "scope"
+    assert _effort_events(eng) == []
 
 
 def test_capacity_downgrade_edges(tmp_path, project) -> None:
-    """Band edges: 69 -> role default (no event); 70 -> downgraded."""
-    for util, expect_model in ((69, "claude-opus-4-8"), (70, "claude-sonnet-4-6")):
+    """Band edges: 69 -> spec-default effort (no event); 70 -> effort downshifted."""
+    for util, expect_effort in ((69, "high"), (70, "medium")):
         eng = _engine(tmp_path / f"u{util}", project)
         eng.create_run("r1", route_by_capacity=True)
         eng.add_task("r1", "t1")
         eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
         w = eng.next_work("r1", "t1", util_pct=util)
-        assert w.model == expect_model
-        assert bool(_downgrade_events(eng)) == (util >= 70)
+        assert w.model == "claude-opus-4-8"  # the model lever never fires first
+        assert w.effort == expect_effort
+        assert bool(_effort_events(eng)) == (util >= 70)
 
 
 def test_capacity_downgrade_critical_band_unchanged(tmp_path, project) -> None:
@@ -122,11 +148,11 @@ def test_capacity_downgrade_critical_band_unchanged(tmp_path, project) -> None:
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     with pytest.raises(CapacityExhausted):
         eng.next_work("r1", "t1", util_pct=90)
-    assert _downgrade_events(eng) == []
+    assert _downgrade_events(eng) == [] and _effort_events(eng) == []
 
 
 def test_capacity_downgrade_honors_lane_pin(tmp_path, project) -> None:
-    """A lane that disallows fallback is a pin: never capacity-downgraded."""
+    """A lane that disallows fallback is a pin: NEITHER lever is capacity-downgraded."""
     from orchestrator.routing import Router
     eng = _engine(tmp_path, project, router=Router(allow_fallback=False))
     eng.create_run("r1", route_by_capacity=True)
@@ -134,42 +160,46 @@ def test_capacity_downgrade_honors_lane_pin(tmp_path, project) -> None:
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=80)
     assert w.model == "claude-opus-4-8"  # pinned, not downgraded
-    assert _downgrade_events(eng) == []
+    assert w.effort == "high"  # effort lever equally pinned by the lane
+    assert _downgrade_events(eng) == [] and _effort_events(eng) == []
 
 
 def test_capacity_downgrade_then_rate_limited_composes(tmp_path, project) -> None:
-    """A capacity-downgraded dispatch that THEN rate-limits degrades down the SAME chain,
-    once per step — no double-drop, floor/cooldown logic intact."""
+    """A high-util dispatch (effort downshifted, model held) that THEN rate-limits degrades
+    the MODEL down the chain, and the capacity levers must NOT fire again on the re-queue
+    (pending_fallback_model set) — no double-drop, floor/cooldown logic intact."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", route_by_capacity=True)
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
-    # High util downgrades opus -> sonnet on the fresh dispatch.
+    # High util downshifts effort (high -> medium); the model stays opus (#96 ordering).
     w = eng.next_work("r1", "t1", util_pct=75)
-    assert w.model == "claude-sonnet-4-6"
-    # That sonnet dispatch rate-limits: fallback queues the NEXT chain step (haiku), and the
-    # capacity downgrade must NOT fire again on the re-queue (pending_fallback_model set).
+    assert w.model == "claude-opus-4-8" and w.effort == "medium"
+    # That dispatch rate-limits: fallback queues the NEXT chain step (sonnet), and the
+    # capacity levers must NOT fire again on the re-queue (pending_fallback_model set).
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_rate_limited_fallback"
-    assert eng.store.load_task("r1", "t1").pending_fallback_model == "claude-haiku-4-5"
+    assert eng.store.load_task("r1", "t1").pending_fallback_model == "claude-sonnet-4-6"
     nxt = eng.next_work("r1", "t1", util_pct=75)  # still high util
-    assert nxt.model == "claude-haiku-4-5"  # the queued fallback, NOT re-downgraded past it
-    # exactly one downgrade event across the whole path (the fresh dispatch only)
-    assert len(_downgrade_events(eng)) == 1
+    assert nxt.model == "claude-sonnet-4-6"  # the queued fallback, NOT re-downgraded past it
+    assert nxt.effort == "high"  # spec default: the re-queue skips the capacity levers
+    # exactly one effort event across the whole path (the fresh dispatch only)
+    assert len(_effort_events(eng)) == 1 and _downgrade_events(eng) == []
 
 
 def test_capacity_downgrade_at_floor_is_noop(tmp_path, project) -> None:
-    """When the resolved model is already the chain floor, a high-util downgrade is a
-    no-op (no cheaper tier) and emits no event."""
+    """When the effort is pinned at its floor AND the resolved model is already the chain
+    floor, a high-util downgrade is a no-op (no cheaper tier on either lever), no event."""
     from orchestrator.capacity import CapacityPolicy
     # A policy that would drop 3 steps still can't go past haiku.
     eng = _engine(tmp_path, project, capacity=CapacityPolicy(downgrade_steps=9))
     eng.create_run("r1", route_by_capacity=True)
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", effort="low")  # effort lever floored -> the model lever fires
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)
     assert w.model == "claude-haiku-4-5"  # 3+ steps from opus floors at haiku
     assert len(_downgrade_events(eng)) == 1  # opus -> haiku, one event
+    assert _effort_events(eng) == []
 
 
 # --- rate-limit re-dispatch on a cheaper model (#1) --------------------------

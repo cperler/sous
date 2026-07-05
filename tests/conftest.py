@@ -153,6 +153,7 @@ def make_result(
         stage=work.stage,
         attempt=work.attempt,
         model=work.model,
+        effort=work.effort,  # echoed like a real runner (#96 audit thread)
         status=status,
         structured_output=structured_output,
         error=error,
