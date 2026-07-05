@@ -1838,9 +1838,14 @@ class Engine:
         IS the gate record (who/when/why).
 
         As an out-of-band transition (like ``approve``/``hold_for_approval``) this method
-        performs the same post-transition run-level effects that ``record()`` would: it
-        cascade-blocks any dependents of the now-closed task and calls
-        ``_maybe_finalize_run`` so the run reaches a terminal state instead of staying open.
+        performs the full set of post-transition run-level effects via the shared
+        ``_finalize_task_terminal`` helper (#110): surface the rejection reason in the
+        durable artifacts (evidence-out, #52/#109 — see below), cascade-block any
+        dependents of the now-closed task, release its port block (best-effort, #5),
+        harvest any learnings it accrued into the cross-run KB (best-effort, #72), and
+        call ``_maybe_finalize_run`` so the run reaches a terminal state instead of
+        staying open. No ``task_failed`` notification is emitted — a deliberate human
+        close is not an execution failure.
 
         Evidence-out (best-effort, like ``_on_task_completed``): the human-readable task
         index gains a rejection line, and — when the task has an issue — a rejection note
