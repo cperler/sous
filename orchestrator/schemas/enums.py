@@ -48,6 +48,45 @@ class ExecutionMode(StrEnum):
     ENGINE = "engine"  # deterministic, in-process, no model call (e.g. intake setup)
 
 
+class Effort(StrEnum):
+    """Per-dispatch reasoning-effort vocabulary (#96): a second routing lever beside the
+    model — hard stages (scope/implement) run high, mechanical stages (deliver) low. The
+    engine only NAMES the level; each execution adapter translates it best-effort into its
+    provider's own flag (claude ``--effort``, codex ``model_reasoning_effort``), and the
+    deterministic ENGINE lane carries none. Additive vocabulary — pre-#96 docs/WorkItems
+    simply have no effort, which every consumer treats as "provider default"."""
+
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+
+
+# Cheapest -> most expensive: the downshift ordering the capacity lever walks (#96),
+# the effort sibling of model_table's fallback chain.
+EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH)
+
+
+def effort_below(effort: str | Effort | None) -> str | None:
+    """One step DOWN the effort ordering (high -> medium -> low), or None at the floor /
+    when unset — the effort analog of ``ModelTable.fallback_after``. The capacity
+    DOWNGRADE band tries this lever BEFORE a model downgrade (#96)."""
+    if effort is None:
+        return None
+    idx = EFFORT_ORDER.index(Effort(effort))
+    return EFFORT_ORDER[idx - 1].value if idx > 0 else None
+
+
+def resolve_effort(name: str) -> Effort:
+    """Normalize/validate an ``--effort`` input to the Effort vocabulary — the single
+    place effort input is checked before it lands on a Task pin (mirrors
+    ``resolve_model_alias`` for ``--model``, #84)."""
+    try:
+        return Effort(name.strip().lower())
+    except ValueError:
+        valid = ", ".join(e.value for e in Effort)
+        raise ValueError(f"unknown effort {name!r}; valid values: {valid}") from None
+
+
 class Provider(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"

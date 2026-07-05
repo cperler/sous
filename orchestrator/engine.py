@@ -77,6 +77,8 @@ from .schemas.enums import (
     Stage,
     StageStatus,
     TaskState,
+    effort_below,
+    resolve_effort,
 )
 from .schemas.status import Run, Task, TaskRef
 from .schemas.work import LanePolicy, LaneUsed, StageResult, TokenUsage, WorkItem
@@ -259,6 +261,7 @@ class Engine:
         deterministic_stages: tuple[Stage, ...] | list[Stage] | None = None,
         estimate: str | float | None = None,
         model: str | None = None,
+        effort: str | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -270,8 +273,10 @@ class Engine:
         pipeline pin opts out of the preset default. ``depends_on``/``provider_tag``
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
-        ``82:codex`` tag / ralph dependency analysis, human-supplied). Validation
-        (non-empty, duplicate-free) is the Task model's.
+        ``82:codex`` tag / ralph dependency analysis, human-supplied). ``model`` pins a
+        per-task model tier (#84); ``effort`` pins a per-task reasoning effort
+        (low/medium/high, #96) that overrides the stage-spec defaults the same way.
+        Validation (non-empty, duplicate-free) is the Task model's.
 
         Cost-aware lane routing (#34): when the run enables ``route_by_cost`` AND no
         ``pipeline`` is explicitly pinned, the deterministic ``cost_router`` picks the
@@ -297,6 +302,12 @@ class Engine:
                     f"{task_id} is {task_provider.value}-provider "
                     f"(provider_tag={tag!r}) — pin a {task_provider.value} model instead"
                 )
+        # Per-task effort pin (#96): normalized/validated BEFORE any state is written,
+        # exactly like the model pin. Provider-agnostic — every lane translates (or
+        # ignores) the same low/medium/high vocabulary, so no provider check is needed.
+        effort_pin: str | None = None
+        if effort is not None:
+            effort_pin = resolve_effort(effort).value
         run = self.store.load_run(run_id)
         # Cost-aware lane routing (#34): only for an UN-pinned task on a route_by_cost run.
         # An explicit pipeline pin is always honored (never overridden). The decision is
@@ -343,6 +354,7 @@ class Engine:
             body=spec.body,
             provider_tag=tag,
             model_pin=model_pin,
+            effort_pin=effort_pin,
             issue_number=spec.issue_number,
             depends_on=deps,
             execution_lane=effective_lane,
@@ -467,9 +479,11 @@ class Engine:
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
         # sources — never a second selection mechanism.
         deterministic = spec.deterministic or stage in task.deterministic_stages
+        effort: str | None = None
         if deterministic:
             # No model: route to the in-process ENGINE lane (a shell runner does the work).
             # heysoo #227 — don't ask an LLM to run `git worktree add` / `gh pr create`.
+            # No model also means no effort — the ENGINE lane has nothing to throttle.
             lane = LanePolicy(
                 execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False
             )
@@ -489,32 +503,50 @@ class Engine:
                 or task.model_pin
                 or self.models.model_for_role(spec.model_role, lane.provider)
             )
-            # Capacity-aware downgrade (#12): on a route_by_capacity run, when CURRENT util
-            # is in the high band (>= downgrade_threshold, and < the per-call gate that
-            # already blocked dispatch above), drop a FRESH dispatch to a cheaper model to
-            # keep progressing under load. DISTINCT from cost routing (headroom, not USD).
-            # Skipped for a rate-limit re-queue (``pending_fallback_model`` already picked
-            # the cheaper model — never double-drop; the rate-limit floor/cooldown logic
-            # stays intact), when the lane disallows fallback (an explicit pin honored), and
-            # for a per-task model pin (#84 — an explicit tier choice is honored, same rule as
-            # a pipeline/lane pin; the rate-limit chain may still degrade it, capacity may not).
-            # Never silent: every applied downgrade emits ``model_downgraded``.
+            # Effort resolution (#96), mirroring the model precedence: an explicit
+            # per-task effort pin overrides the stage-spec default (scope/implement
+            # high, test/review medium, deliver low). None (a spec without a default)
+            # means "provider default" and emits exactly today's dispatch.
+            effort = task.effort_pin or (spec.effort.value if spec.effort is not None else None)
+            # Capacity-aware downgrade (#12/#96): on a route_by_capacity run, when CURRENT
+            # util is in the high band (>= downgrade_threshold, and < the per-call gate that
+            # already blocked dispatch above), degrade a FRESH dispatch to keep progressing
+            # under load. DISTINCT from cost routing (headroom, not USD). Lever ORDERING
+            # (#96): effort is the cheaper dial, so downshift effort ONE step first
+            # (high -> medium -> low) and only downgrade the MODEL when the effort lever is
+            # unavailable (already at the low floor, unset, or pinned). Pins are honored
+            # per-lever: an effort_pin exempts effort, a model_pin exempts the model (#84 —
+            # an explicit choice is honored, same rule as a pipeline/lane pin; the rate-limit
+            # chain may still degrade a pinned model, capacity may not). Skipped for a
+            # rate-limit re-queue (``pending_fallback_model`` already picked the cheaper
+            # model — never double-drop; the rate-limit floor/cooldown logic stays intact)
+            # and when the lane disallows fallback. Never silent: every applied drop emits
+            # ``effort_downgraded`` / ``model_downgraded``.
             if (
                 run.route_by_capacity
                 and task.pending_fallback_model is None
-                and task.model_pin is None
                 and lane.allow_fallback
                 and self.capacity.dispatch_band(util_pct) is DispatchBand.DOWNGRADE
             ):
-                downgraded = self._capacity_downgrade(model)
-                if downgraded != model:
+                lowered = effort_below(effort) if task.effort_pin is None else None
+                if lowered is not None:
                     self.store.append_event(
                         run_id,
-                        {"ts": _now(), "type": "model_downgraded", "run_id": run_id,
+                        {"ts": _now(), "type": "effort_downgraded", "run_id": run_id,
                          "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
-                         "from": model, "to": downgraded},
+                         "from": effort, "to": lowered},
                     )
-                    model = downgraded
+                    effort = lowered
+                elif task.model_pin is None:
+                    downgraded = self._capacity_downgrade(model)
+                    if downgraded != model:
+                        self.store.append_event(
+                            run_id,
+                            {"ts": _now(), "type": "model_downgraded", "run_id": run_id,
+                             "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
+                             "from": model, "to": downgraded},
+                        )
+                        model = downgraded
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump
@@ -582,6 +614,7 @@ class Engine:
             prompt=prompt,
             schema_ref=spec.schema_ref,
             model=model,
+            effort=effort,
             agent=agent,
             lane_policy=lane,
             created_at=_now(),
@@ -650,6 +683,7 @@ class Engine:
                 "stage": stage.value,
                 "attempt": attempt,
                 "model": model,
+                "effort": effort,
                 "agent": agent,
                 "work_item_id": work.id,
             },
@@ -877,6 +911,7 @@ class Engine:
             "status": effective.status.value,
             "outcome": outcome,
             "model": result.model,
+            "effort": result.effort,  # #96: the reasoning effort the dispatch ran at
             "lane_used": result.lane_used.model_dump(),
             "cost_usd": cost,
             "session_ref": result.session_ref,
@@ -907,6 +942,7 @@ class Engine:
                 "task_id": result.task_id,
                 "stage": result.stage.value,
                 "attempt": result.attempt,
+                "effort": result.effort,  # #96: audit alongside model/lane
                 "status": effective.status.value,
                 "outcome": outcome,
                 "lane": result.lane_used.execution_mode.value,

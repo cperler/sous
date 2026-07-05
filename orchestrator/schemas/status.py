@@ -79,6 +79,13 @@ class Task(BaseModel):
     # when the lane allows, and a queued pending_fallback_model takes precedence for that dispatch.
     # Additive field: pre-#84 task docs load with None, so no SCHEMA_VERSION bump is needed.
     model_pin: str | None = None
+    # Per-task reasoning-effort pin (#96): an Effort value ("low"/"medium"/"high") that
+    # overrides the stage-spec default on model-lane stages — the effort sibling of
+    # model_pin, validated at add_task via resolve_effort. A pin is honored by the
+    # capacity effort-downshift (pins win, same rule as model_pin); deterministic
+    # ENGINE-lane stages never carry effort regardless. Additive field: pre-#96 task
+    # docs load with None, so no SCHEMA_VERSION bump is needed.
+    effort_pin: str | None = None
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     # Provenance: the lane preset this task was added under. Sequencing reads

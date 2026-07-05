@@ -524,6 +524,7 @@ def to_stage_result(
         stage=work.stage,
         attempt=work.attempt,
         model=work.model,
+        effort=work.effort,  # #96: echoed for the ledger row / stage events (audit)
         status=status,
         structured_output=structured,
         raw_output=raw.raw_output,
@@ -925,6 +926,10 @@ def claude_cli_transport(
             else ["--output-format", "json"]
         argv = ["claude", "-p", work.prompt, "--model", work.model,
                 "--dangerously-skip-permissions", *fmt]
+        if work.effort:
+            # #96: per-stage reasoning effort — the claude CLI's session effort level
+            # (low/medium/high). Unset emits exactly the pre-#96 argv (byte-identical).
+            argv += ["--effort", work.effort]
         if work.agent:
             argv += ["--agent", work.agent]
         if schema_json_for and (schema := schema_json_for(work.schema_ref)):
@@ -1206,7 +1211,13 @@ def codex_cli_transport(
                 schema_file = Path(td) / "schema.json"
                 schema_file.write_text(_codex_strict_schema(schema), encoding="utf-8")
                 schema_flags = ["--output-schema", str(schema_file)]
-            tail = ["-m", work.model, "--skip-git-repo-check", *schema_flags,
+            # #96: per-stage reasoning effort via codex's config override (same TOML-quoted
+            # `-c` shape as the resume write posture below). In `tail` so BOTH the fresh and
+            # resume calls carry it; unset emits exactly the pre-#96 argv (byte-identical).
+            effort_cfg = (
+                ["-c", f'model_reasoning_effort="{work.effort}"'] if work.effort else []
+            )
+            tail = ["-m", work.model, *effort_cfg, "--skip-git-repo-check", *schema_flags,
                     "--json", "--output-last-message", str(last), work.prompt]
             if session_ref:
                 # Resume carries the warm session. It takes no sandbox/approval/--add-dir flags,

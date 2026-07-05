@@ -53,6 +53,9 @@ class CostLedger:
             "stage": result.stage.value,
             "attempt": result.attempt,
             "model": result.model,
+            # #96: the reasoning effort the dispatch ran at, alongside model — so a cost
+            # report can split spend by effort as well as tier. None on effort-less rows.
+            "effort": result.effort,
             "provider": result.lane_used.provider.value,
             "lane": result.lane_used.execution_mode.value,
             "input_tokens": usage.input,

@@ -266,6 +266,12 @@ def main(argv: list[str] | None = None) -> int:
                          "stages so a heavy-architecture task runs on a higher tier, e.g. "
                          "'--model fable' (claude-fable-5). Validated against the task's provider "
                          "at add time (#84)")
+    at.add_argument("--effort", default=None, choices=["low", "medium", "high"],
+                    help="per-task reasoning-effort pin (#96): overrides the stage-spec "
+                         "defaults (scope/implement high, test/review medium, deliver low) "
+                         "on model-lane stages; translated per lane (claude --effort, codex "
+                         "model_reasoning_effort). Honored by the capacity downshift like "
+                         "--model pins")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -936,13 +942,13 @@ def main(argv: list[str] | None = None) -> int:
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,
                             deterministic_stages=det, estimate=args.estimate,
-                            model=args.model)
+                            model=args.model, effort=args.effort)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
                "execution_lane": task.execution_lane.value,
                "depends_on": task.depends_on, "provider_tag": task.provider_tag,
-               "model_pin": task.model_pin})
+               "model_pin": task.model_pin, "effort_pin": task.effort_pin})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
         # the ENGINE lane — #33) run in-process — drain them here so the interactive
