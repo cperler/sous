@@ -66,6 +66,11 @@ def route_request(
         JSON, or ``404`` when there is no stream to probe (interactive/ENGINE lane, or nothing
         dispatched yet). Missing ``run``/``task`` → ``400``.
       - anything else → ``404``.
+
+    ``snap_kwargs`` is forwarded verbatim to ``dashboard_snapshot``; the same keys the CLI
+    accepts (``show_all``, ``limit``, ``stale_after_s``) work here. ``clock`` and
+    ``usage_reader`` are injected for deterministic testing — tests freeze ``clock`` and omit
+    ``usage_reader``; production callers use the ``time.time`` and ``read_usage`` defaults.
     """
     snap_kwargs = snap_kwargs or {}
     if path in ("/", "/index.html"):
