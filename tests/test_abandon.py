@@ -184,6 +184,104 @@ def test_abandon_unknown_disposition_raises(tmp_path, project) -> None:
         eng.abandon("r1", "t1", reason="bad arg", disposition="closed")
 
 
+def _task_failed_notifications(eng: Engine, run: str = "r1") -> list[dict]:
+    return [
+        e for e in eng.store.read_events(run)
+        if e["type"] == "notification" and e.get("kind") == "task_failed"
+    ]
+
+
+def test_abandon_failed_emits_task_failed_notification(tmp_path, project) -> None:
+    # #110/#107: the failed abandon path now fires the SAME task_failed alert record()'s
+    # terminal-failure path emits (previously abandon silently skipped it). The notification
+    # audit row is always appended even when no notify hook is installed.
+    eng = _engine(tmp_path, project)
+    _mid_dispatch(eng)
+    eng.abandon("r1", "t1", reason="orphaned")
+
+    notes = _task_failed_notifications(eng)
+    assert len(notes) == 1
+    assert notes[0]["task_id"] == "t1"
+    assert notes[0]["stage"] == "scope"  # the abandoned dispatch's stage
+    assert "orphaned" in notes[0]["reason"]  # last_error carries the abandon reason
+
+
+def test_abandon_failed_calls_notify_hook_when_installed(tmp_path, project) -> None:
+    # The duck-typed notify(kind, payload) hook (the old monitor's email/desktop seam) is
+    # invoked on the failed abandon, not just the audit row.
+    seen: list[tuple[str, dict]] = []
+    project.notify = lambda kind, payload: seen.append((kind, payload))  # type: ignore[attr-defined]
+    eng = _engine(tmp_path, project)
+    _mid_dispatch(eng)
+    eng.abandon("r1", "t1", reason="orphaned")
+
+    task_failed = [payload for kind, payload in seen if kind == "task_failed"]
+    assert len(task_failed) == 1
+    assert task_failed[0]["task_id"] == "t1"
+
+
+def test_abandon_rejected_surfaces_rejection_and_publishes_note(tmp_path, project) -> None:
+    # #110/#109: a rejected abandon now routes through _surface_rejection — it publishes a
+    # rejection note to the task source with the reason READ BACK from the durable artifact
+    # (not just an inline task_index write), exactly as reject() does.
+    eng = _engine(tmp_path, project)
+    _mid_dispatch(eng)
+    reason = "run walked away; closing as infeasible"
+    eng.abandon("r1", "t1", reason=reason, disposition="rejected")
+
+    # A note was published, carrying the round-tripped reason and who closed it.
+    notes = project.task_source.notes
+    assert len(notes) == 1
+    body = notes[0]["body"]
+    assert reason in body  # read back from load_rejection, not the in-hand arg
+    assert "infeasible" in body.lower()
+    # The publish is audited.
+    published = [e for e in eng.store.read_events("r1") if e["type"] == "rejection_note_published"]
+    assert len(published) == 1
+    # A deliberate human close is NOT an execution failure ⇒ no task_failed alert (mirrors
+    # reject()'s silence).
+    assert _task_failed_notifications(eng) == []
+
+
+def test_abandon_applies_mutation_via_locked_update_task(tmp_path, project, monkeypatch) -> None:
+    # #108: the terminal transition is applied through the per-task locked read-modify-write
+    # (store.update_task on the FRESH doc), not a bare load_task + in-place mutate + save_task
+    # that could clobber a concurrent writer.
+    eng = _engine(tmp_path, project)
+    _mid_dispatch(eng)
+
+    update_calls: list[tuple[str, str]] = []
+    save_calls: list[str] = []
+    real_update = eng.store.update_task
+    real_save = eng.store.save_task
+
+    def spy_update(run_id, task_id, mutator):
+        update_calls.append((run_id, task_id))
+        return real_update(run_id, task_id, mutator)
+
+    def spy_save(task):
+        save_calls.append(task.task_id)
+        return real_save(task)
+
+    monkeypatch.setattr(eng.store, "update_task", spy_update)
+    monkeypatch.setattr(eng.store, "save_task", spy_save)
+
+    task = eng.abandon("r1", "t1", reason="orphaned")
+
+    # The mutation went through the locked update_task path...
+    assert ("r1", "t1") in update_calls
+    # ...and NOT through a bare save_task (the old load+mutate+save escape is gone).
+    assert save_calls == []
+    # The transition still landed atomically: lease cleared, terminal state, counter bumped.
+    assert task.state is TaskState.FAILED
+    assert task.pending_work_item_id is None
+    assert task.stage_counter >= 1
+    # The persisted doc reflects the same transition (read-modify-write committed under lock).
+    persisted = eng.store.load_task("r1", "t1")
+    assert persisted.state is TaskState.FAILED
+    assert persisted.pending_work_item_id is None
+
+
 def test_cli_abandon_releases_lease_and_finalizes(tmp_path, capsys) -> None:
     from orchestrator.cli import main
     from orchestrator.schemas.work import WorkItem

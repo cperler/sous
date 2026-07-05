@@ -103,6 +103,20 @@ def test_no_note_published_when_the_task_has_no_issue(tmp_path, project) -> None
     assert eng.store.load_task("r1", "t1").state is TaskState.CLOSED_INFEASIBLE
 
 
+def test_reject_emits_no_task_failed_notification(tmp_path, project) -> None:
+    # #110: reject() now delegates its post-transition effects to the shared
+    # _finalize_task_terminal helper. A deliberate human close is NOT an execution failure,
+    # so — like before the refactor — it must emit NO task_failed alert (the failed alert is
+    # reserved for the FAILED disposition on the abandon/record paths).
+    eng = _engine(tmp_path, project)
+    _hold_and_reject(eng, "the feature was descoped upstream")
+    failed = [
+        e for e in eng.store.read_events("r1")
+        if e["type"] == "notification" and e.get("kind") == "task_failed"
+    ]
+    assert failed == []
+
+
 def test_scheduler_breaker_does_not_count_a_rejection(tmp_path, project) -> None:
     # threshold=2 ⇒ it takes TWO consecutive genuine failures to pause. One real failure
     # PLUS one human rejection must stay UNDER the threshold: a deliberate close is not a
