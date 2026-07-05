@@ -401,6 +401,28 @@ class Engine:
             out.append(ref.task_id)
         return out
 
+    def in_flight(self, run_id: str) -> list[str]:
+        """Tasks with an outstanding dispatch lease (RUNNING, ``pending_work_item_id``
+        set) — one Workflow invocation is currently out for each.
+
+        Read-only. The per-task supervisor subtracts this from the capacity ``limit``
+        to size remaining headroom (``limit - len(in_flight)``) so concurrency binds
+        across concurrently-live background invocations, not just within one round —
+        and correctly after a resume, since a crash leaves the lease held and this
+        re-counts it. Complements ``dispatchable`` (which EXCLUDES leased tasks): the
+        two sets are disjoint, and their split is the whole point — you cannot see
+        remaining capacity from ``dispatchable`` alone once dispatches overlap.
+        """
+        run = self.store.load_run(run_id)
+        out: list[str] = []
+        for ref in run.task_refs:
+            if ref.state in TERMINAL_TASK_STATES:
+                continue
+            doc = self.store.load_task(run_id, ref.task_id)
+            if doc.pending_work_item_id is not None:
+                out.append(ref.task_id)
+        return out
+
     # --- dispatch / record ----------------------------------------------------
     def next_work(
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False

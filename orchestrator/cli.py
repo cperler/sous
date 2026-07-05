@@ -971,7 +971,13 @@ def main(argv: list[str] | None = None) -> int:
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
         ready = sched.dispatchable(args.run)
         limit = eng.capacity.dispatch_limit(util_pct, args.max_concurrent)
-        _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit]})
+        # in_flight = tasks with a live dispatch lease. The per-task supervisor
+        # (orchestrate-batch-interactive) sizes remaining headroom as `limit - in_flight`
+        # so concurrency binds across concurrently-live background invocations, not just
+        # within one round — re-checked before every follow-on dispatch (#97).
+        in_flight = eng.in_flight(args.run)
+        _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit],
+               "in_flight": in_flight, "in_flight_count": len(in_flight)})
     elif args.cmd == "run-headless":
         import time
 
