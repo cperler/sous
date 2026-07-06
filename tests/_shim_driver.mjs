@@ -13,11 +13,13 @@ const shimPath = process.argv[2]
 const src = readFileSync(shimPath, 'utf8').replace(/^export\s+const\s+meta/m, 'const meta')
 
 const capturedSchemas = []
+const capturedEffort = {} // prompt -> the `effort` opt agent() received (#96)
 const phase = () => {}
 const log = () => {}
 const parallel = async (thunks) => Promise.all(thunks.map((t) => t()))
-const agent = async (_prompt, opts) => {
+const agent = async (prompt, opts) => {
   capturedSchemas.push(opts.schema)
+  capturedEffort[prompt] = 'effort' in opts ? opts.effort : '<absent>'
   return { ok: true }
 }
 
@@ -33,7 +35,9 @@ const argsObj = {
     },
   },
   workItems: [
-    { id: 'wi-1', content_hash: 'h1', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-4-8', schema_ref: 'implement', prompt: 'p1' },
+    // wi-1 carries a #96 effort; wi-2 is effort-less (pre-#96 shape) — the shim must
+    // pass the former to agent() and keep the latter's opts/result effort-free.
+    { id: 'wi-1', content_hash: 'h1', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-4-8', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
     { id: 'wi-2', content_hash: 'h2', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-4-8', schema_ref: 'implement', prompt: 'p2' },
   ],
 }
@@ -51,4 +55,6 @@ console.log(JSON.stringify({
   statuses: results.map((r) => r.status),
   completedAt: results.map((r) => r.completed_at),
   schemaKeys: capturedSchemas.map((s) => (s ? Object.keys(s) : null)),
+  agentEffort: capturedEffort, // prompt -> effort opt (undefined serializes as absent)
+  resultEffort: Object.fromEntries(results.map((r) => [r.work_item_id, r.effort])),
 }))
