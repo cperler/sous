@@ -43,3 +43,9 @@ def test_shim_parses_string_args_and_sanitizes_schema() -> None:
         assert keys is not None
         assert "$schema" not in keys and "$id" not in keys
         assert "type" in keys and "properties" in keys  # real schema body preserved
+
+    # (3) #96 effort pass-through: wi-1 (effort="high") reaches agent() as the `effort`
+    # opt and is echoed on its result row; effort-less wi-2 stays effort-free on both
+    # sides (undefined -> absent in the agent opts JSON, null on the result row).
+    assert data["agentEffort"] == {"p1": "high"}  # p2 absent: no effort forwarded
+    assert data["resultEffort"] == {"wi-1": "high", "wi-2": None}
