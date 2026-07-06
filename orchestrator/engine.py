@@ -439,6 +439,21 @@ class Engine:
     def next_work(
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
     ) -> WorkItem | None:
+        """Emit the task's next dispatchable WorkItem, or None when there is nothing to
+        dispatch (terminal/parked task, budget pause, or pipeline exhausted).
+
+        The single dispatch-resolution point: picks the stage, routes the lane
+        (deterministic stages -> the in-process ENGINE lane), and resolves BOTH routing
+        dimensions of a model-lane dispatch — the model (rate-limit fallback > model_pin >
+        role default) and, since #96, the reasoning effort (effort_pin > stage-spec
+        default > None = provider default). On a route_by_capacity run in the DOWNGRADE
+        band it degrades a fresh dispatch by the cheaper lever first: effort down one step
+        (emitting ``effort_downgraded``) and only then the model (``model_downgraded``);
+        per-lever pins are exempt. Emitting stamps the dispatch lease
+        (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
+        supervisor crash instead. Raises ``CapacityExhausted`` at the per-call gate or
+        during a rate-limit cooldown, ``ContractError`` on a lease conflict.
+        """
         # Budget backpressure (#34): consult the run's metered spend against its budget at
         # this dispatch point. Once spend >= budget, do NOT dispatch new work — PAUSE the
         # run (reusing the PAUSED/unpause machinery) and return None; in-flight recorded
