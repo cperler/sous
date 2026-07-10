@@ -469,9 +469,12 @@ def main(argv: list[str] | None = None) -> int:
 
     db = sub.add_parser("dashboard", help="cross-session board (#6): one attention-first view "
                                           "over ALL runs under --root (runs/), not just one")
-    db.add_argument("--watch", action="store_true", help="clear-screen + reprint on a loop")
-    db.add_argument("--serve", action="store_true",
-                    help="serve a read-only web dashboard (polls for run updates) instead of printing")
+    # --watch and --serve are two different output modes; passing both used to let
+    # --serve silently win (#121). Make them mutually exclusive so argparse errors out.
+    db_mode = db.add_mutually_exclusive_group()
+    db_mode.add_argument("--watch", action="store_true", help="clear-screen + reprint on a loop")
+    db_mode.add_argument("--serve", action="store_true",
+                         help="serve a read-only web dashboard (polls for run updates) instead of printing")
     db.add_argument("--port", type=int, default=8787, help="--serve bind port")
     db.add_argument("--host", default="127.0.0.1", help="--serve bind host (default localhost only)")
     db.add_argument("--interval", type=int, default=30, help="--watch refresh interval seconds")

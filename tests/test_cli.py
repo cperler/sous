@@ -238,3 +238,37 @@ def test_cli_dashboard_serve_wires_web_dashboard(tmp_path, capsys, monkeypatch) 
     assert "stale_after_s" in captured["kw"]["snap_kwargs"]
     assert callable(captured["kw"]["usage_reader"])
     assert "serving at" in capsys.readouterr().out
+
+
+# --- #121: `dashboard --serve` and `--watch` are mutually exclusive (no silent win) ---
+
+def test_cli_dashboard_serve_and_watch_are_mutually_exclusive(tmp_path, capsys) -> None:
+    # Passing both used to let --serve silently win; argparse must now error out.
+    with pytest.raises(SystemExit) as exc:
+        main([
+            "--root", str(tmp_path), "--project", "tests.fakeproject",
+            "dashboard", "--serve", "--watch",
+        ])
+    assert exc.value.code != 0
+    err = capsys.readouterr().err
+    assert "not allowed with" in err and "--serve" in err and "--watch" in err
+
+
+def test_cli_dashboard_watch_alone_still_parses(tmp_path, capsys, monkeypatch) -> None:
+    # Each mode flag on its own must still reach its dispatch branch.
+    from orchestrator import dashboard
+
+    captured = {}
+
+    def fake_render_watch(root, **kw) -> None:  # stands in for the blocking loop
+        captured["root"] = root
+        captured["interval"] = kw.get("interval")
+
+    monkeypatch.setattr(dashboard, "render_watch", fake_render_watch)
+    rc = main([
+        "--root", str(tmp_path), "--project", "tests.fakeproject",
+        "dashboard", "--watch", "--interval", "1",
+    ])
+    assert rc == 0
+    assert captured["root"] == str(tmp_path)
+    assert captured["interval"] == 1
