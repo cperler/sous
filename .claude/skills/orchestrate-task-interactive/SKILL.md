@@ -43,6 +43,12 @@ You never call a model directly and you never run `claude -p`.
    The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds the WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it — the engine classifies TIMEOUT and retries from the checkpoint. Never leave a hung dispatch un-recorded.
    The shim calls `agent()` in-session and **returns** an array of `StageResult`
    objects (it cannot write to disk). It does the actual work in the task's worktree.
+   - **Honor the WorkItem's `effort`** (#96/#140): each WorkItem carries a per-stage
+     reasoning `effort` (`low`/`medium`/`high`, or absent). The shim forwards it as
+     `agent({ effort: wi.effort })` so the dispatched sub-agent runs at that reasoning
+     level — pass the WorkItem through **unmodified** and never strip or override
+     `effort`. It rides back on the `StageResult` (echoed for the ledger/audit row), so
+     dropping it both mis-sets the sub-agent's effort and corrupts the cost attribution.
 3. **persist + record**: write each returned `StageResult` to a temp file and run
    `… record --result <file>`. Read the JSON outcome:
    - `task_completed` → the PR is open; stop (success).
