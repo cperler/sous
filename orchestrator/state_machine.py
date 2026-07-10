@@ -48,11 +48,20 @@ def is_done(task: Task) -> bool:
     return next_stage(task) is None
 
 
-def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int = 0) -> None:
+def begin_stage(
+    task: Task,
+    stage: Stage,
+    *,
+    now: str,
+    model: str,
+    attempt: int = 0,
+    effort: str | None = None,
+) -> None:
     """Mark a stage running and point the resume cursor at it.
 
     Clears completed_at/error from any prior attempt so a RUNNING record with a
     null completed_at is an unambiguous crash marker (resume_point relies on this).
+    Records the dispatched ``effort`` (#138) so an abandon can attribute it.
     """
     rec = task.stages[stage]
     rec.status = StageStatus.RUNNING
@@ -61,6 +70,7 @@ def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int 
     rec.error = None
     rec.attempt = attempt
     rec.model = model
+    rec.effort = effort
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now

@@ -33,6 +33,12 @@ class StageRecord(BaseModel):
     completed_at: str | None = None
     attempt: int = 0
     model: str | None = None
+    # The reasoning effort this dispatch was launched at (#96/#138) — persisted at
+    # begin_stage so an abandoned dispatch (which has no runner-echoed StageResult) can
+    # still attribute effort on its cost-ledger row, symmetric with model. Pure audit
+    # metadata; None on effort-less dispatches (ENGINE lane, every pre-#96 record).
+    # Additive field: pre-#138 task docs load with None, so no SCHEMA_VERSION bump.
+    effort: str | None = None
     provider: Provider | None = None
     lane: ExecutionMode | None = None
     cost_usd: float | None = None
