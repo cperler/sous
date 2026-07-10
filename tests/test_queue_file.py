@@ -17,6 +17,7 @@ import threading
 import pytest
 
 from orchestrator.queue_file import (
+    _HAVE_FCNTL,
     QueueError,
     QueueFile,
     drive_queue,
@@ -92,6 +93,17 @@ def test_concurrent_producers_do_not_lose_entries(tmp_path) -> None:
     tasks = [e["tasks"][0] for e in QueueFile(path).read()]
     assert tasks[0] == "seed"  # the pre-existing entry is never lost
     assert sorted(tasks[1:]) == sorted(f"t{i}" for i in range(n))  # all N producers survived
+
+
+@pytest.mark.skipif(not _HAVE_FCNTL, reason="fcntl lock path uses the .lock sentinel file")
+def test_lock_sentinel_is_not_truncated_on_acquire(tmp_path) -> None:
+    # #125: the flock sentinel is opened in append mode, so acquiring the lock never truncates
+    # it. Pre-seed the sentinel and confirm an append (which takes the lock) leaves it intact.
+    path = tmp_path / "queue.json"
+    lock_file = path.with_name(f"{path.name}.lock")
+    lock_file.write_text("keep-me")
+    QueueFile(path).append(make_entry(["a"]))
+    assert lock_file.read_text() == "keep-me"  # 'a' mode, not 'w' — no truncation
 
 
 # --- QueueFile: malformed input → typed QueueError --------------------------------

@@ -125,7 +125,7 @@ class QueueFile:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if _HAVE_FCNTL:
             lock_file = self.path.with_name(f"{self.path.name}.lock")
-            fh = open(lock_file, "w")  # noqa: SIM115 - held across the yield
+            fh = open(lock_file, "a")  # noqa: SIM115 - held across the yield; append avoids truncating the sentinel
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
                 yield
