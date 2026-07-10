@@ -17,6 +17,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
@@ -1990,7 +1991,7 @@ class Engine:
             )
 
     def _finalize_task_terminal(
-        self, run_id: str, task: Task, *, disposition: str, reason: str
+        self, run_id: str, task: Task, *, disposition: Literal["rejected", "failed"], reason: str
     ) -> None:
         """Run the shared post-transition run-level effects every operator-invoked
         finalize path (``reject``, ``abandon``, and future ones like ``force_complete``)
