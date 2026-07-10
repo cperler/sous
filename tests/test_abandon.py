@@ -120,6 +120,23 @@ def test_abandon_writes_zero_cost_row_and_dispatch_abandoned_stage_log(tmp_path,
     assert events[0]["disposition"] == "failed"
 
 
+def test_abandon_attributes_the_dispatched_effort_on_the_cost_row(tmp_path, project) -> None:
+    # #138: an abandoned dispatch echoes its model onto the $0 cost row — effort must ride
+    # along symmetrically. begin_stage persists the dispatched effort on the stage record, so
+    # the synthetic StageResult can read it back even though no runner echoed a result.
+    eng = _engine(tmp_path, project)
+    stage = _mid_dispatch(eng)  # scope dispatched at the spec-default effort ("high")
+    # The lease is outstanding: the stage record already carries the dispatched effort.
+    assert eng.store.load_task("r1", "t1").stages[stage].effort == "high"
+
+    eng.abandon("r1", "t1", reason="orphaned")
+
+    scope_rows = [r for r in eng.ledger.rows() if r["stage"] == "scope"]
+    assert len(scope_rows) == 1
+    # Effort is attributed on the abandoned row, not silently dropped to None.
+    assert scope_rows[0]["effort"] == "high"
+
+
 def test_abandon_liveness_guard_refuses_when_stream_recent_and_force_overrides(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     _mid_dispatch(eng)
