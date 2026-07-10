@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .errors import StatusStoreError
+from .errors import StatusNotFoundError, StatusStoreError
 from .schemas.enums import SCHEMA_VERSION
 from .schemas.status import Run, Task
 
@@ -156,7 +156,7 @@ class StatusStore:
         try:
             text = path.read_text(encoding="utf-8")
         except FileNotFoundError as exc:
-            raise StatusStoreError(f"status file not found: {path}") from exc
+            raise StatusNotFoundError(f"status file not found: {path}") from exc
         except OSError as exc:  # pragma: no cover - defensive
             raise StatusStoreError(f"failed to read {path}: {exc}") from exc
         try:

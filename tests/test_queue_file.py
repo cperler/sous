@@ -16,10 +16,13 @@ import threading
 
 import pytest
 
+from orchestrator.errors import StatusNotFoundError, StatusStoreError
 from orchestrator.queue_file import (
     _HAVE_FCNTL,
     QueueError,
     QueueFile,
+    _ingest_batch,
+    _run_exists,
     drive_queue,
     make_entry,
     run_id_for,
@@ -195,6 +198,47 @@ def test_drive_queue_reuses_run_on_reingest(tmp_path) -> None:
     assert second["runs"][0]["added"] == []  # t1 already present — nothing re-added
     assert second["runs"][0]["final_state"] == "completed"
     assert qf.read() == []
+
+
+# --- _run_exists: a corrupt store must NOT read as "run absent" (#112) ------------
+
+def test_run_exists_false_only_for_genuine_not_found(tmp_path) -> None:
+    # A run id with no doc on disk is genuinely absent → False (the create-or-reuse path
+    # relies on this to know when to create). StatusNotFoundError is the narrow signal.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    assert _run_exists(eng, "never-created") is False
+
+
+def test_run_exists_raises_on_corrupt_run_doc(tmp_path) -> None:
+    # Regression (#112): a corrupt (unparseable) run doc must RAISE, not be swallowed as
+    # "run not found". Swallowing it would let _ingest_batch call create_run and overwrite
+    # the partially-valid on-disk state.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.store._run_path("r1").write_text("{ this is not valid json", encoding="utf-8")
+
+    with pytest.raises(StatusStoreError) as excinfo:
+        _run_exists(eng, "r1")
+    # the corrupt-file error, NOT the narrow not-found subclass, propagates.
+    assert not isinstance(excinfo.value, StatusNotFoundError)
+
+
+def test_ingest_batch_does_not_recreate_over_a_corrupt_run(tmp_path) -> None:
+    # #112 at the caller: with a corrupt run doc, _ingest_batch must surface the error
+    # instead of silently create_run-ing over it. Guard create_run to prove it isn't called.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.store._run_path("r1").write_text("not json at all", encoding="utf-8")
+
+    def _fail(*a, **k):
+        raise AssertionError("create_run must not run over a corrupt existing run")
+
+    eng.create_run = _fail  # type: ignore[method-assign]
+    with pytest.raises(StatusStoreError):
+        _ingest_batch(eng, make_entry(["t1"]), "r1", lane=ExecutionLane.FULL)
 
 
 # --- drive_queue: requeue on ingest failure ---------------------------------------

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import Engine
-from .errors import OrchestratorError, StatusStoreError
+from .errors import OrchestratorError, StatusNotFoundError
 from .scheduler import Runner, Scheduler
 from .schemas.enums import ExecutionLane
 
@@ -227,10 +227,15 @@ def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
 
 
 def _run_exists(engine: Engine, run_id: str) -> bool:
+    """True iff ``run_id`` has a loadable run doc. Only a genuine not-found returns False;
+    an unreadable or corrupt-JSON run doc raises (``StatusNotFoundError`` is the narrow
+    not-found signal, so I/O and parse errors are NOT swallowed as "run absent" — #112).
+    Swallowing them would let ``_ingest_batch`` re-``create_run`` over partially-valid,
+    on-disk state."""
     try:
         engine.store.load_run(run_id)
         return True
-    except StatusStoreError:
+    except StatusNotFoundError:
         return False
 
 

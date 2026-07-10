@@ -11,6 +11,13 @@ class StatusStoreError(OrchestratorError):
     """Status persistence/locking failures."""
 
 
+class StatusNotFoundError(StatusStoreError):
+    """A status document does not exist — the genuine "not found" case, distinct from an
+    unreadable or corrupt-JSON file (which stay plain ``StatusStoreError``). A subclass so
+    existing ``except StatusStoreError`` catches still cover it, but a caller probing for
+    existence can catch ONLY this and let real I/O/parse failures bubble up (#112)."""
+
+
 class ResumeError(OrchestratorError):
     """Invalid/incomplete state for resume."""
 
