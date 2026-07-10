@@ -275,3 +275,62 @@ def test_analysis_empty_is_zeroed(tmp_path: Path) -> None:
     assert a["session_reuse"]["win_pct"] == 0.0
     assert a["session_reuse"]["cache_hit_ratio"] == 0.0
     assert a["by_stage"] == {} and a["by_task"] == {}
+
+
+def test_by_effort_groups_and_rates(tmp_path: Path) -> None:
+    """(stage, effort, model) grouping with summed spend/duration and retry/failure rates (#141).
+
+    The implement/high group has two rows: a clean first attempt and a failed retry
+    (attempt>0, status=failure) — so retry_rate and failure_rate are each 1/2."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "attempt": 0,
+         "status": "success", "cost_usd": 2.0, "duration_s": 10.0},
+        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "attempt": 1,
+         "status": "failure", "cost_usd": 3.0, "duration_s": 20.0},
+        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-4-6", "attempt": 0,
+         "status": "success", "cost_usd": 0.5, "duration_s": 4.0},
+    ]
+    agg = ledger.by_effort(rows=rows)
+    # ordered by stage then effort then model: deliver/low precedes implement/high
+    assert [(g["stage"], g["effort"], g["model"]) for g in agg] == [
+        ("deliver", "low", "claude-sonnet-4-6"),
+        ("implement", "high", "claude-opus-4-8"),
+    ]
+    impl = agg[1]
+    assert impl["invocations"] == 2
+    assert impl["cost_usd"] == 5.0
+    assert impl["total_duration_s"] == 30.0
+    assert impl["avg_duration_s"] == 15.0
+    assert impl["retries"] == 1 and impl["retry_rate"] == 0.5
+    assert impl["failures"] == 1 and impl["failure_rate"] == 0.5
+    deliver = agg[0]
+    assert deliver["invocations"] == 1
+    assert deliver["retry_rate"] == 0.0 and deliver["failure_rate"] == 0.0
+
+
+def test_by_effort_none_effort_normalized_and_graceful_statuses(tmp_path: Path) -> None:
+    """None effort buckets under '(default)'; skipped/rate_limited are NOT failures (#141)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        # effort absent -> (default); a rate_limited re-queue is a graceful fallback, not a failure
+        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "rate_limited",
+         "cost_usd": 0.0},
+        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "skipped",
+         "cost_usd": 0.0},
+        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "success",
+         "cost_usd": 1.0},
+    ]
+    agg = ledger.by_effort(rows=rows)
+    assert len(agg) == 1
+    g = agg[0]
+    assert g["effort"] == "(default)"
+    assert g["invocations"] == 3
+    # rate_limited + skipped + success are all non-failures
+    assert g["failures"] == 0 and g["failure_rate"] == 0.0
+    # tolerant of the missing duration_s field
+    assert g["total_duration_s"] == 0.0 and g["avg_duration_s"] == 0.0
+
+
+def test_by_effort_empty_is_empty_list(tmp_path: Path) -> None:
+    assert CostLedger(tmp_path / "stage-costs.jsonl").by_effort() == []

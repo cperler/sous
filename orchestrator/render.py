@@ -112,6 +112,32 @@ def render_cost_report(run_id: str, analysis: dict) -> str:
     return "\n".join(lines)
 
 
+def render_by_effort(run_id: str, agg: list[dict]) -> str:
+    """Render `ledger.by_effort()` into an effort-tuning table keyed by stage/effort/model (#141).
+
+    One row per (stage, effort, model) group with calls, cost, avg duration, retry-rate and
+    failure-rate — the empirical evidence for validating or revising the per-stage effort
+    defaults from #96. Groups arrive pre-ordered (stage, then effort, then model)."""
+    lines = [
+        f"# Cost by effort — {run_id}",
+        "",
+        "_Per-stage reasoning effort (#96) validated against real spend: does a given "
+        "stage/effort actually cost, retry, or fail more? Evidence to tune the #96 defaults._",
+        "",
+        "| Stage | Effort | Model | Calls | Cost (USD) | Avg dur (s) | Retry rate | Failure rate |",
+        "|---|---|---|---:|---:|---:|---:|---:|",
+    ]
+    for g in agg:
+        lines.append(
+            f"| `{g.get('stage', 'unknown')}` | `{g.get('effort', '(default)')}` | "
+            f"`{g.get('model', 'unknown')}` | {g.get('invocations', 0)} | "
+            f"${(g.get('cost_usd') or 0.0):.4f} | {(g.get('avg_duration_s') or 0.0):.1f} | "
+            f"{(g.get('retry_rate') or 0.0) * 100:.0f}% | {(g.get('failure_rate') or 0.0) * 100:.0f}% |"
+        )
+    lines += ["", "_Priced from the single model table; raw rows in `stage-costs.jsonl`._", ""]
+    return "\n".join(lines)
+
+
 def _cost_breakdown_table(heading: str, col: str, buckets: dict) -> list[str]:
     """Shared per-stage / per-task table body, ordered by descending cost."""
     lines = [

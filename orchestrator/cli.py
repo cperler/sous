@@ -378,7 +378,10 @@ def main(argv: list[str] | None = None) -> int:
     tl.add_argument("--lines", type=int, default=20, help="how many trailing lines to show")
     tl.add_argument("--follow", action="store_true", help="poll for and print new output")
     tl.add_argument("--interval", type=int, default=2, help="--follow poll interval seconds")
-    sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
+    cr = sub.add_parser("cost-report", help="per-stage/-task cost breakdown + the session-reuse win")
+    cr.add_argument("--by-effort", action="store_true",
+                    help="instead of the default report, split spend/duration/retry+failure "
+                         "rates by (stage, effort, model) to tune the #96 per-stage effort table (#141)")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
     sp = sub.add_parser("spec", help="front door (#18): idea → validated spec → dependency-ordered issues")
@@ -1057,7 +1060,7 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"watch": "done", "run_id": args.run, "run_state": final["run_state"],
                "progress": final["progress"]})
     elif args.cmd == "cost-report":
-        _emit(eng.ledger.analysis())
+        _emit(eng.ledger.by_effort() if args.by_effort else eng.ledger.analysis())
     elif args.cmd == "retrospective":
         _emit(eng.retrospective(args.run))
     else:  # pragma: no cover
