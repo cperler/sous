@@ -48,11 +48,23 @@ def is_done(task: Task) -> bool:
     return next_stage(task) is None
 
 
-def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int = 0) -> None:
+def begin_stage(
+    task: Task,
+    stage: Stage,
+    *,
+    now: str,
+    model: str,
+    attempt: int = 0,
+    effort: str | None = None,
+) -> None:
     """Mark a stage running and point the resume cursor at it.
 
     Clears completed_at/error from any prior attempt so a RUNNING record with a
     null completed_at is an unambiguous crash marker (resume_point relies on this).
+
+    Stamps ``effort`` (#139) alongside ``model`` so the dispatched reasoning effort is
+    durable on the stage record even before the result returns — a crash between
+    dispatch and result still attributes the effort the stage was running at.
     """
     rec = task.stages[stage]
     rec.status = StageStatus.RUNNING
@@ -61,6 +73,7 @@ def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int 
     rec.error = None
     rec.attempt = attempt
     rec.model = model
+    rec.effort = effort
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now
@@ -78,6 +91,7 @@ def apply_result(
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
+    rec.effort = result.effort  # #139: fold the ran-at effort, mirroring model
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd
