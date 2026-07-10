@@ -190,7 +190,11 @@ class QueueFile:
         return entry
 
     def peek_head(self) -> dict | None:
-        """Return the head batch without removing it, or ``None`` when the queue is empty."""
+        """Return the head batch without removing it, or ``None`` when the queue is empty.
+
+        Intentionally *not* locked: safe only under the single-consumer assumption. With
+        multiple concurrent consumers a stale read is possible — the head may be popped by
+        another consumer between this peek and any follow-up action."""
         entries = self.read()
         return entries[0] if entries else None
 
