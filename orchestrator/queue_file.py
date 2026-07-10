@@ -304,7 +304,14 @@ def drive_queue(
 
         idle_waited = 0  # a batch arrived — reset the idle clock
         entry = queue.pop_head()
-        assert entry is not None  # peek saw it; single consumer, so pop can't miss
+        if entry is None:
+            # peek saw a head; a single consumer means pop cannot miss it. If it does,
+            # the queue was mutated concurrently — surface it instead of proceeding on
+            # None (a bare `assert` would be stripped under `python -O`).
+            raise QueueError(
+                "queue head vanished between peek_head and pop_head "
+                "(concurrent mutation of a single-consumer queue?)"
+            )
         run_id = run_id_for(entry, prefix=run_id_prefix)
         existed = _run_exists(engine, run_id)
         try:

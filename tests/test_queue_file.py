@@ -208,6 +208,24 @@ def test_drive_queue_requeues_head_on_ingest_failure(tmp_path, monkeypatch) -> N
     assert qf.peek_head()["branch"] == "b"
 
 
+# --- drive_queue: peek-then-pop invariant holds under `python -O` -----------------
+
+def test_drive_queue_raises_when_pop_misses_after_peek() -> None:
+    # Guard (issue #114): peek saw a head but pop returned None — a single-consumer
+    # invariant violation (concurrent mutation). The old `assert entry is not None`
+    # was a no-op under `python -O`; the guard must raise a typed QueueError in every
+    # execution mode. engine/runner are never reached before the raise — pass sentinels.
+    class _PopMissesQueue:
+        def peek_head(self):
+            return make_entry(["t1"])  # a head is visible…
+
+        def pop_head(self):
+            return None  # …but it vanished before we could pop it
+
+    with pytest.raises(QueueError, match="vanished between peek_head and pop_head"):
+        drive_queue(object(), _PopMissesQueue(), None)
+
+
 # --- drive_queue: idle-timeout exit on an empty queue -----------------------------
 
 def test_drive_queue_idle_timeout_exits(tmp_path) -> None:
