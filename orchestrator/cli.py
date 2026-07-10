@@ -286,8 +286,10 @@ def main(argv: list[str] | None = None) -> int:
         help="list DAG-ready tasks and in-flight capacity state (#97): "
              "'dispatchable' = unleased tasks whose deps are met; "
              "'in_flight'/'in_flight_count' = tasks with a live dispatch lease right now. "
-             "Remaining headroom = limit - in_flight_count. Re-check before every "
-             "follow-on dispatch so the cap binds across concurrent background invocations.",
+             "Remaining headroom = limit - in_flight_count, and 'dispatch_now' is "
+             "'dispatchable' already sliced to that headroom (in-flight leases subtracted, #135). "
+             "Re-check before every follow-on dispatch so the cap binds across concurrent "
+             "background invocations.",
     )
     d.add_argument("--util", default="0", help=util_help)
     d.add_argument("--max-concurrent", type=int, default=3)
@@ -989,7 +991,12 @@ def main(argv: list[str] | None = None) -> int:
         # so concurrency binds across concurrently-live background invocations, not just
         # within one round — re-checked before every follow-on dispatch (#97).
         in_flight = eng.in_flight(args.run)
-        _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:limit],
+        # Invariant (#135): dispatch_now = DAG-ready ∩ remaining headroom AFTER
+        # in-flight leases — i.e. `limit - in_flight_count`, clamped at 0. Slicing
+        # by the raw `limit` (pre-#97) over-counted free slots whenever tasks were
+        # already leased, so the pre-sliced set is bounded by the real headroom here.
+        headroom = max(0, limit - len(in_flight))
+        _emit({"dispatchable": ready, "limit": limit, "dispatch_now": ready[:headroom],
                "in_flight": in_flight, "in_flight_count": len(in_flight)})
     elif args.cmd == "run-headless":
         import time

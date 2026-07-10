@@ -24,7 +24,8 @@ directly and never run `claude -p`.
 ## The loop (repeat until `status.run_state` is terminal)
 1. **dispatchable**: `D=$(… dispatchable --util auto --max-concurrent 3)`.
    - `D.dispatch_now` is the engine-bounded set to run THIS round (DAG-ready ∩
-     capacity limit). The engine's `limit` is binding — never dispatch more than
+     remaining headroom = `limit - in_flight_count`, so in-flight leases are already
+     subtracted). The engine's `limit` is binding — never dispatch more than
      `dispatch_now`, even if the Workflow cap could allow more.
    - If `dispatch_now` is empty but tasks remain non-terminal, you're capacity-
      stalled (`limit==0`) — wait for the usage window, then retry.

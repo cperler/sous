@@ -118,3 +118,42 @@ def test_dispatchable_cli_reports_in_flight_for_capacity(tmp_path, project, caps
     assert d["in_flight_count"] == 2
     # limit - in_flight_count is the real remaining capacity: 3 - 2 == 1 free slot.
     assert d["limit"] - d["in_flight_count"] == 1
+
+
+def test_dispatch_now_subtracts_in_flight_from_capacity(tmp_path, project, capsys) -> None:
+    # #135: dispatch_now must slice `dispatchable` by the REMAINING headroom after
+    # in-flight leases (`limit - in_flight_count`), not by the raw `limit`. With N
+    # tasks leased, dispatch_now == ready[:limit - N] — never the pre-#97 ready[:limit].
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+
+    def run_json(*argv):
+        assert main(list(base + list(argv))) == 0
+        out = capsys.readouterr().out.strip()
+        return json.loads(out) if out and out != "null" else None
+
+    run_json("init-run", "--lane", "full")
+    for t in ("t1", "t2", "t3", "t4"):
+        run_json("add-task", "--task", t)
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "cli-c.jsonl"),
+                 load_project("tests.fakeproject"))
+    # Lease t1 out of band: 1 in flight, {t2,t3,t4} remain DAG-ready and unleased.
+    eng.next_work("r1", "t1")
+
+    limit = 3
+    d = run_json("dispatchable", "--max-concurrent", str(limit), "--util", "0")
+    ready = d["dispatchable"]
+    assert ready == ["t2", "t3", "t4"]
+    assert d["in_flight_count"] == 1
+    # headroom = limit - in_flight_count = 3 - 1 = 2, so only the first 2 ready run now.
+    assert d["dispatch_now"] == ready[:limit - d["in_flight_count"]]
+    assert d["dispatch_now"] == ["t2", "t3"]
+
+    # Now saturate: lease t2 and t3 too (3 in flight >= limit) -> zero headroom.
+    eng.next_work("r1", "t2")
+    eng.next_work("r1", "t3")
+    d2 = run_json("dispatchable", "--max-concurrent", str(limit), "--util", "0")
+    assert d2["in_flight_count"] == 3
+    assert d2["dispatchable"] == ["t4"]           # t4 still DAG-ready and unleased
+    # limit - in_flight_count == 0 -> dispatch_now clamps to empty (never negative).
+    assert d2["dispatch_now"] == []
