@@ -265,7 +265,8 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
     argv, _cwd = comment
     assert "https://github.com/o/r/pull/77" in argv  # selected by the reused PR url
     body = argv[argv.index("--body") + 1]
-    assert "task/42" in body and "fix cycle 2" in body  # names the branch + review cycle
+    # A genuine review cycle: names the branch, the review-fix commits, and the cycle number.
+    assert "task/42" in body and "review-fix commits" in body and "fix cycle 2" in body
 
 
 def test_deliver_reuse_comment_uses_number_when_no_url(tmp_path) -> None:
@@ -288,7 +289,10 @@ def test_deliver_reuse_comment_uses_number_when_no_url(tmp_path) -> None:
     comment = next(c for c in gh.calls if c[0][:3] == ["gh", "pr", "comment"])
     assert "88" in comment[0]  # PR selected by number
     body = comment[0][comment[0].index("--body") + 1]
-    assert "fix cycle" not in body  # no review_cycles in context → no cycle suffix
+    # #118: no review_cycles in context (a raw re-run) → generic wording, never "review-fix
+    # commits" or a cycle number the run didn't have.
+    assert "fix cycle" not in body and "review-fix commits" not in body
+    assert "updated commits" in body
 
 
 def test_deliver_reuse_comment_failure_never_fails_stage(tmp_path) -> None:
