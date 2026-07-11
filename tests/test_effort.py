@@ -202,6 +202,42 @@ def test_effort_persisted_on_the_stage_record(tmp_path, project) -> None:
     assert eng.store.load_task("r1", "t1").stages[Stage.SCOPE].effort == "high"
 
 
+def test_stage_record_effort_is_the_effort_enum(tmp_path, project) -> None:
+    """#147: StageRecord.effort is typed as the Effort enum, not a bare str. The value is a
+    genuine Effort instance at the begin_stage stamp, after the result fold, AND after a
+    store round-trip (pydantic coerces the persisted "high" back to Effort.HIGH). None stays
+    None on a deterministic ENGINE-lane stage. StrEnum keeps the == "high" comparisons true."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    intake = eng.next_work("r1", "t1")
+    eng.record("r1", make_result(intake))
+    assert eng.store.load_task("r1", "t1").stages[Stage.INTAKE].effort is None
+    # stamped at begin_stage (in-flight, before any result)
+    w = eng.next_work("r1", "t1")
+    running = eng.store.load_task("r1", "t1").stages[Stage.SCOPE].effort
+    assert running is Effort.HIGH
+    # folded from the echoed result, then round-tripped through the store (load coercion)
+    eng.record("r1", make_result(w))
+    recorded = eng.store.load_task("r1", "t1").stages[Stage.SCOPE].effort
+    assert recorded is Effort.HIGH
+
+
+def test_begin_stage_coerces_str_effort_to_enum() -> None:
+    """#147: begin_stage stamps a genuine Effort even from a bare-str effort (the engine
+    passes the stage-spec ``.value``) — validate_assignment is off, so the record's enum
+    typing is upheld by the explicit coercion, not just by load-time validation."""
+    from orchestrator.schemas.status import Task
+    from orchestrator.state_machine import begin_stage
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    begin_stage(task, Stage.SCOPE, now="x", model="claude-opus-4-8", effort="high")
+    assert task.stages[Stage.SCOPE].effort is Effort.HIGH
+    # an effort-less dispatch (ENGINE lane / spec without a default) stays None
+    begin_stage(task, Stage.INTAKE, now="x", model="engine", effort=None)
+    assert task.stages[Stage.INTAKE].effort is None
+
+
 # --- transport translation: claude --effort / codex model_reasoning_effort -------
 
 def _stub_run(calls: list):

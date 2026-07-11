@@ -15,6 +15,7 @@ from .enums import (
     LANE_STAGES,
     SCHEMA_VERSION,
     TERMINAL_TASK_STATES,
+    Effort,
     ExecutionLane,
     ExecutionMode,
     Provider,
@@ -42,8 +43,10 @@ class StageRecord(BaseModel):
     # audit: durable per-stage effort attribution alongside model/provider/cost. None on
     # effort-less dispatches (a spec without a default) and on deterministic ENGINE-lane
     # stages (no model, no effort). Additive field: pre-#138/#139 records load with
-    # effort=None, so no SCHEMA_VERSION bump.
-    effort: str | None = None
+    # effort=None, so no SCHEMA_VERSION bump. Typed as the Effort enum (#147) — the sibling
+    # attribution fields provider/lane already hold their enums; a stored "high" coerces to
+    # Effort.HIGH on load, and the StrEnum still serializes/compares as its "high" value.
+    effort: Effort | None = None
     provider: Provider | None = None
     lane: ExecutionMode | None = None
     cost_usd: float | None = None
