@@ -16,7 +16,13 @@ import json
 from pathlib import Path
 
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
+from .schemas.enums import STAGE_ORDER
 from .schemas.work import StageResult
+
+# Pipeline-execution rank for a stage's string value (#154): lets by_effort() order
+# groups in the natural INTAKE→SCOPE→IMPLEMENT→TEST→DELIVER→REVIEW sequence instead of
+# alphabetically. Unknown/malformed stages sort last (after every known stage).
+_STAGE_RANK: dict[str, int] = {stage.value: i for i, stage in enumerate(STAGE_ORDER)}
 
 
 class CostLedger:
@@ -159,7 +165,8 @@ class CostLedger:
         ``effort`` of ``None`` is normalized to the ``(default)`` label so effort-less rows
         still bucket cleanly. Tolerant of malformed/partial rows via ``.get`` defaults, and
         accepts pre-read ``rows`` so a caller reads the JSONL once. Returned as a list of
-        group dicts ordered by ``stage`` then ``effort`` then ``model`` for readability."""
+        group dicts ordered by ``stage`` (in pipeline-execution order, not alphabetical —
+        #154) then ``effort`` then ``model`` for readability."""
         rows = self.rows() if rows is None else rows
         groups: dict[tuple[str, str, str], dict] = {}
         for row in rows:
@@ -196,7 +203,14 @@ class CostLedger:
             g["retry_rate"] = round(g["retries"] / n, 4) if n else 0.0
             g["failure_rate"] = round(g["failures"] / n, 4) if n else 0.0
             out.append(g)
-        out.sort(key=lambda g: (g["stage"], g["effort"], g["model"]))
+        out.sort(
+            key=lambda g: (
+                _STAGE_RANK.get(g["stage"], len(STAGE_ORDER)),
+                g["stage"],
+                g["effort"],
+                g["model"],
+            )
+        )
         return out
 
     def analysis(self, rows: list[dict] | None = None) -> dict:

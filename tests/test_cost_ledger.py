@@ -292,19 +292,20 @@ def test_by_effort_groups_and_rates(tmp_path: Path) -> None:
          "status": "success", "cost_usd": 0.5, "duration_s": 4.0},
     ]
     agg = ledger.by_effort(rows=rows)
-    # ordered by stage then effort then model: deliver/low precedes implement/high
+    # ordered by stage in PIPELINE order then effort then model (#154): IMPLEMENT (pipeline
+    # rank 2) precedes DELIVER (rank 4), even though "deliver" < "implement" alphabetically.
     assert [(g["stage"], g["effort"], g["model"]) for g in agg] == [
-        ("deliver", "low", "claude-sonnet-4-6"),
         ("implement", "high", "claude-opus-4-8"),
+        ("deliver", "low", "claude-sonnet-4-6"),
     ]
-    impl = agg[1]
+    impl = agg[0]
     assert impl["invocations"] == 2
     assert impl["cost_usd"] == 5.0
     assert impl["total_duration_s"] == 30.0
     assert impl["avg_duration_s"] == 15.0
     assert impl["retries"] == 1 and impl["retry_rate"] == 0.5
     assert impl["failures"] == 1 and impl["failure_rate"] == 0.5
-    deliver = agg[0]
+    deliver = agg[1]
     assert deliver["invocations"] == 1
     assert deliver["retry_rate"] == 0.0 and deliver["failure_rate"] == 0.0
 
@@ -330,6 +331,26 @@ def test_by_effort_none_effort_normalized_and_graceful_statuses(tmp_path: Path) 
     assert g["failures"] == 0 and g["failure_rate"] == 0.0
     # tolerant of the missing duration_s field
     assert g["total_duration_s"] == 0.0 and g["avg_duration_s"] == 0.0
+
+
+def test_by_effort_orders_stages_in_pipeline_sequence(tmp_path: Path) -> None:
+    """Groups sort by STAGE_ORDER (INTAKE→…→REVIEW), not alphabetically (#154).
+
+    Rows are supplied in scrambled order and include an unknown stage, which must sort
+    after every known stage (and alphabetically among any peers)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"stage": "review", "effort": "medium", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "intake", "effort": "low", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "deliver", "effort": "low", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "scope", "effort": "high", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "implement", "effort": "high", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "test", "effort": "medium", "model": "m", "attempt": 0, "status": "success"},
+        {"stage": "mystery", "effort": "low", "model": "m", "attempt": 0, "status": "success"},
+    ]
+    assert [g["stage"] for g in ledger.by_effort(rows=rows)] == [
+        "intake", "scope", "implement", "test", "deliver", "review", "mystery",
+    ]
 
 
 def test_by_effort_empty_is_empty_list(tmp_path: Path) -> None:
