@@ -47,7 +47,9 @@ You never call a model directly and you never run `claude -p`.
      reasoning `effort` (`low`/`medium`/`high`, or absent). The shim forwards it as
      `agent({ effort: wi.effort })` so the dispatched sub-agent runs at that reasoning
      level — pass the WorkItem through **unmodified** and never strip or override
-     `effort`. It rides back on the `StageResult` (echoed for the ledger/audit row), so
+     `effort` (an absent `effort` is itself valid — it means "use the provider default,"
+     which the shim expresses as `wi.effort || undefined`; do not substitute a value of
+     your own). It rides back on the `StageResult` (echoed for the ledger/audit row), so
      dropping it both mis-sets the sub-agent's effort and corrupts the cost attribution.
 3. **persist + record**: write each returned `StageResult` to a temp file and run
    `… record --result <file>`. Read the JSON outcome:
