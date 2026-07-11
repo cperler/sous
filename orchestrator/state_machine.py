@@ -61,7 +61,11 @@ def begin_stage(
 
     Clears completed_at/error from any prior attempt so a RUNNING record with a
     null completed_at is an unambiguous crash marker (resume_point relies on this).
-    Records the dispatched ``effort`` (#138) so an abandon can attribute it.
+
+    Stamps ``effort`` (#96/#138/#139) alongside ``model`` so the dispatched reasoning
+    effort is durable on the stage record even before the result returns — a crash
+    between dispatch and result, or an abandoned dispatch (which has no runner-echoed
+    StageResult), still attributes the effort the stage was running at.
     """
     rec = task.stages[stage]
     rec.status = StageStatus.RUNNING
@@ -88,6 +92,7 @@ def apply_result(
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
+    rec.effort = result.effort  # #139: fold the ran-at effort, mirroring model
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd

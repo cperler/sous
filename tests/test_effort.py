@@ -182,6 +182,26 @@ def test_effort_recorded_on_events_and_ledger_row(tmp_path, project) -> None:
     assert by_stage["intake"]["effort"] is None  # deterministic: effort-less row
 
 
+def test_effort_persisted_on_the_stage_record(tmp_path, project) -> None:
+    """#139: the dispatched effort is durable on the per-stage record — stamped at
+    begin_stage (visible while RUNNING, before the result returns) and folded from the
+    result at record, mirroring ``model``. Deterministic ENGINE-lane stages carry None."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    # intake (deterministic ENGINE lane): no model call, no effort on the record
+    intake = eng.next_work("r1", "t1")
+    eng.record("r1", make_result(intake))
+    assert eng.store.load_task("r1", "t1").stages[Stage.INTAKE].effort is None
+    # scope (model lane, spec-default high): stamped at dispatch, before any result
+    w = eng.next_work("r1", "t1")
+    running = eng.store.load_task("r1", "t1").stages[Stage.SCOPE]
+    assert running.effort == "high" and running.status.value == "running"
+    # ...and folded from the echoed result at record (stays high)
+    eng.record("r1", make_result(w))
+    assert eng.store.load_task("r1", "t1").stages[Stage.SCOPE].effort == "high"
+
+
 # --- transport translation: claude --effort / codex model_reasoning_effort -------
 
 def _stub_run(calls: list):

@@ -33,11 +33,16 @@ class StageRecord(BaseModel):
     completed_at: str | None = None
     attempt: int = 0
     model: str | None = None
-    # The reasoning effort this dispatch was launched at (#96/#138) — persisted at
-    # begin_stage so an abandoned dispatch (which has no runner-echoed StageResult) can
-    # still attribute effort on its cost-ledger row, symmetric with model. Pure audit
-    # metadata; None on effort-less dispatches (ENGINE lane, every pre-#96 record).
-    # Additive field: pre-#138 task docs load with None, so no SCHEMA_VERSION bump.
+    # Reasoning effort this stage was dispatched at (#96/#138/#139): an Effort value
+    # ("low"/"medium"/"high"), the effort sibling of ``model``. Stamped at begin_stage
+    # (the dispatched value) and folded from the result in apply_result, exactly like
+    # ``model``, so it is durable before the result returns — a crash-before-result or an
+    # abandoned dispatch (which has no runner-echoed StageResult) still attributes the
+    # effort the stage ran at, and its cost-ledger row stays symmetric with model. Pure
+    # audit: durable per-stage effort attribution alongside model/provider/cost. None on
+    # effort-less dispatches (a spec without a default) and on deterministic ENGINE-lane
+    # stages (no model, no effort). Additive field: pre-#138/#139 records load with
+    # effort=None, so no SCHEMA_VERSION bump.
     effort: str | None = None
     provider: Provider | None = None
     lane: ExecutionMode | None = None
