@@ -17,6 +17,7 @@ import time
 import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from typing import Literal
 
 from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
@@ -1990,7 +1991,7 @@ class Engine:
             )
 
     def _finalize_task_terminal(
-        self, run_id: str, task: Task, *, disposition: str, reason: str
+        self, run_id: str, task: Task, *, disposition: Literal["rejected", "failed"], reason: str
     ) -> None:
         """Run the shared post-transition run-level effects every operator-invoked
         finalize path (``reject``, ``abandon``, and future ones like ``force_complete``)
@@ -2139,6 +2140,10 @@ class Engine:
             stage=stage,
             attempt=dispatched.attempt,
             model=dispatched.model or ENGINE_MODEL,
+            # #138: echo the dispatched effort (persisted by begin_stage) so the abandoned
+            # cost-ledger row attributes effort symmetrically with model. None on effort-less
+            # (ENGINE-lane / pre-#96) dispatches.
+            effort=dispatched.effort,
             status=ResultStatus.FAILURE,
             raw_output=f"Dispatch abandoned (no model call completed): {reason}",
             lane_used=LaneUsed(

@@ -20,7 +20,12 @@ from orchestrator.cost_policy import (
 )
 from orchestrator.engine import Engine
 from orchestrator.render import render_cost_summary
-from orchestrator.schemas.enums import LANE_STAGES, ExecutionLane, Stage
+from orchestrator.schemas.enums import (
+    LANE_DETERMINISTIC_STAGES,
+    LANE_STAGES,
+    ExecutionLane,
+    Stage,
+)
 from orchestrator.schemas.work import TokenUsage
 from orchestrator.spec_intake import estimate_budget, render_estimate
 from orchestrator.status_store import StatusStore
@@ -210,6 +215,46 @@ def test_routing_thin_budget_downgrades_next_task(tmp_path) -> None:
     ev = [e for e in eng.store.read_events("r1") if e["type"] == "lane_routed"
           and e["task_id"] == "t2"]
     assert ev and ev[0]["preset"] == "lite"
+
+
+def test_routing_decision_overrides_lane_preset_deterministic_default(tmp_path) -> None:
+    # Three-way precedence, rung 2 vs 3 (#119): when route_by_cost is on, the deterministic
+    # stages come from the ROUTING DECISION, and that wins over the lane preset default.
+    # These two only diverge when a lane is pinned explicitly (otherwise effective_lane
+    # collapses to the routed lane and both sources compute the same value), so pin FULL —
+    # whose preset default is NO deterministic stages — while a thin budget routes the
+    # pipeline to LITE. The task ends up with $0 TEST/DELIVER from the decision, proving the
+    # decision beat FULL's () preset default.
+    assert LANE_DETERMINISTIC_STAGES[ExecutionLane.FULL] == ()  # FULL preset default: none forced
+    eng = _engine(tmp_path)
+    eng.create_run("r1", ExecutionLane.FULL, budget_usd=1.0, route_by_cost=True)
+    eng.add_task("r1", "t1")
+    _advance(eng, task="t1")  # intake $0
+    _advance(eng, tokens=TokenUsage(input=190_000, output=0), task="t1")  # spend $0.95 -> LITE band
+
+    t2 = eng.add_task("r1", "t2", ExecutionLane.FULL)  # explicit FULL lane, but budget is thin
+    assert t2.pipeline == LANE_STAGES[ExecutionLane.LITE]  # routing still downgrades the pipeline
+    # the decision's {TEST, DELIVER} won over FULL's () preset default (rung 2 > rung 3)
+    assert set(t2.deterministic_stages) == {Stage.TEST, Stage.DELIVER}
+    ev = [e for e in eng.store.read_events("r1") if e["type"] == "lane_routed"
+          and e["task_id"] == "t2"]
+    assert ev and ev[0]["preset"] == "lite"
+
+
+def test_explicit_deterministic_stages_override_the_routing_decision(tmp_path) -> None:
+    # Three-way precedence, rung 1 vs 2 (#119): an explicit deterministic_stages arg
+    # (--deterministic-stages) wins over the cost-routing decision. A thin budget routes to
+    # LITE (whose decision forces {TEST, DELIVER}), but the caller pins DELIVER only, and that
+    # pin survives untouched — routing still governs the LANE/pipeline, not the pin.
+    eng = _engine(tmp_path)
+    eng.create_run("r1", ExecutionLane.FULL, budget_usd=1.0, route_by_cost=True)
+    eng.add_task("r1", "t1")
+    _advance(eng, task="t1")  # intake $0
+    _advance(eng, tokens=TokenUsage(input=190_000, output=0), task="t1")  # spend $0.95 -> LITE band
+
+    t2 = eng.add_task("r1", "t2", deterministic_stages=[Stage.DELIVER])
+    assert t2.deterministic_stages == (Stage.DELIVER,)  # caller pin wins over routing's {TEST, DELIVER}
+    assert t2.pipeline == LANE_STAGES[ExecutionLane.LITE]  # routing still picks the pipeline
 
 
 def test_explicit_pipeline_pin_always_honored(tmp_path) -> None:

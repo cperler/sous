@@ -16,9 +16,13 @@ import threading
 
 import pytest
 
+from orchestrator.errors import StatusNotFoundError, StatusStoreError
 from orchestrator.queue_file import (
+    _HAVE_FCNTL,
     QueueError,
     QueueFile,
+    _ingest_batch,
+    _run_exists,
     drive_queue,
     make_entry,
     run_id_for,
@@ -92,6 +96,17 @@ def test_concurrent_producers_do_not_lose_entries(tmp_path) -> None:
     tasks = [e["tasks"][0] for e in QueueFile(path).read()]
     assert tasks[0] == "seed"  # the pre-existing entry is never lost
     assert sorted(tasks[1:]) == sorted(f"t{i}" for i in range(n))  # all N producers survived
+
+
+@pytest.mark.skipif(not _HAVE_FCNTL, reason="fcntl lock path uses the .lock sentinel file")
+def test_lock_sentinel_is_not_truncated_on_acquire(tmp_path) -> None:
+    # #125: the flock sentinel is opened in append mode, so acquiring the lock never truncates
+    # it. Pre-seed the sentinel and confirm an append (which takes the lock) leaves it intact.
+    path = tmp_path / "queue.json"
+    lock_file = path.with_name(f"{path.name}.lock")
+    lock_file.write_text("keep-me")
+    QueueFile(path).append(make_entry(["a"]))
+    assert lock_file.read_text() == "keep-me"  # 'a' mode, not 'w' — no truncation
 
 
 # --- QueueFile: malformed input → typed QueueError --------------------------------
@@ -185,6 +200,47 @@ def test_drive_queue_reuses_run_on_reingest(tmp_path) -> None:
     assert qf.read() == []
 
 
+# --- _run_exists: a corrupt store must NOT read as "run absent" (#112) ------------
+
+def test_run_exists_false_only_for_genuine_not_found(tmp_path) -> None:
+    # A run id with no doc on disk is genuinely absent → False (the create-or-reuse path
+    # relies on this to know when to create). StatusNotFoundError is the narrow signal.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    assert _run_exists(eng, "never-created") is False
+
+
+def test_run_exists_raises_on_corrupt_run_doc(tmp_path) -> None:
+    # Regression (#112): a corrupt (unparseable) run doc must RAISE, not be swallowed as
+    # "run not found". Swallowing it would let _ingest_batch call create_run and overwrite
+    # the partially-valid on-disk state.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.store._run_path("r1").write_text("{ this is not valid json", encoding="utf-8")
+
+    with pytest.raises(StatusStoreError) as excinfo:
+        _run_exists(eng, "r1")
+    # the corrupt-file error, NOT the narrow not-found subclass, propagates.
+    assert not isinstance(excinfo.value, StatusNotFoundError)
+
+
+def test_ingest_batch_does_not_recreate_over_a_corrupt_run(tmp_path) -> None:
+    # #112 at the caller: with a corrupt run doc, _ingest_batch must surface the error
+    # instead of silently create_run-ing over it. Guard create_run to prove it isn't called.
+    repo = _repo(tmp_path)
+    eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.store._run_path("r1").write_text("not json at all", encoding="utf-8")
+
+    def _fail(*a, **k):
+        raise AssertionError("create_run must not run over a corrupt existing run")
+
+    eng.create_run = _fail  # type: ignore[method-assign]
+    with pytest.raises(StatusStoreError):
+        _ingest_batch(eng, make_entry(["t1"]), "r1", lane=ExecutionLane.FULL)
+
+
 # --- drive_queue: requeue on ingest failure ---------------------------------------
 
 def test_drive_queue_requeues_head_on_ingest_failure(tmp_path, monkeypatch) -> None:
@@ -206,6 +262,24 @@ def test_drive_queue_requeues_head_on_ingest_failure(tmp_path, monkeypatch) -> N
     # the popped batch was re-prepended at the head, not dropped.
     assert [e["tasks"] for e in qf.read()] == [["bad"]]
     assert qf.peek_head()["branch"] == "b"
+
+
+# --- drive_queue: peek-then-pop invariant holds under `python -O` -----------------
+
+def test_drive_queue_raises_when_pop_misses_after_peek() -> None:
+    # Guard (issue #114): peek saw a head but pop returned None — a single-consumer
+    # invariant violation (concurrent mutation). The old `assert entry is not None`
+    # was a no-op under `python -O`; the guard must raise a typed QueueError in every
+    # execution mode. engine/runner are never reached before the raise — pass sentinels.
+    class _PopMissesQueue:
+        def peek_head(self):
+            return make_entry(["t1"])  # a head is visible…
+
+        def pop_head(self):
+            return None  # …but it vanished before we could pop it
+
+    with pytest.raises(QueueError, match="vanished between peek_head and pop_head"):
+        drive_queue(object(), _PopMissesQueue(), None)
 
 
 # --- drive_queue: idle-timeout exit on an empty queue -----------------------------

@@ -5,6 +5,7 @@ from __future__ import annotations
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.render import (
+    render_by_effort,
     render_cost_report,
     render_cost_summary,
     render_stage,
@@ -155,6 +156,26 @@ def test_render_cost_report_markdown() -> None:
     assert "50.0%" in md  # cache hit ratio
     assert "## By stage" in md and "## By task" in md
     assert "`intake`" in md
+
+
+def test_render_by_effort_markdown() -> None:
+    agg = [
+        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-4-6", "invocations": 3,
+         "cost_usd": 0.75, "avg_duration_s": 4.2, "retry_rate": 0.33, "failure_rate": 0.0},
+        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "invocations": 2,
+         "cost_usd": 5.0, "avg_duration_s": 15.0, "retry_rate": 0.5, "failure_rate": 0.5},
+    ]
+    md = render_by_effort("r1", agg)
+    assert "# Cost by effort — r1" in md
+    assert "| Stage | Effort | Model | Calls | Cost (USD) | Avg dur (s) | Retry rate | Failure rate |" in md
+    assert "`deliver`" in md and "`low`" in md and "`claude-sonnet-4-6`" in md
+    assert "$5.0000" in md and "15.0" in md
+    assert "50%" in md  # retry/failure rates rendered as percentages
+
+
+def test_render_by_effort_defensive_on_empty() -> None:
+    md = render_by_effort("r1", [])
+    assert "# Cost by effort — r1" in md
 
 
 def test_render_cost_report_defensive_on_empty() -> None:

@@ -140,6 +140,65 @@ class CostLedger:
             total += row.get("cost_usd") or 0.0
         return round(total, 6)
 
+    def by_effort(self, rows: list[dict] | None = None) -> list[dict]:
+        """Split spend/duration/retry+failure rates by ``(stage, effort, model)`` (#141).
+
+        Closes the #96 loop: the per-stage effort defaults (SCOPE/IMPLEMENT=high,
+        TEST/REVIEW=medium, DELIVER=low) are a-priori judgments; this aggregation lets
+        real run history validate or revise them (e.g. does DELIVER at low actually retry
+        more?). Each group carries, over its rows:
+
+        * ``invocations`` — number of ledger rows in the group
+        * ``cost_usd`` — summed (authoritative) spend
+        * ``total_duration_s`` / ``avg_duration_s`` — wall time summed and averaged
+        * ``retries`` / ``retry_rate`` — rows that are re-dispatches (``attempt > 0``)
+        * ``failures`` / ``failure_rate`` — rows whose status is a real failure, using the
+          same semantics as ``retrospective._is_failure_status`` (anything not in
+          ``success``/``skipped``/``rate_limited``; the last two are graceful, not failures)
+
+        ``effort`` of ``None`` is normalized to the ``(default)`` label so effort-less rows
+        still bucket cleanly. Tolerant of malformed/partial rows via ``.get`` defaults, and
+        accepts pre-read ``rows`` so a caller reads the JSONL once. Returned as a list of
+        group dicts ordered by ``stage`` then ``effort`` then ``model`` for readability."""
+        rows = self.rows() if rows is None else rows
+        groups: dict[tuple[str, str, str], dict] = {}
+        for row in rows:
+            stage = row.get("stage", "unknown")
+            effort = row.get("effort") or "(default)"
+            model = row.get("model", "unknown")
+            key = (stage, effort, model)
+            g = groups.setdefault(
+                key,
+                {
+                    "stage": stage,
+                    "effort": effort,
+                    "model": model,
+                    "invocations": 0,
+                    "cost_usd": 0.0,
+                    "total_duration_s": 0.0,
+                    "retries": 0,
+                    "failures": 0,
+                },
+            )
+            g["invocations"] += 1
+            g["cost_usd"] = round(g["cost_usd"] + (row.get("cost_usd") or 0.0), 6)
+            g["total_duration_s"] += row.get("duration_s") or 0.0
+            if (row.get("attempt") or 0) > 0:
+                g["retries"] += 1
+            status = row.get("status", "")
+            if status not in ("success", "skipped", "rate_limited"):
+                g["failures"] += 1
+        out: list[dict] = []
+        for g in groups.values():
+            n = g["invocations"]
+            g["total_duration_s"] = round(g["total_duration_s"], 3)
+            g["avg_duration_s"] = round(g["total_duration_s"] / n, 3) if n else 0.0
+            g["retry_rate"] = round(g["retries"] / n, 4) if n else 0.0
+            g["failure_rate"] = round(g["failures"] / n, 4) if n else 0.0
+            out.append(g)
+        out.sort(key=lambda g: (g["stage"], g["effort"], g["model"]))
+        return out
+
     def analysis(self, rows: list[dict] | None = None) -> dict:
         """Rich cost report: per-stage + per-task breakdowns and the session-reuse win.
 

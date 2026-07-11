@@ -102,9 +102,11 @@ class DeterministicDeliverRunner:
         if not selector:
             return
         cycles = _to_int(ctx.get("review_cycles"))
-        which = f" (fix cycle {cycles})" if cycles else ""
+        # #118: only a genuine review fix cycle names the review-fix commits + cycle number. A
+        # raw re-run reusing the PR carries no cycle info, so keep the wording generic.
+        what = f"the review-fix commits (fix cycle {cycles})" if cycles else "updated commits"
         body = (
-            f"Orchestrator re-pushed `{branch}` with the review-fix commits{which}; "
+            f"Orchestrator re-pushed `{branch}` with {what}; "
             "this PR now reflects the latest changes."
         )
         # Advisory only: a failing/absent gh never breaks an already-successful deliver.

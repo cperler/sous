@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import Engine
-from .errors import OrchestratorError, StatusStoreError
+from .errors import OrchestratorError, StatusNotFoundError
 from .scheduler import Runner, Scheduler
 from .schemas.enums import ExecutionLane
 
@@ -125,7 +125,7 @@ class QueueFile:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         if _HAVE_FCNTL:
             lock_file = self.path.with_name(f"{self.path.name}.lock")
-            fh = open(lock_file, "w")  # noqa: SIM115 - held across the yield
+            fh = open(lock_file, "a")  # noqa: SIM115 - held across the yield; append avoids truncating the sentinel
             try:
                 fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
                 yield
@@ -190,7 +190,11 @@ class QueueFile:
         return entry
 
     def peek_head(self) -> dict | None:
-        """Return the head batch without removing it, or ``None`` when the queue is empty."""
+        """Return the head batch without removing it, or ``None`` when the queue is empty.
+
+        Intentionally *not* locked: safe only under the single-consumer assumption. With
+        multiple concurrent consumers a stale read is possible — the head may be popped by
+        another consumer between this peek and any follow-up action."""
         entries = self.read()
         return entries[0] if entries else None
 
@@ -223,10 +227,15 @@ def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
 
 
 def _run_exists(engine: Engine, run_id: str) -> bool:
+    """True iff ``run_id`` has a loadable run doc. Only a genuine not-found returns False;
+    an unreadable or corrupt-JSON run doc raises (``StatusNotFoundError`` is the narrow
+    not-found signal, so I/O and parse errors are NOT swallowed as "run absent" — #112).
+    Swallowing them would let ``_ingest_batch`` re-``create_run`` over partially-valid,
+    on-disk state."""
     try:
         engine.store.load_run(run_id)
         return True
-    except StatusStoreError:
+    except StatusNotFoundError:
         return False
 
 
@@ -300,7 +309,14 @@ def drive_queue(
 
         idle_waited = 0  # a batch arrived — reset the idle clock
         entry = queue.pop_head()
-        assert entry is not None  # peek saw it; single consumer, so pop can't miss
+        if entry is None:
+            # peek saw a head; a single consumer means pop cannot miss it. If it does,
+            # the queue was mutated concurrently — surface it instead of proceeding on
+            # None (a bare `assert` would be stripped under `python -O`).
+            raise QueueError(
+                "queue head vanished between peek_head and pop_head "
+                "(concurrent mutation of a single-consumer queue?)"
+            )
         run_id = run_id_for(entry, prefix=run_id_prefix)
         existed = _run_exists(engine, run_id)
         try:
