@@ -117,3 +117,30 @@ def test_begin_stage_clears_completed_at_on_retry(tmp_path, project) -> None:
     task = eng.store.load_task("r1", "t1")
     rec = task.stages[Stage.IMPLEMENT]
     assert rec.status is StageStatus.RUNNING and rec.completed_at is None  # valid crash marker
+
+
+# #150 — apply_result re-syncs rec.effort from result.effort, mirroring rec.model. A capacity
+# effort downshift between begin_stage and the runner returning would otherwise leave the record
+# at the pre-downshift value; the result carries the effort actually run.
+def test_apply_result_syncs_effort_from_result() -> None:
+    from orchestrator.schemas.enums import ExecutionMode, Provider
+    from orchestrator.schemas.status import Task
+    from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
+    from orchestrator.state_machine import apply_result, begin_stage
+
+    task = Task(task_id="t1", run_id="r1", created_at="t0", updated_at="t0")
+    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-4-8", effort="high")
+    assert task.stages[Stage.IMPLEMENT].effort == "high"  # dispatched value
+
+    # The runner returns having actually run at a lower effort (downshifted after begin_stage).
+    result = StageResult(
+        work_item_id="w1", content_hash="h1", run_id="r1", task_id="t1",
+        stage=Stage.IMPLEMENT, attempt=0, model="claude-opus-4-8", effort="medium",
+        status=ResultStatus.SUCCESS,
+        structured_output={"files_changed": ["a.py"], "summary": "done", "committed": True},
+        lane_used=LaneUsed(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE,
+                           invocation="agent"),
+        token_usage=TokenUsage(input=10, output=2), completed_at="t2",
+    )
+    apply_result(task, result, now="t2", cost_usd=0.01)
+    assert task.stages[Stage.IMPLEMENT].effort == "medium"  # re-synced from the result

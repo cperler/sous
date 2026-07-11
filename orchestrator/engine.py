@@ -697,7 +697,7 @@ class Engine:
                 )
             if next_stage(t) is not stage:
                 raise ContractError(f"task {task_id} stage advanced under dispatch of {stage.value}")
-            begin_stage(t, stage, now=_now(), model=model, attempt=attempt)
+            begin_stage(t, stage, now=_now(), model=model, effort=effort, attempt=attempt)
             t.state = TaskState.RUNNING
             t.pending_work_item_id = work.id
             t.pending_content_hash = work.content_hash

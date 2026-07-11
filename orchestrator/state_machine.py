@@ -48,7 +48,9 @@ def is_done(task: Task) -> bool:
     return next_stage(task) is None
 
 
-def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int = 0) -> None:
+def begin_stage(
+    task: Task, stage: Stage, *, now: str, model: str, effort: str | None = None, attempt: int = 0
+) -> None:
     """Mark a stage running and point the resume cursor at it.
 
     Clears completed_at/error from any prior attempt so a RUNNING record with a
@@ -61,6 +63,7 @@ def begin_stage(task: Task, stage: Stage, *, now: str, model: str, attempt: int 
     rec.error = None
     rec.attempt = attempt
     rec.model = model
+    rec.effort = effort
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now
@@ -78,6 +81,10 @@ def apply_result(
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
+    # Re-sync effort from the result for the same reason as model (#150): a capacity-driven
+    # effort downshift between begin_stage and the runner returning would otherwise leave the
+    # record at the pre-downshift value while result.effort holds the value actually run.
+    rec.effort = result.effort
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd

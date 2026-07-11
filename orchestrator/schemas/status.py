@@ -33,6 +33,7 @@ class StageRecord(BaseModel):
     completed_at: str | None = None
     attempt: int = 0
     model: str | None = None
+    effort: str | None = None  # reasoning effort the dispatch ran at (#96); mirrors model
     provider: Provider | None = None
     lane: ExecutionMode | None = None
     cost_usd: float | None = None
