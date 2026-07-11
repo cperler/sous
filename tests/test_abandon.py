@@ -111,6 +111,11 @@ def test_abandon_writes_zero_cost_row_and_dispatch_abandoned_stage_log(tmp_path,
     assert "orphaned" in (log["raw_output"] or "")
     assert (tmp_path / "stages" / "t1" / f"{seq:02d}-scope.md").exists()
 
+    # #151: the stage log surfaces the effort attribution field, agreeing with the
+    # cost-ledger row (both source it from the same synthetic result).
+    assert "effort" in log
+    assert log["effort"] == scope_rows[0]["effort"]
+
     # The event stream carries a dispatch_abandoned row for the audit trail.
     events = [e for e in eng.store.read_events("r1") if e["type"] == "dispatch_abandoned"]
     assert len(events) == 1
