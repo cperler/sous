@@ -12,6 +12,7 @@ import json
 
 from .schemas.enums import (
     STAGE_ORDER,
+    Effort,
     ExecutionMode,
     Provider,
     ResultStatus,
@@ -55,7 +56,7 @@ def begin_stage(
     now: str,
     model: str,
     attempt: int = 0,
-    effort: str | None = None,
+    effort: str | Effort | None = None,
 ) -> None:
     """Mark a stage running and point the resume cursor at it.
 
@@ -74,7 +75,9 @@ def begin_stage(
     rec.error = None
     rec.attempt = attempt
     rec.model = model
-    rec.effort = effort
+    # Coerce to the Effort enum (#147): validate_assignment is off, so the tightened
+    # StageRecord.effort field is only enum-coerced on load — do it explicitly here.
+    rec.effort = Effort(effort) if effort is not None else None
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now
@@ -92,7 +95,8 @@ def apply_result(
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
-    rec.effort = result.effort  # #139: fold the ran-at effort, mirroring model
+    # #139: fold the ran-at effort, mirroring model; coerce to the Effort enum (#147).
+    rec.effort = Effort(result.effort) if result.effort is not None else None
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd
