@@ -1235,14 +1235,21 @@ class Engine:
             return None
         out = result.structured_output or {}
         approved_false = out.get("approved") is False  # explicit self-report only
-        # #41: a deterministically-detected docs-only change has no behavioral surface, so a
-        # `tests_meaningful=false` verdict must NOT reject it for lacking new tests (the
-        # reviewer is asked to skip that criterion for docs-only, but we enforce it engine-side
-        # too — the tag is ENGINE-lane-only, so a model can't fabricate this exemption). An
-        # explicit `approved=false` still rejects normally: docs-only relaxes the tests
-        # criterion, never the reviewer's substantive approval.
-        docs_only = task.context.get("change_class") == "docs-only"
-        tests_vacuous = out.get("tests_meaningful") is False and not docs_only
+        # #41/#168: a task with NO model test surface has nothing for the #13 independent
+        # test-validate gate to bite on, so a `tests_meaningful=false` verdict must NOT reject
+        # it for lacking meaningful new tests. Two engine-side, non-fabricatable signals qualify
+        # (both derived from add_task-time state, never from a model's output — so a model can't
+        # self-exempt): (a) #41 a deterministically-detected docs-only change (ENGINE-lane-only
+        # `change_class` tag); (b) #168 the TEST stage did not run on a model lane — absent from
+        # the pipeline (micro) or opted into the deterministic $0 ENGINE runner (#33/#68), so no
+        # model wrote/graded the tests the reviewer would be judging. An explicit `approved=false`
+        # still rejects normally: this relaxes only the tests criterion, never a substantive reject.
+        no_model_test_surface = (
+            task.context.get("change_class") == "docs-only"
+            or Stage.TEST not in task.pipeline
+            or Stage.TEST in task.deterministic_stages
+        )
+        tests_vacuous = out.get("tests_meaningful") is False and not no_model_test_surface
         if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")

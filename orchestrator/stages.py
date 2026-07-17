@@ -291,6 +291,18 @@ def render_prompt(
             "or hold this change for lacking new/updated tests. Judge it on documentation "
             "correctness and clarity instead."
         )
+    # #168: belt-and-suspenders with the engine's fail-open-on-omit gate — tell the reviewer
+    # to OMIT `tests_meaningful` (rather than answer `false`) when there is no test surface to
+    # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal
+    # `false` on a no-test-surface change is what spuriously kicked #144 into a fix cycle.
+    if stage is Stage.REVIEW:
+        instruction += (
+            "\n\n## Reporting tests_meaningful\n"
+            "Only set `tests_meaningful` when there ARE tests to judge. If this change has no "
+            "test surface (e.g. a docs/config-only change, or nothing whose behavior tests "
+            "could exercise), OMIT the field entirely rather than answering `false` — a literal "
+            "`false` reads as a rejection for lacking meaningful tests."
+        )
     # #62: a frontend change (deterministic signal on files_changed folded from IMPLEMENT)
     # gets the design-review criteria block appended to the REVIEW prompt. Project-agnostic
     # wording; the heysoo-specific design tokens live in the adapter's design agent.
