@@ -82,7 +82,12 @@ Because the shim only returns results **on Workflow completion**, a session deat
 mid-dispatch loses only the in-flight **batch**. The crash leaves the dispatch lease
 held, so a plain `… next` refuses (it guards the in-flight result) — recover with
 `… next --resume`, which re-emits the un-recorded stage at the same attempt. Keep
-batches small.
+batches small. **Use `--resume` ONLY to recover a genuine crash, never as a routine
+re-preview** — always capture `next` into `WORK` in the single call above so you never
+call `next` then `next --resume` for the same live stage. A resume that supersedes a
+still-outstanding lease is self-describing in the timeline (#142): the re-dispatch's
+`stage_dispatched` carries `resume: true` / `supersedes: <old work_item_id>` and the
+retired lease gets its own `lease_superseded` event, so no orphan dispatch is left.
 
 ## Audit (every gate)
 Run `… status` and check `lane_audit.clean == true`: every recorded model call must

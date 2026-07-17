@@ -98,6 +98,54 @@ def test_multi_task_run_completes(tmp_path, project) -> None:
     assert eng.status("r1")["run_state"] == "completed"  # not stuck at len<=1 bug
 
 
+# #142 — a normal (non-resume) dispatch leaves no orphan stage_dispatched: every
+# dispatched work_item_id gets a matching stage_recorded, and no lease is superseded.
+def test_normal_dispatch_leaves_no_orphan_stage_dispatched(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    while (w := eng.next_work("r1", "t1")) is not None:
+        eng.record("r1", make_result(w))
+    events = eng.store.read_events("r1")
+    dispatched = [e for e in events if e["type"] == "stage_dispatched"]
+    recorded = [e for e in events if e["type"] == "stage_recorded"]
+    # one dispatch per recorded stage: no superseded lease inflates the dispatch count
+    assert len(dispatched) == len(recorded)
+    assert not [e for e in events if e["type"] == "lease_superseded"]
+    assert not [e for e in dispatched if e.get("resume")]
+
+
+# #142 — a resume re-lease is self-describing: the re-dispatch carries the resume marker
+# + the lease it supersedes, and the superseded (never-recorded) lease gets its own
+# `lease_superseded` event so a naive consumer can discount it.
+def test_resume_release_marks_superseded_lease(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_attempts=5, breaker_threshold=9)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # scope
+    w1 = eng.next_work("r1", "t1")  # implement dispatched, then "crash" (never recorded)
+    w2 = eng.next_work("r1", "t1", resume=True)  # supervisor resumes -> fresh WorkItem
+    assert w2.id != w1.id
+
+    events = eng.store.read_events("r1")
+    superseded = [e for e in events if e["type"] == "lease_superseded"]
+    assert len(superseded) == 1
+    assert superseded[0]["work_item_id"] == w1.id  # the retired, never-recorded lease
+    assert superseded[0]["superseded_by"] == w2.id
+    # the re-dispatch event is stamped as a resume of the old lease
+    redispatch = [
+        e for e in events
+        if e["type"] == "stage_dispatched" and e["work_item_id"] == w2.id
+    ]
+    assert len(redispatch) == 1
+    assert redispatch[0].get("resume") is True
+    assert redispatch[0].get("supersedes") == w1.id
+    # the FIRST (superseded) dispatch was NOT retroactively marked as a resume
+    first = [e for e in events if e["type"] == "stage_dispatched" and e["work_item_id"] == w1.id]
+    assert len(first) == 1 and not first[0].get("resume")
+
+
 # Finding (cleanup) — single pricing source: ledger and engine agree
 def test_single_pricing_source(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
