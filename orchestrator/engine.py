@@ -118,6 +118,19 @@ def _in_future(iso: str | None) -> bool:
 # headless stream; `force=True` overrides it when the operator knows the process is dead.
 DEFAULT_ABANDON_MIN_IDLE_S = 300
 
+# Filing threshold for review evidence-out (#188): a review can surface any number of
+# non-blocking findings, but task completion must not become a hydra (one task spawning
+# a dozen follow-ups, as batch-queue-1 did). Only findings dispositioned `file` (or with
+# an absent disposition, for backward compatibility) are filed, and only up to this cap
+# per task; `fix_now`/`drop` findings — and any `file` finding over the cap — are surfaced
+# in the completion note's "Noted, not filed" section instead, so nothing is silently
+# dropped without ballooning the backlog.
+MAX_FILED_FOLLOWUPS_PER_TASK = 2
+
+# Non-blocking dispositions the engine must NOT file (they are noted in the completion
+# note instead). Anything else — including an absent disposition — files.
+_UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop"})
+
 
 # Failure kinds whose committed work is NOT implicated by the failure itself, so any
 # commits the attempt made before dying are worth KEEPING for the retry (#59): the model
@@ -2588,7 +2601,12 @@ class Engine:
             if task.pr_url:
                 ts.mark_complete(task.task_id, task.pr_url)
             followups = self._file_review_followups(run_id, task, ts)
-            improvement_ref = self._file_review_improvement(run_id, task, ts)
+            # #188 dedup: don't file the improvement as a separate enhancement when it is
+            # the same observation the reviewer also emitted as a (now-filed) non-blocking
+            # finding (the #186/#187 class — one idea, filed twice). Fingerprint the filed
+            # titles and suppress a matching improvement.
+            filed_fps = {self._issue_fingerprint(f["title"]) for f in followups}
+            improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
             self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
@@ -2604,10 +2622,14 @@ class Engine:
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
-        """File each non-blocking review finding as a deferred-scope follow-up issue, so
-        nothing the reviewer noticed is silently dropped (the project's scope-ledger norm).
-        Returns ``[{"title", "ref"}]``; a no-op when the adapter lacks ``file_followup`` or
-        the review reported none."""
+        """File non-blocking review findings as deferred-scope follow-up issues — but only
+        the ones that clear the #188 filing threshold, so task completion doesn't become a
+        hydra. A finding is filed only when its ``disposition`` is ``file`` (or absent, for
+        backward compatibility) AND the per-task cap (``MAX_FILED_FOLLOWUPS_PER_TASK``) is
+        not yet reached; ``fix_now``/``drop`` findings and cap overflow are skipped here and
+        surfaced in the completion note's "Noted, not filed" section instead (nothing is
+        silently dropped). Returns ``[{"title", "ref"}]`` for the FILED findings; a no-op
+        when the adapter lacks ``file_followup`` or the review reported none."""
         file_followup = getattr(task_source, "file_followup", None)
         if not callable(file_followup):
             return []
@@ -2621,6 +2643,17 @@ class Engine:
                 continue
             title = str(finding.get("title") or "").strip()  # coerce: a model may emit non-strings
             if not title:
+                continue
+            # #188 gate: skip findings the reviewer marked as fix-in-place or drop; they are
+            # surfaced in the completion note, not filed. An absent/unknown disposition
+            # defaults to filing (preserves the pre-#188 behavior for the un-validated
+            # interactive lane and older reviews).
+            disposition = str(finding.get("disposition") or "").strip().casefold()
+            if disposition in _UNFILED_DISPOSITIONS:
+                continue
+            # #188 cap: past the per-task limit, additional `file` findings are also noted,
+            # not filed — the completion note lists them as "over per-task cap".
+            if len(filed) >= MAX_FILED_FOLLOWUPS_PER_TASK:
                 continue
             body = (
                 f"{str(finding.get('detail') or '').strip()}\n\n"
@@ -2645,10 +2678,16 @@ class Engine:
             filed.append({"title": title, "ref": ref})
         return filed
 
-    def _file_review_improvement(self, run_id: str, task: Task, task_source: object) -> str | None:
+    def _file_review_improvement(
+        self, run_id: str, task: Task, task_source: object,
+        skip_fingerprints: set[str] | None = None,
+    ) -> str | None:
         """File the review's single forward-looking improvement idea as an ``enhancement``
         issue (the self-improvement loop — heysoo's Innovation Brainstorm). Returns the
-        issue ref, or None when the adapter lacks ``file_followup`` or the review had none."""
+        issue ref, or None when the adapter lacks ``file_followup``, the review had none,
+        or (#188) the idea fingerprint-matches an already-filed follow-up (``skip_fingerprints``)
+        — one observation must not be filed twice as both a non-blocking finding and an
+        enhancement."""
         file_followup = getattr(task_source, "file_followup", None)
         if not callable(file_followup):
             return None
@@ -2658,6 +2697,13 @@ class Engine:
             return None
         title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
+            return None
+        if skip_fingerprints and self._issue_fingerprint(title) in skip_fingerprints:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "improvement_deduped", "run_id": run_id,
+                 "task_id": task.task_id, "title": title},
+            )
             return None
         body = (
             f"{str(improvement.get('detail') or '').strip()}\n\n"

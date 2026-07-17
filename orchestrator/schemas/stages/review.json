@@ -37,13 +37,18 @@
     },
     "non_blocking": {
       "type": "array",
-      "description": "findings that do NOT block approval but should be tracked as follow-ups; the engine files each as a deferred-scope issue at finalize (empty if none)",
+      "description": "findings that do NOT block approval; each carries a `disposition` that gates what the engine does with it at finalize. Only `file` (or an absent disposition, for backward compatibility) becomes a deferred-scope issue — and only up to a small per-task cap; `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
       "items": {
         "type": "object",
         "required": ["title"],
         "properties": {
           "title": {"type": "string", "description": "one-line issue title"},
-          "detail": {"type": "string", "description": "what/why/where — the follow-up issue body"}
+          "detail": {"type": "string", "description": "what/why/where — the follow-up issue body"},
+          "disposition": {
+            "type": "string",
+            "enum": ["fix_now", "file", "drop"],
+            "description": "filing threshold. `file`: a maintainer would put this on the backlog independently — out-of-scope (different subsystem / needs its own design) OR non-trivial (real work/risk). `fix_now`: a trivial nit WITHIN the blast radius of this change (a docstring the edit made stale, a guard/type on a touched line) the implementer should have absorbed in place — not worth a ticket. `drop`: a real-but-untracked observation, noted and moved on. Absent disposition defaults to `file` (backward-compatible)."
+          }
         },
         "additionalProperties": true
       }

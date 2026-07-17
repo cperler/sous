@@ -486,6 +486,25 @@ def render_completion_note(
             suffix = f" → {ref}" if ref else " → (filing failed)"
             lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
 
+    # #188: the "noted, moving on" destination. A non-blocking finding the engine did NOT
+    # file — dispositioned `fix_now`/`drop`, or a `file` finding past the per-task cap — is
+    # surfaced here so the drop bucket is durable in the PR/issue note (nothing silently
+    # dropped). Derived from the review's findings minus the titles that got filed above.
+    filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
+    _noted_reason = {"fix_now": "fixed in place (boy-scout)", "drop": "noted, not tracked"}
+    noted: list[str] = []
+    for finding in review.get("non_blocking") or []:
+        if not isinstance(finding, dict):
+            continue
+        title = str(finding.get("title") or "").strip()
+        if not title or title in filed_titles:
+            continue
+        disposition = str(finding.get("disposition") or "").strip().casefold()
+        reason = _noted_reason.get(disposition, "over per-task cap")
+        noted.append(f"- {title} — {reason}")
+    if noted:
+        lines += ["", "### Noted, not filed"] + noted
+
     # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
@@ -503,9 +522,9 @@ def render_completion_note(
         if str(retro.get("detail", "")).strip():
             lines.append(str(retro["detail"]).strip())
 
-    lines += ["", "_Produced by the orchestration harness — nothing dropped: non-blocking "
-              "findings are tracked as follow-up issues; the improvement idea is filed as an "
-              "enhancement._", ""]
+    lines += ["", "_Produced by the orchestration harness — nothing dropped: findings that "
+              "clear the filing bar are tracked as follow-up issues, the rest are noted "
+              "above; the improvement idea is filed as an enhancement._", ""]
     return "\n".join(lines)
 
 
