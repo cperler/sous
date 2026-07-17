@@ -202,6 +202,34 @@ def test_effort_persisted_on_the_stage_record(tmp_path, project) -> None:
     assert eng.store.load_task("r1", "t1").stages[Stage.SCOPE].effort == "high"
 
 
+def test_apply_result_re_syncs_effort_on_downshift() -> None:
+    """#150: apply_result re-syncs rec.effort from result.effort, mirroring rec.model. The
+    other record tests fold an *echoed* effort (dispatched == run); this covers the asymmetric
+    case — a capacity downshift between begin_stage and the runner returning would otherwise
+    leave the record at the pre-downshift value while result.effort holds the value run."""
+    from orchestrator.schemas.enums import ResultStatus
+    from orchestrator.schemas.status import Task
+    from orchestrator.schemas.work import LaneUsed, StageResult
+    from orchestrator.state_machine import apply_result, begin_stage
+
+    task = Task(task_id="t1", run_id="r1", created_at="t0", updated_at="t0")
+    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-4-8", effort="high")
+    assert task.stages[Stage.IMPLEMENT].effort is Effort.HIGH  # dispatched value
+
+    # The runner returns having actually run at a lower effort (downshifted after begin_stage).
+    result = StageResult(
+        work_item_id="w1", content_hash="h1", run_id="r1", task_id="t1",
+        stage=Stage.IMPLEMENT, attempt=0, model="claude-opus-4-8", effort="medium",
+        status=ResultStatus.SUCCESS,
+        structured_output={"files_changed": ["a.py"], "summary": "done", "committed": True},
+        lane_used=LaneUsed(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE,
+                           invocation="agent"),
+        token_usage=TokenUsage(input=10, output=2), completed_at="t2",
+    )
+    apply_result(task, result, now="t2", cost_usd=0.01)
+    assert task.stages[Stage.IMPLEMENT].effort is Effort.MEDIUM  # re-synced from the result
+
+
 def test_stage_record_effort_is_the_effort_enum(tmp_path, project) -> None:
     """#147: StageRecord.effort is typed as the Effort enum, not a bare str. The value is a
     genuine Effort instance at the begin_stage stamp, after the result fold, AND after a
