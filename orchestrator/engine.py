@@ -1230,7 +1230,15 @@ class Engine:
         Also the independent test-validate half (#13): the reviewer — a different agent
         from the one that wrote/ran the tests — reports ``tests_meaningful``; an explicit
         ``false`` REJECTS even an approved review (vacuous-green tests are exactly what
-        the self-graded TEST gate can't catch about itself). Fail-open when omitted."""
+        the self-graded TEST gate can't catch about itself). Fail-open when omitted.
+
+        The #13 gate is suppressed for tasks with NO model test surface (#41/#168): i.e.
+        when ``change_class == "docs-only"`` (ENGINE-detected, not model-asserted), when
+        ``Stage.TEST`` is absent from the task's pipeline (micro tasks), or when TEST ran
+        on the deterministic ENGINE lane (opted in via ``deterministic_stages``). A model
+        cannot self-exempt: all three signals are fixed at ``add_task`` time. An explicit
+        ``approved=false`` still rejects normally — the exemption covers only the vacuous-
+        tests criterion, never a substantive reviewer rejection."""
         if result.stage is not Stage.REVIEW:
             return None
         out = result.structured_output or {}

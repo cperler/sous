@@ -248,6 +248,22 @@ def render_prompt(
     Sections 1–2 form the byte-identical prefix a downstream stage can reuse from cache;
     the volatile per-stage content trails it. ``context``/``project_commands`` are plain
     dicts so this stays project-agnostic (the engine supplies them).
+
+    Stage-specific directives appended to the instruction section:
+
+    - TEST/REVIEW + ``change_class == "docs-only"`` (#41): tells the runner that the
+      change has no behavioral surface, so test-coverage / ``tests_meaningful`` criteria
+      don't apply. The tag is set deterministically by the ENGINE-lane git diff, so a
+      model cannot trigger this exemption by asserting it in its output.
+
+    - REVIEW (all tasks, #168): instructs the reviewer to OMIT ``tests_meaningful``
+      rather than answer ``false`` when there is no test surface to judge — belt-and-
+      suspenders with the engine's fail-open-on-omit behaviour in ``_review_verdict``.
+      A literal ``false`` on a no-test-surface change spuriously triggers the #13
+      independent-test-validate reject.
+
+    - REVIEW + frontend change (#62): appends the design-review lens when folded context
+      signals a frontend file was changed.
     """
     spec = STAGE_SPECS[stage]
     parts: list[str] = []
