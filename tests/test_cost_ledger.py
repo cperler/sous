@@ -203,6 +203,28 @@ def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
     assert ledger.total_attributed() == summary["total_cost_usd"]
 
 
+def test_summary_by_effort_spend_and_engine_lane(tmp_path: Path) -> None:
+    """summary() rolls spend up by reasoning effort and tags the ENGINE-lane $0 win (#169)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"model": "claude-opus-4-8", "effort": "high", "lane": "headless", "cost_usd": 5.0},
+        {"model": "claude-opus-4-8", "effort": "high", "lane": "headless", "cost_usd": 1.0},
+        {"model": "claude-sonnet-4-6", "effort": "medium", "lane": "headless", "cost_usd": 0.5},
+        # an effort-less deterministic ENGINE-lane row: no model cost, buckets under (default)
+        {"model": "none", "effort": None, "lane": "engine", "cost_usd": 0.0},
+    ]
+    summary = ledger.summary(rows=rows)
+
+    by_effort = summary["by_effort_spend"]
+    assert by_effort["high"] == {"invocations": 2, "cost_usd": 6.0}
+    assert by_effort["medium"] == {"invocations": 1, "cost_usd": 0.5}
+    # None effort normalizes to the (default) bucket
+    assert by_effort["(default)"] == {"invocations": 1, "cost_usd": 0.0}
+
+    # ENGINE-lane attribution: one deterministic, genuinely-$0 invocation
+    assert summary["engine_lane"] == {"invocations": 1, "cost_usd": 0.0}
+
+
 def test_rows_roundtrip(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     recorded = [

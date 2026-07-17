@@ -91,11 +91,24 @@ class CostLedger:
             return [json.loads(line) for line in fh if line.strip()]
 
     def summary(self, rows: list[dict] | None = None) -> dict:
-        """Aggregate the ledger: totals plus a per-model breakdown.
+        """Aggregate the ledger: totals plus per-model, per-effort, and ENGINE-lane rollups.
+
+        Alongside the per-model breakdown, two additive rollups over the already-present
+        row fields (#169, no schema change):
+
+        * ``by_effort_spend`` — spend split by the reasoning effort the dispatch ran at
+          (#96), keyed by ``high``/``medium``/``low`` with ``None`` normalized to the
+          ``(default)`` label. Lets an operator see how much spend high-effort stages
+          consume vs medium/low — the actionable signal for tuning ``effort_pin`` defaults.
+        * ``engine_lane`` — deterministic ENGINE-lane attribution (#68/#120): the count and
+          (always $0) cost of rows the engine ran with no model call (``lane == "engine"``),
+          so the deterministic-stage cost win is a visible line item, not a ledger scan.
 
         Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once
         and shares it. Tolerant of a malformed/partial row via ``.get`` defaults."""
         by_model: dict[str, dict] = {}
+        by_effort_spend: dict[str, dict] = {}
+        engine_lane = {"invocations": 0, "cost_usd": 0.0}
         total_cost = 0.0
         total_invocations = 0
         unmetered_calls = 0
@@ -120,12 +133,25 @@ class CostLedger:
             bucket["input_tokens"] += row.get("input_tokens", 0) or 0
             bucket["output_tokens"] += row.get("output_tokens", 0) or 0
             bucket["cost_usd"] = round(bucket["cost_usd"] + cost, 6)
+            # Per-effort spend rollup (#145/#152): None -> '(default)' so effort-less rows
+            # (deterministic ENGINE-lane stages, specs without a default) still bucket cleanly.
+            ebucket = by_effort_spend.setdefault(
+                row.get("effort") or "(default)", {"invocations": 0, "cost_usd": 0.0}
+            )
+            ebucket["invocations"] += 1
+            ebucket["cost_usd"] = round(ebucket["cost_usd"] + cost, 6)
+            # Deterministic ENGINE-lane attribution (#120): rows the engine ran itself.
+            if row.get("lane") == "engine":
+                engine_lane["invocations"] += 1
+                engine_lane["cost_usd"] = round(engine_lane["cost_usd"] + cost, 6)
         return {
             "total_cost_usd": round(total_cost, 6),
             "total_invocations": total_invocations,
             "unmetered_calls": unmetered_calls,
             "total_wall_s": round(total_wall_s, 1),
             "by_model": by_model,
+            "by_effort_spend": by_effort_spend,
+            "engine_lane": engine_lane,
         }
 
     def total_attributed(self) -> float:
@@ -166,7 +192,8 @@ class CostLedger:
         still bucket cleanly. Tolerant of malformed/partial rows via ``.get`` defaults, and
         accepts pre-read ``rows`` so a caller reads the JSONL once. Returned as a list of
         group dicts ordered by ``stage`` (in pipeline-execution order, not alphabetical —
-        #154) then ``effort`` then ``model`` for readability."""
+        #154) then ``effort`` then ``model`` for readability. Unknown/malformed stages sort
+        after every known stage, and alphabetically among themselves (#166)."""
         rows = self.rows() if rows is None else rows
         groups: dict[tuple[str, str, str], dict] = {}
         for row in rows:

@@ -112,7 +112,9 @@ def test_abandon_writes_zero_cost_row_and_dispatch_abandoned_stage_log(tmp_path,
     assert (tmp_path / "stages" / "t1" / f"{seq:02d}-scope.md").exists()
 
     # #151: the stage log surfaces the effort attribution field, agreeing with the
-    # cost-ledger row (both source it from the same synthetic result).
+    # cost-ledger row (both source it from the same synthetic result). Key-PRESENCE is the
+    # meaningful guard here; the value equality is None == None for an abandoned dispatch
+    # (no model ran, so the synthetic result carries no effort) — documented, not vacuous (#163).
     assert "effort" in log
     assert log["effort"] == scope_rows[0]["effort"]
 

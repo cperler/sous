@@ -12,14 +12,33 @@ from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
 from .schemas.status import StageRecord, Task
 from .stream_probe import looks_like_event_stream, readable_text_from_stream
 
+# Effort rows read high→low (then the effort-less '(default)' bucket, then any unknown
+# label) rather than alphabetically, so the per-effort spend table scans in intensity order.
+_EFFORT_RANK = {"high": 0, "medium": 1, "low": 2, "(default)": 3}
+
+
+def _effort_sort_key(effort: str) -> tuple[int, str]:
+    return (_EFFORT_RANK.get(effort, 4), effort)
+
 
 def _cost_cell(rec: StageRecord) -> str:
-    """Cost column for a stage row. The interactive lane can't meter per-stage cost
-    in-session, so it records 0.0 — render that as ``n/a`` rather than ``$0.0000``, which
-    reads as 'this stage was free'. Metered lanes (headless/codex) show the real figure."""
+    """Cost column for a stage row. The deterministic ENGINE lane runs no model, so its
+    genuine $0 is tagged ``$0 (engine)`` (#68/#120) — a visible deterministic-stage win, not
+    a bare $0 that reads as free-because-unmetered. The interactive lane can't meter
+    per-stage cost in-session, so it records 0.0 — render that as ``n/a`` rather than
+    ``$0.0000``. Metered lanes (headless/codex) show the real figure."""
+    if rec.lane is ExecutionMode.ENGINE:
+        return "$0 (engine)"
     if rec.lane is ExecutionMode.INTERACTIVE:
         return "n/a"
     return f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
+
+
+def _effort_cell(rec: StageRecord) -> str:
+    """Effort column for a stage row (#159): the reasoning effort the stage ran at, the
+    sibling of ``model``. Shows high vs medium after any capacity downshift; ``—`` on
+    effort-less rows (deterministic ENGINE-lane stages, specs without a default)."""
+    return rec.effort.value if rec.effort is not None else "—"
 
 
 def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) -> str:
@@ -61,6 +80,15 @@ def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) 
     wall_s = summary.get("total_wall_s") or 0.0
     if wall_s:
         lines.append(f"- Wall time (in model calls): **{wall_s / 60.0:.1f} min**")
+    # Deterministic ENGINE-lane line item (#68/#120): make the $0 deterministic-stage win a
+    # visible figure — invocations the engine ran itself, at no model cost — rather than a
+    # saving an operator has to reconstruct by scanning stage-costs.jsonl by hand.
+    engine_lane = summary.get("engine_lane") or {}
+    if engine_lane.get("invocations"):
+        lines.append(
+            f"- Deterministic (engine) lane: **{engine_lane['invocations']} invocation(s) "
+            f"at $0 (engine)** — ran in-process, no model call"
+        )
     lines += [
         "",
         "| Model | Invocations | Input tok | Output tok | Cost (USD) |",
@@ -71,6 +99,21 @@ def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) 
             f"| `{model}` | {m.get('invocations', 0)} | {m.get('input_tokens', 0)} | "
             f"{m.get('output_tokens', 0)} | ${(m.get('cost_usd') or 0.0):.4f} |"
         )
+    # Per-effort spend (#145/#152): spend split by reasoning effort alongside per-model, so
+    # an operator sees how much high-effort stages consume vs medium/low when tuning defaults.
+    by_effort_spend = summary.get("by_effort_spend") or {}
+    if by_effort_spend:
+        lines += [
+            "",
+            "| Effort | Invocations | Cost (USD) |",
+            "|---|---:|---:|",
+        ]
+        for effort in sorted(by_effort_spend, key=_effort_sort_key):
+            e = by_effort_spend[effort]
+            lines.append(
+                f"| `{effort}` | {e.get('invocations', 0)} | "
+                f"${(e.get('cost_usd') or 0.0):.4f} |"
+            )
     lines += ["", "_Priced from the single model table; raw rows in `stage-costs.jsonl`._", ""]
     return "\n".join(lines)
 
@@ -384,13 +427,16 @@ def render_task_index(task: Task, rejection_reason: str | None = None) -> str:
         lines.append(f"Closed as infeasible: _{rejection_reason}_")
     lines += [
         "",
-        "| # | Stage | Status | Model | Cost |",
-        "|---:|---|---|---|---:|",
+        "| # | Stage | Status | Model | Effort | Cost |",
+        "|---:|---|---|---|---|---:|",
     ]
     for seq, stage in enumerate(STAGE_ORDER, start=1):
         rec = task.stages[stage]
         model = f"`{rec.model}`" if rec.model else "—"
-        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {_cost_cell(rec)} |")
+        lines.append(
+            f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | "
+            f"{_effort_cell(rec)} | {_cost_cell(rec)} |"
+        )
     lines.append("")
     return "\n".join(lines)
 
@@ -416,13 +462,16 @@ def render_completion_note(
         f"- **PR:** {task.pr_url or '(none)'}",
         f"- **Review:** {verdict}",
         "",
-        "| # | Stage | Status | Model | Cost |",
-        "|---:|---|---|---|---:|",
+        "| # | Stage | Status | Model | Effort | Cost |",
+        "|---:|---|---|---|---|---:|",
     ]
     for seq, stage in enumerate(STAGE_ORDER, start=1):
         rec = task.stages[stage]
         model = f"`{rec.model}`" if rec.model else "—"
-        lines.append(f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | {_cost_cell(rec)} |")
+        lines.append(
+            f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | "
+            f"{_effort_cell(rec)} | {_cost_cell(rec)} |"
+        )
 
     blocking = [format_review_issue(i) for i in (review.get("issues") or [])]
     blocking = [i for i in blocking if i]
@@ -529,8 +578,8 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
 
     lines += [
         "",
-        "| Stage | Status | Attempts | Cost |",
-        "|---|---|---:|---:|",
+        "| Stage | Status | Attempts | Effort | Cost |",
+        "|---|---|---:|---|---:|",
     ]
     next_marked = False
     for stage in task.pipeline:
@@ -542,7 +591,7 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
             label += " (next)"
             next_marked = True
         lines.append(
-            f"| {stage.value} | {label} | {rec.attempt} | {_cost_cell(rec)} |"
+            f"| {stage.value} | {label} | {rec.attempt} | {_effort_cell(rec)} | {_cost_cell(rec)} |"
         )
     lines += ["", "_Live progress from the orchestration harness; updated as stages land._", ""]
     return "\n".join(lines)
