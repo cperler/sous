@@ -1060,7 +1060,14 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"watch": "done", "run_id": args.run, "run_state": final["run_state"],
                "progress": final["progress"]})
     elif args.cmd == "cost-report":
-        _emit(eng.ledger.by_effort() if args.by_effort else eng.ledger.analysis())
+        if args.by_effort:
+            # AC#4 (#167): a no-Python-required readable surface — render by_effort()'s
+            # pipeline-ordered spend/retry/failure-rate table instead of dumping raw JSON.
+            from .render import render_by_effort
+
+            print(render_by_effort(args.run, eng.ledger.by_effort()))
+        else:
+            _emit(eng.ledger.analysis())
     elif args.cmd == "retrospective":
         _emit(eng.retrospective(args.run))
     else:  # pragma: no cover

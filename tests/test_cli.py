@@ -49,11 +49,23 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     assert status["lane_audit"]["clean"] is True
     assert status["lane_audit"]["total_calls"] == 6
     assert status["cost"]["total_invocations"] == 6
+    # #169: the cost block carries the per-effort + ENGINE-lane rollups. The deterministic
+    # intake stage ran on the ENGINE lane, so its $0 invocation is attributed there.
+    assert "by_effort_spend" in status["cost"]
+    assert status["cost"]["engine_lane"]["invocations"] >= 1
+    assert status["cost"]["engine_lane"]["cost_usd"] == 0.0
 
     report = _run(capsys, *base, "cost-report")
     assert set(report["by_stage"]) == {"intake", "scope", "implement", "test", "deliver", "review"}
     assert "net_win_usd" in report["session_reuse"]
     assert (tmp_path / "cost-report.md").exists()  # written at run finalize
+
+    # #169/#167: --by-effort emits the human-readable table (Markdown), not raw JSON
+    rc = main([*base, "cost-report", "--by-effort"])
+    assert rc == 0
+    by_effort_out = capsys.readouterr().out
+    assert "# Cost by effort — run1" in by_effort_out
+    assert "| Stage | Effort | Model | Calls |" in by_effort_out
 
 
 def test_cli_next_resume_reemits_leased_item_and_record_succeeds(tmp_path, capsys) -> None:

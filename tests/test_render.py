@@ -6,11 +6,14 @@ from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.render import (
     render_by_effort,
+    render_completion_note,
     render_cost_report,
     render_cost_summary,
+    render_progress,
     render_stage,
     render_task_index,
 )
+from orchestrator.schemas.enums import Effort, ExecutionMode, Stage, StageStatus
 from orchestrator.schemas.status import Task
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
@@ -25,6 +28,67 @@ def test_render_cost_summary_markdown() -> None:
     md = render_cost_summary("r1", summary)
     assert "# Cost summary — r1" in md
     assert "$1.5000" in md and "claude-opus-4-8" in md and "| Model |" in md
+
+
+def test_render_cost_summary_per_effort_table_and_engine_lane(tmp_path: object = None) -> None:
+    """#169: the summary surfaces the per-effort spend table and the ENGINE-lane line item."""
+    summary = {
+        "total_invocations": 3,
+        "total_cost_usd": 6.5,
+        "by_model": {"claude-opus-4-8": {"invocations": 2, "input_tokens": 0,
+                                         "output_tokens": 0, "cost_usd": 6.0}},
+        "by_effort_spend": {
+            "high": {"invocations": 2, "cost_usd": 6.0},
+            "medium": {"invocations": 1, "cost_usd": 0.5},
+            "(default)": {"invocations": 1, "cost_usd": 0.0},
+        },
+        "engine_lane": {"invocations": 1, "cost_usd": 0.0},
+    }
+    md = render_cost_summary("r1", summary)
+    # per-effort table, ordered high -> medium -> (default), alongside the by-model table
+    assert "| Effort | Invocations | Cost (USD) |" in md
+    hi = md.index("`high`")
+    med = md.index("`medium`")
+    default = md.index("`(default)`")
+    assert hi < med < default
+    assert "$6.0000" in md
+    # deterministic ENGINE-lane line item makes the $0 win visible (#68/#120)
+    assert "Deterministic (engine) lane: **1 invocation(s) at $0 (engine)**" in md
+
+
+def _task_with_attributed_stages() -> Task:
+    t = Task(task_id="#9", run_id="r1", created_at="2026-07-16T00:00:00Z",
+             updated_at="x", title="Demo")
+    # a deterministic ENGINE-lane stage ($0, no model/effort)
+    t.stages[Stage.INTAKE].status = StageStatus.COMPLETED
+    t.stages[Stage.INTAKE].lane = ExecutionMode.ENGINE
+    # a model-lane stage that ran at high effort
+    t.stages[Stage.SCOPE].status = StageStatus.COMPLETED
+    t.stages[Stage.SCOPE].lane = ExecutionMode.HEADLESS
+    t.stages[Stage.SCOPE].model = "claude-opus-4-8"
+    t.stages[Stage.SCOPE].effort = Effort.HIGH
+    t.stages[Stage.SCOPE].cost_usd = 2.5
+    return t
+
+
+def test_render_task_index_carries_effort_column_and_engine_tag() -> None:
+    md = render_task_index(_task_with_attributed_stages())
+    assert "| # | Stage | Status | Model | Effort | Cost |" in md
+    assert "high" in md  # the SCOPE stage's effort surfaces
+    assert "$0 (engine)" in md  # the ENGINE-lane intake stage is tagged
+    assert "$2.5000" in md
+
+
+def test_render_progress_carries_effort_column_and_engine_tag() -> None:
+    md = render_progress(_task_with_attributed_stages(), now="2026-07-16T00:05:00Z")
+    assert "| Stage | Status | Attempts | Effort | Cost |" in md
+    assert "high" in md and "$0 (engine)" in md
+
+
+def test_render_completion_note_carries_effort_column_and_engine_tag() -> None:
+    md = render_completion_note(_task_with_attributed_stages())
+    assert "| # | Stage | Status | Model | Effort | Cost |" in md
+    assert "high" in md and "$0 (engine)" in md
 
 
 def test_render_stage_renders_structured_output_as_readable_markdown() -> None:
