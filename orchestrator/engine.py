@@ -2605,7 +2605,13 @@ class Engine:
             # the same observation the reviewer also emitted as a (now-filed) non-blocking
             # finding (the #186/#187 class — one idea, filed twice). Fingerprint the filed
             # titles and suppress a matching improvement.
-            filed_fps = {self._issue_fingerprint(f["title"]) for f in followups}
+            # Dedup the improvement only against ACTUALLY-filed follow-ups (#190): a finding
+            # whose file_followup raised is appended with ref=None, and must NOT suppress an
+            # identically-titled improvement — otherwise a filing failure leaves neither in
+            # the tracker (the note records it, but the backlog entry is silently lost).
+            filed_fps = {
+                self._issue_fingerprint(f["title"]) for f in followups if f.get("ref") is not None
+            }
             improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
             self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize

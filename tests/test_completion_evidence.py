@@ -260,6 +260,58 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
 
 
+class _FailFirstSource:
+    """file_followup raises on the FIRST call then succeeds — a transient filing failure."""
+
+    def __init__(self) -> None:
+        self.followups: list = []
+        self.notes: list = []
+        self._calls = 0
+
+    def resolve(self, task_id: str) -> TaskSpec:
+        return TaskSpec(task_id=task_id, title="x", body="y", issue_number=1)
+
+    def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
+        pass
+
+    def file_followup(self, title: str, body: str, labels=None) -> str:
+        self._calls += 1
+        if self._calls == 1:
+            raise RuntimeError("gh flaked")
+        self.followups.append({"title": title, "body": body, "labels": labels})
+        return f"https://example.test/issues/{self._calls}"
+
+    def publish_note(self, task_id: str, body: str, *, pr_url=None) -> None:
+        self.notes.append(body)
+
+
+def test_failed_followup_does_not_dedup_a_matching_improvement(tmp_path, project) -> None:
+    # #190: filed_fps must exclude ref=None (filing-failed) findings. A finding whose
+    # file_followup raised must NOT suppress an identically-titled improvement — otherwise a
+    # transient filing failure leaves NEITHER in the tracker. Here the finding's filing fails
+    # and the improvement shares its title; the improvement must still file as an enhancement.
+    project._task_source = _FailFirstSource()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    shared = "Type abandon() disposition as a Literal"
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
+        "improvement": {"title": shared, "detail": "same idea, restated"},
+    })
+
+    ts = project.task_source
+    # the finding's filing failed (ref=None); the improvement is NOT deduped and DOES file
+    assert [f["labels"] for f in ts.followups] == [["enhancement"]]
+    events = _events(tmp_path)
+    assert not any(e["type"] == "improvement_deduped" for e in events)
+    assert sum(e["type"] == "followup_failed" for e in events) == 1
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is True
+
+
 class _BareSource:
     """A v1-era task source: resolve + mark_complete only, no evidence-out hooks."""
 
