@@ -1038,60 +1038,66 @@ class Engine:
                  "task_id": result.task_id, "stage": result.stage.value,
                  "blocked_reason": scope_blocked_reason},
             )
-        # Alerting (#55): fire the transition notifications HERE in the engine, not in
-        # the scheduler tick — this is the ONE layer that catches BOTH scheduler-driven
-        # batches AND single-task engine-lane runs (the interactive `next`/`record`
-        # drain has no scheduler loop). A terminal failure and an AUTONOMOUS park at the
-        # human gate (scope-infeasible / review-rejected-held — NOT the human-initiated
-        # hold_for_approval, which the human already knows about) are exactly the
-        # unattended-run events the old monitor alerted on.
-        if outcome.startswith("task_failed"):
-            self.emit_notification(
-                run_id, "task_failed",
-                {"run_id": run_id, "task_id": result.task_id, "kind": "task_failed",
-                 "summary": f"task {result.task_id} FAILED at {result.stage.value} "
-                            f"({outcome})",
-                 "stage": result.stage.value,
-                 "reason": effective.error or outcome},
-            )
-        elif task.state is TaskState.BLOCKED_ON_HUMAN:
-            self.emit_notification(
-                run_id, "task_blocked",
-                {"run_id": run_id, "task_id": result.task_id, "kind": "task_blocked",
-                 "summary": f"task {result.task_id} BLOCKED_ON_HUMAN at "
-                            f"{result.stage.value} ({outcome}) — needs a human decision",
-                 "stage": result.stage.value,
-                 "reason": scope_blocked_reason or task.last_error or outcome},
-            )
-        # #5: audit the port block intake just allocated (it folded port_base into the
-        # context plane via CONTEXT_KEYS[INTAKE]); the engine is the event authority, the
-        # adapter does the allocation. Only on a fresh INTAKE success that carries a block.
-        if (
-            result.stage is Stage.INTAKE
-            and effective.status is ResultStatus.SUCCESS
-            and (pb := task.context.get("port_base")) is not None
-        ):
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "ports_allocated", "run_id": run_id,
-                 "task_id": result.task_id, "port_base": pb,
-                 "port_count": task.context.get("port_count")},
-            )
-        # Post-transition run-level effects: cascade-block dependents of a failed task,
-        # mark_complete + finalize the run when everything is terminal.
+        # Alerting (#55) + post-transition run-level effects. A terminal FAILURE routes
+        # through the SHARED ``_finalize_task_terminal`` helper (#133) — the same one the
+        # operator finalize paths (``reject``/``abandon``) use — so ALL post-terminal
+        # effects (operator-invoked AND model-result-driven) have a single source of truth
+        # and cannot drift: the helper emits the ``task_failed`` alert (#55/#107),
+        # cascade-blocks dependents, releases the port block (#5), harvests learnings (#72),
+        # and finalizes the run. ``outcome.startswith("task_failed")`` ⟺ ``task.state is
+        # FAILED`` (the only apply path that sets FAILED here returns a ``task_failed_*``
+        # outcome), so this covers exactly the branch that fired those effects inline before.
+        # The helper's failed-path notification reason is ``task.last_error or reason``; on
+        # this path ``last_error`` is unset, so passing ``effective.error or outcome``
+        # reproduces the prior inline payload's reason (e.g. the gate/runner error, else the
+        # outcome slug).
         if task.state is TaskState.FAILED:
-            self._cascade_from(run_id, result.task_id)
-        if task.state is TaskState.COMPLETED:
-            self._on_task_completed(run_id, task)
-        # #5: a terminal task's worktree is done with its ports — release the block so a
-        # later task can reuse it. Best-effort (wrapped in the helper); never breaks finalize.
-        if task.state in TERMINAL_TASK_STATES:
-            self._release_ports(run_id, task)
-            # #72: distil this finished task's learnings into the durable cross-run KB so a
-            # later run doesn't re-pay to learn the same lesson. Skips a clean task (empty
-            # learnings); best-effort — never breaks the terminal transition.
-            self._harvest_task_learnings(run_id, task)
-        self._maybe_finalize_run(run_id)
+            self._finalize_task_terminal(
+                run_id, task, disposition="failed", reason=effective.error or outcome
+            )
+        else:
+            # Non-failure transitions keep their own emissions + terminal handling. An
+            # AUTONOMOUS park at the human gate (scope-infeasible / review-rejected-held —
+            # NOT the human-initiated hold_for_approval, which the human already knows about)
+            # is exactly the unattended-run event the old monitor alerted on.
+            if task.state is TaskState.BLOCKED_ON_HUMAN:
+                self.emit_notification(
+                    run_id, "task_blocked",
+                    {"run_id": run_id, "task_id": result.task_id, "kind": "task_blocked",
+                     "summary": f"task {result.task_id} BLOCKED_ON_HUMAN at "
+                                f"{result.stage.value} ({outcome}) — needs a human decision",
+                     "stage": result.stage.value,
+                     "reason": scope_blocked_reason or task.last_error or outcome},
+                )
+            # #5: audit the port block intake just allocated (it folded port_base into the
+            # context plane via CONTEXT_KEYS[INTAKE]); the engine is the event authority, the
+            # adapter does the allocation. Only on a fresh INTAKE success that carries a block
+            # (never on the FAILED path above — this is guarded on a SUCCESS result).
+            if (
+                result.stage is Stage.INTAKE
+                and effective.status is ResultStatus.SUCCESS
+                and (pb := task.context.get("port_base")) is not None
+            ):
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "ports_allocated", "run_id": run_id,
+                     "task_id": result.task_id, "port_base": pb,
+                     "port_count": task.context.get("port_count")},
+                )
+            # Post-transition run-level effects for the non-failure branch: mark_complete on
+            # a COMPLETED task, then finalize the run when everything is terminal.
+            if task.state is TaskState.COMPLETED:
+                self._on_task_completed(run_id, task)
+            # #5: a terminal task's worktree is done with its ports — release the block so a
+            # later task can reuse it. Best-effort (wrapped in the helper); never breaks
+            # finalize.
+            if task.state in TERMINAL_TASK_STATES:
+                self._release_ports(run_id, task)
+                # #72: distil this finished task's learnings into the durable cross-run KB so
+                # a later run doesn't re-pay to learn the same lesson. Skips a clean task
+                # (empty learnings); best-effort — never breaks the terminal transition.
+                self._harvest_task_learnings(run_id, task)
+            self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
             "outcome": outcome,
@@ -2223,11 +2229,14 @@ class Engine:
                  "run_id": run_id, "task_id": task_id},
             )
         # The task doc is already persisted by update_task above; the index/ref-state below
-        # are derived artifacts (a failed abandon renders here; a rejected one is re-rendered
-        # from the read-back artifact by _surface_rejection inside the finalize helper).
-        self.store.write_task_index(
-            task_id, render_task_index(task, rejection_reason=rejection_reason)
-        )
+        # are derived artifacts. A FAILED abandon renders the task index HERE. A REJECTED
+        # abandon SKIPS this write (#132): _finalize_task_terminal → _surface_rejection
+        # immediately re-renders the index from the READ-BACK rejection artifact, so an
+        # inline write would be redundant (overwritten with identical content).
+        if disposition == "failed":
+            self.store.write_task_index(
+                task_id, render_task_index(task, rejection_reason=rejection_reason)
+            )
         self._set_ref_state(run_id, task_id, task.state)
         self.store.append_event(
             run_id,
