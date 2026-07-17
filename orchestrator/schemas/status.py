@@ -98,8 +98,11 @@ class Task(BaseModel):
     # model_pin, validated at add_task via resolve_effort. A pin is honored by the
     # capacity effort-downshift (pins win, same rule as model_pin); deterministic
     # ENGINE-lane stages never carry effort regardless. Additive field: pre-#96 task
-    # docs load with None, so no SCHEMA_VERSION bump is needed.
-    effort_pin: str | None = None
+    # docs load with None, so no SCHEMA_VERSION bump is needed. Typed as the Effort enum
+    # (#161, following #147's StageRecord.effort): the sibling attribution field
+    # StageRecord.effort already holds its enum; a stored "low" coerces to Effort.LOW on
+    # load, and the StrEnum still serializes/compares as its "low" value.
+    effort_pin: Effort | None = None
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
     # Provenance: the lane preset this task was added under. Sequencing reads

@@ -146,6 +146,23 @@ def test_effort_pin_wins_over_spec_default_across_stages(tmp_path, project) -> N
         assert seen[stage] == "low"
 
 
+def test_effort_pin_is_typed_as_effort_enum(tmp_path, project) -> None:
+    """#161: Task.effort_pin is tightened from ``str | None`` to ``Effort | None`` (the
+    sibling of the #147 StageRecord.effort migration). A pin is the enum member at
+    construction AND after a store round-trip (a stored "low" coerces to Effort.LOW),
+    while still comparing/serializing as its "low" value for backward compatibility."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    task = eng.add_task("r1", "t1", effort="low")
+    assert task.effort_pin is Effort.LOW  # not the bare string
+    reloaded = eng.store.load_task("r1", "t1")
+    assert reloaded.effort_pin is Effort.LOW  # coerces from the stored "low" on load
+    assert reloaded.effort_pin == "low"  # StrEnum still compares as its value
+    # An unpinned task keeps None (no effort), unchanged.
+    unpinned = eng.add_task("r1", "t2", effort=None)
+    assert unpinned.effort_pin is None
+
+
 def test_deterministic_stage_carries_no_effort_even_pinned(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")

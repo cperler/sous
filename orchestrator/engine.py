@@ -69,6 +69,7 @@ from .schemas.enums import (
     LANE_STAGES,
     TERMINAL_RUN_STATES,
     TERMINAL_TASK_STATES,
+    Effort,
     ExecutionLane,
     ExecutionMode,
     FailureKind,
@@ -306,9 +307,9 @@ class Engine:
         # Per-task effort pin (#96): normalized/validated BEFORE any state is written,
         # exactly like the model pin. Provider-agnostic — every lane translates (or
         # ignores) the same low/medium/high vocabulary, so no provider check is needed.
-        effort_pin: str | None = None
+        effort_pin: Effort | None = None
         if effort is not None:
-            effort_pin = resolve_effort(effort).value
+            effort_pin = resolve_effort(effort)
         run = self.store.load_run(run_id)
         # Cost-aware lane routing (#34): only for an UN-pinned task on a route_by_cost run.
         # An explicit pipeline pin is always honored (never overridden). The decision is
@@ -545,7 +546,9 @@ class Engine:
             # per-task effort pin overrides the stage-spec default (scope/implement
             # high, test/review medium, deliver low). None (a spec without a default)
             # means "provider default" and emits exactly today's dispatch.
-            effort = task.effort_pin or (spec.effort.value if spec.effort is not None else None)
+            effort = (task.effort_pin.value if task.effort_pin is not None else None) or (
+                spec.effort.value if spec.effort is not None else None
+            )
             # Capacity-aware downgrade (#12/#96): on a route_by_capacity run, when CURRENT
             # util is in the high band (>= downgrade_threshold, and < the per-call gate that
             # already blocked dispatch above), degrade a FRESH dispatch to keep progressing
