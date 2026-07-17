@@ -2203,6 +2203,7 @@ class Engine:
             "status": synthetic.status.value,
             "outcome": "dispatch_abandoned",
             "model": synthetic.model,
+            "effort": synthetic.effort,  # #151: surface effort alongside model, as the cost ledger does
             "lane_used": synthetic.lane_used.model_dump(),
             "cost_usd": cost,
             "raw_output": synthetic.raw_output,
