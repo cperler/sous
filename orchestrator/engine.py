@@ -690,13 +690,22 @@ class Engine:
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
         # can't both claim the task — the loser sees the moved lease/stage and raises.
+        # On a resume, the outstanding lease is superseded by this fresh WorkItem
+        # (a new work.id); capture the old id under the lock (#142) so the timeline can
+        # be made self-describing — its `stage_dispatched` will never get a matching
+        # `stage_recorded`, so a naive counter would over-count dispatches without it.
+        superseded_lease: str | None = None
+
         def _commit(t: Task) -> None:
+            nonlocal superseded_lease
             if t.pending_work_item_id is not None and not resume:
                 raise ContractError(
                     f"task {task_id} dispatch raced: lease {t.pending_work_item_id} taken"
                 )
             if next_stage(t) is not stage:
                 raise ContractError(f"task {task_id} stage advanced under dispatch of {stage.value}")
+            if resume and t.pending_work_item_id is not None and t.pending_work_item_id != work.id:
+                superseded_lease = t.pending_work_item_id
             begin_stage(t, stage, now=_now(), model=model, attempt=attempt, effort=effort)
             t.state = TaskState.RUNNING
             t.pending_work_item_id = work.id
@@ -711,21 +720,43 @@ class Engine:
 
         self.store.update_task(run_id, task_id, _commit)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
-        self.store.append_event(
-            run_id,
-            {
-                "ts": _now(),
-                "type": "stage_dispatched",
-                "run_id": run_id,
-                "task_id": task_id,
-                "stage": stage.value,
-                "attempt": attempt,
-                "model": model,
-                "effort": effort,
-                "agent": agent,
-                "work_item_id": work.id,
-            },
-        )
+        # #142: when a resume supersedes an outstanding lease, retire the old work_item_id
+        # with its own event FIRST — so a consumer scanning the timeline sees the
+        # superseded dispatch closed out before the re-dispatch, and never pairs a live
+        # `stage_recorded` against the stale lease.
+        if superseded_lease is not None:
+            self.store.append_event(
+                run_id,
+                {
+                    "ts": _now(),
+                    "type": "lease_superseded",
+                    "run_id": run_id,
+                    "task_id": task_id,
+                    "stage": stage.value,
+                    "attempt": attempt,
+                    "work_item_id": superseded_lease,
+                    "superseded_by": work.id,
+                },
+            )
+        event: dict = {
+            "ts": _now(),
+            "type": "stage_dispatched",
+            "run_id": run_id,
+            "task_id": task_id,
+            "stage": stage.value,
+            "attempt": attempt,
+            "model": model,
+            "effort": effort,
+            "agent": agent,
+            "work_item_id": work.id,
+        }
+        # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
+        # supersedes so a reader can tell a genuine crash-recovery re-lease from a fresh
+        # dispatch without joining on `work_item_id` against `stage_recorded`.
+        if superseded_lease is not None:
+            event["resume"] = True
+            event["supersedes"] = superseded_lease
+        self.store.append_event(run_id, event)
         return work
 
     def record(self, run_id: str, result: StageResult) -> dict:

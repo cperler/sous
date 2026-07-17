@@ -89,7 +89,12 @@ the same `ROOT`/`RUN`: `dispatchable` re-derives what's left, `in_flight` re-cou
 still-leased tasks, and the engine re-emits any un-recorded stage (a crash-marked
 RUNNING stage re-dispatches at the same attempt — no double-execution). **Resume
 granularity is per task, not per round** — only the individual in-flight task's stage
-is re-run, never a whole round.
+is re-run, never a whole round. Resume only on a genuine crash — always capture `next`
+into `WORK` in the single call above, never `next` then `next --resume` for the same
+live stage. A resume that supersedes a still-held lease is self-describing in the
+timeline (#142): the re-dispatch's `stage_dispatched` carries `resume: true` /
+`supersedes: <old work_item_id>` and the retired lease gets a `lease_superseded` event,
+so a consumer counting `stage_dispatched` can discount the superseded one.
 
 ## Audit (every gate)
 `… --shared-root … status` → `lane_audit.clean == true`: every recorded call
