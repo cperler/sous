@@ -315,12 +315,15 @@ def test_deliver_reuse_comment_failure_never_fails_stage(tmp_path) -> None:
     assert res.structured_output["pr_number"] == 77 and res.structured_output.get("reused") is True
 
 
-def test_deliver_refuses_when_no_commits(tmp_path) -> None:
+def test_deliver_refuses_when_no_commits_and_no_existing_pr(tmp_path) -> None:
+    # The genuine empty-PR case: zero commits vs base AND no PR already open for the head.
     def responder(argv):
         if argv[:2] == ["git", "rev-parse"]:
             return _cp(0, "task/42\n")
         if "rev-list" in argv:
             return _cp(0, "0\n")  # zero commits vs base
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, "")  # ...and no existing PR
         return _cp(0)
 
     gh = _FakeGh(responder)
@@ -329,6 +332,53 @@ def test_deliver_refuses_when_no_commits(tmp_path) -> None:
     assert res.status is ResultStatus.FAILURE
     assert "no commits" in (res.error or "")
     assert not gh.ran("push") and not gh.ran("gh", "pr", "create")  # no empty PR
+
+
+def test_deliver_no_commits_reuses_existing_pr_as_noop_success(tmp_path) -> None:
+    # #168: a fix-cycle DELIVER on a branch with NO new commits vs base but an EXISTING open
+    # PR (same head) is a no-op reuse SUCCESS, not the empty-PR breaker — the PR IS the
+    # deliverable. Nothing changed, so DO NOT re-push or leave a re-pushed advisory comment.
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if "rev-list" in argv:
+            return _cp(0, "0\n")  # zero commits vs base
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, '[{"number": 156, "url": "https://github.com/o/r/pull/156"}]')
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(_deliver_wi())
+
+    assert res.status is ResultStatus.SUCCESS
+    out = res.structured_output
+    assert out["pr_number"] == 156 and out["pr_url"].endswith("/pull/156") and out["reused"] is True
+    _assert_schema_valid("deliver", out)
+    # no-op: never push, never open a duplicate, never leave a "re-pushed" comment.
+    assert not gh.ran("push")
+    assert not gh.ran("gh", "pr", "create")
+    assert not gh.ran("gh", "pr", "comment")
+
+
+def test_deliver_no_commits_reuses_folded_pr_url_without_gh_list(tmp_path) -> None:
+    # The folded pr_url (engine sets it once DELIVER has run) short-circuits reuse on the
+    # no-commit path too — no gh pr list needed, still a no-op reuse success.
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if "rev-list" in argv:
+            return _cp(0, "0\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/156", "pr_number": 156})
+    )
+    assert res.status is ResultStatus.SUCCESS
+    out = res.structured_output
+    assert out["pr_number"] == 156 and out.get("reused") is True
+    assert not gh.ran("push") and not gh.ran("gh", "pr", "list")
+    assert not gh.ran("gh", "pr", "comment") and not gh.ran("gh", "pr", "create")
 
 
 def test_deliver_fails_on_push_error(tmp_path) -> None:

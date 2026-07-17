@@ -145,6 +145,41 @@ def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, pro
     assert out2["outcome"] == "task_completed"
 
 
+def test_deterministic_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
+    """#168: a task whose TEST stage runs on the deterministic $0 ENGINE lane has no
+    model-written/graded tests for the #13 gate to bite on, so a reviewer's
+    tests_meaningful=false must NOT reject an otherwise-approved review (the #144 misfire)."""
+    from orchestrator.schemas.enums import Stage as _Stage
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    task = eng.add_task("r1", "t1", deterministic_stages=[_Stage.TEST, _Stage.DELIVER])
+    assert _Stage.TEST in task.deterministic_stages
+    w = _advance_to_review(eng)  # FULL pipeline (6 stages), TEST just runs on ENGINE lane
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": False,
+    }))
+    assert out["outcome"] == "task_completed"  # deterministic TEST → no model test surface
+
+
+def test_micro_no_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
+    """#168: a MICRO task has no TEST stage at all — no test surface — so a reviewer's
+    tests_meaningful=false must NOT reject an otherwise-approved review."""
+    from orchestrator.schemas.enums import ExecutionLane
+    from orchestrator.schemas.enums import Stage as _Stage
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.MICRO)
+    task = eng.add_task("r1", "t1")
+    assert _Stage.TEST not in task.pipeline  # micro: intake, implement, deliver, review
+    for _ in range(3):  # intake, implement, deliver
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    w = eng.next_work("r1", "t1")
+    assert w.stage is Stage.REVIEW
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": False,
+    }))
+    assert out["outcome"] == "task_completed"
+
+
 def _advance_to_review_with_test(eng, *, test_output, test_mode=None, test_provider=None,
                                  run="r1", task="t1"):
     """Drive intake→scope→implement with defaults, record TEST with a custom result, then

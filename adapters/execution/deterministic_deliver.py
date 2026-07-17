@@ -9,8 +9,9 @@ when an issue number is present; never a duplicate PR).
 
 Two things the model DELIVER did are deliberately NOT done here:
   - the docstring refresh — a model judgment; a pipeline that wants it keeps model DELIVER;
-  - opening a PR when the branch has no commits — that would be a silent empty PR, so this
-    runner fails the stage honestly instead.
+  - opening a PR when the branch has no commits AND none already exists — that would be a
+    silent empty PR, so this runner fails the stage honestly instead. (A no-commit re-deliver
+    whose PR is already open is a no-op reuse-success, not a failure — #168.)
 
 Every subprocess call goes through an injected ``runner`` (default ``subprocess.run``) so
 unit tests never touch the network or a real ``gh``.
@@ -80,6 +81,16 @@ class DeterministicDeliverRunner:
         ctx = work.context or {}
         branch = self._branch(cwd)
         if not self._has_commits(cwd):
+            # #168: a fix cycle can re-run DELIVER on a branch whose diff is unchanged (the
+            # fix-implement correctly made no new commit — e.g. a docs-only change with nothing
+            # to fix). If a PR already exists for this head, that PR IS the deliverable — the
+            # no-op re-deliver is a SUCCESS reuse, not a breaker. Only a branch with no commits
+            # AND no existing PR is a genuine empty-PR refusal. Do NOT push or leave a re-pushed
+            # comment on the no-commit path: nothing changed, so there is nothing to re-push.
+            existing = self._existing_pr(cwd, branch, ctx)
+            if existing:
+                return {"pr_number": existing["number"], "pr_url": existing["url"],
+                        "reused": True}
             raise _DeliverError(
                 f"no commits on {branch} vs base — refusing to open an empty PR"
             )
