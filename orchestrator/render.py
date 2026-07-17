@@ -449,7 +449,12 @@ def render_completion_note(
     run logs. Derived purely from the task's recorded stages + the follow-ups the engine
     filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
     None if filing failed). ``improvement_ref`` is the URL of the enhancement issue the
-    engine filed from the review's improvement idea (None if unfiled)."""
+    engine filed from the review's improvement idea (None if unfiled).
+
+    #188 — nothing silently dropped: non-blocking findings the engine did NOT file
+    (dispositioned ``fix_now``/``drop``, or ``file`` findings past the per-task cap) are
+    surfaced in a "Noted, not filed" section with a short reason so the drop bucket is
+    durable in the PR/issue note rather than vanishing."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
