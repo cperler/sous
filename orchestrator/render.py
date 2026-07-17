@@ -449,7 +449,12 @@ def render_completion_note(
     run logs. Derived purely from the task's recorded stages + the follow-ups the engine
     filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
     None if filing failed). ``improvement_ref`` is the URL of the enhancement issue the
-    engine filed from the review's improvement idea (None if unfiled)."""
+    engine filed from the review's improvement idea (None if unfiled).
+
+    #188 — nothing silently dropped: non-blocking findings the engine did NOT file
+    (dispositioned ``fix_now``/``drop``, or ``file`` findings past the per-task cap) are
+    surfaced in a "Noted, not filed" section with a short reason so the drop bucket is
+    durable in the PR/issue note rather than vanishing."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -486,6 +491,25 @@ def render_completion_note(
             suffix = f" → {ref}" if ref else " → (filing failed)"
             lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
 
+    # #188: the "noted, moving on" destination. A non-blocking finding the engine did NOT
+    # file — dispositioned `fix_now`/`drop`, or a `file` finding past the per-task cap — is
+    # surfaced here so the drop bucket is durable in the PR/issue note (nothing silently
+    # dropped). Derived from the review's findings minus the titles that got filed above.
+    filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
+    _noted_reason = {"fix_now": "fixed in place (boy-scout)", "drop": "noted, not tracked"}
+    noted: list[str] = []
+    for finding in review.get("non_blocking") or []:
+        if not isinstance(finding, dict):
+            continue
+        title = str(finding.get("title") or "").strip()
+        if not title or title in filed_titles:
+            continue
+        disposition = str(finding.get("disposition") or "").strip().casefold()
+        reason = _noted_reason.get(disposition, "over per-task cap")
+        noted.append(f"- {title} — {reason}")
+    if noted:
+        lines += ["", "### Noted, not filed"] + noted
+
     # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
@@ -503,9 +527,9 @@ def render_completion_note(
         if str(retro.get("detail", "")).strip():
             lines.append(str(retro["detail"]).strip())
 
-    lines += ["", "_Produced by the orchestration harness — nothing dropped: non-blocking "
-              "findings are tracked as follow-up issues; the improvement idea is filed as an "
-              "enhancement._", ""]
+    lines += ["", "_Produced by the orchestration harness — nothing dropped: findings that "
+              "clear the filing bar are tracked as follow-up issues, the rest are noted "
+              "above; the improvement idea is filed as an enhancement._", ""]
     return "\n".join(lines)
 
 

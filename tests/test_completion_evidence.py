@@ -158,6 +158,160 @@ def test_finalize_no_findings_files_nothing_but_still_notes(tmp_path, project) -
     assert len(ts.notes) == 1  # a clean run still publishes its completion evidence
 
 
+# --- #188 filing threshold (disposition gate / per-task cap / dedup) ----------------
+
+
+def test_disposition_gate_files_only_file_and_absent(tmp_path, project) -> None:
+    # `fix_now`/`drop` findings are NOT filed; `file` and an absent disposition ARE — and
+    # the skipped ones are surfaced in the completion note so nothing is silently dropped.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "non_blocking": [
+            {"title": "Automate the events-balance audit", "detail": "d", "disposition": "file"},
+            {"title": "Legacy finding without a disposition", "detail": "d"},  # absent -> file
+            {"title": "Stale docstring after #133", "detail": "d", "disposition": "fix_now"},
+            {"title": "Cosmetic wording nit", "detail": "d", "disposition": "drop"},
+        ],
+    })
+
+    ts = project.task_source
+    filed_titles = [f["title"] for f in ts.followups]
+    assert filed_titles == [
+        "Automate the events-balance audit",
+        "Legacy finding without a disposition",
+    ]
+    # the two unfiled findings are durable in the note, with their reason
+    note = ts.notes[0]["body"]
+    assert "### Noted, not filed" in note
+    assert "Stale docstring after #133 — fixed in place (boy-scout)" in note
+    assert "Cosmetic wording nit — noted, not tracked" in note
+    # ...and neither leaked into a filed issue
+    assert "Stale docstring after #133" not in filed_titles
+    assert "Cosmetic wording nit" not in filed_titles
+
+
+def test_per_task_cap_bounds_filed_followups(tmp_path, project) -> None:
+    # More than the cap of `file` findings: only the first N are filed; the overflow is
+    # noted, not dropped.
+    from orchestrator.engine import MAX_FILED_FOLLOWUPS_PER_TASK
+
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(MAX_FILED_FOLLOWUPS_PER_TASK + 2)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    assert len(ts.followups) == MAX_FILED_FOLLOWUPS_PER_TASK
+    # the overflow findings are surfaced as "over per-task cap", not silently dropped
+    note = ts.notes[0]["body"]
+    assert "### Noted, not filed" in note
+    assert note.count("over per-task cap") == 2
+
+
+def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
+    # The #186/#187 class: one observation emitted as both a non_blocking finding and the
+    # improvement idea must be filed ONCE, not twice.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    shared = "Type abandon() disposition as a Literal"
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
+        "improvement": {"title": shared, "detail": "same idea, restated"},
+    })
+
+    ts = project.task_source
+    # filed exactly once (as the deferred-scope follow-up), not also as an enhancement
+    assert len(ts.followups) == 1
+    assert ts.followups[0]["labels"] == ["deferred-scope"]
+    assert not any(f["labels"] == ["enhancement"] for f in ts.followups)
+
+    events = _events(tmp_path)
+    assert any(e["type"] == "improvement_deduped" for e in events)
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is False
+
+
+def test_distinct_improvement_still_files(tmp_path, project) -> None:
+    # A genuinely distinct improvement (no fingerprint overlap) is still filed as an
+    # enhancement — dedup must not swallow real ideas.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{"title": "Guard the --repo path", "detail": "d", "disposition": "file"}],
+        "improvement": {"title": "Add a run-finalize dedup pass", "detail": "different idea"},
+    })
+
+    ts = project.task_source
+    assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
+
+
+class _FailFirstSource:
+    """file_followup raises on the FIRST call then succeeds — a transient filing failure."""
+
+    def __init__(self) -> None:
+        self.followups: list = []
+        self.notes: list = []
+        self._calls = 0
+
+    def resolve(self, task_id: str) -> TaskSpec:
+        return TaskSpec(task_id=task_id, title="x", body="y", issue_number=1)
+
+    def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
+        pass
+
+    def file_followup(self, title: str, body: str, labels=None) -> str:
+        self._calls += 1
+        if self._calls == 1:
+            raise RuntimeError("gh flaked")
+        self.followups.append({"title": title, "body": body, "labels": labels})
+        return f"https://example.test/issues/{self._calls}"
+
+    def publish_note(self, task_id: str, body: str, *, pr_url=None) -> None:
+        self.notes.append(body)
+
+
+def test_failed_followup_does_not_dedup_a_matching_improvement(tmp_path, project) -> None:
+    # #190: filed_fps must exclude ref=None (filing-failed) findings. A finding whose
+    # file_followup raised must NOT suppress an identically-titled improvement — otherwise a
+    # transient filing failure leaves NEITHER in the tracker. Here the finding's filing fails
+    # and the improvement shares its title; the improvement must still file as an enhancement.
+    project._task_source = _FailFirstSource()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    shared = "Type abandon() disposition as a Literal"
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
+        "improvement": {"title": shared, "detail": "same idea, restated"},
+    })
+
+    ts = project.task_source
+    # the finding's filing failed (ref=None); the improvement is NOT deduped and DOES file
+    assert [f["labels"] for f in ts.followups] == [["enhancement"]]
+    events = _events(tmp_path)
+    assert not any(e["type"] == "improvement_deduped" for e in events)
+    assert sum(e["type"] == "followup_failed" for e in events) == 1
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is True
+
+
 class _BareSource:
     """A v1-era task source: resolve + mark_complete only, no evidence-out hooks."""
 
@@ -370,6 +524,24 @@ def test_review_schema_accepts_non_blocking() -> None:
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
             "approved": True, "issues": [], "non_blocking": [{"detail": "no title"}],
+        })
+
+    # #188: the optional per-finding disposition enum is accepted...
+    validator.validate({
+        "approved": True, "issues": [],
+        "non_blocking": [
+            {"title": "a", "disposition": "file"},
+            {"title": "b", "disposition": "fix_now"},
+            {"title": "c", "disposition": "drop"},
+        ],
+    })
+    # ...a missing disposition still validates (backward-compatible default = file)...
+    validator.validate({"approved": True, "issues": [], "non_blocking": [{"title": "d"}]})
+    # ...and an out-of-enum disposition is rejected
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({
+            "approved": True, "issues": [],
+            "non_blocking": [{"title": "e", "disposition": "maybe"}],
         })
 
     # self-improvement loop fields are optional objects with a required title
