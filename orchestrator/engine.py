@@ -251,6 +251,7 @@ class Engine:
         cross_provider_fallback: bool = False,
         warm_retry: bool = False,
         progress_comments: bool = False,
+        max_filed_followups: int | None = None,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
@@ -262,8 +263,15 @@ class Engine:
         REUSED on the retry when the failure was mechanical (#8 — off by design per the
         2026-07-01 design pass §2, so this is the explicit, bounded opt-in); ``progress_comments``
         opts into mid-run progress commentary on the driving issue/PR (#64 — outward-facing, so
-        default off). All default off; the routers are DISTINCT levers (USD vs rate-limit
-        headroom vs provider outage vs failed-session reuse)."""
+        default off). ``max_filed_followups`` (#196) sets a run-wide default cap on filed
+        review follow-ups so every task in the run shares a non-default baseline without
+        repeating it per add_task; None inherits the engine constructor default. All default
+        off; the routers are DISTINCT levers (USD vs rate-limit headroom vs provider outage
+        vs failed-session reuse)."""
+        if max_filed_followups is not None and max_filed_followups < 0:
+            raise ContractError(
+                f"max_filed_followups must be >= 0, got {max_filed_followups} for run {run_id}"
+            )
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
@@ -271,6 +279,7 @@ class Engine:
             cross_provider_fallback=cross_provider_fallback,
             warm_retry=warm_retry,
             progress_comments=progress_comments,
+            max_filed_followups=max_filed_followups,
         )
         self.store.save_run(run)
         return run
@@ -2667,9 +2676,9 @@ class Engine:
         """File non-blocking review findings as deferred-scope follow-up issues — but only
         the ones that clear the #188 filing threshold, so task completion doesn't become a
         hydra. A finding is filed only when its ``disposition`` is ``file`` (or absent, for
-        backward compatibility) AND the per-task cap (``Task.max_filed_followups``, falling
-        back to the engine-wide ``max_filed_followups`` default — #191) is
-        not yet reached; ``fix_now``/``drop`` findings and cap overflow are skipped here and
+        backward compatibility) AND the filing cap (``Task.max_filed_followups``, falling
+        back to the run-wide ``Run.max_filed_followups`` then the engine-wide default —
+        #191/#196) is not yet reached; ``fix_now``/``drop`` findings and cap overflow are skipped here and
         surfaced in the completion note's "Noted, not filed" section instead (nothing is
         silently dropped). Returns ``[{"title", "ref"}]`` for the FILED findings; a no-op
         when the adapter lacks ``file_followup`` or the review reported none."""
@@ -2680,8 +2689,19 @@ class Engine:
         findings = (review.output or {}).get("non_blocking") if review else None
         if not findings:
             return []
-        # #191: per-task override wins; None inherits the engine-wide default.
-        cap = task.max_filed_followups if task.max_filed_followups is not None else self.max_filed_followups
+        # Cap precedence (#191/#196): per-task override > run-wide default (set at
+        # create_run) > engine constructor default. A cheap single run read at filing time
+        # (mirrors the route_by_capacity pattern) so a run-wide baseline survives the
+        # per-command CLI process boundary that rebuilds the engine.
+        if task.max_filed_followups is not None:
+            cap = task.max_filed_followups
+        else:
+            run = self.store.load_run(run_id)
+            cap = (
+                run.max_filed_followups
+                if run.max_filed_followups is not None
+                else self.max_filed_followups
+            )
         filed: list[dict] = []
         for finding in findings:
             if not isinstance(finding, dict):

@@ -343,6 +343,14 @@ class Run(_StatusModel):
     # against a real repo only posts when explicitly opted in. Additive field: pre-#64 run
     # docs load with the default, no SCHEMA_VERSION bump.
     progress_comments: bool = False
+    # Review evidence-out filing cap (#191/#196): the run-wide DEFAULT number of non-blocking
+    # findings a task files as follow-up issues, set once at run-create time so every task in
+    # the run shares a non-default baseline without repeating --max-filed-followups per add.
+    # The precedence at filing time is per-task (``Task.max_filed_followups``) > this run
+    # default > the engine constructor default (``MAX_FILED_FOLLOWUPS_PER_TASK``). None = no
+    # run-level override (fall through to the engine default). Additive field: pre-#196 run
+    # docs load with the default, no SCHEMA_VERSION bump.
+    max_filed_followups: int | None = None
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""
