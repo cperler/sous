@@ -82,6 +82,14 @@ class Task(BaseModel):
     state: TaskState = TaskState.PENDING
     attempt: int = 0
     max_attempts: int = 3
+    # Per-task cap on how many non-blocking review findings are FILED as follow-up issues
+    # (#191): the tunable sibling of the engine-wide default. A micro-pipeline for a small
+    # fix and a full-pipeline for a large feature have very different expected review
+    # surfaces, so an operator can raise/lower the cap per task type (via add_task) without
+    # touching engine code, and adapters can surface it from the task doc. None = inherit the
+    # engine's ``max_filed_followups`` default; an explicit value (>= 0) overrides it for this
+    # task. Additive field: pre-#191 task docs load with None, so no SCHEMA_VERSION bump.
+    max_filed_followups: int | None = None
     title: str = ""
     body: str = ""  # task-source description (e.g. the GitHub issue body) — feeds prompts
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)

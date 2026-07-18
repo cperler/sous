@@ -124,7 +124,10 @@ DEFAULT_ABANDON_MIN_IDLE_S = 300
 # an absent disposition, for backward compatibility) are filed, and only up to this cap
 # per task; `fix_now`/`drop` findings — and any `file` finding over the cap — are surfaced
 # in the completion note's "Noted, not filed" section instead, so nothing is silently
-# dropped without ballooning the backlog.
+# dropped without ballooning the backlog. This is the engine-wide DEFAULT (#191): it is
+# overridable at engine-construction / run-create time via ``max_filed_followups`` and,
+# more granularly, per task via ``add_task(max_filed_followups=...)`` — a micro-pipeline
+# and a full-pipeline have very different expected review surfaces.
 MAX_FILED_FOLLOWUPS_PER_TASK = 2
 
 # Non-blocking dispositions the engine must NOT file (they are noted in the completion
@@ -174,6 +177,7 @@ class Engine:
         rate_limit_cooldown_s: int = 900,
         max_infra_resets: int = 2,
         max_salvage_keeps: int = 1,
+        max_filed_followups: int = MAX_FILED_FOLLOWUPS_PER_TASK,
         progress_throttle_s: float = 60.0,
         use_learnings_kb: bool = True,
     ) -> None:
@@ -215,6 +219,13 @@ class Engine:
         # if the salvaged work didn't unstick the retry, the next salvageable failure
         # discards the pile and starts clean from the checkpoint.
         self.max_salvage_keeps = max_salvage_keeps
+        # Review evidence-out filing cap (#188/#191): the engine-wide DEFAULT number of
+        # non-blocking findings a task files as follow-up issues. A per-task
+        # ``Task.max_filed_followups`` (set via add_task) overrides this; None there falls
+        # back here. Validated non-negative at construction.
+        if max_filed_followups < 0:
+            raise ValueError(f"max_filed_followups must be >= 0, got {max_filed_followups}")
+        self.max_filed_followups = max_filed_followups
         # Mid-run progress commentary (#64): don't hammer the GitHub API on rapid stage
         # boundaries — skip a publish if this task's last one was < this many seconds ago.
         # The last-publish stamp is per-PROCESS in-memory (record() is frequent and this is
@@ -277,6 +288,7 @@ class Engine:
         estimate: str | float | None = None,
         model: str | None = None,
         effort: str | None = None,
+        max_filed_followups: int | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -291,7 +303,11 @@ class Engine:
         ``82:codex`` tag / ralph dependency analysis, human-supplied). ``model`` pins a
         per-task model tier (#84); ``effort`` pins a per-task reasoning effort
         (low/medium/high, #96) that overrides the stage-spec defaults the same way.
-        Validation (non-empty, duplicate-free) is the Task model's.
+        ``max_filed_followups`` (#191) caps how many non-blocking review findings THIS task
+        files as follow-up issues, overriding the engine-wide default for a task type whose
+        expected review surface differs (a micro fix vs a full feature); None inherits the
+        engine default, a negative value is rejected. Validation (non-empty, duplicate-free)
+        is the Task model's.
 
         Cost-aware lane routing (#34): when the run enables ``route_by_cost`` AND no
         ``pipeline`` is explicitly pinned, the deterministic ``cost_router`` picks the
@@ -323,6 +339,13 @@ class Engine:
         effort_pin: Effort | None = None
         if effort is not None:
             effort_pin = resolve_effort(effort)
+        # Per-task filing cap (#191): validated BEFORE any state is written, like the pins.
+        # None inherits the engine default; a negative cap is nonsensical (a cap of 0 already
+        # means "file nothing").
+        if max_filed_followups is not None and max_filed_followups < 0:
+            raise ContractError(
+                f"max_filed_followups must be >= 0, got {max_filed_followups} for task {task_id}"
+            )
         run = self.store.load_run(run_id)
         # Cost-aware lane routing (#34): only for an UN-pinned task on a route_by_cost run.
         # An explicit pipeline pin is always honored (never overridden). The decision is
@@ -376,6 +399,7 @@ class Engine:
             pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
             deterministic_stages=tuple(deterministic_stages or ()),
             max_attempts=self.max_attempts,
+            max_filed_followups=max_filed_followups,
         )
         self.store.save_task(task)
         if route_reason is not None:
@@ -2631,7 +2655,8 @@ class Engine:
         """File non-blocking review findings as deferred-scope follow-up issues — but only
         the ones that clear the #188 filing threshold, so task completion doesn't become a
         hydra. A finding is filed only when its ``disposition`` is ``file`` (or absent, for
-        backward compatibility) AND the per-task cap (``MAX_FILED_FOLLOWUPS_PER_TASK``) is
+        backward compatibility) AND the per-task cap (``Task.max_filed_followups``, falling
+        back to the engine-wide ``max_filed_followups`` default — #191) is
         not yet reached; ``fix_now``/``drop`` findings and cap overflow are skipped here and
         surfaced in the completion note's "Noted, not filed" section instead (nothing is
         silently dropped). Returns ``[{"title", "ref"}]`` for the FILED findings; a no-op
@@ -2643,6 +2668,8 @@ class Engine:
         findings = (review.output or {}).get("non_blocking") if review else None
         if not findings:
             return []
+        # #191: per-task override wins; None inherits the engine-wide default.
+        cap = task.max_filed_followups if task.max_filed_followups is not None else self.max_filed_followups
         filed: list[dict] = []
         for finding in findings:
             if not isinstance(finding, dict):
@@ -2659,7 +2686,7 @@ class Engine:
                 continue
             # #188 cap: past the per-task limit, additional `file` findings are also noted,
             # not filed — the completion note lists them as "over per-task cap".
-            if len(filed) >= MAX_FILED_FOLLOWUPS_PER_TASK:
+            if len(filed) >= cap:
                 continue
             body = (
                 f"{str(finding.get('detail') or '').strip()}\n\n"
