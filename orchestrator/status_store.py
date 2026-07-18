@@ -215,6 +215,40 @@ class StatusStore:
             self._write_task(task)  # already under the lock
             return task
 
+    def commit_task_events(
+        self,
+        run_id: str,
+        task_id: str,
+        mutator: Callable[[Task], None],
+        events: list[dict] | Callable[[Task], list[dict]] | None = None,
+    ) -> Task:
+        """Transactional task mutation + bookkeeping events under one task lock.
+
+        Read-modify-write the task like :meth:`update_task`, but append the
+        associated audit events (built after the mutation, so they can reflect the
+        mutated state) and commit the task doc together. The ordering is the
+        invariant: the events are appended to ``events.jsonl`` FIRST (each append
+        atomic), then the task doc is written LAST as the single durable commit
+        point. Because the task-doc write is ordered last, a durably persisted task
+        mutation implies its events are already on disk — closing the orphan window
+        where a crash between the task write and a separate ``append_event`` left a
+        task claiming a dispatch with no matching ``stage_dispatched`` event.
+
+        ``events`` may be a static list or a callable receiving the mutated task
+        (used when an event field is only known after the read-modify-write, e.g.
+        a superseded lease id captured inside the mutator).
+        """
+        path = self._task_path(run_id, task_id)
+        with self.with_lock(path):
+            task = self.load_task(run_id, task_id)
+            mutator(task)
+            task.updated_at = _utc_now_iso()
+            evs = events(task) if callable(events) else (events or [])
+            for ev in evs:
+                self.append_event(run_id, ev)  # atomic append, events-file lock
+            self._write_task(task)  # durable commit point — LAST, already under lock
+            return task
+
     # ---- audit sidecar --------------------------------------------------
 
     def append_event(self, run_id: str, event: dict) -> None:

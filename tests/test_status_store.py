@@ -115,6 +115,63 @@ def test_append_event_appends_n_lines(tmp_path):
     assert [e["seq"] for e in parsed] == list(range(n))
 
 
+def test_commit_task_events_writes_events_and_task(tmp_path):
+    store = StatusStore(tmp_path)
+    store.save_task(_make_task())
+
+    def _mutate(t):
+        t.pending_work_item_id = "wi-1"
+
+    store.commit_task_events(
+        "r1",
+        "t1",
+        _mutate,
+        lambda t: [{"type": "stage_dispatched", "work_item_id": t.pending_work_item_id}],
+    )
+    assert store.load_task("r1", "t1").pending_work_item_id == "wi-1"
+    lines = (tmp_path / "events.jsonl").read_text().splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"type": "stage_dispatched", "work_item_id": "wi-1"}
+    ]
+
+
+def test_commit_task_events_events_precede_task_commit(tmp_path):
+    """Invariant (#174): a crash in the task-doc write must not orphan the events.
+    Inject a failure at the task-doc write step and assert the events are already
+    durable while the task doc still reflects the PRE-dispatch state — i.e. no
+    task-mutated-but-event-missing orphan is possible."""
+    store = StatusStore(tmp_path)
+    store.save_task(_make_task())
+
+    boom = RuntimeError("crash during task-doc write")
+
+    def _explode(_task):
+        raise boom
+
+    store._write_task = _explode  # type: ignore[method-assign]
+
+    def _mutate(t):
+        t.pending_work_item_id = "wi-1"
+
+    with pytest.raises(RuntimeError):
+        store.commit_task_events(
+            "r1",
+            "t1",
+            _mutate,
+            [{"type": "stage_dispatched", "work_item_id": "wi-1"}],
+        )
+
+    # Event is durable...
+    lines = (tmp_path / "events.jsonl").read_text().splitlines()
+    assert [json.loads(line) for line in lines] == [
+        {"type": "stage_dispatched", "work_item_id": "wi-1"}
+    ]
+    # ...but the task doc never advanced — so no orphan (task claims a dispatch whose
+    # event is missing) can exist. The reverse (event present, task not) is safe.
+    del store._write_task  # restore the class method for a clean load
+    assert store.load_task("r1", "t1").pending_work_item_id is None
+
+
 def test_v0_dict_loads_via_migrate(tmp_path):
     store = StatusStore(tmp_path)
     ts = _now()
