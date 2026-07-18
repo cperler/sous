@@ -225,6 +225,22 @@ def test_summary_by_effort_spend_and_engine_lane(tmp_path: Path) -> None:
     assert summary["engine_lane"] == {"invocations": 1, "cost_usd": 0.0}
 
 
+def test_summary_empty_effort_surfaces_as_anomaly_not_default(tmp_path: Path) -> None:
+    """A present-but-empty '' effort buckets under '' — the data anomaly it is — while a
+    genuinely-absent (None/missing) effort still normalizes to '(default)' (#180)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"model": "m", "effort": "", "lane": "headless", "cost_usd": 2.0},
+        {"model": "m", "effort": None, "lane": "engine", "cost_usd": 0.0},
+        {"model": "m", "lane": "engine", "cost_usd": 0.0},  # effort key absent entirely
+    ]
+    by_effort = ledger.summary(rows=rows)["by_effort_spend"]
+    # '' does NOT collapse into '(default)': it surfaces as its own bucket
+    assert by_effort[""] == {"invocations": 1, "cost_usd": 2.0}
+    # None + missing both normalize to '(default)'
+    assert by_effort["(default)"] == {"invocations": 2, "cost_usd": 0.0}
+
+
 def test_rows_roundtrip(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     recorded = [
@@ -352,7 +368,25 @@ def test_by_effort_none_effort_normalized_and_graceful_statuses(tmp_path: Path) 
     # rate_limited + skipped + success are all non-failures
     assert g["failures"] == 0 and g["failure_rate"] == 0.0
     # tolerant of the missing duration_s field
+    assert "duration_s" not in rows[0]
     assert g["total_duration_s"] == 0.0 and g["avg_duration_s"] == 0.0
+
+
+def test_by_effort_empty_effort_surfaces_as_anomaly_not_default(tmp_path: Path) -> None:
+    """A present-but-empty '' effort forms its own (stage, '', model) group rather than
+    silently folding into '(default)'; None/missing still normalize to '(default)' (#180)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    rows = [
+        {"stage": "review", "effort": "", "model": "m", "attempt": 0, "status": "success",
+         "cost_usd": 2.0},
+        {"stage": "review", "effort": None, "model": "m", "attempt": 0, "status": "success",
+         "cost_usd": 1.0},
+    ]
+    agg = ledger.by_effort(rows=rows)
+    efforts = {g["effort"] for g in agg}
+    assert efforts == {"", "(default)"}
+    empty = next(g for g in agg if g["effort"] == "")
+    assert empty["invocations"] == 1 and empty["cost_usd"] == 2.0
 
 
 def test_by_effort_orders_stages_in_pipeline_sequence(tmp_path: Path) -> None:
