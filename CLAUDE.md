@@ -28,8 +28,8 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   `adapters/execution/`. Don't add project-specific logic to `orchestrator/`.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
-  `main`; the `phase-3a-engine` branch is kept fast-forwarded to `main`. Remote:
-  `github.com/cperler/orchestration-template` (private; push `main` after committing).
+  `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`
+  after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the
   worktree, the task branch, and checkpoint tags — but NEVER the run's log dir under
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).
