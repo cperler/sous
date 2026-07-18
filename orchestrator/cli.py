@@ -272,6 +272,11 @@ def main(argv: list[str] | None = None) -> int:
                          "on model-lane stages; translated per lane (claude --effort, codex "
                          "model_reasoning_effort). Honored by the capacity downshift like "
                          "--model pins")
+    at.add_argument("--max-filed-followups", type=int, default=None,
+                    help="per-task cap on how many non-blocking review findings are FILED as "
+                         "follow-up issues (#191); overrides the engine-wide default for a task "
+                         "type with a different expected review surface (a micro fix vs a full "
+                         "feature). Omitted, the engine default applies; must be >= 0")
     util_help = "5h utilization %% for the capacity gates: a number, or 'auto' to probe"
     n = sub.add_parser("next")
     n.add_argument("--task", required=True)
@@ -957,7 +962,8 @@ def main(argv: list[str] | None = None) -> int:
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,
                             deterministic_stages=det, estimate=args.estimate,
-                            model=args.model, effort=args.effort)
+                            model=args.model, effort=args.effort,
+                            max_filed_followups=args.max_filed_followups)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],

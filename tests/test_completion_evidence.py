@@ -217,6 +217,74 @@ def test_per_task_cap_bounds_filed_followups(tmp_path, project) -> None:
     assert note.count("over per-task cap") == 2
 
 
+def test_per_task_cap_override_raises_the_limit(tmp_path, project) -> None:
+    # #191: a task type with a larger review surface files MORE follow-ups than the engine
+    # default, set per task at add_task without touching engine code.
+    from orchestrator.engine import MAX_FILED_FOLLOWUPS_PER_TASK
+
+    raised = MAX_FILED_FOLLOWUPS_PER_TASK + 2
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", max_filed_followups=raised)
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(raised + 1)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    # the per-task cap (not the default) bounds the filing; the single overflow is noted
+    assert len(ts.followups) == raised
+    assert ts.notes[0]["body"].count("over per-task cap") == 1
+
+
+def test_per_task_cap_override_of_zero_files_nothing(tmp_path, project) -> None:
+    # #191: a cap of 0 files no follow-ups at all — every `file` finding is noted, not filed.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", max_filed_followups=0)
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(3)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    assert ts.followups == []
+    assert ts.notes[0]["body"].count("over per-task cap") == 3
+
+
+def test_engine_default_cap_is_configurable(tmp_path, project) -> None:
+    # #191: the engine-wide default (run-create time) is tunable, and an un-overridden task
+    # inherits it.
+    eng = _engine(tmp_path, project, max_filed_followups=1)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")  # no per-task override -> inherits the engine default of 1
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(3)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    assert len(ts.followups) == 1
+    assert ts.notes[0]["body"].count("over per-task cap") == 2
+
+
+def test_negative_per_task_cap_is_rejected(tmp_path, project) -> None:
+    # #191: a negative cap is nonsensical (0 already means "file nothing") — rejected before
+    # any state is written.
+    from orchestrator.errors import ContractError
+
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    with pytest.raises(ContractError, match="max_filed_followups must be >= 0"):
+        eng.add_task("r1", "t1", max_filed_followups=-1)
+
+
 def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
     # The #186/#187 class: one observation emitted as both a non_blocking finding and the
     # improvement idea must be filed ONCE, not twice.
