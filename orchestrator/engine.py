@@ -734,45 +734,55 @@ class Engine:
             if prior_learnings and "prior_learnings" not in t.context:
                 t.context["prior_learnings"] = prior_learnings
 
-        self.store.update_task(run_id, task_id, _commit)
+        # #174: commit the task mutation and its bookkeeping events transactionally —
+        # events appended FIRST, the task doc written LAST as the single durable commit
+        # point — so a crash can never leave the task claiming a dispatch (pending lease
+        # set / lease superseded) without the matching `stage_dispatched` (and, on a
+        # resume, `lease_superseded`) already on disk. Events are built after `_commit`
+        # runs so they can read `superseded_lease`, which the mutator captures under the
+        # lock.
+        def _dispatch_events(_t: Task) -> list[dict]:
+            evs: list[dict] = []
+            # #142: when a resume supersedes an outstanding lease, retire the old
+            # work_item_id with its own event FIRST — so a consumer scanning the timeline
+            # sees the superseded dispatch closed out before the re-dispatch, and never
+            # pairs a live `stage_recorded` against the stale lease.
+            if superseded_lease is not None:
+                evs.append(
+                    {
+                        "ts": _now(),
+                        "type": "lease_superseded",
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "stage": stage.value,
+                        "attempt": attempt,
+                        "work_item_id": superseded_lease,
+                        "superseded_by": work.id,
+                    }
+                )
+            event: dict = {
+                "ts": _now(),
+                "type": "stage_dispatched",
+                "run_id": run_id,
+                "task_id": task_id,
+                "stage": stage.value,
+                "attempt": attempt,
+                "model": model,
+                "effort": effort,
+                "agent": agent,
+                "work_item_id": work.id,
+            }
+            # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
+            # supersedes so a reader can tell a genuine crash-recovery re-lease from a
+            # fresh dispatch without joining on `work_item_id` against `stage_recorded`.
+            if superseded_lease is not None:
+                event["resume"] = True
+                event["supersedes"] = superseded_lease
+            evs.append(event)
+            return evs
+
+        self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
-        # #142: when a resume supersedes an outstanding lease, retire the old work_item_id
-        # with its own event FIRST — so a consumer scanning the timeline sees the
-        # superseded dispatch closed out before the re-dispatch, and never pairs a live
-        # `stage_recorded` against the stale lease.
-        if superseded_lease is not None:
-            self.store.append_event(
-                run_id,
-                {
-                    "ts": _now(),
-                    "type": "lease_superseded",
-                    "run_id": run_id,
-                    "task_id": task_id,
-                    "stage": stage.value,
-                    "attempt": attempt,
-                    "work_item_id": superseded_lease,
-                    "superseded_by": work.id,
-                },
-            )
-        event: dict = {
-            "ts": _now(),
-            "type": "stage_dispatched",
-            "run_id": run_id,
-            "task_id": task_id,
-            "stage": stage.value,
-            "attempt": attempt,
-            "model": model,
-            "effort": effort,
-            "agent": agent,
-            "work_item_id": work.id,
-        }
-        # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
-        # supersedes so a reader can tell a genuine crash-recovery re-lease from a fresh
-        # dispatch without joining on `work_item_id` against `stage_recorded`.
-        if superseded_lease is not None:
-            event["resume"] = True
-            event["supersedes"] = superseded_lease
-        self.store.append_event(run_id, event)
         return work
 
     def record(self, run_id: str, result: StageResult) -> dict:
