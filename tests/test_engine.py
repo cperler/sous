@@ -59,6 +59,85 @@ def test_every_call_is_cost_attributed_clean(tmp_path, project) -> None:
     assert audit["by_lane"] == {"engine:none": 1, "interactive:claude": 5}
 
 
+def test_events_audit_balances_a_clean_run(tmp_path, project) -> None:
+    # #175: a full run's dispatch/record timeline balances with no orphaned leases.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    _drive_to_completion(eng)
+
+    audit = eng.status("r1")["events_audit"]
+    assert audit["clean"] is True
+    assert audit["orphans"] == []
+    assert audit["dispatched"] == audit["recorded"] == 6  # one close per dispatch
+    assert audit["superseded"] == 0 and audit["abandoned"] == 0
+    assert audit["outstanding"] == 0  # a completed run holds no live lease
+
+
+def test_events_audit_flags_an_orphaned_dispatch(tmp_path, project) -> None:
+    # A stage_dispatched whose lease is never closed (the #142 orphan) is flagged. Drive the
+    # audit over a synthetic timeline; the unknown run_id makes outstanding-lease lookup a
+    # no-op, so an unclosed dispatch can only be an orphan.
+    eng = _engine(tmp_path, project)
+    events = [
+        {"type": "stage_dispatched", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-closed"},
+        {"type": "stage_recorded", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-closed"},
+        {"type": "stage_dispatched", "run_id": "r1", "task_id": "t1",
+         "stage": "review", "attempt": 1, "work_item_id": "w-orphan"},
+    ]
+    audit = eng.events_audit("r1", events=events)
+    assert audit["clean"] is False
+    assert [o["work_item_id"] for o in audit["orphans"]] == ["w-orphan"]
+    assert audit["orphans"][0]["stage"] == "review"
+    assert audit["dispatched"] == 2 and audit["recorded"] == 1
+
+
+def test_events_audit_discounts_superseded_and_abandoned_leases(tmp_path, project) -> None:
+    # A superseded (resume re-dispatch) or abandoned lease closes its dispatch — neither
+    # is an orphan even though it never gets a stage_recorded.
+    eng = _engine(tmp_path, project)
+    events = [
+        {"type": "stage_dispatched", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-old"},
+        {"type": "lease_superseded", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-old", "superseded_by": "w-new"},
+        {"type": "stage_dispatched", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-new"},
+        {"type": "stage_recorded", "run_id": "r1", "task_id": "t1",
+         "stage": "implement", "attempt": 1, "work_item_id": "w-new"},
+        {"type": "stage_dispatched", "run_id": "r1", "task_id": "t2",
+         "stage": "review", "attempt": 1, "work_item_id": "w-gone"},
+        {"type": "dispatch_abandoned", "run_id": "r1", "task_id": "t2",
+         "stage": "review", "attempt": 1, "work_item_id": "w-gone", "reason": "orphaned"},
+    ]
+    audit = eng.events_audit("r1", events=events)
+    assert audit["clean"] is True
+    assert audit["dispatched"] == 3
+    assert audit["superseded"] == 1 and audit["abandoned"] == 1
+
+
+def test_events_audit_clean_across_a_real_superseded_lease(tmp_path, project) -> None:
+    # #142/#175: a resume re-dispatch supersedes the outstanding lease. The old
+    # stage_dispatched never gets a stage_recorded, but its lease_superseded closes it —
+    # the audit stays clean with the old lease counted, not flagged as an orphan.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w1 = eng.next_work("r1", "t1")
+    assert w1 is not None
+    w2 = eng.next_work("r1", "t1", resume=True)  # re-lease: supersedes w1
+    assert w2 is not None and w2.id != w1.id
+    eng.record("r1", make_result(w2))
+
+    audit = eng.status("r1")["events_audit"]
+    assert audit["clean"] is True
+    assert audit["orphans"] == []
+    assert audit["superseded"] == 1
+    assert audit["dispatched"] == 2 and audit["recorded"] == 1
+
+
 def test_lite_lane_skips_scope(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.LITE)

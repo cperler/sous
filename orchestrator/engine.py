@@ -1077,6 +1077,11 @@ class Engine:
                 "task_id": result.task_id,
                 "stage": result.stage.value,
                 "attempt": result.attempt,
+                # #175: stamp the closed lease so the events-balance audit can join a
+                # `stage_recorded` back to its opening `stage_dispatched` by work_item_id
+                # (lease_superseded/dispatch_abandoned already carry it) — the join key that
+                # turns the #142 hand-count into an automated orphan check.
+                "work_item_id": result.work_item_id,
                 "effort": result.effort,  # #96: audit alongside model/lane
                 "status": effective.status.value,
                 "outcome": outcome,
@@ -2491,6 +2496,9 @@ class Engine:
             "cost": summary,
             "budget": budget,  # #34: metered spend vs. budget (None when no budget set)
             "lane_audit": self.lane_audit(run_id, rows=rows),
+            # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
+            # automatically at every poll / batch completion instead of by hand-count.
+            "events_audit": self.events_audit(run_id),
         }
 
     def lane_audit(self, run_id: str, *, rows: list[dict] | None = None) -> dict:
@@ -2519,6 +2527,83 @@ class Engine:
             "unattributed": unattributed,
             "off_lane": off_lane,
             "clean": unattributed == 0 and off_lane == 0,
+        }
+
+    def events_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
+        """Balance every dispatch lease against its terminal event (#175).
+
+        The #142 orphan bug — superseded leases inflating ``stage_dispatched`` over
+        ``stage_recorded`` (29 vs 23) — was caught only because a human hand-counted the
+        timeline. This makes that check automatic and self-describing: each
+        ``stage_dispatched`` opens a ``work_item_id`` that must be closed by exactly one of
+        ``stage_recorded`` / ``lease_superseded`` / ``dispatch_abandoned``, OR still be a
+        live outstanding lease (a dispatch currently in flight on a non-terminal task). A
+        dispatched lease with no closing event that is not outstanding is an ORPHAN and gets
+        flagged — the regression this audit exists to surface at batch completion / CI
+        instead of during a manual post-run inspection of production logs.
+
+        Robust to pre-#175 logs: a ``stage_recorded`` written before this change carries no
+        ``work_item_id`` and cannot be joined by id, so those are counted and the orphan
+        list is conservatively discounted by that many — old, known-good history never
+        false-flags.
+        """
+        events = self.store.read_events(run_id) if events is None else events
+        dispatched: dict[str, dict] = {}  # work_item_id -> opening dispatch info
+        closed: dict[str, str] = {}  # work_item_id -> closing event type
+        recorded_no_wid = 0  # pre-#175 stage_recorded rows without a joinable lease id
+        counts = {"stage_dispatched": 0, "stage_recorded": 0,
+                  "lease_superseded": 0, "dispatch_abandoned": 0}
+        for ev in events:
+            etype = ev.get("type")
+            if etype in counts:
+                counts[etype] += 1
+            wid = ev.get("work_item_id")
+            if etype == "stage_dispatched":
+                if wid:
+                    dispatched[wid] = {"task_id": ev.get("task_id"),
+                                       "stage": ev.get("stage"),
+                                       "attempt": ev.get("attempt")}
+            elif etype in ("stage_recorded", "lease_superseded", "dispatch_abandoned"):
+                if wid:
+                    # First close wins: a later duplicate can't unflag an already-closed lease.
+                    closed.setdefault(wid, etype)
+                elif etype == "stage_recorded":
+                    recorded_no_wid += 1
+
+        # Live in-flight leases (held by a non-terminal task) are legitimately unclosed
+        # mid-run — discount them so a status() poll of a running batch never false-flags.
+        # A terminal task must NOT hold a lease, so those are deliberately NOT discounted.
+        outstanding: set[str] = set()
+        try:
+            run = self.store.load_run(run_id)
+            for ref in run.task_refs:
+                if ref.state in TERMINAL_TASK_STATES:
+                    continue
+                doc = self.store.load_task(run_id, ref.task_id)
+                if doc.pending_work_item_id is not None:
+                    outstanding.add(doc.pending_work_item_id)
+        except Exception:  # noqa: BLE001 - the audit is best-effort; a bad load must not raise
+            pass
+
+        orphans = [
+            {"work_item_id": wid, **info}
+            for wid, info in dispatched.items()
+            if wid not in closed and wid not in outstanding
+        ]
+        # Pre-#175 logs: a work_item_id-less stage_recorded closed SOME dispatch we can't
+        # attribute by id. Conservatively drop that many orphans (avoid false positives on
+        # old history); new runs stamp every stage_recorded, so recorded_no_wid == 0 and the
+        # list is exact.
+        if recorded_no_wid and orphans:
+            orphans = orphans[recorded_no_wid:]
+        return {
+            "dispatched": counts["stage_dispatched"],
+            "recorded": counts["stage_recorded"],
+            "superseded": counts["lease_superseded"],
+            "abandoned": counts["dispatch_abandoned"],
+            "outstanding": len(outstanding),
+            "orphans": orphans,
+            "clean": not orphans,
         }
 
     # --- helpers --------------------------------------------------------------
