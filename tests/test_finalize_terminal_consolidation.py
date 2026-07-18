@@ -107,6 +107,32 @@ def test_record_completion_still_finalizes_without_the_failed_alert(tmp_path) ->
     assert [tid for tid, _pr in project.task_source.completed] == ["t1"]  # mark_complete ran
 
 
+# --- #184: the failed-alert reason is the caller's reason, not a stale last_error -------
+
+def test_finalize_failed_alert_reason_ignores_stale_last_error(tmp_path) -> None:
+    # #184: task.last_error can still hold an earlier review-rejection message
+    # (_apply_review_rejection sets it and never clears it). The task_failed alert must
+    # report the reason for THIS terminal transition — the caller's ``reason`` — not the
+    # stale last_error, so a max-attempts death is not misreported as the prior rejection.
+    project = FakeProject()
+    calls: list[tuple[str, dict]] = []
+    project.notify = lambda kind, payload: calls.append((kind, payload))
+    eng = _engine(tmp_path, project)
+    _drive_to_implement(eng)
+
+    task = eng.store.load_task("r1", "t1")
+    task.last_error = "review rejected: some earlier blocking issue"  # the stale value
+    eng.store.save_task(task)
+
+    eng._finalize_task_terminal(
+        "r1", task, disposition="failed", reason="implement failed: fresh runner error"
+    )
+
+    failed = next(p for k, p in calls if k == "task_failed")
+    assert failed["reason"] == "implement failed: fresh runner error"
+    assert "review rejected" not in failed["reason"]  # the stale last_error did NOT leak
+
+
 # --- #131: the helper's disposition parameter is a Literal ----------------------------
 
 def test_finalize_helper_disposition_is_literal() -> None:

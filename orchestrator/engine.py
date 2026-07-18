@@ -1144,10 +1144,11 @@ class Engine:
         # and finalizes the run. ``outcome.startswith("task_failed")`` ⟺ ``task.state is
         # FAILED`` (the only apply path that sets FAILED here returns a ``task_failed_*``
         # outcome), so this covers exactly the branch that fired those effects inline before.
-        # The helper's failed-path notification reason is ``task.last_error or reason``; on
-        # this path ``last_error`` is unset, so passing ``effective.error or outcome``
-        # reproduces the prior inline payload's reason (e.g. the gate/runner error, else the
-        # outcome slug).
+        # The helper's failed-path notification reason is the ``reason`` passed here (#184:
+        # it no longer prefers ``task.last_error``, which can carry a stale value from an
+        # earlier review-rejection cycle — see _apply_review_rejection). Passing
+        # ``effective.error or outcome`` reproduces the prior inline payload's reason (e.g.
+        # the gate/runner error, else the outcome slug).
         if task.state is TaskState.FAILED:
             self._finalize_task_terminal(
                 run_id, task, disposition="failed", reason=effective.error or outcome
@@ -2163,6 +2164,12 @@ class Engine:
             # Same alerting record()'s terminal-failure path fires (#55/#107): a task that
             # died is exactly the unattended-run event the old monitor alerted on. Always
             # appends the notification audit row even when no notify hook is installed.
+            # #184: the alert reason is the caller's authoritative ``reason`` — NOT
+            # ``task.last_error``, which can still hold an earlier review-rejection message
+            # (_apply_review_rejection sets it and it is never cleared) and would otherwise
+            # misreport a max-attempts death as the prior rejection. Each caller already
+            # passes the reason for THIS terminal transition (record: effective.error or
+            # outcome; abandon: the abandon reason; reject: the human's reason).
             stage = task.current_stage
             self.emit_notification(
                 run_id, "task_failed",
@@ -2171,7 +2178,7 @@ class Engine:
                             + (f" at {stage.value}" if stage else "")
                             + f": {reason}",
                  "stage": stage.value if stage else None,
-                 "reason": task.last_error or reason},
+                 "reason": reason},
             )
         self._maybe_finalize_run(run_id)
 
