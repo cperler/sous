@@ -285,6 +285,50 @@ def test_negative_per_task_cap_is_rejected(tmp_path, project) -> None:
         eng.add_task("r1", "t1", max_filed_followups=-1)
 
 
+def test_run_default_cap_bounds_filed_followups(tmp_path, project) -> None:
+    # #196: the run-wide default (set at create_run) caps an un-overridden task, so every task
+    # in the run shares the baseline without repeating it per add_task.
+    eng = _engine(tmp_path, project)  # engine constructor default (2) is NOT what binds here
+    eng.create_run("r1", ExecutionLane.FULL, max_filed_followups=1)
+    eng.add_task("r1", "t1")  # no per-task override -> inherits the run default of 1
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(3)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    assert len(ts.followups) == 1
+    assert ts.notes[0]["body"].count("over per-task cap") == 2
+
+
+def test_per_task_cap_overrides_run_default(tmp_path, project) -> None:
+    # #196: the per-task cap still wins over the run-wide default (task > run > engine).
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL, max_filed_followups=0)  # run says file nothing
+    eng.add_task("r1", "t1", max_filed_followups=2)  # ...but this task overrides to 2
+
+    findings = [
+        {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
+        for i in range(3)
+    ]
+    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+
+    ts = project.task_source
+    assert len(ts.followups) == 2
+    assert ts.notes[0]["body"].count("over per-task cap") == 1
+
+
+def test_negative_run_cap_is_rejected(tmp_path, project) -> None:
+    # #196: a negative run-wide cap is rejected before the run is written, like the per-task one.
+    from orchestrator.errors import ContractError
+
+    eng = _engine(tmp_path, project)
+    with pytest.raises(ContractError, match="max_filed_followups must be >= 0"):
+        eng.create_run("r1", ExecutionLane.FULL, max_filed_followups=-1)
+
+
 def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
     # The #186/#187 class: one observation emitted as both a non_blocking finding and the
     # improvement idea must be filed ONCE, not twice.
