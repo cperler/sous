@@ -269,9 +269,9 @@ def test_stage_record_effort_is_the_effort_enum(tmp_path, project) -> None:
 
 
 def test_begin_stage_coerces_str_effort_to_enum() -> None:
-    """#147: begin_stage stamps a genuine Effort even from a bare-str effort (the engine
-    passes the stage-spec ``.value``) — validate_assignment is off, so the record's enum
-    typing is upheld by the explicit coercion, not just by load-time validation."""
+    """#147/#172: begin_stage stamps a genuine Effort even from a bare-str effort — the
+    status models' validate_assignment convention coerces at the write, so the record's
+    enum typing holds without any explicit Effort(...) wrap at the use site."""
     from orchestrator.schemas.status import Task
     from orchestrator.state_machine import begin_stage
 
