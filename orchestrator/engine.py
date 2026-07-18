@@ -2122,7 +2122,7 @@ class Engine:
         task_id: str,
         *,
         reason: str,
-        disposition: str = "failed",
+        disposition: Literal["failed", "rejected"] = "failed",
         min_idle_s: int = DEFAULT_ABANDON_MIN_IDLE_S,
         force: bool = False,
     ) -> Task:
