@@ -23,6 +23,14 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   (promote / keep-with-comment / close-with-reason). File or close issues as you build or
   defer. `DEFERRED.md` documents the discipline; the pre-2026-07-01 ledger is frozen at
   `docs/deferred-history.md`.
+- **Run-level settings must persist on the Run/Task doc, not engine memory.** Every CLI
+  subcommand rebuilds the Engine from constructor DEFAULTS (`cli._engine` passes only
+  store/ledger/project/router/registry), so a setting chosen at run-create time is lost by
+  the next subcommand unless it is stored on `Run` (or `Task`) and re-read at the stage
+  boundary that consults it (dispatch/retry/review-gate/filing/completion). A guard test
+  (`tests/test_run_settings_persistence.py`) enforces that every `create_run` param is a
+  `Run` field; the full audit + pattern is in
+  `docs/reviews/2026-07-18-run-level-settings-persistence-audit.md` (#206).
 - **The engine never calls a model and stays project-agnostic.** New projects plug in via
   a project-owned `<repo>/.orchestration/` adapter (loaded by path, contract-checked) or
   `adapters/project/<name>/` for in-repo reference adapters; new execution lanes via
