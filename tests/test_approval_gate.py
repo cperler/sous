@@ -46,6 +46,44 @@ def test_approve_writes_the_artifact_and_releases_the_task(tmp_path, project) ->
     assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
 
 
+def test_hold_commits_event_atomically_with_the_task_doc(tmp_path, project) -> None:
+    # #199: hold_for_approval routes through commit_task_events, so a crash in the task-doc
+    # write can never leave a BLOCKED_ON_HUMAN task with no held_for_approval event. Inject a
+    # failure at the task-doc write and assert the event is durable while the doc is unchanged.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    orig_write = eng.store._write_task
+    eng.store._write_task = lambda _t: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        eng.hold_for_approval("r1", "t1", what="x")
+    eng.store._write_task = orig_write
+    # The event is on disk (appended BEFORE the failed task-doc write)...
+    events = [e for e in eng.store.read_events("r1") if e["type"] == "held_for_approval"]
+    assert len(events) == 1
+    # ...but the task never advanced — no orphaned event/state mismatch.
+    assert eng.store.load_task("r1", "t1").state is TaskState.PENDING
+
+
+def test_approve_commits_event_atomically_and_writes_no_artifact_on_write_failure(
+    tmp_path, project
+) -> None:
+    # #199: approve commits the `approved` event with the PENDING task doc via
+    # commit_task_events; write_approval runs AFTER. A crash in the task-doc write leaves the
+    # task still held and writes NO approval artifact (the gate record follows the commit).
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.hold_for_approval("r1", "t1", what="x")
+    orig_write = eng.store._write_task
+    eng.store._write_task = lambda _t: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        eng.approve("r1", "t1", approved_by="craig")
+    eng.store._write_task = orig_write
+    assert eng.store.load_task("r1", "t1").state is TaskState.BLOCKED_ON_HUMAN
+    assert eng.store.load_approval("r1", "t1") is None  # write_approval never reached
+
+
 def test_hold_refuses_in_flight_and_terminal_tasks(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
@@ -81,6 +119,26 @@ def test_reject_closes_a_held_task_and_finalizes_the_run(tmp_path, project) -> N
     assert artifact["rejected_by"] == "craig"
     assert artifact["reason"] == "genuinely infeasible"
     assert artifact["at"]  # timestamped
+
+
+def test_reject_commits_event_atomically_and_writes_no_artifact_on_write_failure(
+    tmp_path, project
+) -> None:
+    # #199: reject commits the terminal transition + `rejected` event via commit_task_events;
+    # write_rejection + finalize follow. A crash in the task-doc write leaves the task still
+    # held and writes NO rejection artifact (the gate record follows the commit, and its
+    # read-back by _finalize_task_terminal is never reached).
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.hold_for_approval("r1", "t1", what="infeasible")
+    orig_write = eng.store._write_task
+    eng.store._write_task = lambda _t: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        eng.reject("r1", "t1", rejected_by="craig", reason="nope")
+    eng.store._write_task = orig_write
+    assert eng.store.load_task("r1", "t1").state is TaskState.BLOCKED_ON_HUMAN
+    assert eng.store.load_rejection("r1", "t1") is None  # write_rejection never reached
 
 
 def test_reject_refuses_a_task_that_is_not_held(tmp_path, project) -> None:

@@ -1808,13 +1808,15 @@ class Engine:
                 )
             t.state = TaskState.BLOCKED_ON_HUMAN
 
-        task = self.store.update_task(run_id, task_id, _hold)
-        self._set_ref_state(run_id, task_id, TaskState.BLOCKED_ON_HUMAN)
-        self.store.append_event(
-            run_id,
-            {"ts": _now(), "type": "held_for_approval", "run_id": run_id,
-             "task_id": task_id, "what": what},
+        # #199: commit the task mutation + its transition event atomically (event
+        # appended first, task doc last) so a crash can never leave a held task with no
+        # held_for_approval event — the same orphan gap dispatch closed via this primitive.
+        task = self.store.commit_task_events(
+            run_id, task_id, _hold,
+            [{"ts": _now(), "type": "held_for_approval", "run_id": run_id,
+              "task_id": task_id, "what": what}],
         )
+        self._set_ref_state(run_id, task_id, TaskState.BLOCKED_ON_HUMAN)
         return task
 
     def approve(self, run_id: str, task_id: str, *, approved_by: str, what: str = "") -> Task:
@@ -1828,18 +1830,21 @@ class Engine:
                 )
             t.state = TaskState.PENDING
 
-        task = self.store.update_task(run_id, task_id, _release)
+        # #199: commit the release + its `approved` event atomically (event first, task
+        # doc last), so a durable PENDING transition always has its event on disk. The
+        # mutator's state guard runs inside the commit, so a rejected release still raises
+        # BEFORE any approval artifact is written (no spurious gate record on the error path).
+        task = self.store.commit_task_events(
+            run_id, task_id, _release,
+            [{"ts": _now(), "type": "approved", "run_id": run_id, "task_id": task_id,
+              "approved_by": approved_by, "what": what}],
+        )
         self.store.write_approval(
             run_id, task_id,
             {"approved_by": approved_by, "at": _now(), "what": what, "run_id": run_id,
              "task_id": task_id},
         )
         self._set_ref_state(run_id, task_id, TaskState.PENDING)
-        self.store.append_event(
-            run_id,
-            {"ts": _now(), "type": "approved", "run_id": run_id, "task_id": task_id,
-             "approved_by": approved_by, "what": what},
-        )
         return task
 
     # --- alerting seam (#55) ----------------------------------------------------
@@ -2040,18 +2045,22 @@ class Engine:
                 )
             t.state = TaskState.CLOSED_INFEASIBLE
 
-        task = self.store.update_task(run_id, task_id, _reject)
+        # #199: commit the terminal transition + its `rejected` event atomically (event
+        # first, task doc last) so a durably CLOSED_INFEASIBLE task always has its event.
+        # The mutator's state guard runs inside the commit, so a non-held task raises
+        # BEFORE the rejection artifact is written. write_rejection stays AFTER the commit
+        # and BEFORE _finalize_task_terminal, which reads the artifact back (#52).
+        task = self.store.commit_task_events(
+            run_id, task_id, _reject,
+            [{"ts": _now(), "type": "rejected", "run_id": run_id, "task_id": task_id,
+              "rejected_by": rejected_by, "reason": reason}],
+        )
         self.store.write_rejection(
             run_id, task_id,
             {"rejected_by": rejected_by, "at": _now(), "reason": reason, "run_id": run_id,
              "task_id": task_id},
         )
         self._set_ref_state(run_id, task_id, TaskState.CLOSED_INFEASIBLE)
-        self.store.append_event(
-            run_id,
-            {"ts": _now(), "type": "rejected", "run_id": run_id, "task_id": task_id,
-             "rejected_by": rejected_by, "reason": reason},
-        )
         # Out-of-band transition (like approve/hold, not via record()), so it must perform
         # record()'s post-transition run-level effects itself. All of them — the rejection
         # evidence-out (#52), cascade, port release (#5), learnings harvest (#72), and
@@ -2178,7 +2187,8 @@ class Engine:
         transitions the task DIRECTLY to a terminal state — FAILED (``disposition='failed'``)
         or CLOSED_INFEASIBLE (``disposition='rejected'``, writing the same durable rejection
         artifact ``reject`` does). The task-doc mutation is applied under the per-task lock
-        via ``update_task`` (#108). It then runs the SAME post-transition run-level effects
+        via ``commit_task_events`` (#108/#199 — the ``dispatch_abandoned`` event commits
+        atomically with the task doc). It then runs the SAME post-transition run-level effects
         the other operator finalize paths do, via the shared ``_finalize_task_terminal``
         helper (#110): on ``rejected`` it surfaces the rejection (publishes a note + renders
         the read-back reason, #109); on ``failed`` it emits the ``task_failed`` alert
@@ -2274,9 +2284,11 @@ class Engine:
         # Clear the lease and fold the abandonment into the stage record + task state DIRECTLY
         # (not via apply_result / record — an abandoned dispatch never converges, so none of
         # the retry/salvage/fallback machinery applies). #108: apply the mutation under the
-        # per-task lock via update_task (a read-modify-write on the FRESH doc) so a concurrent
-        # writer can't clobber the transition — the side-effecting reads/computation above
-        # (probe, synthetic result, ledger row, lane) already ran outside the lock.
+        # per-task lock (a read-modify-write on the FRESH doc) so a concurrent writer can't
+        # clobber the transition — the side-effecting reads/computation above (probe, synthetic
+        # result, ledger row, lane) already ran outside the lock. #199: commit via
+        # commit_task_events so the `dispatch_abandoned` event is appended (first) atomically
+        # with the task-doc write (last) — no terminal task with a missing transition event.
         error = f"dispatch_abandoned: {reason}"
 
         def _abandon(t: Task) -> None:
@@ -2297,7 +2309,13 @@ class Engine:
             )
             t.stage_counter += 1
 
-        task = self.store.update_task(run_id, task_id, _abandon)
+        task = self.store.commit_task_events(
+            run_id, task_id, _abandon,
+            [{"ts": _now(), "type": "dispatch_abandoned", "run_id": run_id, "task_id": task_id,
+              "stage": stage.value, "attempt": dispatched.attempt, "work_item_id": work_item_id,
+              "reason": reason, "disposition": disposition,
+              "stream_last_grew": stream_last_grew, "forced": force}],
+        )
         seq = task.stage_counter
         payload = {
             "work_item_id": work_item_id,
@@ -2326,8 +2344,8 @@ class Engine:
                 {"rejected_by": "abandon", "at": completed_at, "reason": reason,
                  "run_id": run_id, "task_id": task_id},
             )
-        # The task doc is already persisted by update_task above; the index/ref-state below
-        # are derived artifacts. A FAILED abandon renders the task index HERE. A REJECTED
+        # The task doc is already persisted by commit_task_events above; the index/ref-state
+        # below are derived artifacts. A FAILED abandon renders the task index HERE. A REJECTED
         # abandon SKIPS this write (#132): _finalize_task_terminal → _surface_rejection
         # immediately re-renders the index from the READ-BACK rejection artifact, so an
         # inline write would be redundant (overwritten with identical content).
@@ -2336,13 +2354,7 @@ class Engine:
                 task_id, render_task_index(task, rejection_reason=rejection_reason)
             )
         self._set_ref_state(run_id, task_id, task.state)
-        self.store.append_event(
-            run_id,
-            {"ts": _now(), "type": "dispatch_abandoned", "run_id": run_id, "task_id": task_id,
-             "stage": stage.value, "attempt": dispatched.attempt, "work_item_id": work_item_id,
-             "reason": reason, "disposition": disposition,
-             "stream_last_grew": stream_last_grew, "forced": force},
-        )
+        # (#199: the `dispatch_abandoned` event is emitted with the task-doc commit above.)
         # Shared out-of-band post-transition run-level effects (#110): the rejection
         # evidence-out (#109 — publishes a note + re-renders the index from the read-back
         # artifact), cascade-block, port release, learnings harvest, the task_failed alert
