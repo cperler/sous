@@ -190,7 +190,9 @@ def serve(
         clock=clock,
         snap_kwargs=snap_kwargs,
     )
-    bound_host, bound_port = httpd.server_address[0], httpd.server_address[1]
+    raw_host = httpd.server_address[0]
+    bound_host = raw_host.decode() if isinstance(raw_host, bytes) else raw_host
+    bound_port = httpd.server_address[1]
     url = f"http://{bound_host}:{bound_port}/"
     if on_ready is not None:
         on_ready(url)

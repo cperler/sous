@@ -947,6 +947,9 @@ class Engine:
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
         if do_fallthrough:
+            # do_fallthrough implies provider_out_reason is not None (see above); assert it so
+            # the reason: str parameter type-checks without laundering the None through.
+            assert provider_out_reason is not None
             outcome = self._apply_fallthrough(task, result, provider_out_reason)
         elif effective.status is ResultStatus.RATE_LIMITED:
             # Transient: re-queue the stage (RUNNING marker keeps the attempt) — either
@@ -1480,7 +1483,7 @@ class Engine:
             return  # nothing committed past the checkpoint — plain reset, no salvage noise
         salvageable = self._work_not_implicated(result, infra_only=infra_only)
         shas = [str(c.get("sha", ""))[:9] for c in commits]
-        total = int(salvage.get("count") or len(commits))
+        total = int((salvage or {}).get("count") or len(commits))
         if salvageable and task.salvage_count < self.max_salvage_keeps:
             task.salvage_count += 1
             task.salvage_in_place = True  # next_work suppresses the reset -> work is kept

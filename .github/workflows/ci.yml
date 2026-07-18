@@ -1,0 +1,31 @@
+name: CI
+
+# The required-green gate (#194): tests + lint + type-check on every push and PR, the
+# same trio CLAUDE.md's "Working norms" names. mypy is what makes the abandon()
+# disposition Literal (and every other annotation) a real analysis gate, not documentation.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Sync dependencies
+        run: uv sync
+
+      - name: Tests
+        run: uv run pytest
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Type-check
+        run: uv run mypy

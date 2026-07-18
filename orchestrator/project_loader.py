@@ -73,6 +73,8 @@ def _import_adapter_dir(path: Path):
     spec = importlib.util.spec_from_file_location(
         mod_name, init, submodule_search_locations=[str(path)]
     )
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"project adapter dir {path} could not be imported (no loader for {init})")
     module = importlib.util.module_from_spec(spec)
     sys.modules[mod_name] = module  # register BEFORE exec so `from .x import y` resolves
     try:

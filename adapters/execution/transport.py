@@ -594,7 +594,8 @@ def _codex_session_id(events_stdout: str) -> str | None:
             continue
         if not isinstance(ev, dict):
             continue
-        msg = ev.get("msg") if isinstance(ev.get("msg"), dict) else {}
+        raw_msg = ev.get("msg")
+        msg = raw_msg if isinstance(raw_msg, dict) else {}
         for key in ("thread_id", "session_id", "conversation_id"):
             v = ev.get(key) or msg.get(key)
             if isinstance(v, str) and v:
@@ -945,7 +946,7 @@ def claude_cli_transport(
         proc_env = subprocess_env(work)
         stream_files: dict | None = None
         try:
-            if streaming:
+            if root is not None:  # == streaming; narrows root for the _stream_dir calls below
                 tee_path = _stream_dir(root, work.task_id) / stream_filename(
                     work.stage.value, work.attempt, retry
                 )
@@ -1298,7 +1299,10 @@ def codex_cli_transport(
             raw = _call(work, None)
         # Without a schema wired there's nothing to validate — keep validate-at-runner behavior.
         schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
-        call = _call
+        # Typed as the 3-arg shape _schema_retry_loop consumes so the schema-rejected
+        # branch below can rebind it to a use_schema-dropping wrapper without a redefinition
+        # clash (_call carries an extra defaulted use_schema arg, compatible with this).
+        call: Callable[[WorkItem, str | None, int], RawResult] = _call
         # The schema nudge must never be the reason a call fails: if codex's strict validator
         # rejects even the transformed schema (a future strictness rule we don't cover), drop
         # the `--output-schema` flag for this dispatch — postamble + retry loop remain the

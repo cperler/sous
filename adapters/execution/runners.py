@@ -14,6 +14,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from adapters.project.base import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
 
@@ -40,7 +41,7 @@ def _schema_json_provider(schema_for: SchemaProvider) -> Callable[[str], str | N
 
     def json_for(ref: str) -> str | None:
         if ref not in cache:
-            schema = schema_for(ref) if schema_for else None
+            schema = schema_for(ref) if schema_for is not None else None
             cache[ref] = json.dumps(schema) if schema is not None else None
         return cache[ref]
 
@@ -53,7 +54,7 @@ def build_registry(
     headless_schema_provider: SchemaProvider | None = None,
     codex_transport: Transport | None = None,
     codex_schema_provider: SchemaProvider | None = None,
-    setup_project: object | None = None,
+    setup_project: ProjectConfig | None = None,
     include_interactive: bool = True,
     run_log_root: str | Path | None = None,
 ) -> Registry:

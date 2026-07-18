@@ -128,6 +128,8 @@ def default_engine_factory(
     from .schemas.enums import ExecutionMode, Provider
     from .status_store import StatusStore
 
+    if project_spec is None:
+        raise SystemExit("dashboard needs --project to build the per-run lane registry")
     project = load_project(project_spec)
     exec_mode = ExecutionMode(mode)
     prov = Provider(provider) if provider else None

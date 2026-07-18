@@ -22,6 +22,7 @@ selfhost = "adapters.project.selfhost"
 [dependency-groups]
 dev = [
     "hypothesis>=6.156.1",
+    "mypy>=1.11",
     "pytest>=8.0",
     "ruff>=0.6",
 ]
@@ -57,3 +58,15 @@ target-version = "py311"
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM", "BLE"]
 ignore = ["E501"]  # line length handled pragmatically in tests/fixtures
+
+[tool.mypy]
+# Type-check the shipped code (engine + adapters). Tests stay out of the gate;
+# they lean on dynamic fixtures and would drown the signal.
+files = ["orchestrator", "adapters"]
+python_version = "3.11"
+
+# jsonschema ships no type stubs — silence the import-untyped errors structurally
+# here rather than sprinkling per-line ignores at each import.
+[[tool.mypy.overrides]]
+module = ["jsonschema", "jsonschema.*"]
+ignore_missing_imports = true

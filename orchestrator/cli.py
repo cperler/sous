@@ -28,6 +28,10 @@ import argparse
 import json
 import sys
 from pathlib import Path
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 from adapters.execution.runners import build_registry
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
@@ -38,6 +42,19 @@ from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
 from .schemas.work import StageResult
+
+
+def _auto_util_provider() -> Callable[[], float]:
+    """A live 5-hour-usage util probe: re-probes each tick so the gate tracks reality
+    (0.0 when no usage snapshot is available). Shared by the queue-drive and headless
+    schedulers so neither nests a per-branch ``def`` in ``main``'s scope."""
+    from .usage_probe import read_usage
+
+    def provider() -> float:
+        usage = read_usage()
+        return usage.five_hour_pct if usage else 0.0
+
+    return provider
 
 
 def _is_shared_runs_root(root: Path, run: str) -> bool:
@@ -588,8 +605,8 @@ def main(argv: list[str] | None = None) -> int:
 
         if not args.root:
             p.error("--root is required for tail")
-        path = find_current_stream(Path(args.root), args.task, args.stage)
-        if path is None:
+        stream_path = find_current_stream(Path(args.root), args.task, args.stage)
+        if stream_path is None:
             print(f"(no live stream for task {args.task} — interactive/ENGINE lane, "
                   "or nothing dispatched yet)")
             return 0
@@ -598,10 +615,10 @@ def main(argv: list[str] | None = None) -> int:
             import time
 
             with contextlib.suppress(KeyboardInterrupt):  # interactive Ctrl-C ends the follow
-                follow_stream(path, emit=print, sleeper=time.sleep,
+                follow_stream(stream_path, emit=print, sleeper=time.sleep,
                               lines=args.lines, poll_interval=args.interval)
             return 0
-        for line in read_tail(path, lines=args.lines) or []:
+        for line in read_tail(stream_path, lines=args.lines) or []:
             print(line)
         return 0
 
@@ -762,7 +779,8 @@ def main(argv: list[str] | None = None) -> int:
         # The auto-analysis producer (#57). candidates/validate are lightweight (no run);
         # apply needs the engine. The model authors the plan — this only fetches, validates,
         # and applies. load_plan raises BatchPlanError (a clear message) on bad input.
-        from .batch_plan import BatchPlanError, apply_plan, load_plan, topological_order
+        from .batch_plan import BatchPlanError, apply_plan, load_plan
+        from .batch_plan import topological_order as batch_topological_order
         from .batch_plan import validate_plan as validate_batch_plan
 
         def _known_ids(project_arg: str | None) -> list[str] | None:
@@ -807,7 +825,7 @@ def main(argv: list[str] | None = None) -> int:
                 _emit({"ok": False, "error": str(exc)})
                 return 1
             _emit({"ok": True, "tasks": len(plan["tasks"]),
-                   "order": topological_order(plan)})
+                   "order": batch_topological_order(plan)})
             return 0
         # batch-plan apply — needs the engine (root/run/project).
         if not args.root or not args.run or not args.project:
@@ -896,14 +914,7 @@ def main(argv: list[str] | None = None) -> int:
         from .usage_probe import resolve_util
 
         util_pct, _ = resolve_util(args.util)
-        util_provider = None
-        if args.util == "auto":
-            from .usage_probe import read_usage
-
-            def util_provider() -> float:  # re-probe each tick so the gate tracks reality
-                usage = read_usage()
-                return usage.five_hour_pct if usage else 0.0
-
+        util_provider = _auto_util_provider() if args.util == "auto" else None
         try:
             summary = drive_queue(
                 eng, QueueFile(args.queue_file), registry_runner(eng.registry),
@@ -985,13 +996,13 @@ def main(argv: list[str] | None = None) -> int:
         # dispatches with no outstanding lease, so they take the normal path.
         work = eng.next_work(args.run, args.task, util_pct=util_pct, resume=args.resume)
         while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
-            result = eng.registry.resolve(work.lane_policy).dispatch(work)
-            eng.record(args.run, result)
+            stage_result = eng.registry.resolve(work.lane_policy).dispatch(work)
+            eng.record(args.run, stage_result)
             work = eng.next_work(args.run, args.task, util_pct=util_pct)
         _emit(None if work is None else json.loads(work.model_dump_json()))
     elif args.cmd == "record":
-        result = StageResult.model_validate_json(Path(args.result).read_text())
-        _emit(eng.record(args.run, result))
+        stage_result = StageResult.model_validate_json(Path(args.result).read_text())
+        _emit(eng.record(args.run, stage_result))
     elif args.cmd == "dispatchable":
         from .scheduler import Scheduler
 
@@ -1018,14 +1029,7 @@ def main(argv: list[str] | None = None) -> int:
         from .scheduler import Scheduler
 
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
-        util_provider = None
-        if args.util == "auto":
-            from .usage_probe import read_usage
-
-            def util_provider() -> float:  # re-probe each tick so the gate tracks reality
-                usage = read_usage()
-                return usage.five_hour_pct if usage else 0.0
-
+        util_provider = _auto_util_provider() if args.util == "auto" else None
         _emit(sched.run(
             args.run, registry_runner(eng.registry), util_pct=util_pct,
             util_provider=util_provider, sleeper=time.sleep if args.wait else None,
@@ -1044,11 +1048,16 @@ def main(argv: list[str] | None = None) -> int:
         task = eng.reject(args.run, args.task, rejected_by=args.by, reason=args.reason)
         _emit({"rejected": task.task_id, "state": task.state.value, "by": args.by})
     elif args.cmd == "abandon":
+        # args.disposition is an argparse Namespace attr (typed Any), so abandon()'s
+        # Literal never bites at this call site. Narrow it to the Literal here — the
+        # argparse choices=["failed", "rejected"] above is the runtime source of truth
+        # that makes the cast sound — so mypy now flags a non-Literal disposition (#194).
+        disposition = cast(Literal["failed", "rejected"], args.disposition)
         task = eng.abandon(args.run, args.task, reason=args.reason,
-                           disposition=args.disposition, min_idle_s=args.min_idle_s,
+                           disposition=disposition, min_idle_s=args.min_idle_s,
                            force=args.force)
         _emit({"abandoned": task.task_id, "state": task.state.value,
-               "disposition": args.disposition})
+               "disposition": disposition})
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
