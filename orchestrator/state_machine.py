@@ -80,8 +80,9 @@ def begin_stage(
     rec.model = model
     # #172 assignment convention: validate_assignment on the status models coerces a
     # bare "high" to Effort.HIGH right here (and rejects an invalid string) — no
-    # explicit Effort(...) wrap needed.
-    rec.effort = effort
+    # explicit Effort(...) wrap needed. mypy sees only the declared Effort field type
+    # and can't model the runtime coercion, so the str arm needs a targeted ignore.
+    rec.effort = effort  # type: ignore[assignment]
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now
@@ -100,8 +101,9 @@ def apply_result(
     rec.completed_at = now
     rec.model = result.model
     # #139: fold the ran-at effort, mirroring model; the #172 assignment convention
-    # (validate_assignment) coerces the result's bare string to the Effort enum.
-    rec.effort = result.effort
+    # (validate_assignment) coerces the result's bare string to the Effort enum. mypy
+    # can't model that runtime coercion, so the str→Effort write needs a targeted ignore.
+    rec.effort = result.effort  # type: ignore[assignment]
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd

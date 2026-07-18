@@ -14,8 +14,9 @@ pipelines schema v2, session continuity, checkpoints, approval gate — see
 issues. Ongoing work is incremental — pick from the issue tracker or fix-forward.
 
 ## Working norms
-- **Tests + lint, every change:** `uv run pytest` (835 cases) and `uv run ruff check .`
-  must stay green. Add a regression test with each fix.
+- **Tests + lint + types, every change:** `uv run pytest`, `uv run ruff check .`, and
+  `uv run mypy` must stay green (the same trio CI enforces — `.github/workflows/ci.yml`).
+  Add a regression test with each fix.
 - **GitHub issues are the scope ledger** (`gh issue list -R cperler/orchestration-template`).
   Nothing is silently dropped: anything cut, thinned, or found-missing gets an issue labeled
   `deferred-scope` (with source / why / trigger-to-revisit), re-dispositioned at each gate

@@ -33,6 +33,7 @@ import re
 import subprocess
 from pathlib import Path
 
+from adapters.project.base import ProjectConfig
 from orchestrator.port_registry import (
     port_env_for,
     project_needs_ports,
@@ -59,7 +60,7 @@ class _SetupError(Exception):
 class DeterministicSetupRunner:
     """In-process runner for the deterministic ENGINE lane (currently: intake setup)."""
 
-    def __init__(self, project: object, *, base_ref: str = "HEAD") -> None:
+    def __init__(self, project: ProjectConfig, *, base_ref: str = "HEAD") -> None:
         self._project = project  # ProjectConfig (install_cmd; optional setup_task override)
         self._base_ref = base_ref
 

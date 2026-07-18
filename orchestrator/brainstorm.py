@@ -214,7 +214,7 @@ def file_selected(
     picks = _resolve_selection(ranked, selected)
     area = doc["area"]
 
-    create = getattr(task_source, "create_task", None)
+    create: Any = getattr(task_source, "create_task", None)
     if not dry_run and not callable(create):
         raise BrainstormError(
             "task source cannot file issues: it exposes no create_task(title, body, "

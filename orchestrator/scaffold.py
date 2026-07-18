@@ -583,10 +583,13 @@ def scaffold_adapter(
       ``<dest_dir>/<name>/`` — the project-owned layout (``<repo>/.orchestration/``),
       loadable by path via ``orchestrator --project <package_dir>``.
     """
-    if package_dir is None and dest_dir is None:
+    if package_dir is not None:
+        pkg = Path(package_dir)
+    elif dest_dir is not None:
+        pkg = Path(dest_dir) / name.replace("-", "_")
+    else:
         raise ValueError("scaffold_adapter needs dest_dir or package_dir")
     manifest = load_kit_manifest()
-    pkg = Path(package_dir) if package_dir is not None else Path(dest_dir) / name.replace("-", "_")
     pkg.mkdir(parents=True, exist_ok=True)
     cls = _class_name(name)
 

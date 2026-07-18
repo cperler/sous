@@ -268,7 +268,7 @@ def file_spec(spec: dict, task_source: Any, *, dry_run: bool = False) -> dict:
     by_id = {t["id"]: t for t in spec["tasks"]}
     label = spec_label(spec)
 
-    create = getattr(task_source, "create_task", None)
+    create: Any = getattr(task_source, "create_task", None)
     if not dry_run and not callable(create):
         raise SpecError(
             "task source cannot file issues: it exposes no create_task(title, body, "
