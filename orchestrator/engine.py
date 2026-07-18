@@ -531,7 +531,9 @@ class Engine:
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
         # sources — never a second selection mechanism.
         deterministic = spec.deterministic or stage in task.deterministic_stages
-        effort: str | None = None
+        # Effort IS a str (StrEnum), so the resolved pin/spec enum and a downshifted bare
+        # string flow identically into the WorkItem/hash/events (#172).
+        effort: str | Effort | None = None
         if deterministic:
             # No model: route to the in-process ENGINE lane (a shell runner does the work).
             # heysoo #227 — don't ask an LLM to run `git worktree add` / `gh pr create`.
@@ -558,10 +560,10 @@ class Engine:
             # Effort resolution (#96), mirroring the model precedence: an explicit
             # per-task effort pin overrides the stage-spec default (scope/implement
             # high, test/review medium, deliver low). None (a spec without a default)
-            # means "provider default" and emits exactly today's dispatch.
-            effort = (task.effort_pin.value if task.effort_pin is not None else None) or (
-                spec.effort.value if spec.effort is not None else None
-            )
+            # means "provider default" and emits exactly today's dispatch. No ``.value``
+            # extraction (#172): Effort is a StrEnum, so it hashes/serializes/compares
+            # as its "high" value everywhere downstream (WorkItem, events, argv).
+            effort = task.effort_pin or spec.effort
             # Capacity-aware downgrade (#12/#96): on a route_by_capacity run, when CURRENT
             # util is in the high band (>= downgrade_threshold, and < the per-call gate that
             # already blocked dispatch above), degrade a FRESH dispatch to keep progressing

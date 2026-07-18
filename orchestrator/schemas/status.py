@@ -26,7 +26,39 @@ from .enums import (
 )
 
 
-class StageRecord(BaseModel):
+class _StatusModel(BaseModel):
+    """Shared base for every status-document model: the typed-field assignment
+    convention (#172).
+
+    ``validate_assignment=True`` makes enum-typed fields self-coercing at ASSIGNMENT
+    time, not just on load: ``rec.effort = "high"`` stores ``Effort.HIGH`` and an
+    invalid string raises immediately at the write site. Use sites therefore never
+    need ad-hoc ``Effort(...)`` wraps or ``.value`` extractions — the #147
+    (StageRecord.effort) and #161 (Task.effort_pin) migrations both grew those
+    because assignment was lax. ``use_enum_values=False`` keeps the enum instance in
+    memory, while StrEnum serialization keeps the stored JSON byte-identical (a pin
+    still persists as ``"low"``).
+
+    Convention for future open-vocabulary-string -> enum migrations (the design note
+    #172 asks for) — each step is mechanical:
+
+    1. Give the vocabulary a ``StrEnum`` in ``schemas/enums.py`` whose values are
+       exactly today's stored strings.
+    2. Retype the field here from ``str`` to the enum. Loads coerce stored strings;
+       this base's ``validate_assignment`` coerces writes — so no ``.value`` calls
+       or explicit ``Enum(...)`` wraps are needed at any use site (StrEnum members
+       still compare and format as their string value).
+    3. Leave serialization alone: a StrEnum dumps as its value, so stored docs and
+       events stay byte-identical and no SCHEMA_VERSION bump is needed.
+    4. Pin it with a regression test: string assignment coerces, an invalid string
+       raises at assignment, and the JSON round-trip is unchanged (see
+       tests/test_status_assignment.py).
+    """
+
+    model_config = ConfigDict(use_enum_values=False, validate_assignment=True)
+
+
+class StageRecord(_StatusModel):
     """One stage's record inside a task document. Uniform shape — no omissions."""
 
     status: StageStatus = StageStatus.PENDING
@@ -57,7 +89,7 @@ class StageRecord(BaseModel):
     iteration: int | None = None  # adaptive loops (implement/test/review)
 
 
-class ResumeCursor(BaseModel):
+class ResumeCursor(_StatusModel):
     stage: Stage
     hint: str = ""
 
@@ -68,10 +100,8 @@ def _new_stage_map() -> dict[Stage, StageRecord]:
     return {s: StageRecord() for s in Stage}
 
 
-class Task(BaseModel):
+class Task(_StatusModel):
     """Per-task document (status-<run>-<task>.json)."""
-
-    model_config = ConfigDict(use_enum_values=False)
 
     schema_version: str = SCHEMA_VERSION
     document_type: str = "task"
@@ -218,7 +248,7 @@ class Task(BaseModel):
         return self.state in TERMINAL_TASK_STATES
 
 
-class TaskRef(BaseModel):
+class TaskRef(_StatusModel):
     """Lightweight pointer in the run doc; ``state`` is an explicit derived cache."""
 
     task_id: str
@@ -226,7 +256,7 @@ class TaskRef(BaseModel):
     state: TaskState = TaskState.PENDING
 
 
-class Progress(BaseModel):
+class Progress(_StatusModel):
     """Derived view over task states — never stored."""
 
     total: int = 0
@@ -241,10 +271,8 @@ class Progress(BaseModel):
     closed_infeasible: int = 0
 
 
-class Run(BaseModel):
+class Run(_StatusModel):
     """Run/batch document (status-<run>.json)."""
-
-    model_config = ConfigDict(use_enum_values=False)
 
     schema_version: str = SCHEMA_VERSION
     document_type: str = "run"

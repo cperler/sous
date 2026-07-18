@@ -8,7 +8,10 @@ schema makes the crash marker unambiguous.
 
 from __future__ import annotations
 
+import contextlib
 import json
+
+from pydantic import ValidationError
 
 from .schemas.enums import (
     STAGE_ORDER,
@@ -75,9 +78,10 @@ def begin_stage(
     rec.error = None
     rec.attempt = attempt
     rec.model = model
-    # Coerce to the Effort enum (#147): validate_assignment is off, so the tightened
-    # StageRecord.effort field is only enum-coerced on load — do it explicitly here.
-    rec.effort = Effort(effort) if effort is not None else None
+    # #172 assignment convention: validate_assignment on the status models coerces a
+    # bare "high" to Effort.HIGH right here (and rejects an invalid string) — no
+    # explicit Effort(...) wrap needed.
+    rec.effort = effort
     task.current_stage = stage
     task.resume_cursor = ResumeCursor(stage=stage, hint=f"{stage.value} running (attempt {attempt})")
     task.updated_at = now
@@ -95,8 +99,9 @@ def apply_result(
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
-    # #139: fold the ran-at effort, mirroring model; coerce to the Effort enum (#147).
-    rec.effort = Effort(result.effort) if result.effort is not None else None
+    # #139: fold the ran-at effort, mirroring model; the #172 assignment convention
+    # (validate_assignment) coerces the result's bare string to the Effort enum.
+    rec.effort = result.effort
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd
@@ -228,11 +233,15 @@ def _absorb_outputs(task: Task, result: StageResult) -> None:
     the same result yields the same values)."""
     out = result.structured_output or {}
     # Dedicated pr_* fields stay: other consumers read them (_on_task_completed, status()).
+    # Tolerant here too, per the #172 assignment convention: validate_assignment rejects a
+    # malformed model-produced value (e.g. pr_number="") AT this write — skip it rather
+    # than crash record(). Before #172 the garbage landed silently and made the stored doc
+    # unloadable on its next read; dropping the bad value is strictly safer.
     if result.stage is Stage.DELIVER:
-        if "pr_number" in out:
-            task.pr_number = out.get("pr_number")
-        if "pr_url" in out:
-            task.pr_url = out.get("pr_url")
+        for field in ("pr_number", "pr_url"):
+            if field in out:
+                with contextlib.suppress(ValidationError):
+                    setattr(task, field, out[field])
     # Generalized fold: every whitelisted key present in the result, bounded.
     engine_lane = result.lane_used.execution_mode is ExecutionMode.ENGINE
     for key in CONTEXT_KEYS.get(result.stage, ()):
