@@ -8,6 +8,7 @@ dist/
 build/
 runs/
 specs/
+scratchpad/
 .worktrees/
 .claude/worktrees/
 .DS_Store
