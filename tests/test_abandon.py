@@ -267,33 +267,34 @@ def test_abandon_rejected_surfaces_rejection_and_publishes_note(tmp_path, projec
     assert _task_failed_notifications(eng) == []
 
 
-def test_abandon_applies_mutation_via_locked_update_task(tmp_path, project, monkeypatch) -> None:
-    # #108: the terminal transition is applied through the per-task locked read-modify-write
-    # (store.update_task on the FRESH doc), not a bare load_task + in-place mutate + save_task
-    # that could clobber a concurrent writer.
+def test_abandon_applies_mutation_via_locked_commit_task_events(tmp_path, project, monkeypatch) -> None:
+    # #108/#199: the terminal transition is applied through the per-task locked
+    # read-modify-write (store.commit_task_events on the FRESH doc, which also commits the
+    # `dispatch_abandoned` event atomically with the task doc), not a bare load_task +
+    # in-place mutate + save_task that could clobber a concurrent writer.
     eng = _engine(tmp_path, project)
     _mid_dispatch(eng)
 
-    update_calls: list[tuple[str, str]] = []
+    commit_calls: list[tuple[str, str]] = []
     save_calls: list[str] = []
-    real_update = eng.store.update_task
+    real_commit = eng.store.commit_task_events
     real_save = eng.store.save_task
 
-    def spy_update(run_id, task_id, mutator):
-        update_calls.append((run_id, task_id))
-        return real_update(run_id, task_id, mutator)
+    def spy_commit(run_id, task_id, mutator, events=None):
+        commit_calls.append((run_id, task_id))
+        return real_commit(run_id, task_id, mutator, events)
 
     def spy_save(task):
         save_calls.append(task.task_id)
         return real_save(task)
 
-    monkeypatch.setattr(eng.store, "update_task", spy_update)
+    monkeypatch.setattr(eng.store, "commit_task_events", spy_commit)
     monkeypatch.setattr(eng.store, "save_task", spy_save)
 
     task = eng.abandon("r1", "t1", reason="orphaned")
 
-    # The mutation went through the locked update_task path...
-    assert ("r1", "t1") in update_calls
+    # The mutation went through the locked commit_task_events path...
+    assert ("r1", "t1") in commit_calls
     # ...and NOT through a bare save_task (the old load+mutate+save escape is gone).
     assert save_calls == []
     # The transition still landed atomically: lease cleared, terminal state, counter bumped.
@@ -304,6 +305,25 @@ def test_abandon_applies_mutation_via_locked_update_task(tmp_path, project, monk
     persisted = eng.store.load_task("r1", "t1")
     assert persisted.state is TaskState.FAILED
     assert persisted.pending_work_item_id is None
+
+
+def test_abandon_commits_event_atomically_with_the_task_doc(tmp_path, project) -> None:
+    # #199: abandon routes the terminal transition through commit_task_events, so the
+    # `dispatch_abandoned` event is appended (first) atomically with the task-doc write
+    # (last). A crash in the task-doc write leaves the event durable while the task doc still
+    # holds its outstanding lease — no terminal task with a missing transition event.
+    eng = _engine(tmp_path, project)
+    _mid_dispatch(eng)
+    orig_write = eng.store._write_task
+    eng.store._write_task = lambda _t: (_ for _ in ()).throw(RuntimeError("boom"))
+    with pytest.raises(RuntimeError):
+        eng.abandon("r1", "t1", reason="orphaned")
+    eng.store._write_task = orig_write
+    events = [e for e in eng.store.read_events("r1") if e["type"] == "dispatch_abandoned"]
+    assert len(events) == 1  # event durable...
+    doc = eng.store.load_task("r1", "t1")
+    assert doc.pending_work_item_id is not None  # ...task never advanced (lease still held)
+    assert doc.state not in TERMINAL_TASK_STATES
 
 
 def test_cli_abandon_releases_lease_and_finalizes(tmp_path, capsys) -> None:
