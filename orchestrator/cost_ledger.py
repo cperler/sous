@@ -133,10 +133,15 @@ class CostLedger:
             bucket["input_tokens"] += row.get("input_tokens", 0) or 0
             bucket["output_tokens"] += row.get("output_tokens", 0) or 0
             bucket["cost_usd"] = round(bucket["cost_usd"] + cost, 6)
-            # Per-effort spend rollup (#145/#152): None -> '(default)' so effort-less rows
-            # (deterministic ENGINE-lane stages, specs without a default) still bucket cleanly.
+            # Per-effort spend rollup (#145/#152): a genuinely-absent effort (None/missing)
+            # -> '(default)' so effort-less rows (deterministic ENGINE-lane stages, specs
+            # without a default) still bucket cleanly. An explicit ``is None`` guard, not a
+            # falsy one, so a present-but-empty '' effort surfaces as its own bucket — the
+            # data anomaly it is — instead of hiding under '(default)' (#180).
+            effort = row.get("effort")
             ebucket = by_effort_spend.setdefault(
-                row.get("effort") or "(default)", {"invocations": 0, "cost_usd": 0.0}
+                "(default)" if effort is None else effort,
+                {"invocations": 0, "cost_usd": 0.0},
             )
             ebucket["invocations"] += 1
             ebucket["cost_usd"] = round(ebucket["cost_usd"] + cost, 6)
@@ -198,7 +203,10 @@ class CostLedger:
         groups: dict[tuple[str, str, str], dict] = {}
         for row in rows:
             stage = row.get("stage", "unknown")
-            effort = row.get("effort") or "(default)"
+            raw_effort = row.get("effort")
+            # ``is None`` (not falsy) so a present-but-empty '' effort surfaces as its own
+            # anomalous group rather than silently folding into '(default)' (#180).
+            effort = "(default)" if raw_effort is None else raw_effort
             model = row.get("model", "unknown")
             key = (stage, effort, model)
             g = groups.setdefault(
