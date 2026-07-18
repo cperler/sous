@@ -5,6 +5,10 @@ run-level ``progress`` counters are DERIVED, not stored. Every stage record has 
 same shape with ``started_at`` ALWAYS present (null until running) — fixing the
 as-built writer omission. model/provider/cost/tokens live on the stage record, so
 cost is traceable to the exact stage+model (closes D6 at the schema level).
+
+All models here inherit ``_StatusModel``, the typed-field assignment convention
+(#172): enum-typed fields coerce bare strings at assignment time and reject invalid
+ones at the write site. See its docstring for the migration recipe.
 """
 
 from __future__ import annotations

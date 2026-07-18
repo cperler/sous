@@ -229,8 +229,9 @@ def _enforce_context_ceiling(task: Task) -> None:
 def _absorb_outputs(task: Task, result: StageResult) -> None:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
-    missing whitelisted key is skipped) and idempotent (a stage succeeds once; re-folding
-    the same result yields the same values)."""
+    missing whitelisted key is skipped; a pr_* value that fails field validation is
+    dropped rather than raised or stored, #172) and idempotent (a stage succeeds once;
+    re-folding the same result yields the same values)."""
     out = result.structured_output or {}
     # Dedicated pr_* fields stay: other consumers read them (_on_task_completed, status()).
     # Tolerant here too, per the #172 assignment convention: validate_assignment rejects a
