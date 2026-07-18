@@ -46,6 +46,18 @@ MAX_JITTER_S = 300
 DOWNGRADE_THRESHOLD = 70.0
 DOWNGRADE_STEPS = 1
 
+# --- Effort-aware adaptive band (#155, closes the #96/#141 loop) --------------
+# ``by_effort()`` now yields empirical retry/failure rates per (stage, effort). Feed that
+# back into the band so a downshift is DATA-DRIVEN, not one flat threshold: a (stage,
+# effort) group that historically retries/fails MORE gets a SMALLER (less-eager) DOWNGRADE
+# band — raise its lower edge toward the per-call gate so it keeps running at full effort
+# a while longer (a downshift that just gets retried is false economy). ADAPTIVE_BAND_SLOPE
+# is how many utilization points the threshold rises per unit observed rate (rate in
+# [0,1]); ADAPTIVE_BAND_MARGIN keeps the raised threshold strictly BELOW the per-call gate
+# so the DOWNGRADE band can shrink but never collapse into WAIT.
+ADAPTIVE_BAND_SLOPE = 20.0
+ADAPTIVE_BAND_MARGIN = 1.0
+
 
 class DispatchBand(StrEnum):
     """What CURRENT utilization says about a fresh dispatch's MODEL (not its count)."""
@@ -64,6 +76,14 @@ class CapacityPolicy:
     # per-call gate to be reachable.
     downgrade_threshold: float = DOWNGRADE_THRESHOLD
     downgrade_steps: int = DOWNGRADE_STEPS
+    # Effort-aware adaptive band (#155): when on, the engine raises a (stage, effort)
+    # group's downgrade_threshold by ``adaptive_band_slope`` * observed_rate (empirical
+    # retry/failure rate from ``CostLedger.by_effort()``), clamped to stay
+    # ``adaptive_band_margin`` below the per-call gate. Off -> the flat threshold, i.e.
+    # exactly the pre-#155 band. Tunable so the control loop can be dialed or disabled.
+    adaptive_band: bool = True
+    adaptive_band_slope: float = ADAPTIVE_BAND_SLOPE
+    adaptive_band_margin: float = ADAPTIVE_BAND_MARGIN
     min_sleep_s: int = MIN_SLEEP_S
     max_sleep_s: int = MAX_SLEEP_S  # cap on a single wait
     buffer_s: int = RESET_BUFFER_S  # added to a computed reset wait
@@ -93,22 +113,52 @@ class CapacityPolicy:
             allowed = ceiling
         return min(allowed, ceiling)
 
-    def dispatch_band(self, util_pct: float) -> DispatchBand:
+    def effort_downgrade_threshold(self, observed_rate: float) -> float:
+        """Adaptive lower edge of the DOWNGRADE band for one (stage, effort) group (#155).
+
+        Closes the loop #96 opened and #141 measured: ``by_effort()`` gives an empirical
+        retry/failure ``observed_rate`` in [0, 1] per (stage, effort); this turns that
+        observation into control. The base ``downgrade_threshold`` is raised, MONOTONICALLY
+        in the rate, by ``adaptive_band_slope`` * rate — a higher rate yields a HIGHER
+        threshold, i.e. a SMALLER, less-eager DOWNGRADE band (a group that retries when
+        downshifted keeps full effort longer). Clamped to ``[downgrade_threshold,
+        per_call_threshold - adaptive_band_margin]`` so it never drops below the flat base
+        and stays strictly below the per-call gate — the band shrinks but never collapses
+        into WAIT. With ``adaptive_band`` off (or a non-positive slope) it is a no-op that
+        returns the flat ``downgrade_threshold``, i.e. exactly the pre-#155 behavior.
+        """
+
+        if not self.adaptive_band or self.adaptive_band_slope <= 0:
+            return self.downgrade_threshold
+        rate = min(1.0, max(0.0, observed_rate))
+        raised = self.downgrade_threshold + self.adaptive_band_slope * rate
+        ceiling = max(self.downgrade_threshold, self.per_call_threshold - self.adaptive_band_margin)
+        return min(raised, ceiling)
+
+    def dispatch_band(
+        self, util_pct: float, downgrade_threshold: float | None = None
+    ) -> DispatchBand:
         """Cheap-dispatch band (#12): CURRENT util -> a fresh dispatch's model behavior.
 
         Named band table (the capacity sibling of ``cost_policy``'s budget-fraction map),
         ORTHOGONAL to ``dispatch_limit``: this picks the model, that picks how many tasks.
         - util >= per_call (90): WAIT — no dispatch (``at_capacity`` already blocks it).
-        - util >= downgrade (70): DOWNGRADE — keep progressing on a cheaper model.
+        - util >= downgrade edge: DOWNGRADE — keep progressing on a cheaper model.
         - else: NORMAL — role default.
         The DOWNGRADE band deliberately spans BOTH the throttle-to-1 range (80–90) and the
         full-ceiling range (70–80): the model choice and the concurrency cap are separate
         decisions that compose.
+
+        ``downgrade_threshold`` overrides the flat ``self.downgrade_threshold`` for one
+        decision — the engine passes a per-(stage, effort) adaptive edge from
+        ``effort_downgrade_threshold`` (#155). It must stay < ``per_call_threshold`` (the
+        adaptive computation guarantees this) or the DOWNGRADE band would be dead.
         """
 
+        threshold = self.downgrade_threshold if downgrade_threshold is None else downgrade_threshold
         if util_pct >= self.per_call_threshold:
             return DispatchBand.WAIT
-        if util_pct >= self.downgrade_threshold:
+        if util_pct >= threshold:
             return DispatchBand.DOWNGRADE
         return DispatchBand.NORMAL
 
