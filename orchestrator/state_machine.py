@@ -59,7 +59,7 @@ def begin_stage(
     now: str,
     model: str,
     attempt: int = 0,
-    effort: str | Effort | None = None,
+    effort: Effort | None = None,
 ) -> None:
     """Mark a stage running and point the resume cursor at it.
 

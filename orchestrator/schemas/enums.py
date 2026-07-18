@@ -8,6 +8,18 @@ change and must bump SCHEMA_VERSION.
 from __future__ import annotations
 
 from enum import StrEnum
+from typing import NewType
+
+# The model id an attribution field carries (WorkItem/StageResult.model). An OPEN
+# newtype over ``str`` — deliberately NOT a closed StrEnum: the model roster is
+# project-configurable and ids are RETIRED over time, so a StageResult/record naming a
+# since-removed model must still load (the backward-compat regression documented in
+# commit 956bec1 that kept the model half of #161 open). The newtype tightens intent at
+# the type layer — a model id is not just any string — while staying byte-identical to a
+# bare str at runtime (it serializes/hashes/compares exactly as its value), so no
+# SCHEMA_VERSION bump. ``model_table`` keeps its own open-string keying for the same
+# configurable/retired-id tolerance.
+ModelId = NewType("ModelId", str)
 
 # v2: Task carries its own `pipeline` (ordered stage list); v1 docs derive it from
 # execution_lane on load (2026-07-01 design pass §1).
@@ -66,14 +78,15 @@ class Effort(StrEnum):
 EFFORT_ORDER: tuple[Effort, ...] = (Effort.LOW, Effort.MEDIUM, Effort.HIGH)
 
 
-def effort_below(effort: str | Effort | None) -> str | None:
+def effort_below(effort: Effort | None) -> Effort | None:
     """One step DOWN the effort ordering (high -> medium -> low), or None at the floor /
     when unset — the effort analog of ``ModelTable.fallback_after``. The capacity
-    DOWNGRADE band tries this lever BEFORE a model downgrade (#96)."""
+    DOWNGRADE band tries this lever BEFORE a model downgrade (#96). The value is always
+    resolved to an ``Effort`` before the call (#161/#202), so no ``str`` coercion here."""
     if effort is None:
         return None
-    idx = EFFORT_ORDER.index(Effort(effort))
-    return EFFORT_ORDER[idx - 1].value if idx > 0 else None
+    idx = EFFORT_ORDER.index(effort)
+    return EFFORT_ORDER[idx - 1] if idx > 0 else None
 
 
 def resolve_effort(name: str) -> Effort:

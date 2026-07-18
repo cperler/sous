@@ -564,9 +564,11 @@ class Engine:
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
         # sources — never a second selection mechanism.
         deterministic = spec.deterministic or stage in task.deterministic_stages
-        # Effort IS a str (StrEnum), so the resolved pin/spec enum and a downshifted bare
-        # string flow identically into the WorkItem/hash/events (#172).
-        effort: str | Effort | None = None
+        # Resolved to an Effort (from the task pin or stage spec) or downshifted via
+        # effort_below below — always an Effort member or None (#161/#202 narrowed the
+        # transitional ``str | Effort | None``). StrEnum, so it flows identically into the
+        # WorkItem/hash/events (#172).
+        effort: Effort | None = None
         if deterministic:
             # No model: route to the in-process ENGINE lane (a shell runner does the work).
             # heysoo #227 — don't ask an LLM to run `git worktree add` / `gh pr create`.

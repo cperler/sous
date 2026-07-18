@@ -16,7 +16,9 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from .enums import (
     SCHEMA_VERSION,
+    Effort,
     ExecutionMode,
+    ModelId,
     Provider,
     ResultStatus,
     Stage,
@@ -57,10 +59,10 @@ def compute_content_hash(
     stage: Stage,
     prompt: str,
     schema_ref: str,
-    model: str,
+    model: ModelId,
     lane_policy: LanePolicy,
     attempt: int,
-    effort: str | None = None,
+    effort: Effort | None = None,
 ) -> str:
     """Idempotency key for a dispatch.
 
@@ -96,13 +98,17 @@ class WorkItem(BaseModel):
     attempt: int = 0
     prompt: str  # fully rendered by the engine
     schema_ref: str  # key/path the runner fetches; the engine does not interpret it
-    model: str
+    # #161/#202: an OPEN ``ModelId`` newtype over str (not a closed enum) — a retired id
+    # still loads. Serializes/hashes byte-identically to the bare-str shape.
+    model: ModelId
     # Reasoning effort this dispatch runs at (#96): an Effort value ("low"/"medium"/"high"),
     # or None for the provider default (every pre-#96 dispatch). Routing CONTENT like
     # ``model`` — it is folded into content_hash — translated per execution adapter
     # (claude ``--effort``, codex ``model_reasoning_effort``); deterministic ENGINE-lane
-    # stages never carry one.
-    effort: str | None = None
+    # stages never carry one. #161/#202: tightened from ``str | None`` to ``Effort | None``
+    # — pydantic coerces a bare "high" to Effort.HIGH at construction; StrEnum serializes as
+    # its value, so the stored shape is unchanged (no SCHEMA_VERSION bump).
+    effort: Effort | None = None
     agent: str | None = None  # persona the runner dispatches (from the project roster)
     lane_policy: LanePolicy
     timeout_s: int | None = None
@@ -164,10 +170,10 @@ class WorkItem(BaseModel):
         stage: Stage,
         prompt: str,
         schema_ref: str,
-        model: str,
+        model: ModelId,
         lane_policy: LanePolicy,
         created_at: str,
-        effort: str | None = None,
+        effort: Effort | None = None,
         agent: str | None = None,
         attempt: int = 0,
         timeout_s: int | None = None,
@@ -226,12 +232,16 @@ class StageResult(BaseModel):
     task_id: str
     stage: Stage
     attempt: int = 0
-    model: str  # the model id the runner used — priced by the single model_table
+    # the model id the runner used — priced by the single model_table. #161/#202: an OPEN
+    # ``ModelId`` newtype (not a closed enum) so a result naming a retired id still loads.
+    model: ModelId
     # The reasoning effort the dispatch ran at (#96), echoed from the WorkItem so the
     # cost-ledger row and stage events can attribute effort alongside model. Pure audit
     # metadata — it never feeds a verdict or a transition. None on effort-less dispatches
-    # (every pre-#96 result) and the deterministic ENGINE lane.
-    effort: str | None = None
+    # (every pre-#96 result) and the deterministic ENGINE lane. #161/#202: tightened from
+    # ``str | None`` to ``Effort | None`` (StrEnum serializes as its value — stored shape
+    # unchanged).
+    effort: Effort | None = None
     status: ResultStatus
     structured_output: dict | None = None
     raw_output: str | None = None
