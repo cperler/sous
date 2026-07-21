@@ -65,6 +65,8 @@ def begin_stage(
 
     Clears completed_at/error from any prior attempt so a RUNNING record with a
     null completed_at is an unambiguous crash marker (resume_point relies on this).
+    Also clears the task-level ``last_error`` (#213) so a stale prior-attempt error
+    can't leak into a later reader across a review-fix cycle.
 
     Stamps ``effort`` (#96/#138/#139) alongside ``model`` so the dispatched reasoning
     effort is durable on the stage record even before the result returns — a crash
@@ -76,6 +78,13 @@ def begin_stage(
     rec.started_at = now
     rec.completed_at = None
     rec.error = None
+    # #213/#184: clear the TASK-level last_error at attempt start too. apply_result sets
+    # task.last_error on a FAILED result and _apply_review_rejection sets it when a review
+    # cycle parks the task; nothing cleared it, so across a review-fix cycle a later reader
+    # (e.g. the BLOCKED_ON_HUMAN notification reason) could surface a stale prior error.
+    # Resetting here — the start of every fresh stage attempt — kills that class at the
+    # source; apply_result re-sets it if THIS attempt fails.
+    task.last_error = None
     rec.attempt = attempt
     rec.model = model
     # #172 assignment convention: validate_assignment on the status models coerces a
