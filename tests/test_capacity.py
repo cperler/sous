@@ -93,6 +93,61 @@ def test_downgrade_threshold_is_tunable() -> None:
     assert lax.dispatch_band(49) is DispatchBand.NORMAL
 
 
+# --- effort-aware adaptive band (#155) ---------------------------------------
+
+def test_effort_threshold_at_zero_rate_is_base() -> None:
+    # A group that never retries -> the flat base threshold, no adjustment.
+    assert P.effort_downgrade_threshold(0.0) == P.downgrade_threshold
+
+
+def test_effort_threshold_monotonic_in_rate() -> None:
+    # Higher observed retry/failure rate -> higher threshold (smaller, less-eager band).
+    rates = [0.0, 0.1, 0.25, 0.5, 0.75, 1.0]
+    vals = [P.effort_downgrade_threshold(r) for r in rates]
+    assert vals == sorted(vals)
+    assert vals[-1] > vals[0]  # a fully-retrying group is strictly less eager to downshift
+
+
+def test_effort_threshold_clamped_below_per_call() -> None:
+    # Even at rate 1.0 (and a steep slope), the edge stays strictly below the per-call gate
+    # so the DOWNGRADE band shrinks but never collapses into WAIT.
+    steep = CapacityPolicy(adaptive_band_slope=999.0)
+    edge = steep.effort_downgrade_threshold(1.0)
+    assert edge < steep.per_call_threshold
+    assert edge == steep.per_call_threshold - steep.adaptive_band_margin
+
+
+def test_effort_threshold_rate_clamped_to_unit_interval() -> None:
+    # Out-of-range rates are clamped, not extrapolated.
+    assert P.effort_downgrade_threshold(-1.0) == P.effort_downgrade_threshold(0.0)
+    assert P.effort_downgrade_threshold(5.0) == P.effort_downgrade_threshold(1.0)
+
+
+def test_effort_threshold_disabled_is_flat() -> None:
+    off = CapacityPolicy(adaptive_band=False)
+    assert off.effort_downgrade_threshold(1.0) == off.downgrade_threshold
+    # A non-positive slope disables it too (no divide-by-anything, just a no-op).
+    flat = CapacityPolicy(adaptive_band_slope=0.0)
+    assert flat.effort_downgrade_threshold(1.0) == flat.downgrade_threshold
+
+
+def test_dispatch_band_override_shrinks_band_at_edge() -> None:
+    # A raised per-decision threshold flips a util that WOULD downshift at the flat edge
+    # back to NORMAL, and leaves clearly-in-band util still DOWNGRADE.
+    high_rate_edge = P.effort_downgrade_threshold(1.0)  # 89 with defaults
+    assert P.dispatch_band(75) is DispatchBand.DOWNGRADE  # flat edge: in band
+    assert P.dispatch_band(75, high_rate_edge) is DispatchBand.NORMAL  # raised edge: out
+    assert P.dispatch_band(high_rate_edge, high_rate_edge) is DispatchBand.DOWNGRADE
+    # The override never overrides the per-call WAIT gate.
+    assert P.dispatch_band(95, 50.0) is DispatchBand.WAIT
+
+
+def test_dispatch_band_override_none_is_flat() -> None:
+    # Passing no override is identical to the flat single-arg call.
+    for util in (0, 69, 70, 85, 89, 90, 95):
+        assert P.dispatch_band(util, None) is P.dispatch_band(util)
+
+
 # --- seedable, bounded jitter (#4) -------------------------------------------
 
 def test_jitter_within_bounds_seeded() -> None:

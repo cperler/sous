@@ -126,6 +126,82 @@ def test_capacity_downgrade_model_only_when_effort_at_floor(tmp_path, project) -
     assert _effort_events(eng) == []
 
 
+# --- effort-aware adaptive band (#155, closes the #96/#141 loop) --------------
+
+def _seed_group(eng, stage: Stage, effort: str, *, n: int, attempt: int, status: str) -> None:
+    """Append `n` synthetic ledger rows for a (stage, effort) group so by_effort() reports
+    a retry/failure history the adaptive band can react to."""
+    import json
+    eng.ledger.path.parent.mkdir(parents=True, exist_ok=True)
+    with eng.ledger.path.open("a", encoding="utf-8") as fh:
+        for i in range(n):
+            fh.write(json.dumps({
+                "ts": "2026-07-18T00:00:00Z", "run_id": "seed", "task_id": f"s{i}",
+                "stage": stage.value, "effort": effort, "model": "claude-opus-4-8",
+                "attempt": attempt, "status": status, "cost_usd": 0.0, "duration_s": 1.0,
+            }) + "\n")
+
+
+def test_adaptive_band_high_retry_group_not_downshifted(tmp_path, project) -> None:
+    """A (stage, effort) group whose history retries heavily gets a SMALLER band: at a util
+    that downshifts a low-retry stage, this stage keeps full effort (edge raised past util)."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", route_by_capacity=True)
+    eng.add_task("r1", "t1")
+    # scope@high has always retried (rate 1.0) -> edge rises to ~89, above util 75.
+    _seed_group(eng, Stage.SCOPE, "high", n=6, attempt=1, status="success")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    w = eng.next_work("r1", "t1", util_pct=75)
+    assert w.stage is Stage.SCOPE and w.effort == "high"  # NOT downshifted — smaller band
+    assert _effort_events(eng) == [] and _downgrade_events(eng) == []
+
+
+def test_adaptive_band_low_retry_group_still_downshifts_with_audit(tmp_path, project) -> None:
+    """A group with ample, clean history keeps the base edge -> still downshifts at util 75,
+    and the event carries the observed rate, sample size, and effective threshold (auditable)."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", route_by_capacity=True)
+    eng.add_task("r1", "t1")
+    _seed_group(eng, Stage.SCOPE, "high", n=6, attempt=0, status="success")  # rate 0.0
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    w = eng.next_work("r1", "t1", util_pct=75)
+    assert w.effort == "medium"  # base edge held -> downshifted one step as pre-#155
+    ev = _effort_events(eng)
+    assert len(ev) == 1
+    assert ev[0]["observed_rate"] == 0.0 and ev[0]["sample_size"] == 6
+    assert ev[0]["downgrade_threshold"] == eng.capacity.downgrade_threshold
+
+
+def test_adaptive_band_min_sample_guard_falls_back(tmp_path, project) -> None:
+    """Sparse history (below the min-sample floor) is too noisy to trust: the band falls
+    back to today's flat threshold and the high-retry group downshifts as before."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", route_by_capacity=True)
+    eng.add_task("r1", "t1")
+    # Only 2 rows (< ADAPTIVE_BAND_MIN_SAMPLE) even though all retried -> ignored.
+    _seed_group(eng, Stage.SCOPE, "high", n=2, attempt=1, status="success")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    w = eng.next_work("r1", "t1", util_pct=75)
+    assert w.effort == "medium"  # flat-threshold fallback -> downshifted
+    ev = _effort_events(eng)
+    assert len(ev) == 1
+    # Sparse data was NOT acted on: audit fields record the fallback (no rate moved the edge).
+    assert ev[0]["observed_rate"] is None and ev[0]["sample_size"] is None
+    assert ev[0]["downgrade_threshold"] == eng.capacity.downgrade_threshold
+
+
+def test_adaptive_band_disabled_ignores_history(tmp_path, project) -> None:
+    """With the adaptive band off, a heavy-retry history is ignored — the flat band stands."""
+    from orchestrator.capacity import CapacityPolicy
+    eng = _engine(tmp_path, project, capacity=CapacityPolicy(adaptive_band=False))
+    eng.create_run("r1", route_by_capacity=True)
+    eng.add_task("r1", "t1")
+    _seed_group(eng, Stage.SCOPE, "high", n=6, attempt=1, status="success")  # rate 1.0
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    w = eng.next_work("r1", "t1", util_pct=75)
+    assert w.effort == "medium"  # adaptive off -> flat edge -> downshifted despite history
+
+
 def test_capacity_downgrade_edges(tmp_path, project) -> None:
     """Band edges: 69 -> spec-default effort (no event); 70 -> effort downshifted."""
     for util, expect_effort in ((69, "high"), (70, "medium")):

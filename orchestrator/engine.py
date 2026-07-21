@@ -146,6 +146,12 @@ _UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop"})
 # the defect, so the safe default (reset to the checkpoint) stands.
 SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RATE_LIMITED})
 
+# Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
+# rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
+# is too noisy to act on, so the band falls back to the flat downgrade_threshold (today's
+# behavior) — an empty ledger and sparse early runs are unaffected.
+ADAPTIVE_BAND_MIN_SAMPLE = 5
+
 
 def _ref_safe(s: str) -> str:
     """Make an id safe inside a git ref component (tags: design pass §3). Conservative:
@@ -514,7 +520,10 @@ class Engine:
         default > None = provider default). On a route_by_capacity run in the DOWNGRADE
         band it degrades a fresh dispatch by the cheaper lever first: effort down one step
         (emitting ``effort_downgraded``) and only then the model (``model_downgraded``);
-        per-lever pins are exempt. Emitting stamps the dispatch lease
+        per-lever pins are exempt. The band edge is effort-aware (#155, closing the #96/#141
+        loop): a (stage, effort) group whose ledger history retries/fails more gets a
+        smaller, less-eager DOWNGRADE band (the ledger read is confined to the band-edge
+        util region and gated on a minimum sample). Emitting stamps the dispatch lease
         (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
         supervisor crash instead. Raises ``CapacityExhausted`` at the per-call gate or
         during a rate-limit cooldown, ``ContractError`` on a lease conflict.
@@ -634,27 +643,57 @@ class Engine:
                 run.route_by_capacity
                 and task.pending_fallback_model is None
                 and lane.allow_fallback
-                and self.capacity.dispatch_band(util_pct) is DispatchBand.DOWNGRADE
             ):
-                lowered = effort_below(effort) if task.effort_pin is None else None
-                if lowered is not None:
-                    self.store.append_event(
-                        run_id,
-                        {"ts": _now(), "type": "effort_downgraded", "run_id": run_id,
-                         "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
-                         "from": effort, "to": lowered},
-                    )
-                    effort = lowered
-                elif task.model_pin is None:
-                    downgraded = self._capacity_downgrade(model)
-                    if downgraded != model:
+                # Effort-aware adaptive band (#155, closes the #96/#141 loop): the flat
+                # downgrade_threshold becomes a per-(stage, effort) edge driven by empirical
+                # retry/failure history — a group that historically retries when downshifted
+                # gets a SMALLER band (higher edge) so it keeps full effort longer. The
+                # ledger read is confined to the band-edge region [base_edge, per_call): below
+                # base_edge it's NORMAL and above per_call it's WAIT (blocked above) no matter
+                # how the edge moves, so raising it can only flip DOWNGRADE->NORMAL there —
+                # everywhere else the flat threshold suffices and we skip the read.
+                threshold = self.capacity.downgrade_threshold
+                observed_rate = sample_size = None
+                if (
+                    self.capacity.adaptive_band
+                    and self.capacity.downgrade_threshold
+                    <= util_pct
+                    < self.capacity.per_call_threshold
+                ):
+                    observed_rate, sample_size = self._observed_downshift_rate(stage, effort)
+                    if (
+                        observed_rate is not None
+                        and sample_size is not None
+                        and sample_size >= ADAPTIVE_BAND_MIN_SAMPLE
+                    ):
+                        threshold = self.capacity.effort_downgrade_threshold(observed_rate)
+                    else:  # sparse/no history -> fall back to today's flat-threshold behavior
+                        observed_rate = sample_size = None
+                if self.capacity.dispatch_band(util_pct, threshold) is DispatchBand.DOWNGRADE:
+                    # Audit fields shared by both levers so an adaptive downshift is never
+                    # silent and the loop is inspectable: the observed rate + sample that
+                    # moved the edge (None when sparse/disabled) and the EFFECTIVE threshold.
+                    _adaptive = {"observed_rate": observed_rate, "sample_size": sample_size,
+                                 "downgrade_threshold": threshold}
+                    lowered = effort_below(effort) if task.effort_pin is None else None
+                    if lowered is not None:
                         self.store.append_event(
                             run_id,
-                            {"ts": _now(), "type": "model_downgraded", "run_id": run_id,
+                            {"ts": _now(), "type": "effort_downgraded", "run_id": run_id,
                              "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
-                             "from": model, "to": downgraded},
+                             "from": effort, "to": lowered, **_adaptive},
                         )
-                        model = downgraded
+                        effort = lowered
+                    elif task.model_pin is None:
+                        downgraded = self._capacity_downgrade(model)
+                        if downgraded != model:
+                            self.store.append_event(
+                                run_id,
+                                {"ts": _now(), "type": "model_downgraded", "run_id": run_id,
+                                 "task_id": task_id, "stage": stage.value, "util_pct": util_pct,
+                                 "from": model, "to": downgraded, **_adaptive},
+                            )
+                            model = downgraded
         # Attempt is derived from the persisted stage status, not rec.error:
         #  - RUNNING  -> a crash OR a rate-limit re-queue; re-dispatch the SAME attempt
         #  - FAILED   -> a real retry; bump
@@ -1969,6 +2008,29 @@ class Engine:
         return max(0.0, min(1.0, (run.budget_usd - spent) / run.budget_usd))
 
     # --- capacity-aware model downgrade (#12) ----------------------------------
+    def _observed_downshift_rate(
+        self, stage: Stage, effort: Effort | None
+    ) -> tuple[float | None, int | None]:
+        """Empirical instability of a (stage, effort) group from run history (#155).
+
+        Aggregates ``CostLedger.by_effort()`` across models for the resolved stage+effort
+        and returns ``(observed_rate, sample_size)`` — ``observed_rate`` is the worse of the
+        retry and failure rates (either signals a downshift that gets re-run, i.e. false
+        economy), ``sample_size`` the pooled invocation count. Returns ``(None, None)`` when
+        the group has no history so the caller falls back to the flat threshold. Effort is
+        matched by the SAME label ``by_effort`` buckets under: an effort-less dispatch keys
+        to ``(default)``, otherwise the Effort's string value (StrEnum)."""
+        effort_label = "(default)" if effort is None else str(effort)
+        invocations = retries = failures = 0
+        for g in self.ledger.by_effort():
+            if g.get("stage") == stage.value and g.get("effort") == effort_label:
+                invocations += g.get("invocations", 0)
+                retries += g.get("retries", 0)
+                failures += g.get("failures", 0)
+        if invocations <= 0:
+            return None, None
+        return max(retries, failures) / invocations, invocations
+
     def _capacity_downgrade(self, model: str) -> str:
         """The cheaper model ``capacity.downgrade_steps`` down the provider's fallback
         chain, floored at the chain's cheapest tier (never off the end). Reuses the SAME
