@@ -100,3 +100,21 @@ so a consumer counting `stage_dispatched` can discount the superseded one.
 `… --shared-root … status` → `lane_audit.clean == true`: every recorded call
 `interactive:claude`, zero unattributed. The durable timeline is `events.jsonl`;
 per-stage records are under `stages/<task>/NN-<stage>.json`.
+
+## Post-run follow-up triage (opt-in: `--triage-followups`)
+A completed run's evidence-out seam files the review stages' `non_blocking` findings and
+`improvement` ideas as GitHub issues **automatically, with no human gate** (the run must
+never block on a human). That grows the backlog with issues the human never chose to track
+and often can't parse. If the invocation args include **`--triage-followups`** (or the
+human asks to triage the run's filed issues), then **after** the run reaches a terminal
+`run_state` and the audit gate above is clean, invoke the **`triage-followups`** skill on
+this `RUN`:
+- It enumerates only the issues THIS run filed (matched by each issue's
+  `Filed automatically from the <task_id> review` provenance footer, open issues only) and
+  walks them **one at a time**, explaining each from its source review finding
+  (`stages/<task>/NN-review.json`) and the code it points at, then takes the human's
+  keep / close / promote / edit decision per issue.
+- It is a pure human-judgment gate — read-only on the run, acting only on GitHub. It is
+  re-runnable (open-only enumeration), so the human can also defer triage and run
+  `triage-followups` on this run later instead of inline. Without the flag, behavior is
+  exactly as before: the run finalizes and its auto-filed issues stay untriaged.

@@ -93,3 +93,13 @@ retired lease gets its own `lease_superseded` event, so no orphan dispatch is le
 Run `… status` and check `lane_audit.clean == true`: every recorded model call must
 be `interactive:claude` with zero `unattributed`/`off_lane`. A hidden `claude -p`
 would show up here — there should be none.
+
+## Post-run follow-up triage (opt-in: `--triage-followups`)
+A completed task's evidence-out seam files its review's `non_blocking` findings and
+`improvement` idea as GitHub issues automatically, with no human gate. If the invocation
+args include **`--triage-followups`** (or the human asks to triage), then after the task
+is terminal and the audit is clean, invoke the **`triage-followups`** skill on this `RUN`:
+it walks the issues this run filed one at a time — explaining each from its source review
+finding and the code it points at — and takes the human's keep / close / promote / edit
+call. Read-only on the run, re-runnable, so triage can also be done later instead of
+inline. Without the flag, the run finalizes and its auto-filed issues stay untriaged.
