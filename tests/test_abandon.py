@@ -227,7 +227,7 @@ def test_abandon_failed_emits_task_failed_notification(tmp_path, project) -> Non
     assert len(notes) == 1
     assert notes[0]["task_id"] == "t1"
     assert notes[0]["stage"] == "scope"  # the abandoned dispatch's stage
-    assert "orphaned" in notes[0]["reason"]  # last_error carries the abandon reason
+    assert "orphaned" in notes[0]["reason"]  # the alert reason is the abandon reason (#184)
 
 
 def test_abandon_failed_calls_notify_hook_when_installed(tmp_path, project) -> None:
