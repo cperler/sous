@@ -73,6 +73,7 @@ from .schemas.enums import (
     ExecutionLane,
     ExecutionMode,
     FailureKind,
+    ModelId,
     Provider,
     ResultStatus,
     RunState,
@@ -704,7 +705,10 @@ class Engine:
             stage=stage,
             prompt=prompt,
             schema_ref=spec.schema_ref,
-            model=model,
+            # #161 shipped ModelId (open NewType) but #194's mypy gate merged from a
+            # sibling worktree that never saw it, so the trunk needs this cast (identity
+            # at runtime). `model` is resolved from str sources (role default / pins).
+            model=ModelId(model),
             effort=effort,
             agent=agent,
             lane_policy=lane,
@@ -2267,7 +2271,7 @@ class Engine:
             task_id=task_id,
             stage=stage,
             attempt=dispatched.attempt,
-            model=dispatched.model or ENGINE_MODEL,
+            model=ModelId(dispatched.model or ENGINE_MODEL),
             # #138: echo the dispatched effort (persisted by begin_stage) so the abandoned
             # cost-ledger row attributes effort symmetrically with model. None on effort-less
             # (ENGINE-lane / pre-#96) dispatches.
