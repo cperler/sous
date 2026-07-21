@@ -99,3 +99,10 @@ def test_clean_resume_after_kill_no_double_execution(tmp_path) -> None:
     # was re-run after resume.
     assert status["lane_audit"]["total_calls"] == 18
     assert status["lane_audit"]["clean"] is True
+    # #175: after the resume the dispatch/record timeline still balances with zero orphaned
+    # leases — every stage_dispatched is closed by a stage_recorded or (had the kill caught a
+    # lease mid-flight) a lease_superseded. This is the automated form of the #142 hand-count.
+    events_audit = status["events_audit"]
+    assert events_audit["clean"] is True
+    assert events_audit["orphans"] == []
+    assert events_audit["dispatched"] == events_audit["recorded"] + events_audit["superseded"]
