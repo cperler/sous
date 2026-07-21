@@ -182,6 +182,22 @@ class Engine:
         progress_throttle_s: float = 60.0,
         use_learnings_kb: bool = True,
     ) -> None:
+        # Process-boundary persistence (#206): the tuning knobs below are engine-DEFAULT
+        # holders, not durable run config. Every CLI subcommand rebuilds the Engine from
+        # these constructor defaults (``cli._engine`` passes only store/ledger/project/
+        # router/registry), so a value chosen at run-create time is remembered only inside
+        # the process that set it. Any setting consulted at a LATER stage boundary — dispatch,
+        # retry, review-gate, filing, completion — MUST therefore be persisted on the Run
+        # (or Task) doc and re-read there, NOT relied on from self.*. Today the two run-level
+        # settings that cross that boundary do so correctly: ``max_attempts`` is stamped onto
+        # Task at add_task (read as ``task.max_attempts``) and ``max_filed_followups`` onto
+        # Run/Task (read via load_run at filing time — #196). The retry/gate budgets below
+        # (max_review_cycles, max_rate_limit_waits, rate_limit_cooldown_s, max_infra_resets,
+        # max_salvage_keeps, breaker_threshold, budget_soft_fraction) are ALSO consulted at
+        # record()-time across the boundary — they are safe ONLY because no create_run/CLI
+        # override exists yet, so they are always the default. The moment one gains a run-level
+        # override it must land on Run first. See the audit:
+        # docs/reviews/2026-07-18-run-level-settings-persistence-audit.md.
         self.store = store
         self.ledger = ledger
         self.project = project
