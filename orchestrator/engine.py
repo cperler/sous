@@ -2252,10 +2252,10 @@ class Engine:
             # died is exactly the unattended-run event the old monitor alerted on. Always
             # appends the notification audit row even when no notify hook is installed.
             # #184: the alert reason is the caller's authoritative ``reason`` — NOT
-            # ``task.last_error``, which can still hold an earlier review-rejection message
-            # (_apply_review_rejection sets it and it is never cleared) and would otherwise
-            # misreport a max-attempts death as the prior rejection. Each caller already
-            # passes the reason for THIS terminal transition (record: effective.error or
+            # ``task.last_error``, which is not authoritative for THIS terminal transition
+            # (it holds the most recent FAILED/review-rejection error; #213 now clears it at
+            # each attempt start, but the caller's reason is still the correct source here).
+            # Each caller passes the reason for THIS transition (record: effective.error or
             # outcome; abandon: the abandon reason; reject: the human's reason).
             stage = task.current_stage
             self.emit_notification(

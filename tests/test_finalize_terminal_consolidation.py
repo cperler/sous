@@ -133,6 +133,24 @@ def test_finalize_failed_alert_reason_ignores_stale_last_error(tmp_path) -> None
     assert "review rejected" not in failed["reason"]  # the stale last_error did NOT leak
 
 
+# --- #213: begin_stage clears the task-level last_error at each fresh attempt ----------
+
+def test_begin_stage_clears_stale_last_error() -> None:
+    # #213 (root-cause follow-up to #184): nothing cleared task.last_error, so a stale
+    # prior-attempt / review-rejection error could leak into a later reader across a
+    # review-fix cycle. begin_stage now resets it at the start of every fresh stage attempt;
+    # apply_result re-sets it only if THIS attempt fails.
+    from orchestrator.schemas.status import Task
+    from orchestrator.state_machine import begin_stage
+
+    task = Task(task_id="t1", run_id="r1", created_at="t0", updated_at="t0")
+    task.last_error = "review rejected: some earlier blocking issue"  # stale from a prior cycle
+
+    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-4-8", effort="high")
+
+    assert task.last_error is None  # cleared at attempt start; fails if the reset regresses
+
+
 # --- #131: the helper's disposition parameter is a Literal ----------------------------
 
 def test_finalize_helper_disposition_is_literal() -> None:
