@@ -2208,10 +2208,11 @@ class Engine:
     def _finalize_task_terminal(
         self, run_id: str, task: Task, *, disposition: Literal["rejected", "failed"], reason: str
     ) -> None:
-        """Run the shared post-transition run-level effects every operator-invoked
-        finalize path (``reject``, ``abandon``, and future ones like ``force_complete``)
-        must perform after transitioning a task DIRECTLY to a terminal state out of band
-        (i.e. not through ``record``, which carries these effects itself).
+        """Run the shared post-transition run-level effects every finalize path must
+        perform after transitioning a task to a terminal state: the operator-invoked
+        paths (``reject``, ``abandon``, and future ones like ``force_complete``) AND
+        ``record``'s terminal-failure path, routed through here in #133/#182 so every
+        terminal transition shares one choke point.
 
         These effects were previously re-implemented inline in each caller, so each new
         operator path was an opportunity to miss one (#110 — ``abandon`` originally missed
