@@ -411,3 +411,39 @@ def test_by_effort_orders_stages_in_pipeline_sequence(tmp_path: Path) -> None:
 
 def test_by_effort_empty_is_empty_list(tmp_path: Path) -> None:
     assert CostLedger(tmp_path / "stage-costs.jsonl").by_effort() == []
+
+
+def test_by_effort_self_read_is_memoised_and_stat_invalidated(tmp_path: Path) -> None:
+    """#220: the self-read by_effort() path memoises its O(rows) aggregation, keyed on the
+    ledger file's stat, so the band-edge downshift check (fired per dispatch, per tick) does
+    not re-scan the whole JSONL every call — while an appended row still invalidates the memo
+    and an explicit ``rows`` arg neither reads the cache nor poisons it."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+
+    def _append(row: dict) -> None:
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(row) + "\n")
+
+    # No file yet -> [] and a stable memo across repeated calls (same object == cache hit).
+    assert ledger.by_effort() == []
+    assert ledger.by_effort() is ledger.by_effort()
+
+    _append({"stage": "implement", "effort": "high", "model": "m", "attempt": 0,
+             "status": "success", "cost_usd": 1.0})
+    first = ledger.by_effort()
+    assert [g["invocations"] for g in first] == [1]
+    # Unchanged file -> the identical cached object is returned (no re-scan).
+    assert ledger.by_effort() is first
+
+    # A newly appended row grows the file, so the stat key changes and the memo recomputes.
+    _append({"stage": "implement", "effort": "high", "model": "m", "attempt": 1,
+             "status": "failure", "cost_usd": 2.0})
+    second = ledger.by_effort()
+    assert second is not first
+    assert [g["invocations"] for g in second] == [2]
+    assert second[0]["cost_usd"] == 3.0 and second[0]["failure_rate"] == 0.5
+
+    # An explicit rows= arg bypasses the cache entirely and leaves the self-read memo intact.
+    assert ledger.by_effort(rows=[]) == []
+    assert ledger.by_effort() is second
