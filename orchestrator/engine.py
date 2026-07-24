@@ -131,9 +131,11 @@ DEFAULT_ABANDON_MIN_IDLE_S = 300
 # and a full-pipeline have very different expected review surfaces.
 MAX_FILED_FOLLOWUPS_PER_TASK = 2
 
-# Non-blocking dispositions the engine must NOT file (they are noted in the completion
-# note instead). Anything else — including an absent disposition — files.
-_UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop"})
+# Dispositions the engine must NOT file (they are noted in the completion note instead).
+# Anything else — including an absent disposition — files. `fixup` is improvement-only
+# (#223: apply in place in THIS PR, do not file); it is inert for non-blocking findings,
+# whose schema enum doesn't offer it, so sharing the set is safe.
+_UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop", "fixup"})
 
 
 # Failure kinds whose committed work is NOT implicated by the failure itself, so any
@@ -2954,6 +2956,18 @@ class Engine:
             return None
         title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
+            return None
+        # #223 disposition gate: an improvement the reviewer marked `fix_now`/`drop`/`fixup`
+        # is NOT filed as an enhancement — `fixup` is applied in place in this PR, the others
+        # are noted in the completion note. An absent/`file` disposition still files (the
+        # pre-#223 default), so existing behavior is preserved.
+        disposition = str(improvement.get("disposition") or "").strip().casefold()
+        if disposition in _UNFILED_DISPOSITIONS:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "improvement_not_filed", "run_id": run_id,
+                 "task_id": task.task_id, "title": title, "disposition": disposition},
+            )
             return None
         if skip_fingerprints and self._issue_fingerprint(title) in skip_fingerprints:
             self.store.append_event(

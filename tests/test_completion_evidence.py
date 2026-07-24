@@ -372,6 +372,66 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
 
 
+@pytest.mark.parametrize("disposition", ["fix_now", "drop", "fixup"])
+def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, disposition) -> None:
+    # #223: an improvement the reviewer marked fix_now/drop/fixup is NOT filed as an
+    # enhancement — but it IS surfaced in the completion note (nothing silently dropped).
+    # This assertion fails if the disposition gate regresses to always-file.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output={
+        "approved": True, "issues": [],
+        "improvement": {"title": "Expose a retry-count knob",
+                        "detail": "speculative tunability", "disposition": disposition},
+    })
+
+    ts = project.task_source
+    # no enhancement issue filed for the suppressed improvement
+    assert not any(f["labels"] == ["enhancement"] for f in ts.followups)
+
+    # ...but it is durable in the completion note, with a why-not-filed reason
+    note = ts.notes[0]["body"]
+    assert "Expose a retry-count knob" in note
+    reason = "noted, not tracked" if disposition == "drop" else "applied in place, not filed"
+    assert reason in note
+
+    events = _events(tmp_path)
+    not_filed = [e for e in events if e["type"] == "improvement_not_filed"]
+    assert len(not_filed) == 1 and not_filed[0]["disposition"] == disposition
+    assert not any(e["type"] == "improvement_filed" for e in events)
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is False
+
+
+@pytest.mark.parametrize("disposition", ["file", None])
+def test_improvement_with_file_or_absent_disposition_still_files(
+    tmp_path, project, disposition
+) -> None:
+    # #223 backward compat: an explicit `file` disposition — and an absent one — still file
+    # the improvement as an enhancement, exactly as before the disposition field existed.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    improvement = {"title": "Add a schema-validate-retry loop", "detail": "real need"}
+    if disposition is not None:
+        improvement["disposition"] = disposition
+    _drive(eng, review_output={"approved": True, "issues": [], "improvement": improvement})
+
+    ts = project.task_source
+    enh = [f for f in ts.followups if f["labels"] == ["enhancement"]]
+    assert len(enh) == 1
+    assert enh[0]["title"] == "Add a schema-validate-retry loop"
+
+    events = _events(tmp_path)
+    assert any(e["type"] == "improvement_filed" for e in events)
+    assert not any(e["type"] == "improvement_not_filed" for e in events)
+    completed = next(e for e in events if e["type"] == "task_completed")
+    assert completed["improvement_filed"] is True
+
+
 class _FailFirstSource:
     """file_followup raises on the FIRST call then succeeds — a transient filing failure."""
 
@@ -665,3 +725,16 @@ def test_review_schema_accepts_non_blocking() -> None:
     })
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({"approved": True, "issues": [], "improvement": {"detail": "no title"}})
+
+    # #223: the improvement's optional disposition enum (file|fixup|fix_now|drop) validates...
+    for disp in ("file", "fixup", "fix_now", "drop"):
+        validator.validate({
+            "approved": True, "issues": [],
+            "improvement": {"title": "idea", "disposition": disp},
+        })
+    # ...and an out-of-enum improvement disposition is rejected
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({
+            "approved": True, "issues": [],
+            "improvement": {"title": "idea", "disposition": "maybe"},
+        })

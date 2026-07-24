@@ -514,8 +514,22 @@ def render_completion_note(
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
     if improvement and str(improvement.get("title", "")).strip():
-        head = f"💡 **Improvement idea:** {improvement['title']}" + (
-            f" → {improvement_ref}" if improvement_ref else "")
+        # #223 — nothing silently dropped: an improvement dispositioned away from filing
+        # (fixup/fix_now/drop) has no enhancement issue, so surface WHY it wasn't filed
+        # instead of a link, keeping the idea durable in the note.
+        _improvement_reason = {
+            "fixup": "applied in place, not filed",
+            "fix_now": "applied in place, not filed",
+            "drop": "noted, not tracked",
+        }
+        disp = str(improvement.get("disposition", "")).strip().casefold()
+        if improvement_ref:
+            suffix = f" → {improvement_ref}"
+        elif disp in _improvement_reason:
+            suffix = f" — {_improvement_reason[disp]}"
+        else:
+            suffix = ""
+        head = f"💡 **Improvement idea:** {improvement['title']}{suffix}"
         lines += ["", "### Self-improvement", head]
         if str(improvement.get("detail", "")).strip():
             lines.append(str(improvement["detail"]).strip())
