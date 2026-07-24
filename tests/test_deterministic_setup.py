@@ -24,11 +24,11 @@ class _Proj:
         return ["sh", "-c", "exit 0"]
 
 
-def _wi(task: str = "#7") -> WorkItem:
+def _wi(task: str = "#7", context: dict | None = None) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id=task, stage=Stage.INTAKE, prompt="p",
         schema_ref="intake", model="engine", lane_policy=_ENGINE, created_at="now",
-        checkpoint_tag="task/r1/-7/intake/0",
+        checkpoint_tag="task/r1/-7/intake/0", context=context,
     )
 
 
@@ -36,6 +36,23 @@ def _git_repo(path: Path) -> None:
     subprocess.run(["git", "init", "-q"], cwd=path, check=True)
     subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
                     "commit", "--allow-empty", "-qm", "init"], cwd=path, check=True)
+
+
+def _commit(path: Path, name: str, content: str, msg: str) -> None:
+    (path / name).write_text(content)
+    subprocess.run(["git", "add", name], cwd=path, check=True)
+    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
+                    "commit", "-qm", msg], cwd=path, check=True)
+
+
+def _head(path: Path) -> str:
+    return subprocess.run(["git", "rev-parse", "HEAD"], cwd=path,
+                          capture_output=True, text=True).stdout.strip()
+
+
+def _branch(path: Path) -> str:
+    return subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=path,
+                          capture_output=True, text=True).stdout.strip()
 
 
 def test_real_git_setup_creates_worktree_and_tags(tmp_path, monkeypatch) -> None:
@@ -176,6 +193,77 @@ def test_red_baseline_records_classified_failures(tmp_path, monkeypatch) -> None
     assert out["baseline_captured"] is True  # the suite RAN — red is still a baseline
     assert out["baseline_failures"] == ["tests/test_x.py::t1"]
     assert "RED at base" in out["baseline"] and "1 known-failing" in out["baseline"]
+
+
+def test_dep_branch_composed_into_dependent_worktree(tmp_path, monkeypatch) -> None:
+    """#216: a dependent's worktree provably CONTAINS its dependency's shared-signature
+    change (the reduced #161/#194 ModelId scenario), so its gate runs against composed
+    code — not pre-dep trunk. The base_sha the TEST stage will diff from is captured AFTER
+    the merge, and the merged branch is recorded in composed_deps + the baseline note."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    # The pre-#161 world: a shared module typed permissively as ``str``.
+    _commit(tmp_path, "shared.py", "model: str = 'x'\n", "add shared")
+    base = _head(tmp_path)
+    default = _branch(tmp_path)
+    # A DEPENDENCY branch tightens the shared signature (the #161 ModelId retype).
+    subprocess.run(["git", "checkout", "-q", "-b", "task/dep"], cwd=tmp_path, check=True)
+    _commit(tmp_path, "shared.py", "ModelId = str\nmodel: ModelId = 'x'\n", "retype (#161)")
+    subprocess.run(["git", "checkout", "-q", default], cwd=tmp_path, check=True)
+
+    res = DeterministicSetupRunner(_Proj()).dispatch(
+        _wi(context={"dep_branches": ["task/dep"]})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    out = res.structured_output
+    wt = Path(out["worktree"])
+    # The dependency's change is physically present in the dependent's worktree.
+    assert "ModelId" in (wt / "shared.py").read_text()
+    assert out["composed_deps"] == ["task/dep"]
+    assert "composed deps: task/dep" in out["baseline"]
+    # base_sha advanced past the run base (it reflects the composed HEAD).
+    assert out["base_sha"] and out["base_sha"] != base
+
+
+def test_dep_branch_merge_conflict_fails_loudly(tmp_path, monkeypatch) -> None:
+    """#216: a conflict between a dependency and the dependent's base surfaces as a setup
+    FAILURE naming the conflicting branch — never a silent green pass on a half-composed
+    tree. The worktree is rolled back (merge --abort) so a retry starts clean."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _commit(tmp_path, "shared.py", "v = 1\n", "base A")
+    default = _branch(tmp_path)
+    subprocess.run(["git", "branch", "task/dep"], cwd=tmp_path, check=True)  # branch at A
+    subprocess.run(["git", "checkout", "-q", "task/dep"], cwd=tmp_path, check=True)
+    _commit(tmp_path, "shared.py", "v = 2\n", "dep edit")
+    subprocess.run(["git", "checkout", "-q", default], cwd=tmp_path, check=True)
+    _commit(tmp_path, "shared.py", "v = 3\n", "base B (diverged)")  # conflicts with dep
+
+    res = DeterministicSetupRunner(_Proj()).dispatch(
+        _wi(context={"dep_branches": ["task/dep"]})
+    )
+
+    assert res.status is ResultStatus.FAILURE
+    err = (res.error or "").lower()
+    assert "conflict" in err and "task/dep" in (res.error or "")
+
+
+def test_no_dep_branches_is_byte_identical_base_only(tmp_path, monkeypatch) -> None:
+    """#216: a task with no dep_branches (single-task run / disjoint batch) behaves exactly
+    as before — base_sha is the run base, and no dep is composed."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    _commit(tmp_path, "f.py", "x = 1\n", "seed")
+    head = _head(tmp_path)
+
+    res = DeterministicSetupRunner(_Proj()).dispatch(_wi())  # no context / no deps
+
+    assert res.status is ResultStatus.SUCCESS
+    out = res.structured_output
+    assert out["base_sha"] == head  # worktree HEAD == run base, unchanged
+    assert out["composed_deps"] == []
+    assert "composed deps" not in out["baseline"]
 
 
 def test_project_setup_task_override_skips_git(tmp_path, monkeypatch) -> None:

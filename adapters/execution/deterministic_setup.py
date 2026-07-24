@@ -148,12 +148,21 @@ class DeterministicSetupRunner:
         worktree = repo_root / ".worktrees" / safe
         self._ensure_worktree(repo_root, worktree, branch)
 
+        # #216: compose each COMPLETED DAG dependency's branch into this worktree BEFORE
+        # install/baseline, so a dependent's per-PR gate runs against the sibling's shared
+        # type/signature change instead of pre-dep trunk. Idempotent (an already-merged
+        # branch is a no-op), so retry/worktree-reuse is safe. A conflict aborts and raises
+        # (a setup FAILURE) rather than passing a half-composed tree.
+        composed_deps = self._compose_dep_branches(worktree, work)
+
         # Best-effort dependency install (never fatal — a later stage's `uv run`/`npm`
         # re-syncs; a broken install shouldn't block worktree readiness). #63: skip it
         # when this worktree already holds a successful install of the same lockfiles.
         install_note, install_meta = self._install(worktree)
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
+        # #216: capture base_sha AFTER the dep merges so the TEST stage's base_sha..worktree
+        # diff isolates the dependent's OWN change, not the composed dependency code.
         head = _git(str(worktree), "rev-parse", "HEAD")
         base_full = head.stdout.strip() if head.returncode == 0 else ""
         base_sha = base_full[:12] if base_full else "?"
@@ -167,17 +176,24 @@ class DeterministicSetupRunner:
         # a server binds this task's ports even at the intake baseline run.
         port_env = port_env_for(self._project, *ports) if ports else None
         baseline = self._capture_baseline(worktree, port_env)
+        dep_note = (
+            f"; composed deps: {', '.join(composed_deps)}" if composed_deps else ""
+        )
         out = {
             "branch": branch,
             "worktree": str(worktree),
-            # The fork point (worktree HEAD right after branch creation, before any
-            # implement work). The deterministic TEST runner diffs base_sha..worktree to
-            # classify the change (#41 docs-only detection). Empty when HEAD is unreadable.
+            # The fork point: worktree HEAD after branch creation AND any #216 dep-branch
+            # merges, before any implement work. The deterministic TEST runner diffs
+            # base_sha..worktree to classify the change (#41 docs-only detection) and to
+            # isolate the dependent's OWN diff from composed dep code. Empty when HEAD is
+            # unreadable.
             "base_sha": base_full,
             "baseline_captured": baseline["captured"],
             "baseline_failures": baseline["failures"],
+            # #216: the dep branches actually merged into this worktree (audit trail).
+            "composed_deps": composed_deps,
             "baseline": (
-                f"isolated worktree off {base_sha}; install: {install_note}; "
+                f"isolated worktree off {base_sha}{dep_note}; install: {install_note}; "
                 f"tests: {baseline['note']}"
             ),
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
@@ -300,6 +316,35 @@ class DeterministicSetupRunner:
             add = _git(str(repo_root), "worktree", "add", str(worktree), "-b", branch, self._base_ref)
         if add.returncode != 0:
             raise _SetupError(f"git worktree add failed: {add.stderr.strip()[:200]}")
+
+    def _compose_dep_branches(self, worktree: Path, work: WorkItem) -> list[str]:
+        """#216: merge every ``dep_branches`` entry (the engine-resolved branch names of
+        this task's COMPLETED DAG dependencies) into the worktree so the dependent builds
+        ON its dependencies' code, not the run base. Returns the branches actually merged,
+        in order.
+
+        Idempotent: an already-merged branch produces ``Already up to date`` (rc 0) and is
+        a no-op, so a retry or a reused worktree re-runs safely. A merge CONFLICT is fatal —
+        ``git merge --abort`` restores the tree and we raise ``_SetupError`` naming the
+        conflicting dep so the failure surfaces as a setup FAILURE, never a silent
+        half-composed pass. No dep_branches (single-task run / no deps) => ``[]`` no-op."""
+        dep_branches = (work.context or {}).get("dep_branches") or []
+        composed: list[str] = []
+        for dep_branch in dep_branches:
+            if not isinstance(dep_branch, str) or not dep_branch:
+                continue
+            merge = _git(str(worktree), "merge", "--no-edit", dep_branch)
+            if merge.returncode != 0:
+                # Roll the tree back to a clean state before failing so a subsequent retry
+                # starts from an unmerged worktree, then surface the conflict loudly.
+                _git(str(worktree), "merge", "--abort")
+                detail = (merge.stdout + merge.stderr).strip()[:200]
+                raise _SetupError(
+                    f"merge conflict composing dependency branch {dep_branch!r} "
+                    f"into worktree (#216): {detail}"
+                )
+            composed.append(dep_branch)
+        return composed
 
     @staticmethod
     def _run_project(cmd_fn, cwd: Path) -> str:
