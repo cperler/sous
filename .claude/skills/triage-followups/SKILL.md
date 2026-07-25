@@ -81,6 +81,11 @@ Then ask the human to pick a disposition (offer these; "keep" is the safe defaul
 - **promote** — do it soon. Note it for the next `batch-plan` (or, if it's really a new
   chunk of work, `spec-intake`). Add an `enhancement` label if missing and comment that
   it's queued. Do NOT start building it here — triage decides, it doesn't implement.
+- **fix-now / fold** — too small to track: a real one-liner the review should have folded
+  into the PR (the #213 class). Apply the fix directly now (a trivial in-place change),
+  then close the issue with the rationale and a pointer to where it landed: `gh issue
+  close <n> -R "$REPO" --reason "completed" --comment "Fixed in <commit/PR>: <what
+  changed>."`. Use this instead of leaving a valid-but-tiny finding on the backlog to rot.
 - **edit** — the observation is worth keeping but mis-scoped/mis-titled. Retitle or
   rewrite the body (`gh issue edit <n> -R "$REPO" …`) per the human, then keep it open.
 

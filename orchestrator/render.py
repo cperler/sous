@@ -449,12 +449,17 @@ def render_completion_note(
     run logs. Derived purely from the task's recorded stages + the follow-ups the engine
     filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
     None if filing failed). ``improvement_ref`` is the URL of the enhancement issue the
-    engine filed from the review's improvement idea (None if unfiled).
+    engine filed from the review's improvement idea (None if unfiled or suppressed).
 
-    #188 — nothing silently dropped: non-blocking findings the engine did NOT file
-    (dispositioned ``fix_now``/``drop``, or ``file`` findings past the per-task cap) are
-    surfaced in a "Noted, not filed" section with a short reason so the drop bucket is
-    durable in the PR/issue note rather than vanishing."""
+    Nothing silently dropped (#188/#223):
+
+    * Non-blocking findings the engine did NOT file (dispositioned ``fix_now``/``drop``,
+      or ``file`` findings past the per-task cap) appear in a "Noted, not filed" section
+      with a short reason.
+    * An improvement idea dispositioned away from filing (``fix_now``/``fixup`` →
+      "applied in place, not filed"; ``drop`` → "noted, not tracked") is surfaced with
+      that reason instead of an issue link, keeping the idea durable in the note even
+      though no enhancement issue was opened."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -514,8 +519,22 @@ def render_completion_note(
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
     if improvement and str(improvement.get("title", "")).strip():
-        head = f"💡 **Improvement idea:** {improvement['title']}" + (
-            f" → {improvement_ref}" if improvement_ref else "")
+        # #223 — nothing silently dropped: an improvement dispositioned away from filing
+        # (fixup/fix_now/drop) has no enhancement issue, so surface WHY it wasn't filed
+        # instead of a link, keeping the idea durable in the note.
+        _improvement_reason = {
+            "fixup": "applied in place, not filed",
+            "fix_now": "applied in place, not filed",
+            "drop": "noted, not tracked",
+        }
+        disp = str(improvement.get("disposition", "")).strip().casefold()
+        if improvement_ref:
+            suffix = f" → {improvement_ref}"
+        elif disp in _improvement_reason:
+            suffix = f" — {_improvement_reason[disp]}"
+        else:
+            suffix = ""
+        head = f"💡 **Improvement idea:** {improvement['title']}{suffix}"
         lines += ["", "### Self-improvement", head]
         if str(improvement.get("detail", "")).strip():
             lines.append(str(improvement["detail"]).strip())
