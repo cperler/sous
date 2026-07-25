@@ -141,6 +141,20 @@ class ProjectConfig(Protocol):
     # host-shared temp file) don't fit: ``port_range: tuple[int, int]``,
     # ``port_block_size: int``, ``port_registry_path: str``. Same-host scope only.
 
+    # Optional (duck-typed via ``getattr``, NOT part of the versioned contract / not in
+    # _REQUIRED_MEMBERS, no CONTRACT_VERSION bump — same duck-typed pattern as port_env/
+    # notify, and deliberately NOT a Protocol-body method so a pre-#243 adapter still
+    # satisfies ``isinstance(cfg, ProjectConfig)``):
+    #   types_cmd() -> list[str]
+    #       A STATIC-TYPING command DISTINCT from ``typecheck_cmd``, for a project whose CI
+    #       runs a type checker AND a separate linter (this repo: mypy alongside ruff; #243).
+    #       The post-merge ``Engine.trunk_gate`` runs it as an extra verification leg with the
+    #       same ``['true']``/empty no-op handling the other commands get, so an adapter that
+    #       omits it (or returns the sentinel) degrades to skipping it — observably (the gate
+    #       records it under ``skipped``), never a crash. Return the no-op sentinel when the
+    #       project has no type checker distinct from ``typecheck_cmd`` (e.g. heysoo, whose
+    #       ``typecheck_cmd`` IS ``tsc --noEmit``).
+
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]: ...

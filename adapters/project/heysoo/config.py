@@ -72,6 +72,12 @@ class HeysooConfig:
     def typecheck_cmd(self) -> list[str]:
         return ["npx", "tsc", "--noEmit"]
 
+    def types_cmd(self) -> list[str]:
+        # No-op sentinel (#243): heysoo has no static type checker DISTINCT from its
+        # ``typecheck_cmd`` — tsc IS its type checker — so the trunk gate's separate
+        # static-typing leg has nothing extra to run here and skips it observably.
+        return ["true"]
+
     def infra_reset(self) -> list[str]:
         # reset-infra.sh is a SOURCED function library under lib/ (not an executable
         # script — the old pointer at .claude/scripts/reset-infra.sh named a file that
