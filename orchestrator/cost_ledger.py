@@ -24,6 +24,19 @@ from .schemas.work import StageResult
 # alphabetically. Unknown/malformed stages sort last (after every known stage).
 _STAGE_RANK: dict[str, int] = {stage.value: i for i, stage in enumerate(STAGE_ORDER)}
 
+# Canonical model-call attribution fields that BOTH audit write paths must surface under
+# the SAME top-level key (#164): the cost-ledger row (``CostLedger.record``) and every
+# per-stage JSON log payload (``engine._record_result`` and ``engine.abandon``). The
+# ledger is the primary cost-attribution artifact, so the canonical set lives here and the
+# stage-log paths agree with it. Adding a new attribution field means adding it HERE — the
+# parity test (``tests/test_attribution_field_parity.py``) then fails until BOTH paths
+# carry it, catching the next missing-field omission at CI time (the #151 `effort` gap
+# regressing again). Only fields present as a top-level key in both are listed: provider
+# and lane are attribution too, but the stage log nests them inside ``lane_used`` (a dict)
+# while the ledger flattens them (``provider``/``lane``), so they are a deliberate
+# representational difference, not a literal-key parity field.
+_ATTRIBUTION_FIELDS: frozenset[str] = frozenset({"model", "effort", "cost_usd"})
+
 
 class CostLedger:
     """A ``stage-costs.jsonl`` file: one row per model invocation."""
