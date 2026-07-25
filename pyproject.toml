@@ -70,3 +70,72 @@ python_version = "3.11"
 [[tool.mypy.overrides]]
 module = ["jsonschema", "jsonschema.*"]
 ignore_missing_imports = true
+
+# Per-module strictness ratchet (#210). The global default stays lenient
+# (annotations optional), but these modules are already fully annotated and
+# clean, so we gate them: a future un-annotated def in any of them now FAILS
+# `mypy` instead of silently degrading. This is a config-only ratchet — flip a
+# module out of the default set and into this list once its defs are annotated.
+#
+# Deliberately NOT yet promoted (still carry un-annotated defs — the documented
+# next increment, tracked as deferred-scope #241; N = [no-untyped-def]
+# count per module, 19 total): orchestrator.project_loader (5),
+# orchestrator.port_registry (4), orchestrator.usage_probe (3),
+# orchestrator.stream_probe (1), orchestrator.dashboard (1),
+# orchestrator.web_dashboard (1), orchestrator.cli (1),
+# adapters.execution.runners (1), adapters.execution.deterministic_test (1),
+# adapters.execution.deterministic_setup (1).
+[[tool.mypy.overrides]]
+module = [
+    "orchestrator",
+    "orchestrator.alerting",
+    "orchestrator.batch_plan",
+    "orchestrator.brainstorm",
+    "orchestrator.capacity",
+    "orchestrator.cost_ledger",
+    "orchestrator.cost_policy",
+    "orchestrator.dag",
+    "orchestrator.engine",
+    "orchestrator.errors",
+    "orchestrator.failure_classifier",
+    "orchestrator.learnings_kb",
+    "orchestrator.model_table",
+    "orchestrator.queue_file",
+    "orchestrator.render",
+    "orchestrator.retrospective",
+    "orchestrator.retry",
+    "orchestrator.routing",
+    "orchestrator.scaffold",
+    "orchestrator.scheduler",
+    "orchestrator.schemas",
+    "orchestrator.schemas.enums",
+    "orchestrator.schemas.stage_schemas",
+    "orchestrator.schemas.status",
+    "orchestrator.schemas.work",
+    "orchestrator.spec_conformance",
+    "orchestrator.spec_intake",
+    "orchestrator.stages",
+    "orchestrator.state_machine",
+    "orchestrator.status_store",
+    "adapters",
+    "adapters.execution",
+    "adapters.execution.base",
+    "adapters.execution.codex",
+    "adapters.execution.deterministic_deliver",
+    "adapters.execution.headless_claude",
+    "adapters.execution.install_cache",
+    "adapters.execution.interactive",
+    "adapters.execution.transport",
+    "adapters.project",
+    "adapters.project.base",
+    "adapters.project.github_issues",
+    "adapters.project.heysoo",
+    "adapters.project.heysoo.classifier",
+    "adapters.project.heysoo.config",
+    "adapters.project.heysoo.task_source",
+    "adapters.project.selfhost",
+    "adapters.project.selfhost.classifier",
+    "adapters.project.selfhost.config",
+    "adapters.project.selfhost.task_source",
+]
+disallow_untyped_defs = true
