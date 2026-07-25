@@ -12,6 +12,7 @@ Covers the two halves of ``orchestrator.queue_file``:
 from __future__ import annotations
 
 import json
+import multiprocessing as mp
 import threading
 
 import pytest
@@ -96,6 +97,48 @@ def test_concurrent_producers_do_not_lose_entries(tmp_path) -> None:
     tasks = [e["tasks"][0] for e in QueueFile(path).read()]
     assert tasks[0] == "seed"  # the pre-existing entry is never lost
     assert sorted(tasks[1:]) == sorted(f"t{i}" for i in range(n))  # all N producers survived
+
+
+def _append_in_subprocess(path: str, task_id: str, barrier) -> None:
+    """Module-level (so it survives the ``spawn`` start method's pickle-by-reference) worker
+    for the cross-process locking test: barrier-sync with the siblings so every producer piles
+    into ``append`` at once, then append one entry. A raised exception exits non-zero, which
+    the parent asserts on via ``exitcode``."""
+    barrier.wait(timeout=30)
+    QueueFile(path).append(make_entry([task_id]))
+
+
+@pytest.mark.skipif(not _HAVE_FCNTL, reason="cross-process flock semantics require fcntl")
+def test_cross_process_producers_do_not_lose_entries(tmp_path) -> None:
+    # #128 / #113: the concurrent-producers thread test proves within-process serialization,
+    # but the real threat is two SEPARATE `--enqueue` cron invocations — distinct processes,
+    # each opening its own fd on the .lock sentinel. That is exactly what `fcntl.flock` (an
+    # OS-level advisory lock keyed on the inode, not the fd) is for. Fork N real subprocesses
+    # that barrier-synchronize and all append at once; the flock must serialize their
+    # whole-array read-modify-writes so no producer's entry is lost — the precise
+    # cross-process semantics that motivated the lock. `spawn` gives each child a fresh
+    # interpreter (no shared address space), so this can only pass via the kernel lock.
+    path = tmp_path / "queue.json"
+    QueueFile(path).append(make_entry(["seed"]))  # a head every writer must preserve
+
+    ctx = mp.get_context("spawn")
+    n = 4
+    barrier = ctx.Barrier(n)
+    procs = [
+        ctx.Process(target=_append_in_subprocess, args=(str(path), f"p{i}", barrier))
+        for i in range(n)
+    ]
+    for p in procs:
+        p.start()
+    for p in procs:
+        p.join(60)
+
+    for p in procs:
+        assert p.exitcode == 0, f"subprocess {p.name} exited {p.exitcode} (append raised?)"
+
+    tasks = [e["tasks"][0] for e in QueueFile(path).read()]
+    assert tasks[0] == "seed"  # the pre-existing entry is never lost
+    assert sorted(tasks[1:]) == sorted(f"p{i}" for i in range(n))  # all N producers survived
 
 
 @pytest.mark.skipif(not _HAVE_FCNTL, reason="fcntl lock path uses the .lock sentinel file")
