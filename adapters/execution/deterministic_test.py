@@ -24,7 +24,7 @@ loops engage; a green (or only-inherited) run succeeds.
 from __future__ import annotations
 
 import subprocess
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
@@ -68,19 +68,70 @@ def _changed_files(cwd: str, base_sha: str) -> list[str] | None:
     return files
 
 
-def classify_change(cwd: str | None, base_sha: str | None) -> str | None:
+def _file_at_base(cwd: str, base_sha: str, path: str) -> str | None:
+    """The file's content at ``base_sha`` (``git show <base>:<path>``), or None when it did
+    not exist there (added file) or git errors. None means "cannot prove a no-op" → code."""
+    r = _git(cwd, "show", f"{base_sha}:{path}")
+    return r.stdout if r.returncode == 0 else None
+
+
+def _file_in_worktree(cwd: str, path: str) -> str | None:
+    """The file's current worktree content, or None when it is missing (deleted) or cannot
+    be decoded as text (binary). None means "cannot prove a no-op" → code."""
+    try:
+        return (Path(cwd) / path).read_text(encoding="utf-8")
+    except (OSError, ValueError):  # missing / unreadable / UnicodeDecodeError(binary)
+        return None
+
+
+def _is_comment_only_change(cwd: str, base_sha: str, path: str, hook: object) -> bool:
+    """Ask the project ``hook`` whether ``path``'s base→worktree edit is provably comment-
+    only. Requires the file to exist at BOTH ends (a modification, never an add/delete/
+    rename), and treats ANY failure — missing revision, unreadable content, or a hook
+    exception — as "not provably comment-only" → the caller classifies ``code``. This is
+    the #69 loophole guard: doubt is always resolved toward the full test run."""
+    if not callable(hook):
+        return False
+    before = _file_at_base(cwd, base_sha, path)
+    if before is None:  # added / not present at base / git error → cannot prove no-op
+        return False
+    after = _file_in_worktree(cwd, path)
+    if after is None:  # deleted / binary / unreadable → cannot prove no-op
+        return False
+    try:
+        return bool(hook(path, before, after))
+    except Exception:  # noqa: BLE001 - a project hook must never crash classification (→ code)
+        return False
+
+
+def classify_change(cwd: str | None, base_sha: str | None,
+                    project: object | None = None) -> str | None:
     """Deterministically classify the task's diff as ``"docs-only"`` or ``"code"`` — or
     None when it can't be determined (missing cwd/base, git error, or an empty diff). Only
     a real git read sets this, so a model can never claim docs-only (the #41 loophole guard
-    lives at the fold, but detection itself is git-only by construction). ``"docs-only"``
-    requires a NON-EMPTY changeset where every file is documentation; a single non-doc file
-    yields ``"code"``."""
+    lives at the fold, but detection itself is git-only by construction).
+
+    ``"docs-only"`` requires a NON-EMPTY changeset in which EVERY file is either an
+    unambiguous documentation file (#41) OR — when the ``project`` adapter supplies the
+    optional ``is_comment_only_change`` hook (#69) — a source file whose base→worktree edit
+    the adapter proves touched only comments/formatting (e.g. the selfhost adapter's stdlib
+    ``ast`` equality for ``.py`` files). A single file that is neither yields ``"code"``.
+    The hook is strictly optional and language-specific: it lives in the PROJECT adapter, so
+    this engine-lane runner stays project- and language-agnostic, and an adapter without it
+    (or that returns False for any file) falls back to doc-file-only classification."""
     if not cwd or not base_sha:
         return None
     files = _changed_files(cwd, base_sha)
     if not files:  # None (git error) or [] (nothing changed) → undetermined
         return None
-    return "docs-only" if all(_is_doc_file(f) for f in files) else "code"
+    hook = getattr(project, "is_comment_only_change", None)
+    for f in files:
+        if _is_doc_file(f):
+            continue
+        if _is_comment_only_change(cwd, base_sha, f, hook):
+            continue
+        return "code"  # a file that is neither doc nor provably comment-only → real code
+    return "docs-only"
 
 
 class DeterministicTestRunner:
@@ -127,7 +178,9 @@ class DeterministicTestRunner:
         # short-circuit to an HONEST skip (marked skipped: docs-only, never a faked green).
         # The tag also flows into the context plane (ENGINE-lane-only fold) so REVIEW skips
         # test-coverage criteria and the engine won't reject it for lacking new tests.
-        change_class = classify_change(work.cwd, (work.context or {}).get("base_sha"))
+        change_class = classify_change(
+            work.cwd, (work.context or {}).get("base_sha"), self._project
+        )
         if change_class == "docs-only":
             out = {
                 "passed": True,
@@ -135,8 +188,9 @@ class DeterministicTestRunner:
                 "tests_meaningful": True,  # not judged here — see module docstring / REVIEW
                 "change_class": "docs-only",
                 "skipped": "docs-only",
-                "validation_notes": "docs-only change (every changed file is documentation): "
-                                    "no behavioral surface to test — skipped the suite. "
+                "validation_notes": "docs-only change (every changed file is a documentation "
+                                    "file or a provably comment-only source edit): no "
+                                    "behavioral surface to test — skipped the suite. "
                                     "Classified deterministically by diffing base_sha..worktree "
                                     "(no test run faked green).",
             }

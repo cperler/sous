@@ -8,6 +8,7 @@ zero engine changes.
 
 from __future__ import annotations
 
+import ast
 import re
 
 from orchestrator.failure_classifier import Failure
@@ -17,6 +18,41 @@ _PYTEST_FAILED = re.compile(r"^FAILED\s+(\S+)", re.MULTILINE)
 _PYTEST_ERROR = re.compile(r"^ERROR\s+(\S+)", re.MULTILINE)
 # ruff: "path/to/file.py:12:5: E501 ..."
 _RUFF = re.compile(r"^(\S+\.py:\d+:\d+):\s+([A-Z]+\d+)", re.MULTILINE)
+
+
+def _python_ast_fingerprint(source: str) -> str:
+    """A structural AST dump of ``source`` in which comments and formatting are absent by
+    construction. ``ast.parse`` never emits comment nodes (comments are not part of the
+    grammar) and ``ast.dump`` (default args) omits line/column attributes, so two revisions
+    that differ ONLY in comments, blank lines, or other pure whitespace/formatting produce
+    an identical fingerprint. Literal VALUES are retained — a changed string or numeric
+    literal changes the dump — and docstrings ARE nodes (an ``Expr``/``Constant`` head
+    statement), so a docstring edit changes the fingerprint too."""
+    return ast.dump(ast.parse(source))
+
+
+def is_python_comment_only_change(path: str, before: str, after: str) -> bool:
+    """True only when ``path`` is a Python source file whose ``before``/``after`` revisions
+    are PROVABLY equivalent modulo comments and formatting — i.e. they parse to identical
+    ASTs. This is the language-aware (#69) extension of the #41 docs-only tag, and the tag
+    it feeds gates downstream test/review effort, so it is conservative by construction (a
+    false positive would ship a real code change under-tested):
+
+    - a non-``.py`` path returns False — this adapter reasons about Python only, and any
+      other language must fall back to ``code``;
+    - a syntax error in EITHER revision returns False — never assume; fall back to ``code``;
+    - a docstring-only edit returns False — docstrings are load-bearing (``doctest``
+      execution, runtime ``__doc__`` / help text, framework introspection), so they are NOT
+      normalized away and a docstring change counts as a code change;
+    - a whitespace / comment / formatting-only edit returns True — the identical AST is a
+      proof (not a heuristic) that runtime behavior is unchanged, so the suite may be skipped.
+    """
+    if not path.endswith(".py"):
+        return False
+    try:
+        return _python_ast_fingerprint(before) == _python_ast_fingerprint(after)
+    except (SyntaxError, ValueError):  # unparseable / null bytes → cannot prove no-op → code
+        return False
 
 
 class SelfHostClassifier:
@@ -36,6 +72,11 @@ class SelfHostClassifier:
         for m in _RUFF.finditer(test_output):
             add(m.group(1), FailureKind.SHELL, f"ruff {m.group(2)}")  # lint -> "shell"-ish gate
         return out
+
+    def is_comment_only_change(self, path: str, before: str, after: str) -> bool:
+        """#69 hook: is this single file's before→after edit provably comment-only? Delegates
+        to the module-level Python AST comparison (see ``is_python_comment_only_change``)."""
+        return is_python_comment_only_change(path, before, after)
 
     def impacted_tests(self, changed_files: list[str]) -> list[str]:
         impacted: list[str] = []

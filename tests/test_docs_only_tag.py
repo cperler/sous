@@ -4,7 +4,10 @@ Detection diffs the task's fork point (base_sha) against the worktree with a rea
 — a model can never set the tag (the fold guard is tested in test_context_plane). A docs-only
 change (every changed file is documentation) has no behavioral surface, so the deterministic
 TEST runner short-circuits to an HONEST skip (marked skipped: docs-only), never a faked green.
-Comment-only-in-code detection is deliberately OUT OF SCOPE (doc-FILES only).
+Comment-only-in-code detection (#69) is a PROJECT-owned extension consulted here via the
+optional ``is_comment_only_change`` hook — its own adversarial suite lives in
+``test_comment_only_change.py``; this file covers the engine-lane doc-FILE path and the
+backward-compatible fall-through when no such hook is supplied.
 """
 
 from __future__ import annotations

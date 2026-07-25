@@ -67,6 +67,14 @@ class SelfHostConfig:
     def classifier(self) -> SelfHostClassifier:
         return self._classifier
 
+    def is_comment_only_change(self, path: str, before: str, after: str) -> bool:
+        """Optional #69 hook consulted by the deterministic TEST runner to extend the #41
+        docs-only tag from doc FILES to provably comment-only Python source edits. Delegates
+        to this project's classifier (stdlib ``ast`` equality). Absent on adapters whose
+        classifier does not implement it (e.g. heysoo), which then fall back to doc-file-only
+        classification — the runner treats the hook as strictly optional via ``getattr``."""
+        return self._classifier.is_comment_only_change(path, before, after)
+
     @property
     def task_source(self) -> LocalFileTaskSource | GitHubIssuesSource:
         return self._task_source
