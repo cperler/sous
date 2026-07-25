@@ -35,6 +35,14 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   a project-owned `<repo>/.orchestration/` adapter (loaded by path, contract-checked) or
   `adapters/project/<name>/` for in-repo reference adapters; new execution lanes via
   `adapters/execution/`. Don't add project-specific logic to `orchestrator/`.
+- **Pure fold/state-machine functions return what they dropped; only the engine caller
+  emits events.** The `state_machine` fold layer is pure (no wall-clock/random/I/O) so
+  replay/resume is deterministic — never give it an event sink. When a fold silently drops
+  or truncates something that should be observable (the "never silent" convention), have
+  the pure function *return* a notice of what it dropped and let the engine call site emit
+  the warning-grade event. Pattern established by #201 (`_absorb_outputs` → `apply_result`
+  → engine emits `pr_field_dropped`); the natural next candidates are context-ceiling
+  eviction and value truncation in `_enforce_context_ceiling`/`_cap_value`.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
   `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`
