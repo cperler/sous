@@ -9,6 +9,7 @@ fix twice; a raising task source is swallowed, never a crash.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -192,6 +193,85 @@ def test_cli_no_file_fix_reports_red_but_files_nothing(tmp_path, capsys):
     rc = main([
         "--root", str(tmp_path), "--run", "r1", "--project", "tests.redtrunkproject",
         "trunk-gate", "-C", str(tmp_path), "--no-file-fix",
+    ])
+    assert rc == 1
+    out = json.loads(capsys.readouterr().out)
+    assert out["green"] is False
+    assert out["filed"] is None
+
+
+def test_long_output_sets_truncated_flag(tmp_path):
+    """_tail's truncation flag is never-silent: when a command emits more than
+    _TRUNK_GATE_TAIL_LINES (40) lines, the command entry must carry truncated=True
+    AND the filed body must include the "(last lines only)" marker so readers know
+    they're not seeing the full output."""
+
+    # Emit 50 lines (> 40) to stderr; the command still exits 0 so we need the
+    # engine to run to completion for both truncated=True and then also force a
+    # red gate to check the body marker, hence we mix with a second red command.
+    class _LongOutputRedProject(FakeProject):
+        def test_unit_cmd(self, files=None):
+            # 50 lines to stderr, then fail so the body is actually rendered.
+            return ["sh", "-c",
+                    "for i in $(seq 1 50); do echo \"line $i\" >&2; done; exit 1"]
+
+    project = _LongOutputRedProject()
+    eng = _engine(tmp_path, project)
+
+    result = eng.trunk_gate("r1", cwd=tmp_path)
+
+    assert result["green"] is False
+    cmd = next(c for c in result["commands"] if c["name"] == "test_unit")
+    # The crucial assertion: truncation flag must be True when output > 40 lines.
+    assert cmd["truncated"] is True, (
+        f"expected truncated=True for 50-line output; got {cmd['truncated']!r}"
+    )
+    # The tail itself should contain the LAST lines, not the first ones that were dropped.
+    # With 50 lines and a 40-line tail, lines 1-10 are dropped.
+    assert "line 50" in cmd["output_tail"]
+    assert "line 10\n" not in cmd["output_tail"]  # dropped; "line 10" not a substring of higher lines
+
+    # The filed body should carry the "(last lines only)" marker (never-silent in body).
+    assert len(project.task_source.followups) == 1
+    body = project.task_source.followups[0]["body"]
+    assert "(last lines only)" in body
+
+
+def test_nonexistent_cwd_reports_red_and_files_nothing(tmp_path):
+    """A cwd that does not exist is a misconfigured invocation: the gate must NOT fall back
+    to running the verification commands against the process's own cwd (which could report
+    green while having tested the wrong tree). It reports red, emits trunk_gate_error with a
+    cwd_not_found reason, and files nothing — there is nothing to remediate."""
+    project = _GreenProject()  # commands would all pass if they ran against the wrong tree
+    eng = _engine(tmp_path, project)
+
+    missing = Path("/nonexistent/path")
+    result = eng.trunk_gate("r1", cwd=missing)
+
+    assert result["green"] is False
+    assert result["failing"] == ["cwd_check"]
+    assert result["filed"] is None
+    assert result["deduped"] is False
+    # The offending path is surfaced on the synthetic command's tail (never-silent).
+    cmd = next(c for c in result["commands"] if c["name"] == "cwd_check")
+    assert cmd["rc"] == -1
+    assert str(missing) in cmd["output_tail"]
+    # Nothing filed; the error event fired and no verification command ever ran.
+    assert project.task_source.followups == []
+    types = _types(tmp_path)
+    assert "trunk_gate_error" in types
+    assert "trunk_gate_ran" not in types
+    assert "trunk_gate_fix_filed" not in types
+    error = next(e for e in _events(tmp_path) if e["type"] == "trunk_gate_error")
+    assert error["reason"] == "cwd_not_found"
+
+
+def test_cli_nonexistent_cwd_exits_nonzero(tmp_path, capsys):
+    """The CLI must exit non-zero for a missing cwd so a caller cannot mistake a
+    misconfigured invocation for a pass."""
+    rc = main([
+        "--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject",
+        "trunk-gate", "-C", "/nonexistent/path",
     ])
     assert rc == 1
     out = json.loads(capsys.readouterr().out)

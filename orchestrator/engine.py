@@ -3092,9 +3092,37 @@ class Engine:
         red with the error in its tail. Best-effort filing mirrors ``_file_review_followups``
         (``ref=None`` + a ``followup_failed`` event on a raising task source, never a crash)
         and dedups on a prior ``trunk_gate_fix_filed`` event so a re-invocation never files
-        the fix twice."""
+        the fix twice.
+
+        A ``cwd`` that is not an existing directory is a misconfigured invocation, not a
+        red trunk: the gate reports red (synthetic ``cwd_check`` command, ``rc=-1``) and
+        emits ``trunk_gate_error``/``reason=cwd_not_found`` rather than silently running the
+        commands against the process's own cwd — and files nothing (there is nothing to
+        remediate)."""
         cwd_path = Path(cwd)
-        run_cwd = str(cwd_path) if cwd_path.is_dir() else None
+        # Caller contract (never-silent): the invoker must ensure the merged-trunk checkout
+        # exists. If it does not, `subprocess.run(cwd=None, …)` would silently verify the
+        # PROCESS's own cwd — a different tree than requested — and could report green while
+        # having tested the wrong checkout. The gate must never verify a tree other than the
+        # one it was asked to. So a missing cwd is reported red (a misconfigured invocation),
+        # with nothing to remediate — the invocation itself is wrong, not the trunk — hence no
+        # filing. The CLI still exits non-zero on `green=False` so it can't be mistaken for a
+        # pass.
+        if not cwd_path.is_dir():
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "trunk_gate_error", "run_id": run_id,
+                 "cwd": str(cwd_path), "reason": "cwd_not_found"},
+            )
+            return {
+                "run_id": run_id, "green": False, "cwd": str(cwd_path),
+                "commands": [{"name": "cwd_check", "argv": [], "rc": -1,
+                              "output_tail": f"cwd not found: {cwd_path}",
+                              "truncated": False}],
+                "failing": ["cwd_check"], "file_fix": file_fix, "filed": None,
+                "deduped": False,
+            }
+        run_cwd = str(cwd_path)
         commands: list[dict] = []
         for name, getter in (
             ("test_unit", self.project.test_unit_cmd),
