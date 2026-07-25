@@ -52,6 +52,16 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).
   Those are the durable audit trail (`runs/` is gitignored — local, not committed). Do not
   `rm -rf runs/...` as part of cleanup; leave it for the human to prune explicitly.
+- **The post-merge trunk gate is report-and-file, not merge orchestration** (#229, #216
+  Option 2 half (b)). `Engine.trunk_gate(run_id, *, cwd, file_fix=True)` shells the project
+  adapter's declared verification commands over an already-merged trunk checkout (only
+  adapter argv — never a hardcoded pytest/ruff/mypy — so the engine stays project-agnostic
+  and model-free) and, on red, best-effort files ONE `deferred-scope` remediation task,
+  deduped on a prior `trunk_gate_fix_filed` event. The `trunk-gate` CLI subcommand exits
+  non-zero on red for a CI/human wrapper. Deliberately NOT built: no PR-merge orchestration,
+  no pre-merge blocking gate (Option 2 half (a)), no auto-remediation RUN (file-only), and no
+  automatic wiring into scheduler finalize (which is pre-merge). Someone/something external
+  invokes it after the batch's PRs land.
 
 ## Live runs against the product repo (HARD CHECKPOINT)
 A live run writes to the real product repo (heysoo) and opens a PR. **The human picks the

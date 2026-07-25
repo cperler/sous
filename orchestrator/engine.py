@@ -113,6 +113,21 @@ def _in_future(iso: str | None) -> bool:
         return False
 
 
+# Bounded output tail for the trunk gate (#229): a failing verification command can spew
+# thousands of lines, but the event/issue only needs the last few for the operator to see
+# what broke. Truncation is never silent — the caller marks a trimmed tail as such.
+_TRUNK_GATE_TAIL_LINES = 40
+
+
+def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
+    """The last ``n_lines`` of ``text`` plus whether anything was dropped, so a
+    truncated tail can be flagged (never-silent) rather than passed off as the whole."""
+    lines = (text or "").splitlines()
+    if len(lines) <= n_lines:
+        return "\n".join(lines), False
+    return "\n".join(lines[-n_lines:]), True
+
+
 # Default liveness window for `abandon` (#82): a mid-dispatch abandon is refused when the
 # task's provider stream grew within this many seconds of now (the dispatch may still be
 # alive). Five minutes is comfortably longer than a normal inter-event gap on a live
@@ -3054,6 +3069,183 @@ class Engine:
              "task_id": task.task_id, "title": title, "ref": ref},
         )
         return ref
+
+    def trunk_gate(
+        self, run_id: str, *, cwd: str | Path, file_fix: bool = True,
+        timeout_s: int = 1800,
+    ) -> dict:
+        """Post-merge integrity gate (#229): shell the PROJECT ADAPTER's declared
+        verification commands over an already-merged trunk checkout (``cwd``) and,
+        when trunk is red and ``file_fix`` is set, auto-file a single remediation task
+        so a cross-task integration break is caught before a human reads CI.
+
+        Runs the always-present ``test_unit_cmd``/``typecheck_cmd`` pair plus the
+        optional ``test_shell_cmd``/``test_e2e_cmd`` when the adapter declares them
+        non-noop — each via ``subprocess.run`` mirroring ``_run_infra_reset``. The engine
+        stays project-agnostic (only adapter argv, never a hardcoded pytest/ruff/mypy) and
+        NEVER calls a model. A gate with no runnable command (every command the ``['true']``
+        sentinel) has nothing to fail and is reported green.
+
+        Returns a rollup ``{run_id, green, cwd, commands:[{name, argv, rc, output_tail,
+        truncated}], failing, file_fix, filed, deduped}``. ``green`` is every command
+        exiting 0; a command whose invocation raises (missing binary, timeout) is recorded
+        red with the error in its tail. Best-effort filing mirrors ``_file_review_followups``
+        (``ref=None`` + a ``followup_failed`` event on a raising task source, never a crash)
+        and dedups on a prior ``trunk_gate_fix_filed`` event so a re-invocation never files
+        the fix twice."""
+        cwd_path = Path(cwd)
+        run_cwd = str(cwd_path) if cwd_path.is_dir() else None
+        commands: list[dict] = []
+        for name, getter in (
+            ("test_unit", self.project.test_unit_cmd),
+            ("test_e2e", getattr(self.project, "test_e2e_cmd", None)),
+            ("test_shell", getattr(self.project, "test_shell_cmd", None)),
+            ("typecheck", self.project.typecheck_cmd),
+        ):
+            if getter is None:
+                continue
+            try:
+                argv = getter()
+            except Exception:  # noqa: BLE001 - a project command surface must never break the gate
+                continue
+            if not argv or argv == ["true"]:  # skip the no-op sentinel, not just empty
+                continue
+            try:
+                proc = subprocess.run(  # noqa: S603
+                    argv, cwd=run_cwd, capture_output=True, text=True, timeout=timeout_s
+                )
+                rc = proc.returncode
+                tail, truncated = _tail((proc.stdout or "") + (proc.stderr or ""))
+            except (OSError, subprocess.SubprocessError) as exc:
+                rc = -1  # a command that could not even run (missing binary, timeout) is red
+                tail, truncated = f"error ({type(exc).__name__}): {exc}", False
+            commands.append({"name": name, "argv": list(argv), "rc": rc,
+                             "output_tail": tail, "truncated": truncated})
+
+        # `all([])` is True: a gate with nothing to run is not "red" — auto-filing on an
+        # empty command set would be a false alarm, so an empty gate reports green.
+        green = all(c["rc"] == 0 for c in commands)
+        failing = [c["name"] for c in commands if c["rc"] != 0]
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "trunk_gate_ran", "run_id": run_id, "cwd": str(cwd_path),
+             "green": green, "failing": failing,
+             "commands": [{"name": c["name"], "rc": c["rc"]} for c in commands]},
+        )
+        result: dict = {
+            "run_id": run_id, "green": green, "cwd": str(cwd_path), "commands": commands,
+            "failing": failing, "file_fix": file_fix, "filed": None, "deduped": False,
+        }
+        if green:
+            return result
+
+        # Red: state the red rollup regardless of whether we go on to file.
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "trunk_gate_red", "run_id": run_id, "cwd": str(cwd_path),
+             "failing": failing},
+        )
+        if not file_fix:
+            return result
+
+        # Light dedup (never-silent): a prior successful filing for this run means the fix
+        # task already exists — skip a second one and say so, rather than spawn duplicates.
+        prior = next(
+            (e for e in self.store.read_events(run_id)
+             if e.get("type") == "trunk_gate_fix_filed"),
+            None,
+        )
+        if prior is not None:
+            result["deduped"] = True
+            result["filed"] = prior.get("ref")
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "trunk_gate_fix_skipped_duplicate", "run_id": run_id,
+                 "existing_ref": prior.get("ref")},
+            )
+            return result
+
+        result["filed"] = self._file_trunk_gate_fix(run_id, commands, failing)
+        return result
+
+    def _file_trunk_gate_fix(
+        self, run_id: str, commands: list[dict], failing: list[str]
+    ) -> str | None:
+        """File the single post-merge remediation issue for a red trunk (#229). Best-effort
+        exactly like ``_file_review_followups``: a missing/raising ``file_followup`` yields
+        ``ref=None`` (with a ``followup_failed`` event on a raise) and never crashes; a
+        successful filing emits ``trunk_gate_fix_filed`` — also the dedup marker."""
+        task_source = getattr(self.project, "task_source", None)
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return None
+        title = f"Post-merge trunk gate red: {', '.join(failing) or 'unknown'} (run {run_id})"
+        body = self._render_trunk_gate_fix_body(run_id, commands, failing)
+        try:
+            ref = file_followup(title=title, body=body, labels=["deferred-scope"])
+        except Exception as exc:  # noqa: BLE001 - the gate must survive a flaky task source
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "followup_failed", "run_id": run_id,
+                 "title": title, "error": str(exc)},
+            )
+            return None
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "trunk_gate_fix_filed", "run_id": run_id,
+             "title": title, "ref": ref, "failing": failing},
+        )
+        return ref
+
+    def _render_trunk_gate_fix_body(
+        self, run_id: str, commands: list[dict], failing: list[str]
+    ) -> str:
+        """The remediation issue body: the failing command names + output tails, the run id,
+        and the batch's task/PR-URL list so the fixer has the integration context (#216/#229)."""
+        lines = [
+            f"The post-merge trunk gate for run `{run_id}` is **red**: the merged trunk fails "
+            f"verification even though each task's PR was individually green — a cross-task "
+            f"integration break (#216/#229).",
+            "",
+            f"**Failing commands:** {', '.join(failing) or 'unknown'}",
+            "",
+        ]
+        for c in commands:
+            if c["rc"] == 0:
+                continue
+            trunc = " (last lines only)" if c.get("truncated") else ""
+            lines += [
+                f"### `{c['name']}` — rc={c['rc']}",
+                f"`{' '.join(c['argv'])}`",
+                "",
+                f"```\n{c['output_tail']}\n```{trunc}",
+                "",
+            ]
+        batch = self._batch_task_pr_list(run_id)
+        if batch:
+            lines.append("**Batch tasks merged into this trunk:**")
+            lines += [f"- `{e['task_id']}` — {e['pr_url'] or '(no PR)'}" for e in batch]
+            lines.append("")
+        lines.append("_Filed automatically by the post-merge trunk gate (#229)._")
+        return "\n".join(lines)
+
+    def _batch_task_pr_list(self, run_id: str) -> list[dict]:
+        """The run's ``task_id``/PR-URL pairs, for trunk-gate remediation context.
+        Best-effort: a missing run or an unreadable task doc degrades to fewer/absent
+        entries rather than crashing the gate's filing path."""
+        out: list[dict] = []
+        try:
+            run = self.store.load_run(run_id)
+        except Exception:  # noqa: BLE001 - context enrichment must never break filing
+            return out
+        for ref in run.task_refs:
+            try:
+                doc = self.store.load_task(run_id, ref.task_id)
+            except Exception:  # noqa: BLE001 - one unreadable task doc must not drop the rest
+                out.append({"task_id": ref.task_id, "pr_url": None})
+                continue
+            out.append({"task_id": ref.task_id, "pr_url": doc.pr_url})
+        return out
 
     def _publish_completion_note(
         self, run_id: str, task: Task, task_source: object, followups: list[dict],
