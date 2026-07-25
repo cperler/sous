@@ -39,8 +39,10 @@ from adapters.project.base import ADAPTER_CONTRACT_VERSION, ProjectConfig
 # The entry-point group a packaged project (or third-party) registers its adapter under.
 ENTRY_POINT_GROUP = "orchestrator.project_adapters"
 
-# Mirrors the ProjectConfig Protocol (adapters/project/base.py). ``schema_for`` is
-# deliberately absent: it is optional, duck-typed via ``getattr`` by the CLI.
+# Mirrors the ProjectConfig Protocol (adapters/project/base.py). ``schema_for`` and
+# ``types_cmd`` are deliberately absent: both are optional, duck-typed via ``getattr``
+# (the CLI for schema_for, the trunk gate for types_cmd) — so an older external adapter
+# that predates them still satisfies the contract.
 _REQUIRED_MEMBERS = [
     "name",
     "install_cmd",

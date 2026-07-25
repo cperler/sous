@@ -58,7 +58,14 @@ class SelfHostConfig:
         return _NOOP
 
     def typecheck_cmd(self) -> list[str]:
-        return ["uv", "run", "ruff", "check", "."]  # ruff is this project's gate
+        return ["uv", "run", "ruff", "check", "."]  # ruff is this project's LINT gate
+
+    def types_cmd(self) -> list[str]:
+        # Distinct STATIC-TYPING leg (#243): this repo's CI runs mypy alongside ruff, so
+        # the post-merge trunk gate must too (typecheck_cmd above is the linter, not the
+        # type checker). Without this the gate could report green on a trunk mypy — hence
+        # CI — would fail.
+        return ["uv", "run", "mypy"]
 
     def infra_reset(self) -> list[str]:
         return _NOOP

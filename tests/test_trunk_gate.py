@@ -279,5 +279,146 @@ def test_cli_nonexistent_cwd_exits_nonzero(tmp_path, capsys):
     assert out["filed"] is None
 
 
+# --- static-typing leg (#243): the third CI command must be in the gate -------------
+
+
+class _TypedGreenProject(FakeProject):
+    """Declares a distinct static-typing command (the mypy analogue) that passes."""
+
+    def types_cmd(self):
+        return ["echo", "types-ok"]
+
+
+class _RedTypesProject(FakeProject):
+    """The static-typing command is red even though unit/typecheck are green — the exact
+    false-negative #243 fixes: a trunk CI's type checker fails would have reported green."""
+
+    def types_cmd(self):
+        return ["sh", "-c", "echo mypy-boom >&2; exit 1"]
+
+
+def test_types_command_runs_when_adapter_declares_one(tmp_path):
+    """(a) A distinct static-typing command joins the gate's command set when declared."""
+    project = _TypedGreenProject()
+    eng = _engine(tmp_path, project)
+
+    result = eng.trunk_gate("r1", cwd=tmp_path)
+
+    assert result["green"] is True
+    names = [c["name"] for c in result["commands"]]
+    assert "types" in names, f"types leg missing from gate commands: {names}"
+    types_cmd = next(c for c in result["commands"] if c["name"] == "types")
+    assert types_cmd["argv"] == ["echo", "types-ok"]
+    # It is not in skipped (it actually ran).
+    assert "types" not in [s["name"] for s in result["skipped"]]
+
+
+def test_red_types_command_makes_gate_red_and_files(tmp_path):
+    """(b) A red static-typing command reddens the gate and files exactly one fix,
+    mirroring the red test_unit path — this is the case that was slipping through."""
+    project = _RedTypesProject()
+    eng = _engine(tmp_path, project)
+
+    result = eng.trunk_gate("r1", cwd=tmp_path)
+
+    assert result["green"] is False
+    assert "types" in result["failing"]
+    assert result["filed"] is not None
+    assert len(project.task_source.followups) == 1
+    body = project.task_source.followups[0]["body"]
+    assert "types" in body
+    assert "mypy-boom" in body
+    red_cmd = next(c for c in result["commands"] if c["name"] == "types")
+    assert red_cmd["rc"] != 0
+    assert "mypy-boom" in red_cmd["output_tail"]
+    types = _types(tmp_path)
+    assert types.count("trunk_gate_red") == 1
+    assert types.count("trunk_gate_fix_filed") == 1
+
+
+def test_adapter_without_types_method_runs_and_records_skip(tmp_path):
+    """(c) Backward compat: a legacy/external adapter WITHOUT ``types_cmd`` must not crash
+    the gate — it degrades to a skip, recorded (never-silent) as reason ``absent``."""
+    project = _GreenProject()  # FakeProject has no types_cmd
+    assert not hasattr(project, "types_cmd")  # the pre-#243 shape
+    eng = _engine(tmp_path, project)
+
+    result = eng.trunk_gate("r1", cwd=tmp_path)
+
+    assert result["green"] is True  # ran fine, no crash
+    assert "types" not in [c["name"] for c in result["commands"]]
+    skipped = {s["name"]: s["reason"] for s in result["skipped"]}
+    assert skipped.get("types") == "absent"
+    # The skip is observable on the ran event too.
+    ran = next(e for e in _events(tmp_path) if e["type"] == "trunk_gate_ran")
+    assert {"name": "types", "reason": "absent"} in ran["skipped"]
+
+
+def test_noop_types_command_is_skipped_like_other_sentinels(tmp_path):
+    """(d) A ``['true']`` static-typing command is skipped exactly like the other no-op
+    sentinels — recorded under skipped with reason ``noop``, not run, not red."""
+
+    class _NoopTypesProject(FakeProject):
+        def types_cmd(self):
+            return ["true"]
+
+    project = _NoopTypesProject()
+    eng = _engine(tmp_path, project)
+
+    result = eng.trunk_gate("r1", cwd=tmp_path)
+
+    assert result["green"] is True
+    assert "types" not in [c["name"] for c in result["commands"]]
+    skipped = {s["name"]: s["reason"] for s in result["skipped"]}
+    assert skipped.get("types") == "noop"
+
+
+def _gate_argvs(project) -> list[list[str]]:
+    """The non-noop commands ``Engine.trunk_gate`` would run for ``project`` — the same
+    leg selection the engine loop performs, without executing anything."""
+    legs = [
+        project.test_unit_cmd,
+        getattr(project, "test_e2e_cmd", None),
+        getattr(project, "test_shell_cmd", None),
+        project.typecheck_cmd,
+        getattr(project, "types_cmd", None),
+    ]
+    argvs: list[list[str]] = []
+    for getter in legs:
+        if getter is None:
+            continue
+        argv = getter()
+        if not argv or argv == ["true"]:
+            continue
+        argvs.append(list(argv))
+    return argvs
+
+
+def test_gate_covers_every_ci_command_for_selfhost():
+    """(#243 assertion) The trunk gate's command set must cover every verification command
+    this project's CI runs — so a future CI addition can't silently fall out of the gate
+    the way mypy did. Parses .github/workflows/ci.yml's `uv run` steps and asserts each is
+    a prefix of some gate leg for the real self-host adapter."""
+    from adapters.project.selfhost.config import SelfHostConfig
+
+    repo_root = Path(__file__).resolve().parents[1]
+    ci = (repo_root / ".github/workflows/ci.yml").read_text()
+    # The verification commands CI executes: every `run: uv run ...` step (skip `uv sync`).
+    ci_cmds = [
+        line.split("run:", 1)[1].strip().split()
+        for line in ci.splitlines()
+        if "run:" in line and "uv run" in line
+    ]
+    ci_cmds = [c for c in ci_cmds if c[:2] == ["uv", "run"]]
+    assert ci_cmds, "expected to parse `uv run` verification steps from ci.yml"
+
+    gate_argvs = _gate_argvs(SelfHostConfig(tasks_path="/dev/null"))
+    for ci_cmd in ci_cmds:
+        assert any(argv[: len(ci_cmd)] == ci_cmd for argv in gate_argvs), (
+            f"CI command {' '.join(ci_cmd)!r} is not covered by any trunk-gate leg "
+            f"{gate_argvs} — it would run in CI but not in the gate (the #243 gap)."
+        )
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))

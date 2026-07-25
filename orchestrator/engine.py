@@ -3080,14 +3080,20 @@ class Engine:
         so a cross-task integration break is caught before a human reads CI.
 
         Runs the always-present ``test_unit_cmd``/``typecheck_cmd`` pair plus the
-        optional ``test_shell_cmd``/``test_e2e_cmd`` when the adapter declares them
-        non-noop — each via ``subprocess.run`` mirroring ``_run_infra_reset``. The engine
-        stays project-agnostic (only adapter argv, never a hardcoded pytest/ruff/mypy) and
-        NEVER calls a model. A gate with no runnable command (every command the ``['true']``
-        sentinel) has nothing to fail and is reported green.
+        optional ``test_shell_cmd``/``test_e2e_cmd`` and the duck-typed ``types_cmd``
+        (the static-typing leg distinct from the linter, #243) when the adapter declares
+        them non-noop — each via ``subprocess.run`` mirroring ``_run_infra_reset``. The
+        engine stays project-agnostic (only adapter argv, never a hardcoded
+        pytest/ruff/mypy) and NEVER calls a model. A gate with no runnable command (every
+        command the ``['true']`` sentinel) has nothing to fail and is reported green.
+
+        Every leg the gate does NOT run — an adapter without the method (a pre-#243 adapter
+        has no ``types_cmd``), a getter that raised, or the ``['true']``/empty no-op
+        sentinel — is recorded in ``skipped:[{name, reason}]`` (never-silent), so a reader
+        can distinguish an absent/skipped leg from one that ran green.
 
         Returns a rollup ``{run_id, green, cwd, commands:[{name, argv, rc, output_tail,
-        truncated}], failing, file_fix, filed, deduped}``. ``green`` is every command
+        truncated}], failing, skipped, file_fix, filed, deduped}``. ``green`` is every command
         exiting 0; a command whose invocation raises (missing binary, timeout) is recorded
         red with the error in its tail. Best-effort filing mirrors ``_file_review_followups``
         (``ref=None`` + a ``followup_failed`` event on a raising task source, never a crash)
@@ -3124,19 +3130,32 @@ class Engine:
             }
         run_cwd = str(cwd_path)
         commands: list[dict] = []
+        # Never-silent: a leg the gate does NOT run — the adapter omits the method
+        # (``types`` on a pre-#243 adapter), its getter raised, or it returned the
+        # ``['true']``/empty no-op sentinel — is recorded here with WHY, not dropped, so a
+        # reader can tell an absent/skipped leg from one that ran green.
+        skipped: list[dict] = []
         for name, getter in (
             ("test_unit", self.project.test_unit_cmd),
             ("test_e2e", getattr(self.project, "test_e2e_cmd", None)),
             ("test_shell", getattr(self.project, "test_shell_cmd", None)),
             ("typecheck", self.project.typecheck_cmd),
+            # Distinct static-typing leg (#243): the adapter's type checker where that is a
+            # command separate from the linter (selfhost: mypy vs ruff). Duck-typed —
+            # ``getattr(..., None)`` so a legacy/external adapter without ``types_cmd``
+            # degrades to a skip (recorded below), never a crash.
+            ("types", getattr(self.project, "types_cmd", None)),
         ):
             if getter is None:
+                skipped.append({"name": name, "reason": "absent"})
                 continue
             try:
                 argv = getter()
             except Exception:  # noqa: BLE001 - a project command surface must never break the gate
+                skipped.append({"name": name, "reason": "getter_raised"})
                 continue
             if not argv or argv == ["true"]:  # skip the no-op sentinel, not just empty
+                skipped.append({"name": name, "reason": "noop"})
                 continue
             try:
                 proc = subprocess.run(  # noqa: S603
@@ -3158,11 +3177,13 @@ class Engine:
             run_id,
             {"ts": _now(), "type": "trunk_gate_ran", "run_id": run_id, "cwd": str(cwd_path),
              "green": green, "failing": failing,
-             "commands": [{"name": c["name"], "rc": c["rc"]} for c in commands]},
+             "commands": [{"name": c["name"], "rc": c["rc"]} for c in commands],
+             "skipped": skipped},
         )
         result: dict = {
             "run_id": run_id, "green": green, "cwd": str(cwd_path), "commands": commands,
-            "failing": failing, "file_fix": file_fix, "filed": None, "deduped": False,
+            "failing": failing, "skipped": skipped, "file_fix": file_fix, "filed": None,
+            "deduped": False,
         }
         if green:
             return result
