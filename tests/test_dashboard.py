@@ -105,8 +105,29 @@ def test_running_run_surfaces_inflight_activity(tmp_path) -> None:
     assert inflight[0]["task_id"] == "t1"
     assert inflight[0]["stage"] == "scope"
     assert "Bash" in inflight[0]["line"] and "pytest -q" in inflight[0]["line"]
+    # A tailable provider stream exists → the web dashboard may offer its live-stream toggle.
+    assert inflight[0]["stream_available"] is True
     # A healthy running run is not attention.
     assert row["attention"] is False
+
+
+def test_inflight_without_provider_stream_marks_stream_unavailable(tmp_path) -> None:
+    """The interactive×claude / ENGINE lanes run stages in-session with nothing teeing provider
+    stdout to a ``.stream.jsonl`` — so an in-flight task has NO tailable stream. The row must
+    flag ``stream_available`` False so the web dashboard suppresses its (unpopulatable) live-
+    stream affordance instead of advertising an empty panel (#137)."""
+    rr = tmp_path / "r1"
+    eng = _engine(rr)
+    _drive_intake(eng, "r1")
+    w = eng.next_work("r1", "t1")  # dispatch scope; leaves the task RUNNING
+    assert w.stage is Stage.SCOPE
+    # Deliberately write NO stream file (the interactive/ENGINE lane never tees one).
+
+    snap = _snapshot(tmp_path)
+    inflight = snap["runs"][0]["inflight"]
+    assert len(inflight) == 1
+    assert inflight[0]["task_id"] == "t1"
+    assert inflight[0]["stream_available"] is False
 
 
 def test_paused_run_surfaces_reason(tmp_path) -> None:

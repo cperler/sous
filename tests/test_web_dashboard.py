@@ -141,6 +141,10 @@ def test_index_is_self_contained_html(tmp_path) -> None:
     # No external asset host: the page must be fully offline / CSP-safe.
     assert "http://" not in html and "https://" not in html
     assert "/api/snapshot" in html and "/api/stream" in html
+    # #137: the live-stream toggle is gated on the row's stream_available flag, and the
+    # in-session lanes (no tailable provider stream) get an honest note instead.
+    assert "inf.stream_available" in html
+    assert "in-session lane" in html
 
 
 def test_unknown_path_is_404(tmp_path) -> None:
