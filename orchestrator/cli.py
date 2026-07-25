@@ -123,7 +123,7 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
 _ENGINE_COMMANDS = frozenset({
     "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
     "hold", "approve", "unpause", "reject", "abandon", "resume", "status",
-    "watch", "cost-report", "retrospective",
+    "watch", "cost-report", "retrospective", "trunk-gate",
 })
 
 
@@ -384,6 +384,15 @@ def main(argv: list[str] | None = None) -> int:
                          f"{DEFAULT_ABANDON_MIN_IDLE_S}")
     ab.add_argument("--force", action="store_true",
                     help="override the liveness guard (the process is known dead)")
+    tg = sub.add_parser("trunk-gate",
+                        help="post-merge integrity gate (#229): run the project adapter's "
+                             "verification commands over a merged-trunk checkout and auto-file "
+                             "a remediation task when trunk is red (non-zero exit on red)")
+    tg.add_argument("-C", "--cwd", default=".",
+                    help="the merged-trunk checkout to gate (default: repo root)")
+    tg.add_argument("--no-file-fix", dest="file_fix", action="store_false",
+                    help="report only — do NOT auto-file a remediation task on red")
+    tg.set_defaults(file_fix=True)
     sub.add_parser("resume")
     sub.add_parser("status")
     wt = sub.add_parser("watch", help="poll a run to terminal, alerting (project notify "
@@ -1066,6 +1075,11 @@ def main(argv: list[str] | None = None) -> int:
                            force=args.force)
         _emit({"abandoned": task.task_id, "state": task.state.value,
                "disposition": disposition})
+    elif args.cmd == "trunk-gate":
+        result = eng.trunk_gate(args.run, cwd=args.cwd, file_fix=args.file_fix)
+        _emit(result)
+        # Non-zero on red so a human or CI wrapper can branch on the exit code.
+        return 0 if result["green"] else 1
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
