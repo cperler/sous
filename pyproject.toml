@@ -71,20 +71,16 @@ python_version = "3.11"
 module = ["jsonschema", "jsonschema.*"]
 ignore_missing_imports = true
 
-# Per-module strictness ratchet (#210). The global default stays lenient
-# (annotations optional), but these modules are already fully annotated and
+# Per-module strictness ratchet (#210, completed by #241). The global default
+# stays lenient (annotations optional), but these modules are fully annotated and
 # clean, so we gate them: a future un-annotated def in any of them now FAILS
 # `mypy` instead of silently degrading. This is a config-only ratchet — flip a
 # module out of the default set and into this list once its defs are annotated.
 #
-# Deliberately NOT yet promoted (still carry un-annotated defs — the documented
-# next increment, tracked as deferred-scope #241; N = [no-untyped-def]
-# count per module, 19 total): orchestrator.project_loader (5),
-# orchestrator.port_registry (4), orchestrator.usage_probe (3),
-# orchestrator.stream_probe (1), orchestrator.dashboard (1),
-# orchestrator.web_dashboard (1), orchestrator.cli (1),
-# adapters.execution.runners (1), adapters.execution.deterministic_test (1),
-# adapters.execution.deterministic_setup (1).
+# Ratchet complete: every shipped module under files = ["orchestrator", "adapters"]
+# is now listed here (#241 promoted the final 10 that still carried un-annotated
+# defs). A NEW module added to the tree is lenient by default until it is added
+# below — add it here once its defs are annotated so the gate keeps biting.
 [[tool.mypy.overrides]]
 module = [
     "orchestrator",
@@ -92,14 +88,18 @@ module = [
     "orchestrator.batch_plan",
     "orchestrator.brainstorm",
     "orchestrator.capacity",
+    "orchestrator.cli",
     "orchestrator.cost_ledger",
     "orchestrator.cost_policy",
     "orchestrator.dag",
+    "orchestrator.dashboard",
     "orchestrator.engine",
     "orchestrator.errors",
     "orchestrator.failure_classifier",
     "orchestrator.learnings_kb",
     "orchestrator.model_table",
+    "orchestrator.port_registry",
+    "orchestrator.project_loader",
     "orchestrator.queue_file",
     "orchestrator.render",
     "orchestrator.retrospective",
@@ -117,14 +117,20 @@ module = [
     "orchestrator.stages",
     "orchestrator.state_machine",
     "orchestrator.status_store",
+    "orchestrator.stream_probe",
+    "orchestrator.usage_probe",
+    "orchestrator.web_dashboard",
     "adapters",
     "adapters.execution",
     "adapters.execution.base",
     "adapters.execution.codex",
     "adapters.execution.deterministic_deliver",
+    "adapters.execution.deterministic_setup",
+    "adapters.execution.deterministic_test",
     "adapters.execution.headless_claude",
     "adapters.execution.install_cache",
     "adapters.execution.interactive",
+    "adapters.execution.runners",
     "adapters.execution.transport",
     "adapters.project",
     "adapters.project.base",

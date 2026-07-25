@@ -63,7 +63,11 @@ def _http_get(url: str, headers: dict[str, str]) -> str | None:
         return None
 
 
-def fetch_usage(*, token_provider=_keychain_token, http_get=_http_get) -> Usage | None:
+def fetch_usage(
+    *,
+    token_provider: Callable[[], str | None] = _keychain_token,
+    http_get: Callable[[str, dict[str, str]], str | None] = _http_get,
+) -> Usage | None:
     """One live probe of the usage endpoint. None on any failure."""
     token = token_provider()
     if not token:
@@ -99,8 +103,8 @@ def read_usage(
     cache_path: Path = DEFAULT_CACHE,
     ttl_s: int = CACHE_TTL_S,
     *,
-    fetch=fetch_usage,
-    now=time.time,
+    fetch: Callable[[], Usage | None] = fetch_usage,
+    now: Callable[[], float] = time.time,
 ) -> Usage | None:
     """Cached probe: serve a fresh-enough cache file, else fetch and rewrite it.
     The cache lives under the user's cache dir (not /tmp — the old script's cache
@@ -210,7 +214,9 @@ def watch_statusline(
         pass
 
 
-def resolve_util(spec: str | float | None, *, reader=read_usage) -> tuple[float, dict]:
+def resolve_util(
+    spec: str | float | None, *, reader: Callable[[], Usage | None] = read_usage
+) -> tuple[float, dict]:
     """CLI ``--util`` resolution: a number passes through; ``auto`` (or empty) probes.
     Returns ``(util_pct, meta)`` — meta says where the number came from, so a probe
     miss is visible ('gates open at 0.0' is a stated fact, not a silent lie)."""

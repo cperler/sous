@@ -26,6 +26,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import PurePosixPath
 
+from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
@@ -232,7 +233,7 @@ class DeterministicTestRunner:
                 out.append((label, argv))
         return out
 
-    def _classify(self, test_output: str):
+    def _classify(self, test_output: str) -> list[Failure]:
         """Structured failures from raw output via the project classifier (best-effort)."""
         classifier = getattr(self._project, "classifier", None)
         if classifier is None:
