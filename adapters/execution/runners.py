@@ -130,7 +130,9 @@ def build_registry(
     return reg
 
 
-def registry_runner(registry: Registry, *, max_workers: int | None = None):
+def registry_runner(
+    registry: Registry, *, max_workers: int | None = None
+) -> Callable[[list[WorkItem]], list[StageResult]]:
     """A Scheduler Runner that dispatches each WorkItem via its cell's in-process runner.
 
     Raises (via Registry.resolve) if a WorkItem targets an external cell (interactive),

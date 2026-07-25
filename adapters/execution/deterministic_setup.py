@@ -31,6 +31,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from adapters.project.base import ProjectConfig
@@ -347,7 +348,7 @@ class DeterministicSetupRunner:
         return composed
 
     @staticmethod
-    def _run_project(cmd_fn, cwd: Path) -> str:
+    def _run_project(cmd_fn: Callable[[], list[str]], cwd: Path) -> str:
         """Run a project command (install) best-effort; return a short status note."""
         try:
             argv = cmd_fn()

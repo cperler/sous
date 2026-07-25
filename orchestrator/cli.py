@@ -186,7 +186,7 @@ def _engine(args: argparse.Namespace) -> Engine:
     return Engine(store, ledger, project, router=router, registry=registry)
 
 
-def _emit(obj) -> None:
+def _emit(obj: object) -> None:
     json.dump(obj, sys.stdout, indent=2, default=str)
     sys.stdout.write("\n")
 

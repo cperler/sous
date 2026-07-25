@@ -32,7 +32,10 @@ import importlib.util
 import inspect
 import re
 import sys
+from collections.abc import Callable
+from importlib.metadata import EntryPoint, EntryPoints
 from pathlib import Path
+from types import ModuleType
 
 from adapters.project.base import ADAPTER_CONTRACT_VERSION, ProjectConfig
 
@@ -62,7 +65,7 @@ def validate_config(config: object) -> list[str]:
     return [m for m in _REQUIRED_MEMBERS if not hasattr(config, m)]
 
 
-def _import_adapter_dir(path: Path):
+def _import_adapter_dir(path: Path) -> ModuleType:
     """Import ``<path>/__init__.py`` as a standalone package (relative imports work)."""
     init = path / "__init__.py"
     if not init.is_file():
@@ -103,7 +106,9 @@ def _check_contract(spec: str, declared: int | None, *, external: bool) -> None:
         )
 
 
-def _build_config(spec: str, factory, *, external: bool) -> ProjectConfig:
+def _build_config(
+    spec: str, factory: Callable[[], ProjectConfig] | None, *, external: bool
+) -> ProjectConfig:
     """Instantiate a config from its factory (``get_config``/``ConfigClass``) and, for an
     externally-owned adapter, duck-check it against the full ProjectConfig surface."""
     if factory is None:
@@ -119,18 +124,18 @@ def _build_config(spec: str, factory, *, external: bool) -> ProjectConfig:
     return config
 
 
-def _config_from_module(spec: str, module, *, external: bool) -> ProjectConfig:
+def _config_from_module(spec: str, module: ModuleType, *, external: bool) -> ProjectConfig:
     """Load a config from a module exposing module-level ``CONTRACT_VERSION`` + ``get_config``."""
     _check_contract(spec, getattr(module, "CONTRACT_VERSION", None), external=external)
     return _build_config(spec, getattr(module, "get_config", None), external=external)
 
 
-def _project_adapter_entry_points():
+def _project_adapter_entry_points() -> EntryPoints:
     """Registered ``orchestrator.project_adapters`` entry points (indirection for tests)."""
     return importlib.metadata.entry_points(group=ENTRY_POINT_GROUP)
 
 
-def _load_entry_point(ep) -> ProjectConfig:
+def _load_entry_point(ep: EntryPoint) -> ProjectConfig:
     """Resolve a registered adapter entry point (always treated as external/contract-checked).
 
     The entry-point value is either a package module (module protocol) or a

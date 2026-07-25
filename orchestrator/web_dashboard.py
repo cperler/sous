@@ -114,7 +114,7 @@ def _make_handler(
     class _Handler(BaseHTTPRequestHandler):
         server_version = "orchestrator-dashboard/1"
 
-        def log_message(self, *_args) -> None:  # noqa: D401 - quiet the default stderr spam
+        def log_message(self, *_args: object) -> None:  # noqa: D401 - quiet the default stderr spam
             """Silence the per-request stderr logging (this is a local read-only viewer)."""
 
         def do_GET(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler's required name

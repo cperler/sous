@@ -21,7 +21,7 @@ layer can import it without the engine ever importing ``adapters``.
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from .status_store import safe_task_dirname
@@ -126,7 +126,7 @@ def find_current_stream(
 _STREAM_TAIL_CHARS = 2000
 
 
-def _iter_stream_objects(text: str):
+def _iter_stream_objects(text: str) -> Iterator[dict]:
     """Yield each complete, parseable JSON object line of a provider stream (skipping banners
     and partial trailing writes) — the shared spine of the stream-shape helpers."""
     for line in text.splitlines():

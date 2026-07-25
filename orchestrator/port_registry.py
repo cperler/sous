@@ -37,6 +37,7 @@ import contextlib
 import os
 import socket
 import tempfile
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -187,7 +188,10 @@ class PortRegistry:
             return False
 
     def reclaim_stale(
-        self, is_terminal=None, *, now: str | None = None
+        self,
+        is_terminal: Callable[[str, str], bool] | None = None,
+        *,
+        now: str | None = None,
     ) -> list[Allocation]:
         """Free every stale block and return what was freed. Stale = the owning task is
         terminal (``is_terminal(run_id, task_id) -> bool``, when supplied), OR the owning
@@ -213,10 +217,18 @@ class PortRegistry:
         return None
 
     # --- staleness ------------------------------------------------------------
-    def _prune(self, records: list[Allocation], *, now: str, is_terminal) -> list[Allocation]:
+    def _prune(
+        self,
+        records: list[Allocation],
+        *,
+        now: str,
+        is_terminal: Callable[[str, str], bool] | None,
+    ) -> list[Allocation]:
         return [r for r in records if not self._is_stale(r, now, is_terminal)]
 
-    def _is_stale(self, rec: Allocation, now: str, is_terminal) -> bool:
+    def _is_stale(
+        self, rec: Allocation, now: str, is_terminal: Callable[[str, str], bool] | None
+    ) -> bool:
         if is_terminal is not None:
             try:
                 if is_terminal(rec.run_id, rec.task_id):
@@ -285,7 +297,7 @@ class PortRegistry:
                 os.unlink(tmp)
 
     @contextlib.contextmanager
-    def _locked(self):
+    def _locked(self) -> Iterator[None]:
         """Hold an exclusive advisory lock on ``<path>.lock`` across a read-modify-write.
         Degrades to a no-op lock where ``fcntl`` is unavailable (still correct single-process)."""
         self.path.parent.mkdir(parents=True, exist_ok=True)

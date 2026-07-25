@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from .alerting import _fmt_activity
 from .schemas.enums import TERMINAL_RUN_STATES
@@ -569,7 +569,10 @@ def render_watch(
     clear: Callable[[], None] | None = None,
     interval: float = 30,
     max_iters: int | None = None,
-    **snapshot_kwargs,
+    # Forwarded verbatim to dashboard_snapshot's heterogeneous keyword params
+    # (stale_after_s: int, include_activity: bool, engine_factory, clock, ...); a
+    # single value type can't describe that bag, so Any keeps the passthrough honest.
+    **snapshot_kwargs: Any,
 ) -> None:
     """Clear-screen + reprint the board every ``interval`` seconds until interrupted.
 
