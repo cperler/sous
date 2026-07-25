@@ -149,7 +149,7 @@ def apply_result(
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.INTAKE: ("branch", "worktree", "base_sha", "baseline_failures",
-                   "port_base", "port_count"),
+                   "port_base", "port_count", "composed_deps"),
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),

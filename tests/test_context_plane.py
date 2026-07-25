@@ -54,6 +54,18 @@ def test_full_run_folds_every_stage_into_context(tmp_path, project) -> None:
     assert "plan" in eng.store.load_task("r1", "t1").context
 
 
+def test_intake_composed_deps_folds_into_context() -> None:
+    # #232: composed_deps (the #216 dep branches merged at intake) must reach task.context
+    # so the DELIVER stage can annotate the PR with them. Fails if composed_deps is not in
+    # CONTEXT_KEYS[INTAKE] (it would be dropped at the fold and never reach deliver).
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    _absorb_outputs(task, make_result_stub(
+        Stage.INTAKE, {"branch": "b", "worktree": "/wt", "composed_deps": ["task/dep1"]}))
+    assert task.context["composed_deps"] == ["task/dep1"]
+
+
 def test_fold_is_tolerant_of_missing_keys() -> None:
     from orchestrator.schemas.status import Task
 

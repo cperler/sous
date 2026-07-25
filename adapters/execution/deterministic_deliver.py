@@ -205,6 +205,19 @@ def _pr_body(work: WorkItem, ctx: dict) -> str:
     if issue is not None:
         # Mirror the DELIVER template: a GitHub-issue task closes its issue on merge.
         lines += ["", f"Closes #{_issue_ref(issue)}"]
+    # #232: when #216 composed a batch dependency's branch into this worktree at intake,
+    # those commits ride along in this PR's diff until the dependency's own PR merges
+    # (the accepted stacked-PR topology). Name them so a reviewer knows which commits are
+    # upstream context vs. this task's own change, rather than guessing.
+    deps = [str(d) for d in (ctx.get("composed_deps") or []) if str(d).strip()]
+    if deps:
+        lines += [
+            "",
+            "---",
+            "_Built on batch dependencies composed at intake (#216); their commits "
+            f"({', '.join(f'`{d}`' for d in deps)}) appear in this diff until those PRs "
+            "merge. Changes beyond those commits are this task's own._",
+        ]
     return "\n".join(lines)
 
 

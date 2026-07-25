@@ -238,6 +238,48 @@ def test_deliver_opens_fresh_pr_with_closes(tmp_path) -> None:
     assert "Closes #42" in body and "#42" in title and cwd == "/wt/42"
 
 
+def _fresh_pr_responder(argv):
+    if argv[:2] == ["git", "rev-parse"]:
+        return _cp(0, "task/42\n")
+    if "rev-list" in argv:
+        return _cp(0, "2\n")
+    if "push" in argv:
+        return _cp(0)
+    if argv[:3] == ["gh", "pr", "list"]:
+        return _cp(0, "")  # no existing PR
+    if argv[:3] == ["gh", "pr", "create"]:
+        return _cp(0, "https://github.com/o/r/pull/77\n")
+    return _cp(0)
+
+
+def _created_pr_body(gh: _FakeGh) -> str:
+    argv = next(c[0] for c in gh.calls if c[0][:3] == ["gh", "pr", "create"])
+    return argv[argv.index("--body") + 1]
+
+
+def test_deliver_pr_body_annotates_composed_dep_branches(tmp_path) -> None:
+    # #232: when #216 composed batch-dependency branches into this worktree, the PR body
+    # names them so a reviewer knows which commits are upstream context vs. this task's own.
+    gh = _FakeGh(_fresh_pr_responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"composed_deps": ["task/dep1", "task/dep2"]})
+    )
+    assert res.status is ResultStatus.SUCCESS
+    body = _created_pr_body(gh)
+    assert "`task/dep1`" in body and "`task/dep2`" in body
+    assert "#216" in body  # attributes the stacked-PR topology to the compose-at-intake fix
+
+
+def test_deliver_pr_body_omits_dep_section_when_none_composed(tmp_path) -> None:
+    # No composed deps (single-task run / no-dep task) → no dependency annotation at all,
+    # so an ordinary PR body is not polluted with an empty section.
+    gh = _FakeGh(_fresh_pr_responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(_deliver_wi())
+    assert res.status is ResultStatus.SUCCESS
+    body = _created_pr_body(gh)
+    assert "composed at intake" not in body and "#216" not in body
+
+
 def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
     def responder(argv):
         if argv[:2] == ["git", "rev-parse"]:
