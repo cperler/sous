@@ -1048,7 +1048,16 @@ class Engine:
                 task.not_before = cooldown_until
                 outcome = "stage_rate_limited_cooldown"
         else:
-            apply_result(task, effective, now=_now(), cost_usd=cost)
+            pr_field_notices = apply_result(task, effective, now=_now(), cost_usd=cost)
+            # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
+            # the fold is no longer invisible — surface each drop as a warning-grade audit
+            # event, mirroring effort_downgraded/model_downgraded ('never silent').
+            for notice in pr_field_notices:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "pr_field_dropped", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice},
+                )
             if effective.status is ResultStatus.SUCCESS:
                 task.error_signatures = []  # streak resets on a clean stage
                 task.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget

@@ -85,6 +85,43 @@ def test_deliver_fold_skips_malformed_pr_values_instead_of_crashing() -> None:
     assert task.pr_url == "https://example.test/pr/7"  # the valid sibling still folds
 
 
+def test_deliver_fold_returns_drop_notice_for_malformed_pr_value() -> None:
+    """#201: dropping a malformed pr_* value is no longer SILENT — _absorb_outputs
+    returns a bounded drop notice (field + offending value + reason) per drop so the
+    engine can emit a warning-grade audit event. The valid sibling still folds and
+    contributes no notice."""
+    from orchestrator.state_machine import _absorb_outputs
+    from tests.test_context_plane import make_result_stub
+
+    task = _task()
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.DELIVER, {"pr_number": "", "pr_url": "https://example.test/pr/7"},
+    ))
+    assert task.pr_number is None  # dropped value stays unset
+    assert task.pr_url == "https://example.test/pr/7"  # valid sibling still folds
+    assert len(notices) == 1  # exactly one drop, for the malformed field
+    (notice,) = notices
+    assert notice["field"] == "pr_number"
+    assert notice["value"] == "''"  # repr keeps the empty-string type visible
+    assert notice["reason"]  # a non-empty, bounded reason string
+    assert set(notice) == {"field", "value", "reason"}
+
+
+def test_deliver_fold_returns_no_notice_when_all_pr_values_valid() -> None:
+    """#201: a clean DELIVER fold drops nothing, so the notice list is empty (the engine
+    emits no pr_field_dropped event)."""
+    from orchestrator.state_machine import _absorb_outputs
+    from tests.test_context_plane import make_result_stub
+
+    task = _task()
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.DELIVER, {"pr_number": 42, "pr_url": "https://example.test/pr/42"},
+    ))
+    assert notices == []
+    assert task.pr_number == 42
+    assert task.pr_url == "https://example.test/pr/42"
+
+
 # --- 3. stored JSON is byte-identical (StrEnum serializes as its value) ----------
 
 def test_status_json_round_trips_with_string_values() -> None:

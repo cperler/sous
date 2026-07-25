@@ -8,7 +8,6 @@ schema makes the crash marker unambiguous.
 
 from __future__ import annotations
 
-import contextlib
 import json
 
 from pydantic import ValidationError
@@ -104,8 +103,13 @@ def apply_result(
     now: str,
     cost_usd: float | None,
     iteration: int | None = None,
-) -> None:
-    """Fold a StageResult into the task's stage record (status + attribution)."""
+) -> list[dict[str, str]]:
+    """Fold a StageResult into the task's stage record (status + attribution).
+
+    Returns the pr_* drop notices produced by ``_absorb_outputs`` (empty on the
+    non-SUCCESS branch, which folds nothing) so the engine can emit a warning-grade
+    ``pr_field_dropped`` audit event — the fold itself stays a pure, sink-free function
+    and the caller owns the I/O (#201, honouring the 'never silent' convention)."""
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
@@ -123,10 +127,11 @@ def apply_result(
     if iteration is not None:
         rec.iteration = iteration
 
+    pr_field_notices: list[dict[str, str]] = []
     if result.status is ResultStatus.SUCCESS:
         rec.status = StageStatus.COMPLETED
         rec.error = None
-        _absorb_outputs(task, result)
+        pr_field_notices = _absorb_outputs(task, result)
     else:
         rec.status = StageStatus.FAILED
         rec.error = result.error or result.status.value
@@ -134,6 +139,7 @@ def apply_result(
 
     task.current_stage = result.stage
     task.updated_at = now
+    return pr_field_notices
 
 
 # Engine-owned context-fold whitelist (2026-07-01 context-plane design note). Per stage,
@@ -171,6 +177,7 @@ _MAX_STR = 2000  # a single string value
 _MAX_ITEM_STR = 500  # a string element inside a list value
 _MAX_LIST = 40  # elements kept from a list value
 _MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
+_MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice (#201)
 
 
 def _cap_item(x: object) -> object:
@@ -237,23 +244,57 @@ def _enforce_context_ceiling(task: Task) -> None:
         task.context.pop(key, None)
 
 
-def _absorb_outputs(task: Task, result: StageResult) -> None:
+def _bound_dropped_value(value: object) -> str:
+    """Bound a dropped pr_* value to a fixed-length repr for the drop notice, so an
+    oversized/adversarial model value can't bloat the emitted audit event. ``repr`` keeps
+    the type visible (``''`` vs ``0`` vs ``None``) and is deterministic for the scalars a
+    pr_* field carries."""
+    text = repr(value)
+    if len(text) > _MAX_DROPPED_VALUE:
+        return text[:_MAX_DROPPED_VALUE] + " … [truncated]"
+    return text
+
+
+def _short_validation_reason(exc: ValidationError) -> str:
+    """A short, deterministic reason string from a field-validation failure (first error's
+    message, bounded). pydantic error messages are stable, so this replays identically."""
+    errors = exc.errors()
+    reason = str(errors[0]["msg"]) if errors else "validation failed"
+    if len(reason) > _MAX_DROPPED_VALUE:
+        return reason[:_MAX_DROPPED_VALUE] + " … [truncated]"
+    return reason
+
+
+def _absorb_outputs(task: Task, result: StageResult) -> list[dict[str, str]]:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
     missing whitelisted key is skipped; a pr_* value that fails field validation is
     dropped rather than raised or stored, #172) and idempotent (a stage succeeds once;
-    re-folding the same result yields the same values)."""
+    re-folding the same result yields the same values).
+
+    Returns a list of drop notices (one ``{field, value, reason}`` dict per dropped pr_*
+    value, empty when nothing was dropped) so the caller can surface each drop as an audit
+    event instead of losing it silently (#201). The fold stays pure — it emits nothing
+    itself."""
     out = result.structured_output or {}
+    dropped: list[dict[str, str]] = []
     # Dedicated pr_* fields stay: other consumers read them (_on_task_completed, status()).
     # Tolerant here too, per the #172 assignment convention: validate_assignment rejects a
     # malformed model-produced value (e.g. pr_number="") AT this write — skip it rather
     # than crash record(). Before #172 the garbage landed silently and made the stored doc
-    # unloadable on its next read; dropping the bad value is strictly safer.
+    # unloadable on its next read; dropping the bad value is strictly safer. #201: record
+    # each drop so the engine can emit a warning-grade event (drop is no longer invisible).
     if result.stage is Stage.DELIVER:
         for field in ("pr_number", "pr_url"):
             if field in out:
-                with contextlib.suppress(ValidationError):
+                try:
                     setattr(task, field, out[field])
+                except ValidationError as exc:
+                    dropped.append({
+                        "field": field,
+                        "value": _bound_dropped_value(out[field]),
+                        "reason": _short_validation_reason(exc),
+                    })
     # Generalized fold: every whitelisted key present in the result, bounded.
     engine_lane = result.lane_used.execution_mode is ExecutionMode.ENGINE
     for key in CONTEXT_KEYS.get(result.stage, ()):
@@ -265,6 +306,7 @@ def _absorb_outputs(task: Task, result: StageResult) -> None:
             continue
         task.context[key] = _cap_value(out[key])
     _enforce_context_ceiling(task)
+    return dropped
 
 
 def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
