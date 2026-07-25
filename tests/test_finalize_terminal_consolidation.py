@@ -146,7 +146,7 @@ def test_begin_stage_clears_stale_last_error() -> None:
     task = Task(task_id="t1", run_id="r1", created_at="t0", updated_at="t0")
     task.last_error = "review rejected: some earlier blocking issue"  # stale from a prior cycle
 
-    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-4-8", effort="high")
+    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-5", effort="high")
 
     assert task.last_error is None  # cleared at attempt start; fails if the reset regresses
 

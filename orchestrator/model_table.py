@@ -48,13 +48,24 @@ class Role:
 _MODELS: dict[str, ModelInfo] = {
     # claude
     # Mythos-tier, above Opus — reachable ONLY via an explicit per-task pin (#84), never a
-    # role default. Price is the published Anthropic API rate ($10/$50 per Mtok, 2x Opus 4.8),
+    # role default. Price is the published Anthropic API rate ($10/$50 per Mtok, 2x Opus 5),
     # source: platform.claude.com/docs/en/about-claude/models/overview (Claude Fable 5 row,
-    # fetched 2026-07-04).
+    # re-confirmed 2026-07-25 with the Opus 5 / Sonnet 5 bump).
     "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-opus-5": ModelInfo(id="claude-opus-5", input_per_mtok=5.0, output_per_mtok=25.0),
+    # Sonnet 5 carries an INTRODUCTORY rate of $2/$10 per Mtok through 2026-08-31, after
+    # which it reverts to the $3/$15 pinned here. We deliberately price at the standard
+    # rate rather than the discount: the ledger feeds the `--budget-usd` hard-PAUSE gate,
+    # so over-estimating spend fails safe (an early pause), while pricing the discount
+    # would silently under-report every row once the intro window closes. Revisit after
+    # 2026-08-31 only to confirm — no edit should be needed.
+    "claude-sonnet-5": ModelInfo(id="claude-sonnet-5", input_per_mtok=3.0, output_per_mtok=15.0),
+    "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
+    # Superseded claude tiers — retained for PRICING historical ledger rows (runs dispatched
+    # before the Opus 5 / Sonnet 5 bump), not for dispatch. Removing them would make every
+    # prior row unpriced (`priced=False`) and corrupt historical cost reports.
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
-    "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
     # codex (OpenAI) — the ids passed to `codex exec -m`. On a ChatGPT-plan account only
     # gpt-5.5 is accepted (probed live 2026-07-04: gpt-5-codex/gpt-5/gpt-5.5-mini all 400
     # "not supported when using Codex with a ChatGPT account"). Older ids are kept below
@@ -72,8 +83,8 @@ _MODELS: dict[str, ModelInfo] = {
 # codex-routed stage resolves to a codex id, not a claude one shelled to `codex exec -m`.
 _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
     Provider.CLAUDE: {
-        Role.DEEP_REASON: "claude-opus-4-8",
-        Role.REVIEW: "claude-sonnet-4-6",
+        Role.DEEP_REASON: "claude-opus-5",
+        Role.REVIEW: "claude-sonnet-5",
         Role.CHEAP_SHELL: "claude-haiku-4-5",
     },
     # Single supported model on the ChatGPT plan (see _MODELS note) — every role pins to
@@ -91,11 +102,14 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 # a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
     # fable sits at the HEAD (above opus) so a rate-limited fable pin degrades to opus
-    # naturally (fallback_after('claude-fable-5') == 'claude-opus-4-8'). Nothing dispatches
+    # naturally (fallback_after('claude-fable-5') == 'claude-opus-5'). Nothing dispatches
     # chain[0] by default — the role defaults below stay opus/sonnet/haiku, and both the
     # capacity downgrade and rate-limit fallback only walk DOWN the chain, never up into
     # fable — so fable is reachable only through the per-task model pin (#84).
-    Provider.CLAUDE: ("claude-fable-5", "claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"),
+    # Superseded tiers (opus-4-8, sonnet-4-6) are deliberately NOT in the chain: they stay
+    # priceable in _MODELS for historical rows, but a rate-limited Opus 5 degrades straight
+    # to Sonnet 5 rather than sideways into a previous generation.
+    Provider.CLAUDE: ("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"),
     # Single-entry chain: no cheaper supported codex tier to degrade to on this plan. A
     # floor rate-limit therefore goes straight to cooldown (or #7 fallthrough if enabled).
     Provider.CODEX: ("gpt-5.5",),
@@ -156,8 +170,8 @@ class ModelTable:
 # supported tier) and pass through by their exact id.
 _MODEL_ALIASES: dict[str, str] = {
     "fable": "claude-fable-5",
-    "opus": "claude-opus-4-8",
-    "sonnet": "claude-sonnet-4-6",
+    "opus": "claude-opus-5",
+    "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5",
 }
 

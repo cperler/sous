@@ -75,7 +75,7 @@ def _walk_to_floor(eng, run="r1", task="t1"):
     eng.create_run(run)
     eng.add_task(run, task)
     eng.record(run, make_result(eng.next_work(run, task)))  # intake (deterministic)
-    for expected in ("claude-opus-4-8", "claude-sonnet-4-6", "claude-haiku-4-5"):
+    for expected in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
         w = eng.next_work(run, task)
         assert w.stage is Stage.SCOPE and w.model == expected
         out = eng.record(run, make_result(w, status=ResultStatus.RATE_LIMITED,
@@ -92,7 +92,7 @@ def test_floor_rate_limit_cooldowns_then_retries_original_model(tmp_path, projec
     # cooldown elapsed (0s): the SAME stage re-dispatches on the ORIGINAL role model
     # (not the floor model) at the SAME attempt — the old wait-then-retry semantics.
     w = eng.next_work("r1", "t1")
-    assert w.stage is Stage.SCOPE and w.model == "claude-opus-4-8" and w.attempt == 0
+    assert w.stage is Stage.SCOPE and w.model == "claude-opus-5" and w.attempt == 0
     assert eng.store.load_task("r1", "t1").not_before is None  # stamp cleared on dispatch
 
 

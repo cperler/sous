@@ -23,11 +23,11 @@ def test_render_cost_summary_markdown() -> None:
     summary = {
         "total_invocations": 2,
         "total_cost_usd": 1.5,
-        "by_model": {"claude-opus-4-8": {"invocations": 2, "input_tokens": 100, "output_tokens": 50, "cost_usd": 1.5}},
+        "by_model": {"claude-opus-5": {"invocations": 2, "input_tokens": 100, "output_tokens": 50, "cost_usd": 1.5}},
     }
     md = render_cost_summary("r1", summary)
     assert "# Cost summary — r1" in md
-    assert "$1.5000" in md and "claude-opus-4-8" in md and "| Model |" in md
+    assert "$1.5000" in md and "claude-opus-5" in md and "| Model |" in md
 
 
 def test_render_cost_summary_per_effort_table_and_engine_lane(tmp_path: object = None) -> None:
@@ -35,7 +35,7 @@ def test_render_cost_summary_per_effort_table_and_engine_lane(tmp_path: object =
     summary = {
         "total_invocations": 3,
         "total_cost_usd": 6.5,
-        "by_model": {"claude-opus-4-8": {"invocations": 2, "input_tokens": 0,
+        "by_model": {"claude-opus-5": {"invocations": 2, "input_tokens": 0,
                                          "output_tokens": 0, "cost_usd": 6.0}},
         "by_effort_spend": {
             "high": {"invocations": 2, "cost_usd": 6.0},
@@ -65,7 +65,7 @@ def _task_with_attributed_stages() -> Task:
     # a model-lane stage that ran at high effort
     t.stages[Stage.SCOPE].status = StageStatus.COMPLETED
     t.stages[Stage.SCOPE].lane = ExecutionMode.HEADLESS
-    t.stages[Stage.SCOPE].model = "claude-opus-4-8"
+    t.stages[Stage.SCOPE].model = "claude-opus-5"
     t.stages[Stage.SCOPE].effort = Effort.HIGH
     t.stages[Stage.SCOPE].cost_usd = 2.5
     return t
@@ -94,7 +94,7 @@ def test_render_completion_note_carries_effort_column_and_engine_tag() -> None:
 def test_render_stage_renders_structured_output_as_readable_markdown() -> None:
     payload = {
         "stage": "scope", "task_id": "#9", "attempt": 0, "status": "success", "outcome": "stage_completed",
-        "model": "claude-opus-4-8", "lane_used": {"execution_mode": "interactive", "provider": "claude"},
+        "model": "claude-opus-5", "lane_used": {"execution_mode": "interactive", "provider": "claude"},
         "cost_usd": 0.66, "structured_output": {"feasible": True, "plan": ["hoist it"]},
         "raw_output": "did the thing", "error": None, "completed_at": "t",
     }
@@ -164,7 +164,7 @@ def test_render_stage_stream_payload_without_extractable_text() -> None:
 def test_render_stage_titled_findings_are_readable_blocks() -> None:
     payload = {
         "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
-        "outcome": "task_completed", "model": "claude-sonnet-4-6",
+        "outcome": "task_completed", "model": "claude-sonnet-5",
         "lane_used": {"execution_mode": "interactive", "provider": "claude"}, "cost_usd": 0.0,
         "structured_output": {
             "approved": True,
@@ -224,15 +224,15 @@ def test_render_cost_report_markdown() -> None:
 
 def test_render_by_effort_markdown() -> None:
     agg = [
-        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-4-6", "invocations": 3,
+        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-5", "invocations": 3,
          "cost_usd": 0.75, "avg_duration_s": 4.2, "retry_rate": 0.33, "failure_rate": 0.0},
-        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "invocations": 2,
+        {"stage": "implement", "effort": "high", "model": "claude-opus-5", "invocations": 2,
          "cost_usd": 5.0, "avg_duration_s": 15.0, "retry_rate": 0.5, "failure_rate": 0.5},
     ]
     md = render_by_effort("r1", agg)
     assert "# Cost by effort — r1" in md
     assert "| Stage | Effort | Model | Calls | Cost (USD) | Avg dur (s) | Retry rate | Failure rate |" in md
-    assert "`deliver`" in md and "`low`" in md and "`claude-sonnet-4-6`" in md
+    assert "`deliver`" in md and "`low`" in md and "`claude-sonnet-5`" in md
     assert "$5.0000" in md and "15.0" in md
     assert "50%" in md  # retry/failure rates rendered as percentages
 

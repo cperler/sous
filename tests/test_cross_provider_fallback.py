@@ -137,7 +137,7 @@ def test_provider_unavailable_falls_through_to_claude(tmp_path, project) -> None
     nxt = eng.next_work("r1", "t1")
     assert nxt.stage is Stage.IMPLEMENT
     assert nxt.lane_policy.provider is Provider.CLAUDE
-    assert nxt.model == "claude-opus-4-8"           # claude DEEP_REASON default
+    assert nxt.model == "claude-opus-5"           # claude DEEP_REASON default
     assert nxt.attempt == w.attempt                 # provider was out, not the task — no burn
 
 
@@ -228,7 +228,7 @@ def test_rate_limit_floor_exhausted_falls_through(tmp_path, project) -> None:
     ev = _fallthrough_events(eng)
     assert len(ev) == 1 and "cooldown budget exhausted" in ev[0]["reason"]
     nxt = eng.next_work("r1", "t1")
-    assert nxt.lane_policy.provider is Provider.CLAUDE and nxt.model == "claude-opus-4-8"
+    assert nxt.lane_policy.provider is Provider.CLAUDE and nxt.model == "claude-opus-5"
 
 
 # --- no ping-pong: claude never falls through, one-way only ------------------
@@ -243,7 +243,7 @@ def test_claude_failure_never_falls_through(tmp_path, project) -> None:
     w = eng.next_work("r1", "t1")  # scope (claude, opus)
     assert w.lane_policy.provider is Provider.CLAUDE
     # rate-limit claude down its OWN chain to the floor (opus -> sonnet -> haiku)
-    for expect in ("claude-sonnet-4-6", "claude-haiku-4-5"):
+    for expect in ("claude-sonnet-5", "claude-haiku-4-5"):
         eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
         w = eng.next_work("r1", "t1")
         assert w.model == expect

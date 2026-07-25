@@ -552,7 +552,7 @@ def test_render_completion_note_content() -> None:
         task_id="#10", run_id="r1", created_at="t0", updated_at="t0",
         title="Checkpoint-tag GC", pr_url="https://github.com/o/r/pull/23",
     )
-    task.stages[Stage.IMPLEMENT].model = "claude-opus-4-8"
+    task.stages[Stage.IMPLEMENT].model = "claude-opus-5"
     task.stages[Stage.IMPLEMENT].status = StageStatus.COMPLETED
     task.stages[Stage.REVIEW].output = {
         "approved": True, "issues": ["a lingering blocker"],
@@ -566,7 +566,7 @@ def test_render_completion_note_content() -> None:
     assert "Checkpoint-tag GC" in note
     assert "https://github.com/o/r/pull/23" in note
     assert "✅ approved" in note
-    assert "`claude-opus-4-8`" in note  # stage table renders per-stage model
+    assert "`claude-opus-5`" in note  # stage table renders per-stage model
     assert "a lingering blocker" in note  # blocking issues surfaced
     assert "polish → url-1" in note
     assert "other → (filing failed)" in note
@@ -578,7 +578,7 @@ def test_completion_note_costs_read_na_on_the_interactive_lane() -> None:
     task = Task(task_id="#11", run_id="r1", created_at="t0", updated_at="t0", title="X")
     rec = task.stages[Stage.IMPLEMENT]
     rec.status = StageStatus.COMPLETED
-    rec.model = "claude-opus-4-8"
+    rec.model = "claude-opus-5"
     rec.lane = ExecutionMode.INTERACTIVE
     rec.cost_usd = 0.0  # interactive can't meter in-session
 
