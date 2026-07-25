@@ -56,7 +56,7 @@ def _plan(*lenses: str) -> ReviewPlan:
 def _work(effort: str | None = None) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=Stage.IMPLEMENT, prompt="do it",
-        schema_ref="implement", model="claude-opus-4-8", created_at="now",
+        schema_ref="implement", model="claude-opus-5", created_at="now",
         lane_policy=H, effort=effort,
     )
 
@@ -64,11 +64,11 @@ def _work(effort: str | None = None) -> WorkItem:
 def _result(effort: str | None = None) -> StageResult:
     return StageResult(
         work_item_id="wi-1", content_hash="h", run_id="r1", task_id="t1",
-        stage=Stage.IMPLEMENT, model="claude-opus-4-8", effort=effort,
+        stage=Stage.IMPLEMENT, model="claude-opus-5", effort=effort,
         status=ResultStatus.SUCCESS,
         lane_used=LaneUsed(
             execution_mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE,
-            invocation="agent(model=claude-opus-4-8)",
+            invocation="agent(model=claude-opus-5)",
         ),
         completed_at="now",
     )
@@ -116,7 +116,7 @@ def test_workitem_json_round_trips_with_string_values() -> None:
     dumped = w.model_dump(mode="json")
     assert dumped["effort"] == "high"  # the raw string, not an enum repr
     assert isinstance(dumped["effort"], str)
-    assert dumped["model"] == "claude-opus-4-8"
+    assert dumped["model"] == "claude-opus-5"
     assert isinstance(dumped["model"], str)
     # Full fidelity: load(dump) re-dumps to the identical document.
     assert WorkItem.model_validate(dumped).model_dump(mode="json") == dumped
@@ -128,7 +128,7 @@ def test_stageresult_json_round_trips_with_string_values() -> None:
     dumped = r.model_dump(mode="json")
     assert dumped["effort"] == "medium"
     assert isinstance(dumped["effort"], str)
-    assert dumped["model"] == "claude-opus-4-8"
+    assert dumped["model"] == "claude-opus-5"
     assert WorkItem.model_validate(_work().model_dump(mode="json")).effort is None
     assert StageResult.model_validate(dumped).model_dump(mode="json") == dumped
     assert StageResult.model_validate(dumped).effort is Effort.MEDIUM
@@ -138,17 +138,17 @@ def test_content_hash_is_byte_identical_to_the_pre_migration_shape() -> None:
     """The Effort/ModelId retype must not perturb a dispatch's identity key: the hash of
     a bare-string call equals the hash computed from the raw pre-migration string parts."""
     legacy_blob = "\x1f".join(
-        ["implement", "p", "implement", "claude-opus-4-8", "headless:claude", "0", "high"]
+        ["implement", "p", "implement", "claude-opus-5", "headless:claude", "0", "high"]
     )
     legacy = hashlib.sha256(legacy_blob.encode("utf-8")).hexdigest()
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, effort="high",
+        model="claude-opus-5", lane_policy=H, attempt=0, effort="high",
     ) == legacy
     # And the Effort-member call hashes identically to the bare-string call.
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, effort=Effort.HIGH,
+        model="claude-opus-5", lane_policy=H, attempt=0, effort=Effort.HIGH,
     ) == legacy
 
 
@@ -160,7 +160,7 @@ def test_plan_less_workitem_is_byte_identical_to_pre_change() -> None:
     an exclusion — the append is guarded on `plan is not None`, like `effort`), and its
     None field round-trips cleanly. This is the plan-less-path-stays-byte-identical guard."""
     # The hash equals the pre-#73 formula (no plan part in the blob).
-    legacy_blob = "\x1f".join(["implement", "do it", "implement", "claude-opus-4-8",
+    legacy_blob = "\x1f".join(["implement", "do it", "implement", "claude-opus-5",
                                "headless:claude", "0"])
     legacy = hashlib.sha256(legacy_blob.encode("utf-8")).hexdigest()
     w = _work()
@@ -169,7 +169,7 @@ def test_plan_less_workitem_is_byte_identical_to_pre_change() -> None:
     # compute_content_hash with plan=None equals the no-plan-arg call.
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="do it", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, plan=None,
+        model="claude-opus-5", lane_policy=H, attempt=0, plan=None,
     ) == legacy
     # JSON round-trip is loss-free with plan=None present.
     dumped = w.model_dump(mode="json")
@@ -182,7 +182,7 @@ def test_two_finder_sets_yield_different_content_hashes() -> None:
     DIFFERENT work, so they hash differently. A plan-bearing hash also differs from the
     plan-less one (the plan part is genuinely folded in)."""
     base = dict(stage=Stage.REVIEW, prompt="p", schema_ref="review",
-                model="claude-opus-4-8", lane_policy=H, attempt=0)
+                model="claude-opus-5", lane_policy=H, attempt=0)
     h_none = compute_content_hash(**base)
     h_code = compute_content_hash(**base, plan=_plan("find:code"))
     h_code_spec = compute_content_hash(**base, plan=_plan("find:code", "find:spec"))
@@ -198,12 +198,12 @@ def test_workitem_with_plan_json_round_trips() -> None:
     plan = _plan("find:code", "find:tests")
     w = WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=Stage.REVIEW, prompt="p",
-        schema_ref="review", model="claude-opus-4-8", created_at="now",
+        schema_ref="review", model="claude-opus-5", created_at="now",
         lane_policy=H, plan=plan,
     )
     assert w.plan == plan
     assert w.content_hash == compute_content_hash(
-        stage=Stage.REVIEW, prompt="p", schema_ref="review", model="claude-opus-4-8",
+        stage=Stage.REVIEW, prompt="p", schema_ref="review", model="claude-opus-5",
         lane_policy=H, attempt=0, plan=plan,
     )
     dumped = w.model_dump(mode="json")
@@ -219,7 +219,7 @@ def test_stageresult_with_sub_results_and_sub_calls_round_trips() -> None:
     r = _result().model_copy(update={
         "sub_results": {"findings_by_lens": {"find:code": []}, "verdicts": []},
         "sub_calls": (
-            SubCall(phase="find:code", model="claude-opus-4-8",
+            SubCall(phase="find:code", model="claude-opus-5",
                     usage=TokenUsage(input=10, output=5), duration_s=1.5,
                     session_id="s1", stream_file="stages/t/review-attempt0.find:code.stream.jsonl"),
         ),
