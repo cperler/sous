@@ -32,7 +32,7 @@ POLICY_CODEX = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=Provid
 def _wi(stage=Stage.IMPLEMENT, policy=POLICY_HEADLESS) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=stage, prompt="p",
-        schema_ref="implement", model="claude-opus-4-8", lane_policy=policy,
+        schema_ref="implement", model="claude-opus-5", lane_policy=policy,
         created_at="2026-06-22T00:00:00Z",
     )
 

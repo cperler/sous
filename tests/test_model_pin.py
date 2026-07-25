@@ -90,7 +90,7 @@ def test_unpinned_task_uses_role_default(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1")  # scope
-    assert w.stage is Stage.SCOPE and w.model == "claude-opus-4-8"
+    assert w.stage is Stage.SCOPE and w.model == "claude-opus-5"
 
 
 def test_deterministic_stage_ignores_the_pin(tmp_path, project) -> None:
@@ -119,9 +119,9 @@ def test_pinned_task_rate_limited_degrades_to_opus(tmp_path, project) -> None:
     assert w.stage is Stage.SCOPE and w.model == "claude-fable-5"
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_rate_limited_fallback"
-    assert eng.store.load_task("r1", "t1").pending_fallback_model == "claude-opus-4-8"
+    assert eng.store.load_task("r1", "t1").pending_fallback_model == "claude-opus-5"
     nxt = eng.next_work("r1", "t1")  # the queued degrade wins over the pin
-    assert nxt.stage is Stage.SCOPE and nxt.model == "claude-opus-4-8"
+    assert nxt.stage is Stage.SCOPE and nxt.model == "claude-opus-5"
 
 
 # --- interplay: capacity downgrade skips a pinned task -----------------------

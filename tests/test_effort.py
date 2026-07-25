@@ -48,7 +48,7 @@ def _engine(tmp_path, project, **kw) -> Engine:
 def _work(effort: str | None = None, **kw) -> WorkItem:
     args = dict(
         id="wi-1", run_id="r1", task_id="t1", stage=Stage.IMPLEMENT, prompt="do it",
-        schema_ref="implement", model="claude-opus-4-8", created_at="now",
+        schema_ref="implement", model="claude-opus-5", created_at="now",
         lane_policy=H, effort=effort,
     )
     args.update(kw)
@@ -88,7 +88,7 @@ def test_stage_spec_effort_defaults() -> None:
 
 def test_effort_changes_the_content_hash_like_model_does() -> None:
     base = dict(stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-                model="claude-opus-4-8", lane_policy=H, attempt=0)
+                model="claude-opus-5", lane_policy=H, attempt=0)
     assert compute_content_hash(**base, effort="high") != compute_content_hash(**base)
     assert compute_content_hash(**base, effort="high") != compute_content_hash(**base, effort="low")
 
@@ -96,12 +96,12 @@ def test_effort_changes_the_content_hash_like_model_does() -> None:
 def test_unset_effort_hash_matches_the_pre_96_formula() -> None:
     """Backward compatibility: an effort-less dispatch hashes EXACTLY as before #96, so an
     in-flight pre-#96 lease still verifies on record after an engine upgrade."""
-    blob = "\x1f".join(["implement", "p", "implement", "claude-opus-4-8",
+    blob = "\x1f".join(["implement", "p", "implement", "claude-opus-5",
                         "headless:claude", "0"])
     legacy = hashlib.sha256(blob.encode("utf-8")).hexdigest()
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0,
+        model="claude-opus-5", lane_policy=H, attempt=0,
     ) == legacy
 
 
@@ -230,13 +230,13 @@ def test_apply_result_re_syncs_effort_on_downshift() -> None:
     from orchestrator.state_machine import apply_result, begin_stage
 
     task = Task(task_id="t1", run_id="r1", created_at="t0", updated_at="t0")
-    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-4-8", effort="high")
+    begin_stage(task, Stage.IMPLEMENT, now="t1", model="claude-opus-5", effort="high")
     assert task.stages[Stage.IMPLEMENT].effort is Effort.HIGH  # dispatched value
 
     # The runner returns having actually run at a lower effort (downshifted after begin_stage).
     result = StageResult(
         work_item_id="w1", content_hash="h1", run_id="r1", task_id="t1",
-        stage=Stage.IMPLEMENT, attempt=0, model="claude-opus-4-8", effort="medium",
+        stage=Stage.IMPLEMENT, attempt=0, model="claude-opus-5", effort="medium",
         status=ResultStatus.SUCCESS,
         structured_output={"files_changed": ["a.py"], "summary": "done", "committed": True},
         lane_used=LaneUsed(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE,
@@ -276,7 +276,7 @@ def test_begin_stage_coerces_str_effort_to_enum() -> None:
     from orchestrator.state_machine import begin_stage
 
     task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
-    begin_stage(task, Stage.SCOPE, now="x", model="claude-opus-4-8", effort="high")
+    begin_stage(task, Stage.SCOPE, now="x", model="claude-opus-5", effort="high")
     assert task.stages[Stage.SCOPE].effort is Effort.HIGH
     # an effort-less dispatch (ENGINE lane / spec without a default) stays None
     begin_stage(task, Stage.INTAKE, now="x", model="engine", effort=None)

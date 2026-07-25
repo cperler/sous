@@ -37,8 +37,8 @@ const argsObj = {
   workItems: [
     // wi-1 carries a #96 effort; wi-2 is effort-less (pre-#96 shape) — the shim must
     // pass the former to agent() and keep the latter's opts/result effort-free.
-    { id: 'wi-1', content_hash: 'h1', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-4-8', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
-    { id: 'wi-2', content_hash: 'h2', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-4-8', schema_ref: 'implement', prompt: 'p2' },
+    { id: 'wi-1', content_hash: 'h1', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
+    { id: 'wi-2', content_hash: 'h2', run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p2' },
   ],
 }
 // Deliver args as a STRING, exactly as the Workflow runtime was observed to.

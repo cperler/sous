@@ -29,8 +29,8 @@ from tests.conftest import make_result
 def test_model_for_role_is_provider_aware() -> None:
     t = DEFAULT_MODEL_TABLE
     # claude is the default provider (existing behavior preserved)
-    assert t.model_for_role(Role.DEEP_REASON) == "claude-opus-4-8"
-    assert t.model_for_role(Role.DEEP_REASON, Provider.CLAUDE) == "claude-opus-4-8"
+    assert t.model_for_role(Role.DEEP_REASON) == "claude-opus-5"
+    assert t.model_for_role(Role.DEEP_REASON, Provider.CLAUDE) == "claude-opus-5"
     # a codex-routed stage resolves to a codex model id, not a claude one
     codex_deep = t.model_for_role(Role.DEEP_REASON, Provider.CODEX)
     assert codex_deep == "gpt-5.5"
@@ -45,12 +45,12 @@ def test_codex_models_are_priced_from_their_own_row() -> None:
     # codex model priced from the codex row, not a claude fallback
     assert t.cost_usd("gpt-5-codex", usage) == 1.25
     # sanity: different from the claude deep-reason model's input price
-    assert t.cost_usd("claude-opus-4-8", usage) == 5.0
+    assert t.cost_usd("claude-opus-5", usage) == 5.0
 
 
 def test_fallback_stays_within_provider_chain() -> None:
     t = DEFAULT_MODEL_TABLE
-    assert t.fallback_after("claude-opus-4-8") == "claude-sonnet-4-6"
+    assert t.fallback_after("claude-opus-5") == "claude-sonnet-5"
     # single-entry codex chain: gpt-5.5 is both head and floor
     assert t.fallback_after("gpt-5.5") is None
     assert t.fallback_after("nonexistent") is None
@@ -59,7 +59,7 @@ def test_fallback_stays_within_provider_chain() -> None:
 def test_try_cost_usd_tolerates_unknown_model() -> None:
     cost, priced = DEFAULT_MODEL_TABLE.try_cost_usd("some-future-model", TokenUsage(input=100))
     assert cost == 0.0 and priced is False
-    cost, priced = DEFAULT_MODEL_TABLE.try_cost_usd("claude-opus-4-8", TokenUsage(input=100))
+    cost, priced = DEFAULT_MODEL_TABLE.try_cost_usd("claude-opus-5", TokenUsage(input=100))
     assert priced is True and cost > 0.0
 
 
@@ -103,22 +103,22 @@ def test_fable_row_is_priced_at_the_published_rate() -> None:
 def test_fable_is_head_of_the_claude_chain() -> None:
     t = DEFAULT_MODEL_TABLE
     # a rate-limited fable dispatch degrades to opus, then down the existing chain
-    assert t.fallback_after("claude-fable-5") == "claude-opus-4-8"
-    assert t.fallback_after("claude-opus-4-8") == "claude-sonnet-4-6"
+    assert t.fallback_after("claude-fable-5") == "claude-opus-5"
+    assert t.fallback_after("claude-opus-5") == "claude-sonnet-5"
 
 
 def test_role_defaults_unchanged_by_fable_addition() -> None:
     t = DEFAULT_MODEL_TABLE
     # nothing dispatches chain[0] (fable) by default — role defaults stay opus/sonnet/haiku
-    assert t.model_for_role(Role.DEEP_REASON) == "claude-opus-4-8"
-    assert t.model_for_role(Role.REVIEW) == "claude-sonnet-4-6"
+    assert t.model_for_role(Role.DEEP_REASON) == "claude-opus-5"
+    assert t.model_for_role(Role.REVIEW) == "claude-sonnet-5"
     assert t.model_for_role(Role.CHEAP_SHELL) == "claude-haiku-4-5"
 
 
 def test_resolve_model_alias_maps_friendly_names() -> None:
     assert resolve_model_alias("fable") == "claude-fable-5"
-    assert resolve_model_alias("opus") == "claude-opus-4-8"
-    assert resolve_model_alias("sonnet") == "claude-sonnet-4-6"
+    assert resolve_model_alias("opus") == "claude-opus-5"
+    assert resolve_model_alias("sonnet") == "claude-sonnet-5"
     assert resolve_model_alias("haiku") == "claude-haiku-4-5"
     # exact table ids pass through (incl. codex)
     assert resolve_model_alias("claude-fable-5") == "claude-fable-5"
@@ -138,7 +138,7 @@ def test_resolve_model_alias_unknown_raises_listing_valid_names() -> None:
 
 def test_provider_for_model_classifies_both_providers() -> None:
     assert provider_for_model("claude-fable-5") is Provider.CLAUDE
-    assert provider_for_model("claude-opus-4-8") is Provider.CLAUDE
+    assert provider_for_model("claude-opus-5") is Provider.CLAUDE
     assert provider_for_model("gpt-5.5") is Provider.CODEX
     with pytest.raises(ValueError):
         provider_for_model("mystery-model")

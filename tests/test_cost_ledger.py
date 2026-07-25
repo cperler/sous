@@ -18,7 +18,7 @@ from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
 
 def make_result(
     *,
-    model: str = "claude-opus-4-8",
+    model: str = "claude-opus-5",
     stage: Stage = Stage.IMPLEMENT,
     status: ResultStatus = ResultStatus.SUCCESS,
     provider: Provider = Provider.CLAUDE,
@@ -62,12 +62,12 @@ def make_result(
 
 def test_record_uses_table_pricing_exact(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
-    result = make_result(model="claude-opus-4-8", input=1_000_000, output=0)
+    result = make_result(model="claude-opus-5", input=1_000_000, output=0)
     row = ledger.record(result)
     # opus input is $5.0 / Mtok -> exactly 5.0 for 1M input tokens.
     assert row["cost_usd"] == 5.0
     assert row["cost_usd"] == DEFAULT_MODEL_TABLE.cost_usd(
-        "claude-opus-4-8", result.token_usage
+        "claude-opus-5", result.token_usage
     )
 
 
@@ -75,7 +75,7 @@ def test_record_ignores_runner_supplied_cost(tmp_path: Path) -> None:
     """Authoritative pricing: the engine's table wins over a runner's cost."""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     result = make_result(
-        model="claude-opus-4-8", input=1_000_000, output=0, cost_usd=999.99
+        model="claude-opus-5", input=1_000_000, output=0, cost_usd=999.99
     )
     row = ledger.record(result)
     assert row["cost_usd"] == 5.0  # not 999.99
@@ -84,7 +84,7 @@ def test_record_ignores_runner_supplied_cost(tmp_path: Path) -> None:
 def test_record_returns_full_row_fields(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     result = make_result(
-        model="claude-sonnet-4-6",
+        model="claude-sonnet-5",
         stage=Stage.REVIEW,
         status=ResultStatus.SUCCESS,
         provider=Provider.CLAUDE,
@@ -105,7 +105,7 @@ def test_record_returns_full_row_fields(tmp_path: Path) -> None:
     assert row["task_id"] == "task-X"
     assert row["stage"] == "review"
     assert row["attempt"] == 2
-    assert row["model"] == "claude-sonnet-4-6"
+    assert row["model"] == "claude-sonnet-5"
     assert row["provider"] == "claude"
     assert row["lane"] == "interactive"
     assert row["input_tokens"] == 10
@@ -115,7 +115,7 @@ def test_record_returns_full_row_fields(tmp_path: Path) -> None:
     assert row["status"] == "success"
     assert row["work_item_id"] == "wi-X"
     assert row["cost_usd"] == DEFAULT_MODEL_TABLE.cost_usd(
-        "claude-sonnet-4-6", result.token_usage
+        "claude-sonnet-5", result.token_usage
     )
 
 
@@ -162,7 +162,7 @@ def test_no_bypass_two_results_two_rows(tmp_path: Path) -> None:
     )
     normal = make_result(
         work_item_id="wi-normal",
-        model="claude-opus-4-8",
+        model="claude-opus-5",
         stage=Stage.IMPLEMENT,
         input=5_000,
         output=2_000,
@@ -176,9 +176,9 @@ def test_no_bypass_two_results_two_rows(tmp_path: Path) -> None:
 
 def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
-    r1 = make_result(model="claude-opus-4-8", input=1_000_000, output=0)
-    r2 = make_result(model="claude-opus-4-8", input=0, output=1_000_000)
-    r3 = make_result(model="claude-sonnet-4-6", input=1_000_000, output=0)
+    r1 = make_result(model="claude-opus-5", input=1_000_000, output=0)
+    r2 = make_result(model="claude-opus-5", input=0, output=1_000_000)
+    r3 = make_result(model="claude-sonnet-5", input=1_000_000, output=0)
     for r in (r1, r2, r3):
         ledger.record(r)
 
@@ -186,18 +186,18 @@ def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
     assert summary["total_invocations"] == 3
 
     opus_cost = DEFAULT_MODEL_TABLE.cost_usd(
-        "claude-opus-4-8", r1.token_usage
-    ) + DEFAULT_MODEL_TABLE.cost_usd("claude-opus-4-8", r2.token_usage)
-    sonnet_cost = DEFAULT_MODEL_TABLE.cost_usd("claude-sonnet-4-6", r3.token_usage)
+        "claude-opus-5", r1.token_usage
+    ) + DEFAULT_MODEL_TABLE.cost_usd("claude-opus-5", r2.token_usage)
+    sonnet_cost = DEFAULT_MODEL_TABLE.cost_usd("claude-sonnet-5", r3.token_usage)
 
     by_model = summary["by_model"]
-    assert by_model["claude-opus-4-8"]["invocations"] == 2
-    assert by_model["claude-opus-4-8"]["input_tokens"] == 1_000_000
-    assert by_model["claude-opus-4-8"]["output_tokens"] == 1_000_000
-    assert by_model["claude-opus-4-8"]["cost_usd"] == round(opus_cost, 6)
-    assert by_model["claude-sonnet-4-6"]["invocations"] == 1
-    assert by_model["claude-sonnet-4-6"]["input_tokens"] == 1_000_000
-    assert by_model["claude-sonnet-4-6"]["cost_usd"] == round(sonnet_cost, 6)
+    assert by_model["claude-opus-5"]["invocations"] == 2
+    assert by_model["claude-opus-5"]["input_tokens"] == 1_000_000
+    assert by_model["claude-opus-5"]["output_tokens"] == 1_000_000
+    assert by_model["claude-opus-5"]["cost_usd"] == round(opus_cost, 6)
+    assert by_model["claude-sonnet-5"]["invocations"] == 1
+    assert by_model["claude-sonnet-5"]["input_tokens"] == 1_000_000
+    assert by_model["claude-sonnet-5"]["cost_usd"] == round(sonnet_cost, 6)
 
     assert summary["total_cost_usd"] == round(opus_cost + sonnet_cost, 6)
     assert ledger.total_attributed() == summary["total_cost_usd"]
@@ -207,9 +207,9 @@ def test_summary_by_effort_spend_and_engine_lane(tmp_path: Path) -> None:
     """summary() rolls spend up by reasoning effort and tags the ENGINE-lane $0 win (#169)."""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     rows = [
-        {"model": "claude-opus-4-8", "effort": "high", "lane": "headless", "cost_usd": 5.0},
-        {"model": "claude-opus-4-8", "effort": "high", "lane": "headless", "cost_usd": 1.0},
-        {"model": "claude-sonnet-4-6", "effort": "medium", "lane": "headless", "cost_usd": 0.5},
+        {"model": "claude-opus-5", "effort": "high", "lane": "headless", "cost_usd": 5.0},
+        {"model": "claude-opus-5", "effort": "high", "lane": "headless", "cost_usd": 1.0},
+        {"model": "claude-sonnet-5", "effort": "medium", "lane": "headless", "cost_usd": 0.5},
         # an effort-less deterministic ENGINE-lane row: no model cost, buckets under (default)
         {"model": "none", "effort": None, "lane": "engine", "cost_usd": 0.0},
     ]
@@ -322,19 +322,19 @@ def test_by_effort_groups_and_rates(tmp_path: Path) -> None:
     (attempt>0, status=failure) — so retry_rate and failure_rate are each 1/2."""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     rows = [
-        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "attempt": 0,
+        {"stage": "implement", "effort": "high", "model": "claude-opus-5", "attempt": 0,
          "status": "success", "cost_usd": 2.0, "duration_s": 10.0},
-        {"stage": "implement", "effort": "high", "model": "claude-opus-4-8", "attempt": 1,
+        {"stage": "implement", "effort": "high", "model": "claude-opus-5", "attempt": 1,
          "status": "failure", "cost_usd": 3.0, "duration_s": 20.0},
-        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-4-6", "attempt": 0,
+        {"stage": "deliver", "effort": "low", "model": "claude-sonnet-5", "attempt": 0,
          "status": "success", "cost_usd": 0.5, "duration_s": 4.0},
     ]
     agg = ledger.by_effort(rows=rows)
     # ordered by stage in PIPELINE order then effort then model (#154): IMPLEMENT (pipeline
     # rank 2) precedes DELIVER (rank 4), even though "deliver" < "implement" alphabetically.
     assert [(g["stage"], g["effort"], g["model"]) for g in agg] == [
-        ("implement", "high", "claude-opus-4-8"),
-        ("deliver", "low", "claude-sonnet-4-6"),
+        ("implement", "high", "claude-opus-5"),
+        ("deliver", "low", "claude-sonnet-5"),
     ]
     impl = agg[0]
     assert impl["invocations"] == 2
@@ -353,11 +353,11 @@ def test_by_effort_none_effort_normalized_and_graceful_statuses(tmp_path: Path) 
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     rows = [
         # effort absent -> (default); a rate_limited re-queue is a graceful fallback, not a failure
-        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "rate_limited",
+        {"stage": "review", "model": "claude-sonnet-5", "attempt": 0, "status": "rate_limited",
          "cost_usd": 0.0},
-        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "skipped",
+        {"stage": "review", "model": "claude-sonnet-5", "attempt": 0, "status": "skipped",
          "cost_usd": 0.0},
-        {"stage": "review", "model": "claude-sonnet-4-6", "attempt": 0, "status": "success",
+        {"stage": "review", "model": "claude-sonnet-5", "attempt": 0, "status": "success",
          "cost_usd": 1.0},
     ]
     agg = ledger.by_effort(rows=rows)

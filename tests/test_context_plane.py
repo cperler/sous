@@ -316,7 +316,7 @@ def make_result_stub(stage: Stage, output: dict, *, mode=None, provider=None):
 
     return StageResult(
         work_item_id="wi", content_hash="h", run_id="r", task_id="t", stage=stage,
-        attempt=0, model="claude-opus-4-8", status=ResultStatus.SUCCESS,
+        attempt=0, model="claude-opus-5", status=ResultStatus.SUCCESS,
         structured_output=output,
         lane_used=LaneUsed(execution_mode=mode or ExecutionMode.INTERACTIVE,
                            provider=provider or Provider.CLAUDE, invocation="x"),

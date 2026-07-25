@@ -34,7 +34,7 @@ def _engine(tmp_path, project, **kw) -> Engine:
 def _wi(*, stage=Stage.IMPLEMENT, policy=POLICY_HEADLESS, timeout_s=1, cwd=None) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=stage, prompt="p",
-        schema_ref="implement", model="claude-opus-4-8", lane_policy=policy,
+        schema_ref="implement", model="claude-opus-5", lane_policy=policy,
         created_at="2026-06-22T00:00:00Z", timeout_s=timeout_s, cwd=cwd,
     )
 

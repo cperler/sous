@@ -40,7 +40,7 @@ H = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE)
 def _work(effort: str | None = None) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=Stage.IMPLEMENT, prompt="do it",
-        schema_ref="implement", model="claude-opus-4-8", created_at="now",
+        schema_ref="implement", model="claude-opus-5", created_at="now",
         lane_policy=H, effort=effort,
     )
 
@@ -48,11 +48,11 @@ def _work(effort: str | None = None) -> WorkItem:
 def _result(effort: str | None = None) -> StageResult:
     return StageResult(
         work_item_id="wi-1", content_hash="h", run_id="r1", task_id="t1",
-        stage=Stage.IMPLEMENT, model="claude-opus-4-8", effort=effort,
+        stage=Stage.IMPLEMENT, model="claude-opus-5", effort=effort,
         status=ResultStatus.SUCCESS,
         lane_used=LaneUsed(
             execution_mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE,
-            invocation="agent(model=claude-opus-4-8)",
+            invocation="agent(model=claude-opus-5)",
         ),
         completed_at="now",
     )
@@ -100,7 +100,7 @@ def test_workitem_json_round_trips_with_string_values() -> None:
     dumped = w.model_dump(mode="json")
     assert dumped["effort"] == "high"  # the raw string, not an enum repr
     assert isinstance(dumped["effort"], str)
-    assert dumped["model"] == "claude-opus-4-8"
+    assert dumped["model"] == "claude-opus-5"
     assert isinstance(dumped["model"], str)
     # Full fidelity: load(dump) re-dumps to the identical document.
     assert WorkItem.model_validate(dumped).model_dump(mode="json") == dumped
@@ -112,7 +112,7 @@ def test_stageresult_json_round_trips_with_string_values() -> None:
     dumped = r.model_dump(mode="json")
     assert dumped["effort"] == "medium"
     assert isinstance(dumped["effort"], str)
-    assert dumped["model"] == "claude-opus-4-8"
+    assert dumped["model"] == "claude-opus-5"
     assert WorkItem.model_validate(_work().model_dump(mode="json")).effort is None
     assert StageResult.model_validate(dumped).model_dump(mode="json") == dumped
     assert StageResult.model_validate(dumped).effort is Effort.MEDIUM
@@ -122,15 +122,15 @@ def test_content_hash_is_byte_identical_to_the_pre_migration_shape() -> None:
     """The Effort/ModelId retype must not perturb a dispatch's identity key: the hash of
     a bare-string call equals the hash computed from the raw pre-migration string parts."""
     legacy_blob = "\x1f".join(
-        ["implement", "p", "implement", "claude-opus-4-8", "headless:claude", "0", "high"]
+        ["implement", "p", "implement", "claude-opus-5", "headless:claude", "0", "high"]
     )
     legacy = hashlib.sha256(legacy_blob.encode("utf-8")).hexdigest()
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, effort="high",
+        model="claude-opus-5", lane_policy=H, attempt=0, effort="high",
     ) == legacy
     # And the Effort-member call hashes identically to the bare-string call.
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="p", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, effort=Effort.HIGH,
+        model="claude-opus-5", lane_policy=H, attempt=0, effort=Effort.HIGH,
     ) == legacy
