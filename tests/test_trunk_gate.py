@@ -9,6 +9,7 @@ fix twice; a raising task source is swallowed, never a crash.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -403,6 +404,15 @@ def test_gate_covers_every_ci_command_for_selfhost():
 
     repo_root = Path(__file__).resolve().parents[1]
     ci = (repo_root / ".github/workflows/ci.yml").read_text()
+    # This parser only sees SINGLE-LINE `run:` steps. A YAML block step (`run: |`) puts its
+    # commands on following lines, where the scan below would miss them — the guard against
+    # silent drift would itself drift silently (#250). Rather than grow a YAML parser, make
+    # the limitation ENFORCED: if a block step ever appears, fail here and say what to do.
+    assert not re.search(r"^\s*(-\s*)?run:\s*[|>]", ci, re.M), (
+        "ci.yml now uses a multi-line `run: |` step, which this guard cannot parse — its "
+        "commands would silently fall out of trunk-gate coverage (the #243 gap reopening). "
+        "Either keep CI steps single-line, or extend this parser to read block scalars."
+    )
     # The verification commands CI executes: every `run: uv run ...` step (skip `uv sync`).
     ci_cmds = [
         line.split("run:", 1)[1].strip().split()
