@@ -160,7 +160,7 @@ def test_plan_less_workitem_is_byte_identical_to_pre_change() -> None:
     an exclusion — the append is guarded on `plan is not None`, like `effort`), and its
     None field round-trips cleanly. This is the plan-less-path-stays-byte-identical guard."""
     # The hash equals the pre-#73 formula (no plan part in the blob).
-    legacy_blob = "\x1f".join(["implement", "do it", "implement", "claude-opus-4-8",
+    legacy_blob = "\x1f".join(["implement", "do it", "implement", "claude-opus-5",
                                "headless:claude", "0"])
     legacy = hashlib.sha256(legacy_blob.encode("utf-8")).hexdigest()
     w = _work()
@@ -169,7 +169,7 @@ def test_plan_less_workitem_is_byte_identical_to_pre_change() -> None:
     # compute_content_hash with plan=None equals the no-plan-arg call.
     assert compute_content_hash(
         stage=Stage.IMPLEMENT, prompt="do it", schema_ref="implement",
-        model="claude-opus-4-8", lane_policy=H, attempt=0, plan=None,
+        model="claude-opus-5", lane_policy=H, attempt=0, plan=None,
     ) == legacy
     # JSON round-trip is loss-free with plan=None present.
     dumped = w.model_dump(mode="json")
@@ -182,7 +182,7 @@ def test_two_finder_sets_yield_different_content_hashes() -> None:
     DIFFERENT work, so they hash differently. A plan-bearing hash also differs from the
     plan-less one (the plan part is genuinely folded in)."""
     base = dict(stage=Stage.REVIEW, prompt="p", schema_ref="review",
-                model="claude-opus-4-8", lane_policy=H, attempt=0)
+                model="claude-opus-5", lane_policy=H, attempt=0)
     h_none = compute_content_hash(**base)
     h_code = compute_content_hash(**base, plan=_plan("find:code"))
     h_code_spec = compute_content_hash(**base, plan=_plan("find:code", "find:spec"))
@@ -198,12 +198,12 @@ def test_workitem_with_plan_json_round_trips() -> None:
     plan = _plan("find:code", "find:tests")
     w = WorkItem.create(
         id="wi-1", run_id="r1", task_id="t1", stage=Stage.REVIEW, prompt="p",
-        schema_ref="review", model="claude-opus-4-8", created_at="now",
+        schema_ref="review", model="claude-opus-5", created_at="now",
         lane_policy=H, plan=plan,
     )
     assert w.plan == plan
     assert w.content_hash == compute_content_hash(
-        stage=Stage.REVIEW, prompt="p", schema_ref="review", model="claude-opus-4-8",
+        stage=Stage.REVIEW, prompt="p", schema_ref="review", model="claude-opus-5",
         lane_policy=H, attempt=0, plan=plan,
     )
     dumped = w.model_dump(mode="json")
@@ -219,7 +219,7 @@ def test_stageresult_with_sub_results_and_sub_calls_round_trips() -> None:
     r = _result().model_copy(update={
         "sub_results": {"findings_by_lens": {"find:code": []}, "verdicts": []},
         "sub_calls": (
-            SubCall(phase="find:code", model="claude-opus-4-8",
+            SubCall(phase="find:code", model="claude-opus-5",
                     usage=TokenUsage(input=10, output=5), duration_s=1.5,
                     session_id="s1", stream_file="stages/t/review-attempt0.find:code.stream.jsonl"),
         ),
