@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "review_findings",
+  "description": "Sub-call output contract for ONE finder lens in the multi-agent REVIEW workflow (#73): the findings that lens surfaced, reusing review.json's issue-object vocabulary so _issue_fingerprint applies unchanged.",
+  "type": "object",
+  "required": ["findings"],
+  "properties": {
+    "findings": {
+      "type": "array",
+      "description": "blocking/advisory findings this lens surfaced (empty when the lens found nothing). Reuses review.json's issue-object shape exactly — file:description is the convergence fingerprint; severity gates disposition at synthesis.",
+      "items": {
+        "type": "object",
+        "required": ["description"],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": ["critical", "important", "suggestion"],
+            "description": "suggestion findings can't block (they skip adversarial verify and auto-approve at the severity gate); critical/important get verified and drive the fix cycle"
+          },
+          "file": {"type": "string"},
+          "line": {"type": "integer"},
+          "description": {"type": "string"},
+          "suggested_fix": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "tests_meaningful": {
+      "type": "boolean",
+      "description": "the find:tests lens's independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false is vacuous; omitted/absent fails OPEN. Only the find:tests finder emits this."
+    },
+    "improvement": {
+      "type": "object",
+      "description": "self-improvement loop: the single highest-value forward-looking improvement this lens suggests for the PROJECT/roadmap (not a fix for this PR). Omit unless a maintainer would independently prioritize it. The engine folds one across lenses in fixed lens order.",
+      "required": ["title"],
+      "properties": {
+        "title": {"type": "string", "description": "one-line enhancement title"},
+        "detail": {"type": "string", "description": "what/why — the enhancement issue body"},
+        "disposition": {
+          "type": "string",
+          "enum": ["fix_now", "file", "drop", "fixup"],
+          "description": "same filing threshold as review.json's improvement. `file` (or absent): file as an enhancement issue. `fixup`: apply in-place this PR. `fix_now`/`drop`: surfaced in the completion note, not filed."
+        }
+      },
+      "additionalProperties": true
+    },
+    "retrospective": {
+      "type": "object",
+      "description": "self-improvement loop: one lesson this lens teaches about the ORCHESTRATION PROCESS (prompts/stages/tooling/lanes), not the code. The engine folds one across lenses in fixed lens order. Omit if none.",
+      "required": ["title"],
+      "properties": {
+        "title": {"type": "string", "description": "one-line process lesson"},
+        "detail": {"type": "string", "description": "what we learned / what to change"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

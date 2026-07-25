@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "review_verdict",
+  "description": "Sub-call output contract for ONE adversarial verifier in the multi-agent REVIEW workflow (#73): the verdict on a single deduped finding the verifier was asked to refute with evidence from the working tree.",
+  "type": "object",
+  "required": ["fingerprint", "verdict", "reasoning"],
+  "properties": {
+    "fingerprint": {
+      "type": "string",
+      "description": "the _issue_fingerprint of the finding under verification — how the engine's fold matches this verdict back to its finding. An unmatchable fingerprint leaves the finding confirmed (fail toward blocking)."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["confirmed", "refuted"],
+      "description": "`confirmed`: the verifier could not kill the finding — it blocks. `refuted`: the verifier disproved it with evidence — the fold demotes it to non_blocking (prefixed `refuted:`), never silently erased."
+    },
+    "reasoning": {
+      "type": "string",
+      "description": "the evidence for the verdict — for a refutation, why it does not hold; surfaced with the finding so an adversary can't silently erase a real issue"
+    }
+  },
+  "additionalProperties": true
+}

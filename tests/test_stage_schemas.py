@@ -77,6 +77,47 @@ def test_codex_rejects_wrong_type_against_canonical() -> None:
     assert runner.dispatch(_wi("test")).status is ResultStatus.SCHEMA_VIOLATION
 
 
+def test_review_findings_schema_round_trip() -> None:
+    """The #73 review_findings sub-call schema loads, is a valid Draft 2020-12 schema, and
+    accepts a representative finder output (reusing review.json's issue-object vocabulary)."""
+    schema = load_stage_schema("review_findings")
+    assert schema is not None and schema["title"] == "review_findings"
+    Draft202012Validator.check_schema(schema)
+    sample = {
+        "findings": [
+            {
+                "severity": "important",
+                "file": "orchestrator/engine.py",
+                "line": 42,
+                "description": "off-by-one in the retry ceiling",
+                "suggested_fix": "use <= not <",
+            }
+        ],
+        "tests_meaningful": True,
+    }
+    assert not list(Draft202012Validator(schema).iter_errors(sample))
+    # findings is required; a finding requires description.
+    assert list(Draft202012Validator(schema).iter_errors({}))
+    assert list(Draft202012Validator(schema).iter_errors({"findings": [{"file": "x"}]}))
+
+
+def test_review_verdict_schema_round_trip() -> None:
+    """The #73 review_verdict sub-call schema loads, is valid, and accepts an adversarial
+    verifier's verdict on one finding."""
+    schema = load_stage_schema("review_verdict")
+    assert schema is not None and schema["title"] == "review_verdict"
+    Draft202012Validator.check_schema(schema)
+    sample = {
+        "fingerprint": "orchestrator/engine.py:off-by-one in the retry ceiling",
+        "verdict": "refuted",
+        "reasoning": "the ceiling is inclusive in the calling context; no regression",
+    }
+    assert not list(Draft202012Validator(schema).iter_errors(sample))
+    # fingerprint/verdict/reasoning are all required; verdict is an enum.
+    assert list(Draft202012Validator(schema).iter_errors({"verdict": "confirmed"}))
+    assert list(Draft202012Validator(schema).iter_errors({**sample, "verdict": "maybe"}))
+
+
 def test_default_outputs_satisfy_their_schemas() -> None:
     """The test fixtures' default stage outputs validate against the canonical schemas
     (keeps the fixtures and the shipped contracts in lock-step)."""
