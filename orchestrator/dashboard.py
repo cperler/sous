@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING
 
 from .alerting import _fmt_activity
 from .schemas.enums import TERMINAL_RUN_STATES
+from .stream_probe import find_current_stream
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .engine import Engine
@@ -270,12 +271,20 @@ def _run_row(
         if tstate == "running" and stage:
             act = ts.get("activity")
             detail = _fmt_activity(act.get("current_activity")) if act else "working"
+            # Whether a tailable provider stream exists for this in-flight stage RIGHT NOW.
+            # False on the interactive×claude / ENGINE lanes (stages run in-session, nothing
+            # tees `claude -p` / `codex exec` stdout to a `.stream.jsonl`) — so the web
+            # dashboard can suppress its "live stream" affordance instead of advertising a
+            # panel that can only ever render "(no live provider stream)" (#137). A cheap
+            # dir-glob, run only for the handful of running tasks.
+            stream_available = find_current_stream(engine.store.root, tid, stage) is not None
             inflight.append(
                 {
                     "task_id": tid,
                     "stage": stage,
                     "line": f"{stage}: {detail}",
                     "seconds_since_update": ts.get("seconds_since_update"),
+                    "stream_available": stream_available,
                 }
             )
 

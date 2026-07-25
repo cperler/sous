@@ -386,26 +386,37 @@ INDEX_HTML = """<!doctype html>
       (row.inflight || []).forEach(function (inf) {
         var line = h("div", "inflight");
         line.appendChild(document.createTextNode(inf.task_id + " · " + inf.line + "  "));
-        var btn = h("a", "tabbtn", open[row.run_id] ? "hide stream" : "live stream");
-        line.appendChild(btn);
-        btn.addEventListener("click", function (e) {
-          e.stopPropagation();
-          if (open[row.run_id]) {
-            open[row.run_id] = null; stopStream(row.run_id); drill.style.display = "none";
-            btn.textContent = "live stream";
-          } else {
-            open[row.run_id] = { task: inf.task_id, stage: inf.stage };
-            drill.style.display = "block"; btn.textContent = "hide stream";
-            drillStream(row.run_id, inf, drill);
-          }
-        });
+        // Only offer the stream affordance when a tailable provider stream actually exists
+        // (#137). On the interactive×claude / ENGINE lanes stages run in-session with nothing
+        // teeing provider stdout to disk, so the toggle would only ever open an empty panel —
+        // show an honest lane note instead of advertising a stream that can't populate.
+        if (inf.stream_available) {
+          var btn = h("a", "tabbtn", open[row.run_id] ? "hide stream" : "live stream");
+          line.appendChild(btn);
+          btn.addEventListener("click", function (e) {
+            e.stopPropagation();
+            if (open[row.run_id]) {
+              open[row.run_id] = null; stopStream(row.run_id); drill.style.display = "none";
+              btn.textContent = "live stream";
+            } else {
+              open[row.run_id] = { task: inf.task_id, stage: inf.stage };
+              drill.style.display = "block"; btn.textContent = "hide stream";
+              drillStream(row.run_id, inf, drill);
+            }
+          });
+        } else {
+          line.appendChild(h("span", "muted",
+            "in-session lane — no tailable stream; follow events.jsonl / per-stage logs"));
+        }
         card.appendChild(line);
       });
 
       // Re-attach a live poll for a card that was open before this re-render.
       if (open[row.run_id]) {
         var infs = row.inflight || [];
-        var match = infs.filter(function (i) { return i.task_id === open[row.run_id].task; })[0];
+        var match = infs.filter(function (i) {
+          return i.task_id === open[row.run_id].task && i.stream_available;
+        })[0];
         if (match) drillStream(row.run_id, match, drill);
         else { drill.appendChild(h("div", "muted", "(stream ended)")); stopStream(row.run_id); }
       }
