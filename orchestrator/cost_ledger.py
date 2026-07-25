@@ -31,6 +31,13 @@ class CostLedger:
     def __init__(self, path: Path, model_table: ModelTable = DEFAULT_MODEL_TABLE) -> None:
         self.path = Path(path)
         self.model_table = model_table
+        # by_effort() memo (#220): the aggregation is O(rows), and the band-edge downshift
+        # check (engine._observed_downshift_rate) fires it on every dispatch decision across
+        # a scheduler process's thousands of ticks. Cache the last self-read aggregation,
+        # keyed on the ledger file's stat (see _stat_key). Only the ``rows is None`` path
+        # (we read the file) is cached; an explicit ``rows`` arg is the caller's own input.
+        self._by_effort_cache: list[dict] | None = None
+        self._by_effort_cache_key: tuple[int, int] | None = None
 
     def record(self, result: StageResult, *, duration_s: float | None = None) -> dict:
         """Append exactly one JSONL row for this invocation and return it.
@@ -177,6 +184,20 @@ class CostLedger:
             total += row.get("cost_usd") or 0.0
         return round(total, 6)
 
+    def _stat_key(self) -> tuple[int, int] | None:
+        """``(size, mtime_ns)`` of the ledger file, or ``None`` when it does not exist yet.
+
+        The ledger is append-only, so every recorded row grows the file (and bumps mtime) —
+        making this an EXACT invalidation key for the by_effort() memo (#220): the first
+        call after a ``record()`` recomputes, and every band-edge call in between reuses the
+        cached aggregation. Robust to a rewrite/truncation (tests recreate the file) because
+        mtime moves even when size happens to match."""
+        try:
+            st = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (st.st_size, st.st_mtime_ns)
+
     def by_effort(self, rows: list[dict] | None = None) -> list[dict]:
         """Split spend/duration/retry+failure rates by ``(stage, effort, model)`` (#141).
 
@@ -199,7 +220,23 @@ class CostLedger:
         group dicts ordered by ``stage`` (in pipeline-execution order, not alphabetical —
         #154) then ``effort`` then ``model`` for readability. Unknown/malformed stages sort
         after every known stage, and alphabetically among themselves (#166)."""
-        rows = self.rows() if rows is None else rows
+        # #220 memo: cache only the self-read path; an explicit ``rows`` is the caller's own
+        # input and is aggregated directly. The cached groups are read-only — every caller
+        # (engine._observed_downshift_rate, render_by_effort) only reads via ``.get`` — so
+        # the cached list is returned as-is; callers must not mutate it.
+        if rows is not None:
+            return self._aggregate_by_effort(rows)
+        key = self._stat_key()
+        if self._by_effort_cache is not None and self._by_effort_cache_key == key:
+            return self._by_effort_cache
+        result = self._aggregate_by_effort(self.rows())
+        self._by_effort_cache_key = key
+        self._by_effort_cache = result
+        return result
+
+    def _aggregate_by_effort(self, rows: list[dict]) -> list[dict]:
+        """Pure aggregation body of ``by_effort`` (see it for the group schema and ordering);
+        split out so ``by_effort`` can memoise the self-read path (#220)."""
         groups: dict[tuple[str, str, str], dict] = {}
         for row in rows:
             stage = row.get("stage", "unknown")
