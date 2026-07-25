@@ -2944,9 +2944,19 @@ class Engine:
         """File the review's single forward-looking improvement idea as an ``enhancement``
         issue (the self-improvement loop — heysoo's Innovation Brainstorm). Returns the
         issue ref, or None when the adapter lacks ``file_followup``, the review had none,
-        or (#188) the idea fingerprint-matches an already-filed follow-up (``skip_fingerprints``)
-        — one observation must not be filed twice as both a non-blocking finding and an
-        enhancement."""
+        or the improvement was suppressed.
+
+        Suppression cases (all return None):
+
+        * (#223) The improvement carries a ``disposition`` of ``fix_now``, ``drop``, or
+          ``fixup`` — the reviewer judged it unworthy of a standing issue.  An
+          ``improvement_not_filed`` event is emitted so the decision is auditable.
+          ``fixup`` means the change should be applied in place in the current PR; the
+          other two are noted in the completion note.  An absent or ``file`` disposition
+          files unconditionally, preserving pre-#223 behaviour.
+        * (#188) The idea fingerprint-matches an already-filed follow-up
+          (``skip_fingerprints``) — one observation must not be filed twice as both a
+          non-blocking finding and an enhancement."""
         file_followup = getattr(task_source, "file_followup", None)
         if not callable(file_followup):
             return None
