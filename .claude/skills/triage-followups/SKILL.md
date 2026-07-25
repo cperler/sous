@@ -1,17 +1,19 @@
 ---
 name: triage-followups
-description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas) ONE AT A TIME with the human — explaining each from its source finding and the code it points at — and decide keep / close / promote / edit. The human triage gate the evidence-out seam deliberately does not have. Runs after any completed run (batch or single-task); re-runnable later.
+description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas from the evidence-out seam, AND the implement stage's scope-ledger deferred-scope issues) ONE AT A TIME with the human — explaining each from its source finding/rationale and the code it points at — and decide keep / close / promote / edit. The human triage gate the auto-filing seams deliberately do not have. Runs after any completed run (batch or single-task); re-runnable later.
 ---
 
 # Triage follow-ups — human gate on a run's auto-filed issues
 
-You are the **triage supervisor**. When a run finishes, its evidence-out seam files the
-review stage's `non_blocking` findings (as `deferred-scope` issues) and the `improvement`
-idea (as an `enhancement` issue) — automatically, with **no human judgment**. That is by
-design (the run must never block on a human), but it means the backlog grows with issues
-the human never chose to track and often can't parse. This skill is that missing gate:
-walk each auto-filed issue **one at a time**, explain it from its *source* (the reviewer's
-finding + the code it names, not just the terse issue body), and let the human decide
+You are the **triage supervisor**. When a run finishes it auto-files GitHub issues with
+**no human judgment**, from two sources: (1) the evidence-out seam files the review stage's
+`non_blocking` findings (as `deferred-scope`) and the `improvement` idea (as `enhancement`);
+(2) the implement stage files `deferred-scope` issues for work a task deliberately cut/thinned
+(the CLAUDE.md "nothing is silently dropped" discipline). Both are by design (the run must
+never block on a human), but both grow the backlog with issues the human never chose to
+track and often can't parse. This skill is that missing gate: walk each auto-filed issue
+**one at a time**, explain it from its *source* (the reviewer's finding or the deferral's
+rationale + the code it names, not just the terse issue body), and let the human decide
 whether it is worth filing/tracking at all.
 
 This skill only **reads** the run and **acts on GitHub** (close / relabel / comment). It
@@ -27,24 +29,40 @@ second pass skips everything already triaged.
   --shared-root --run "$RUN" --project "$PROJECT" status`.
 
 ## Enumerate — the issues THIS run filed
-Do not guess from time windows. Every auto-filed issue carries a stable provenance footer
-keyed to the filing task: `Filed automatically from the <task_id> review`. So:
+Do not guess from time windows. A run auto-files issues from **two** provenance sources,
+each with its own stable footer keyed to a run task id. Gate **both** — they are both
+auto-filed without a human gate and both grow the backlog:
+
+- **Review-seam issues** — the evidence-out seam files the review stage's `non_blocking`
+  findings (as `deferred-scope`) and the `improvement` idea (as `enhancement`). Footer:
+  `Filed automatically from the <task_id> review`.
+- **Scope-ledger deferrals** — the implement stage files a `deferred-scope` issue whenever
+  a task deliberately cuts/thins/finds-missing work (the CLAUDE.md "nothing is silently
+  dropped" discipline). These do NOT carry the review marker; they carry a `Source:` line
+  naming the task id (e.g. `**Source:** #216 …`, `Source: #224/#223 implementation`).
+
+So:
 
 1. Get the run's task ids: `… status` → each `task_id` (e.g. `#155`, `172`).
-2. Fetch open issues once and filter locally on the marker (exact substring beats GitHub
-   full-text tokenization of `#`/punctuation):
+2. Fetch open issues once and filter locally (exact substring beats GitHub full-text
+   tokenization of `#`/punctuation):
    ```
    gh issue list -R "$REPO" --state open --limit 300 \
      --json number,title,body,labels,createdAt
    ```
-   Keep an issue when its body contains `Filed automatically from the <task_id> review`
-   for **any** task id in the run. That set — and only that set — is what this run filed
-   and what you triage. (Both the `deferred-scope` non-blocking findings and the
-   `enhancement` improvement idea carry the same marker.) **Open only**, so a re-run skips
-   already-triaged issues.
+   Keep an issue when EITHER holds for **any** task id in the run:
+   - **(a) review-seam:** its body contains `Filed automatically from the <task_id> review`
+     (covers both the `deferred-scope` findings and the `enhancement` improvement); OR
+   - **(b) scope-ledger:** it is labeled `deferred-scope` AND its body has a `Source:` line
+     naming that task id (e.g. `Source:` … `#216`). Match the task id both with and without
+     the leading `#`.
+
+   Union the two sets and dedupe by issue number. That union — and only it — is what this
+   run filed and what you triage. **Open only**, so a re-run skips already-triaged issues.
 3. If the set is empty, say so and stop — this run filed nothing, or it's all triaged.
-4. `log`/report the count and the ordered list before starting, so the human knows the
-   size of the queue.
+4. `log`/report the count and the ordered list before starting (noting each issue's
+   provenance — review-seam vs. scope-ledger — so the human knows what they're looking at),
+   so the human knows the size of the queue.
 
 ## The loop — one issue at a time (never batch the presentation)
 For each enumerated issue, in issue-number order, present a compact **brief** and then
@@ -53,12 +71,18 @@ STOP for the human's decision. Do not move to the next issue until this one is d
 Build each brief from three sources — this is the "under the hood" the human is asking for:
 
 1. **The issue** — title, labels, body (`gh issue view <n> -R "$REPO"`).
-2. **The source finding** — open the filing task's review record
-   `runs/<RUN>/stages/<task>/NN-review.json` (the `NN-review` with the highest attempt),
-   and find the matching entry: the `non_blocking[]` element whose `title` equals the
-   issue title, or the `improvement` object. Show its full `detail` and, for a
-   non-blocking finding, its `disposition` (`file`/`fix_now`/`drop`) — the reviewer's own
-   words are far richer than the issue body.
+2. **The source** — depends on provenance:
+   - **Review-seam issue** — open the filing task's review record
+     `runs/<RUN>/stages/<task>/NN-review.json` (highest attempt) and find the matching
+     entry: the `non_blocking[]` element whose `title` equals the issue title, or the
+     `improvement` object. Show its full `detail` and, for a non-blocking finding, its
+     `disposition` (`file`/`fix_now`/`drop`) — the reviewer's own words are far richer than
+     the issue body.
+   - **Scope-ledger deferral** — there is no review entry; the source IS the issue body's
+     own `Source:` / why-deferred / trigger-to-revisit rationale (the implement agent
+     authored it deliberately). Read it, and optionally the filing task's implement record
+     `runs/<RUN>/stages/<task>/NN-implement.json` for what shipped vs. what was cut, so you
+     can judge whether the deferral still holds.
 3. **The code it points at** — if the finding names files/paths/lines/symbols, Read that
    code (at current `main`) and show the relevant few lines, so the human sees the *actual
    thing*, not an abstract description. If it references a PR, link it.
