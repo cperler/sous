@@ -791,7 +791,11 @@ class Engine:
             # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
-            context=self._deterministic_context(task) if deterministic else None,
+            context=(
+                self._deterministic_context(task, stage=stage, run=run)
+                if deterministic
+                else None
+            ),
             # #5: the task's per-task port block, exported into the stage subprocess (BOTH
             # the model CLI and the deterministic test runner) so parallel worktrees don't
             # collide on dev/test-server ports. None until intake has allocated a block (and
@@ -2697,13 +2701,18 @@ class Engine:
         }
 
     # --- helpers --------------------------------------------------------------
-    def _deterministic_context(self, task: Task) -> dict:
+    def _deterministic_context(
+        self, task: Task, *, stage: Stage | None = None, run: Run | None = None
+    ) -> dict:
         """The structured task context a deterministic ENGINE-lane runner reads — the
         SAME facts the model lanes receive through the rendered prompt: the engine-owned
         folded context plane (branch/worktree/baseline_failures/pr_url/…) plus the task
         fields the TEST/DELIVER runners need (issue_number/title/body/task_id). Includes
         ``review_cycles`` when set (#68): the deterministic DELIVER runner uses it to
         annotate a reused PR's advisory comment with which fix cycle re-pushed the branch.
+        For the INTAKE stage of a batch task with DAG dependencies (#216) it also carries
+        ``dep_branches`` — the branch names of this task's COMPLETED deps — so the setup
+        runner can compose their code into the dependent's worktree before its gate runs.
         Purely engine-derived, so no project-specific logic reaches a model call and it
         stays reconstructible on replay. ``setdefault`` lets a folded value win over the
         task field (e.g. a deliver-folded pr_url) without clobbering it."""
@@ -2723,7 +2732,37 @@ class Engine:
         # PR with which review cycle re-pushed it (best-effort comment; never load-bearing).
         if task.review_cycles:
             ctx.setdefault("review_cycles", task.review_cycles)
+        # #216: at INTAKE, compose the tree of every COMPLETED DAG dependency into the
+        # dependent's worktree. The edge only ORDERS execution; without this the dependent
+        # is branched off the run base and its per-PR gate never sees a sibling's shared
+        # type/signature change. Empty (and so a byte-identical no-op) for a single-task
+        # run, a task with no deps, or a later stage.
+        if stage is Stage.INTAKE and run is not None:
+            dep_branches = self._dep_branches(run, task)
+            if dep_branches:
+                ctx["dep_branches"] = dep_branches
         return ctx
+
+    def _dep_branches(self, run: Run, task: Task) -> list[str]:
+        """Branch names of this task's COMPLETED DAG dependencies (#216), in graph order,
+        for the deterministic INTAKE runner to git-merge into the dependent's worktree.
+        Sourced from each completed dep's intake-folded ``branch`` context key. Skips a
+        dep that is unloadable, not yet COMPLETED, or has no resolvable branch — so a
+        task whose deps aren't all composable yet degrades to today's base-only behavior
+        rather than failing. Returns ``[]`` (a clean no-op) when the task has no deps."""
+        deps = run.dependency_graph.get(task.task_id) or []
+        branches: list[str] = []
+        for dep_id in deps:
+            try:
+                dep = self.store.load_task(run.run_id, dep_id)
+            except Exception:  # noqa: BLE001 - an unloadable dep is skipped, never fatal
+                continue
+            if dep.state is not TaskState.COMPLETED:
+                continue
+            branch = (dep.context or {}).get("branch")
+            if isinstance(branch, str) and branch:
+                branches.append(branch)
+        return branches
 
     def _port_env_for_task(self, task: Task) -> dict[str, str] | None:
         """The per-task port env (#5) to export into this task's stage subprocess, or None.
