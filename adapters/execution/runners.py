@@ -84,6 +84,7 @@ def build_registry(
                 provider=Provider.CLAUDE,
                 in_process=False,
                 schema_enforced=True,
+                supports_plan=True,  # the Workflow shim has agent()/parallel() (#73 design §5)
                 status=SUPPORTED,
             )
         )

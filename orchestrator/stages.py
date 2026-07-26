@@ -8,10 +8,12 @@ prompts stay repo-agnostic and the same engine drives any project.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 
 from .model_table import Role
 from .schemas.enums import STAGE_ORDER, Effort, Stage
+from .schemas.work import FinderSpec, ReviewPlan
 
 
 @dataclass(frozen=True)
@@ -211,14 +213,11 @@ def _has_frontend_change(files_changed: object) -> bool:
     return False
 
 
-# Project-agnostic design-review criteria injected into the REVIEW prompt when the change
-# touches frontend files (#62). The heysoo-specific design-system tokens (visual language,
-# component library, theme rules) stay in the adapter's design agent — this block is the
-# reusable craft lens only.
-_DESIGN_REVIEW_LENS = (
-    "\n\n## Frontend change: apply the design-review lens\n"
-    "This change touches user-facing files (per files_changed above). Beyond correctness, "
-    "review the design craft:\n"
+# The design-craft criteria themselves (#62), factored out so the single-reviewer lens below
+# and the #73 ``find:design`` finder body share ONE list — they must not drift. Project-
+# agnostic: the heysoo-specific design-system tokens (visual language, component library,
+# theme rules) stay in the adapter's design agent; this block is the reusable craft lens only.
+_DESIGN_CRITERIA = (
     "- Visual hierarchy: size/weight/spacing guide attention; the primary element reads first.\n"
     "- Spacing & alignment: a consistent scale (e.g. an 8pt grid), no arbitrary one-off values.\n"
     "- Consistency & reuse: reuse existing components/patterns/tokens over reinventing them.\n"
@@ -226,8 +225,31 @@ _DESIGN_REVIEW_LENS = (
     "adequate tap targets; never rely on color alone.\n"
     "- Responsive behavior: works across viewport sizes and larger text; no fixed heights on "
     "text containers; graceful with more/less content.\n"
-    "Treat these as review criteria — blocking only when a change materially harms usability "
+)
+
+# Project-agnostic design-review criteria injected into the REVIEW prompt when the change
+# touches frontend files (#62).
+_DESIGN_REVIEW_LENS = (
+    "\n\n## Frontend change: apply the design-review lens\n"
+    "This change touches user-facing files (per files_changed above). Beyond correctness, "
+    "review the design craft:\n"
+    + _DESIGN_CRITERIA
+    + "Treat these as review criteria — blocking only when a change materially harms usability "
     "or accessibility; otherwise record them as non-blocking polish."
+)
+
+
+# The #41 docs-only directive, verbatim. Hoisted to a constant so the single-reviewer
+# prompt (``render_prompt``) and a workflow finder prompt (``render_review_plan``) say the
+# SAME thing about a deterministically-classified docs-only change — one source of truth,
+# and the hoist keeps ``render_prompt``'s output byte-identical.
+_DOCS_ONLY_DIRECTIVE = (
+    "\n\n## Change classification: DOCS-ONLY\n"
+    "This change was deterministically classified as documentation-only (every "
+    "changed file is docs). It has no behavioral surface, so DO NOT apply "
+    "test-coverage criteria: treat tests_meaningful as satisfied and do not reject "
+    "or hold this change for lacking new/updated tests. Judge it on documentation "
+    "correctness and clarity instead."
 )
 
 
@@ -252,6 +274,56 @@ def _render_context(context: dict) -> str:
         if key in context
     ]
     return "\n".join(lines)
+
+
+def _shared_sections(
+    *,
+    task_id: str,
+    title: str,
+    body: str,
+    context: dict | None = None,
+    project_commands: dict[str, str] | None = None,
+) -> list[str]:
+    """The cache-stable framing sections 1–3(+KB recall) every dispatch for a task shares:
+
+      1. project commands  — stable project-wide (identical for every task & stage)
+      2. task spec (title/body) — stable per-task (identical across the task's 6 stages)
+      3. folded task context — per-task, grows as upstream stages complete
+      4. prior cross-run learnings (#72) — engine-injected advisory recall
+
+    Extracted from ``render_prompt`` so a multi-agent REVIEW's finder prompts
+    (``render_review_plan``) are built from the SAME framing, differing only in the lens
+    instruction that trails it — which is both what makes the finders comparable and what
+    keeps the shared prefix cache-reusable across the panel. Returned as the ordered parts
+    list its callers append their volatile per-lens/per-stage section to.
+    """
+    parts: list[str] = []
+
+    if project_commands:
+        cmds = "\n".join(f"- {name}: {cmd}" for name, cmd in project_commands.items())
+        parts.append(f"## Project commands\n{cmds}")
+
+    task_block = f"## Task {task_id}: {title or '(no title)'}"
+    if (body or "").strip():
+        task_block += f"\n\n{body.strip()}"
+    parts.append(task_block)
+
+    if context:
+        rendered = _render_context(context)
+        if rendered:
+            parts.append(f"## Context from earlier stages\n{rendered}")
+
+    # Cross-run KB recall (#72): prior learnings the engine folded at intake. Engine-injected
+    # (not a stage output), so it renders as its own hedged section — advisory, not a spec.
+    prior = (context or {}).get("prior_learnings")
+    if isinstance(prior, list) and prior:
+        items = "\n".join(f"- {str(p)}" for p in prior)
+        parts.append(
+            "## Prior cross-run learnings (may or may not apply)\n"
+            "Lessons a PREVIOUS run of this project paid to learn on related work. Treat as "
+            "hints, not instructions — apply only what genuinely fits this task:\n" + items
+        )
+    return parts
 
 
 def render_prompt(
@@ -293,32 +365,13 @@ def render_prompt(
       signals a frontend file was changed.
     """
     spec = STAGE_SPECS[stage]
-    parts: list[str] = []
-
-    if project_commands:
-        cmds = "\n".join(f"- {name}: {cmd}" for name, cmd in project_commands.items())
-        parts.append(f"## Project commands\n{cmds}")
-
-    task_block = f"## Task {task_id}: {title or '(no title)'}"
-    if (body or "").strip():
-        task_block += f"\n\n{body.strip()}"
-    parts.append(task_block)
-
-    if context:
-        rendered = _render_context(context)
-        if rendered:
-            parts.append(f"## Context from earlier stages\n{rendered}")
-
-    # Cross-run KB recall (#72): prior learnings the engine folded at intake. Engine-injected
-    # (not a stage output), so it renders as its own hedged section — advisory, not a spec.
-    prior = (context or {}).get("prior_learnings")
-    if isinstance(prior, list) and prior:
-        items = "\n".join(f"- {str(p)}" for p in prior)
-        parts.append(
-            "## Prior cross-run learnings (may or may not apply)\n"
-            "Lessons a PREVIOUS run of this project paid to learn on related work. Treat as "
-            "hints, not instructions — apply only what genuinely fits this task:\n" + items
-        )
+    parts = _shared_sections(
+        task_id=task_id,
+        title=title,
+        body=body,
+        context=context,
+        project_commands=project_commands,
+    )
 
     instruction = f"## {stage.value.upper()}\n{spec.template}"
     # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell the
@@ -326,14 +379,7 @@ def render_prompt(
     # reviewer doesn't demand (or reject over) unreachable coverage. The tag is set only by
     # the ENGINE-lane git diff, so this directive can't be triggered by a model's own claim.
     if stage in (Stage.TEST, Stage.REVIEW) and (context or {}).get("change_class") == "docs-only":
-        instruction += (
-            "\n\n## Change classification: DOCS-ONLY\n"
-            "This change was deterministically classified as documentation-only (every "
-            "changed file is docs). It has no behavioral surface, so DO NOT apply "
-            "test-coverage criteria: treat tests_meaningful as satisfied and do not reject "
-            "or hold this change for lacking new/updated tests. Judge it on documentation "
-            "correctness and clarity instead."
-        )
+        instruction += _DOCS_ONLY_DIRECTIVE
     # #168: belt-and-suspenders with the engine's fail-open-on-omit gate — tell the reviewer
     # to OMIT `tests_meaningful` (rather than answer `false`) when there is no test surface to
     # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal
@@ -356,3 +402,272 @@ def render_prompt(
     parts.append(instruction)
 
     return "\n\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# #73 multi-agent REVIEW: the finder-lens catalog + deterministic plan resolution
+# ---------------------------------------------------------------------------
+#
+# A plan-bearing REVIEW dispatch fans out BELOW the seam (design §1/§2): the engine
+# renders one prompt per lens here, the runner executes them blind to each other, and
+# the engine folds the results back into canonical review.json. Everything in this
+# section is pure and deterministic — same inputs, same plan, byte-for-byte.
+
+# Schema refs the panel's sub-calls validate against (design §1 "Schemas").
+_FINDINGS_SCHEMA_REF = "review_findings"
+_VERDICT_SCHEMA_REF = "review_verdict"
+# Names the shared normalization both lanes dedupe findings with, so an interactive and a
+# headless panel collapse the same duplicates (engine re-dedupes authoritatively at fold).
+_DEDUPE_RULE = "fingerprint-v1"
+
+# Every finder returns the same object shape (review_findings.json), stated once.
+_FINDER_RETURN = (
+    "Return: findings (list of {severity: critical|important|suggestion, file, line, "
+    "description, suggested_fix} — empty when you find nothing, which is a valid and "
+    "useful answer), improvement ({title, detail} or omitted), retrospective "
+    "({title, detail} or omitted)."
+)
+# The blindness contract, stated to every finder identically.
+_FINDER_PREAMBLE = (
+    "You are ONE independent finder on a review panel for the change described above. "
+    "You cannot see the other finders' output and must not speculate about it — do not "
+    "hedge, defer, or assume another lens covers something. Report ONLY findings inside "
+    "YOUR lens, and only ones you can evidence from the working tree: every finding needs "
+    "a file (and a line where you can give one) and a description concrete enough for a "
+    "different agent to verify or refute from the code alone. Do NOT emit a verdict — "
+    "approval is decided by the engine from what survives verification, not by you.\n"
+)
+
+
+@dataclass(frozen=True)
+class _Lens:
+    """One finder lens: its name, the ProjectConfig sub-role its persona resolves through,
+    and the instruction body appended after the shared context sections."""
+
+    name: str
+    agent_role: str
+    body: str
+
+
+_LENS_CODE = _Lens(
+    name="find:code",
+    agent_role="review",  # the base code-reviewer persona
+    body=(
+        "## FIND: CODE — correctness and regressions\n"
+        + _FINDER_PREAMBLE
+        + "Your lens is CORRECTNESS. Read the change and hunt for: logic errors, "
+        "off-by-one/boundary mistakes, unhandled inputs and error paths, regressions to "
+        "existing behavior or public interfaces, transaction/partial-failure hazards, "
+        "concurrency and ordering bugs, resource leaks, and violations of invariants the "
+        "project states about itself. Judge the CODE, not the process.\n"
+        "NOT your lens (other finders own these; stay off them): whether the change matches "
+        "what was asked, whether the tests are meaningful, and visual/design craft.\n"
+        + _FINDER_RETURN
+    ),
+)
+
+_LENS_SPEC = _Lens(
+    name="find:spec",
+    # Reaches the latent `review:spec` roster key (#62 shipped it; nothing dispatched it
+    # until now). A project without that key resolves None -> the base reviewer persona.
+    agent_role="spec",
+    body=(
+        "## FIND: SPEC — built-vs-asked conformance\n"
+        + _FINDER_PREAMBLE
+        + "Your lens is CONFORMANCE: does what was BUILT match what was ASKED? Work "
+        "criterion-by-criterion through the task spec above (and the scope plan in the "
+        "context, if any) and report: acceptance criteria not met, requirements silently "
+        "dropped or reinterpreted, shipped behavior nobody asked for (scope the task did "
+        "not authorize), and stated constraints violated. Quote the criterion you are "
+        "judging against in each finding.\n"
+        "NOT your lens: implementation-quality bugs that are on-spec, test meaningfulness, "
+        "and visual/design craft.\n"
+        + _FINDER_RETURN
+    ),
+)
+
+_LENS_TESTS = _Lens(
+    name="find:tests",
+    # Deliberately `tests` (not the `test` implementer role): an INDEPENDENT judge of test
+    # meaningfulness, so a project must opt a persona in explicitly rather than inherit the
+    # agent that writes the code. Unset -> None -> the base reviewer persona.
+    agent_role="tests",
+    body=(
+        "## FIND: TESTS — do the tests actually hold this change down?\n"
+        + _FINDER_PREAMBLE
+        + "Your lens is TEST MEANINGFULNESS — the independent test-validation dispatch: you "
+        "are a different agent from the one that wrote these tests, which is the point. Read "
+        "the change's tests and judge whether they would FAIL if this change regressed. "
+        "Report as findings: assertions that are vacuous, tautological, or always-green; "
+        "tests that exercise mocks instead of the change; coverage gaps on the change's real "
+        "behavior and error paths; and tests that pin implementation detail rather than "
+        "behavior.\n"
+        "NOT your lens: correctness of the production code itself, spec conformance, and "
+        "visual/design craft.\n"
+        "Also return tests_meaningful (bool) — your verdict on whether the tests genuinely "
+        "cover this change. Only set it when there ARE tests to judge; OMIT the field "
+        "entirely when the change has no test surface (a literal false reads as a rejection "
+        "for lacking meaningful tests).\n"
+        + _FINDER_RETURN
+    ),
+)
+
+_LENS_DESIGN = _Lens(
+    name="find:design",
+    agent_role="design",
+    body=(
+        "## FIND: DESIGN — frontend craft\n"
+        + _FINDER_PREAMBLE
+        + "Your lens is DESIGN CRAFT. This change touches user-facing files (per "
+        "files_changed above). Review the craft:\n"
+        # _DESIGN_REVIEW_LENS reframed as a finder: the SAME project-agnostic criteria the
+        # single-reviewer path appends (#62, shared via _DESIGN_CRITERIA), minus its "treat
+        # these as review criteria" verdict framing — a finder reports, the engine decides.
+        + _DESIGN_CRITERIA
+        + "Severity guidance: `critical`/`important` only when a change materially harms "
+        "usability or accessibility; otherwise `suggestion`.\n"
+        "NOT your lens: backend correctness, spec conformance, and test meaningfulness.\n"
+        + _FINDER_RETURN
+    ),
+)
+
+# The UNRELAXED base panel, in fixed order. `find:design` is appended separately because it
+# is an ADDITION keyed off model-influenced context (safe direction), not part of the base.
+_BASE_LENSES: tuple[_Lens, ...] = (_LENS_CODE, _LENS_SPEC, _LENS_TESTS)
+
+# Adversarial verification (design §2). Engine-AUTHORED with mechanical slots the runner
+# fills per finding — the same `_corrective_prompt` precedent: runners substitute, never
+# author. `{finding}` is the deduped finding (fingerprint + severity + file/line +
+# description); `{diff_hint}` points the verifier at where to look.
+_VERIFY_TEMPLATE = (
+    "## VERIFY: try to refute this finding\n"
+    "You are the ADVERSARY on a review panel. Another agent reported the finding below "
+    "against this change. Your job is to KILL it: read the working tree and try to prove it "
+    "wrong — the code path is unreachable, the case is already handled elsewhere, the cited "
+    "file/line does not say what the finding claims, or the behavior is intended and "
+    "specified. Confirm it ONLY if you cannot refute it with evidence you actually read; "
+    "do not confirm on plausibility, and do not soften or re-scope the finding — verdict "
+    "on it exactly as written.\n\n"
+    "### Finding\n{finding}\n\n"
+    "### Where to look\n{diff_hint}\n\n"
+    "Return: fingerprint (echo the finding's fingerprint EXACTLY, unmodified), verdict "
+    "(confirmed|refuted), reasoning (the evidence you read, cited by file and line)."
+)
+
+
+@dataclass(frozen=True)
+class DiffStat:
+    """Deterministic size of the change under review — ``files`` touched and ``lines``
+    added+deleted, read by the ENGINE lane from ``git diff --numstat`` (never from a model's
+    self-report). The ONLY size signal the finder-set relaxation ladder is allowed to key
+    off; see ``render_review_plan`` for why."""
+
+    files: int
+    lines: int
+
+
+# Relaxation thresholds (both must hold to call a diff trivial). Sized so a one-line typo
+# fix or a small single-file tweak doesn't buy a 3-agent panel, while anything that could
+# plausibly hide a spec deviation or a vacuous test still gets the full base set. Named
+# constants, not magic numbers, so re-tuning them with evidence is a one-line change.
+_TRIVIAL_DIFF_MAX_FILES = 2
+_TRIVIAL_DIFF_MAX_LINES = 20
+
+
+def _is_trivial_diff(diff_stat: DiffStat | None) -> bool:
+    """True only for a diff DETERMINISTICALLY measured as tiny. A missing/undeterminable
+    ``diff_stat`` is NOT trivial — an unmeasurable change gets the full panel, so the
+    failure direction is always toward MORE scrutiny."""
+    if diff_stat is None:
+        return False
+    return (
+        diff_stat.files <= _TRIVIAL_DIFF_MAX_FILES and diff_stat.lines <= _TRIVIAL_DIFF_MAX_LINES
+    )
+
+
+def render_review_plan(
+    *,
+    task_id: str,
+    title: str,
+    body: str,
+    learnings: str = "",
+    context: dict | None = None,
+    project_commands: dict[str, str] | None = None,
+    agent_for: Callable[[Stage, str | None], str | None] | None = None,
+    change_class: str | None = None,
+    diff_stat: DiffStat | None = None,
+) -> ReviewPlan:
+    """Resolve the multi-agent REVIEW plan deterministically at ``next_work`` (design §1).
+
+    Each finder prompt is ``_shared_sections`` (project commands → task spec → folded
+    context → prior learnings) plus ONLY its own lens instruction, so the finders are blind
+    to each other by construction and share a cache-stable prefix. ``learnings`` (prior
+    attempts / a review fix cycle) trails every finder's lens, exactly as it trails the
+    stage instruction in ``render_prompt``.
+
+    **The trust boundary, which is the load-bearing constraint here.** Per
+    ``DETERMINISTIC_ONLY_KEYS``:
+
+    - *Adding* a lens may key off model-influenced context — ``find:design`` fires on
+      ``_has_frontend_change(context["files_changed"])`` — because more scrutiny is always
+      the safe direction: an implementer over-reporting its files only buys itself a
+      stricter panel.
+    - *Dropping* a lens is a RELAXATION and may key ONLY off engine-lane deterministic
+      signals: the explicit ``change_class`` (ENGINE-lane git-diff tag) and ``diff_stat``
+      (``git diff --numstat``) parameters. They are read from the parameters and are
+      deliberately NEVER pulled out of ``context`` inside this function, because ``context``
+      is a channel a model writes to — otherwise an implementer that under-reported its diff
+      size or claimed "docs-only" could talk itself into a thinner review.
+
+    The ladder, in order:
+
+    1. Deterministically-trivial diff ⇒ ``find:code`` alone (a typo fix should not pay for a
+       dedicated spec AND test reviewer, each carrying a full context render).
+    2. Otherwise the unrelaxed base panel: ``find:code``, ``find:spec``, ``find:tests``.
+    3. ``change_class == "docs-only"`` ⇒ drop ``find:tests`` (the same relaxation, on the
+       same trusted tag, the single-reviewer path already makes).
+    4. Independently, a frontend change appends ``find:design`` — so a large frontend diff
+       resolves to the 4-lens full panel.
+
+    ``agent_for`` is the project's roster resolver; a lens whose sub-role the roster does not
+    define resolves to None, which the runner reads as "the base reviewer persona".
+    """
+    shared = _shared_sections(
+        task_id=task_id,
+        title=title,
+        body=body,
+        context=context,
+        project_commands=project_commands,
+    )
+
+    docs_only = change_class == "docs-only"
+    if _is_trivial_diff(diff_stat):
+        lenses: list[_Lens] = [_LENS_CODE]
+    else:
+        lenses = [lens for lens in _BASE_LENSES if not (docs_only and lens is _LENS_TESTS)]
+    if _has_frontend_change((context or {}).get("files_changed")):
+        lenses.append(_LENS_DESIGN)
+
+    finders: list[FinderSpec] = []
+    for lens in lenses:
+        instruction = lens.body
+        # The docs-only directive is ENGINE-trusted (parameter, not context) and rides every
+        # surviving lens so a finder doesn't demand unreachable test coverage.
+        if docs_only:
+            instruction += _DOCS_ONLY_DIRECTIVE
+        if learnings:
+            instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
+        finders.append(
+            FinderSpec(
+                lens=lens.name,
+                prompt="\n\n".join([*shared, instruction]),
+                agent=agent_for(Stage.REVIEW, lens.agent_role) if agent_for else None,
+                schema_ref=_FINDINGS_SCHEMA_REF,
+            )
+        )
+    return ReviewPlan(
+        finders=tuple(finders),
+        verify_template=_VERIFY_TEMPLATE,
+        verify_schema_ref=_VERDICT_SCHEMA_REF,
+        dedupe_rule=_DEDUPE_RULE,
+    )

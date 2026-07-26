@@ -47,6 +47,10 @@ class CodexRunner:
                 provider=Provider.CODEX,
                 in_process=True,
                 schema_enforced=True,
+                # supports_plan stays False (#73 design §5): `codex exec` has no sub-agent
+                # primitive, so this cell can't fan a REVIEW plan out below the seam. The
+                # engine therefore never attaches one here and codex keeps dispatching the
+                # single-reviewer prompt — lane and content_hash stay consistent.
                 status=SUPPORTED,
             ),
             # codex never runs in-session — declare the empty cell honestly.

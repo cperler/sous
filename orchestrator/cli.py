@@ -267,6 +267,13 @@ def main(argv: list[str] | None = None) -> int:
                          "the run shares a non-default baseline without repeating "
                          "--max-filed-followups on every add-task. A per-task override still "
                          "wins; omitted, the engine default applies. Must be >= 0")
+    ir.add_argument("--review-workflow", action="store_true",
+                    help="run REVIEW as a multi-agent find→verify panel (#73): independent "
+                         "finder lenses (code/spec/tests, plus design on a frontend change) "
+                         "whose findings are adversarially verified, instead of one "
+                         "mega-prompt reviewer. Only on lanes that can execute a plan (not "
+                         "codex); micro/lite presets, a loaded API, and a thinning budget all "
+                         "fall back to the single reviewer. Default off")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
@@ -964,14 +971,16 @@ def main(argv: list[str] | None = None) -> int:
                              cross_provider_fallback=args.cross_provider_fallback,
                              warm_retry=args.warm_retry,
                              progress_comments=args.progress_comments,
-                             max_filed_followups=args.max_filed_followups)
+                             max_filed_followups=args.max_filed_followups,
+                             review_workflow=args.review_workflow)
         _emit({"created_run": run.run_id, "lane": run.lane.value,
                "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
                "route_by_capacity": run.route_by_capacity,
                "cross_provider_fallback": run.cross_provider_fallback,
                "warm_retry": run.warm_retry,
                "progress_comments": run.progress_comments,
-               "max_filed_followups": run.max_filed_followups})
+               "max_filed_followups": run.max_filed_followups,
+               "review_workflow": run.review_workflow})
     elif args.cmd == "add-task":
         from .schemas.enums import Stage
 

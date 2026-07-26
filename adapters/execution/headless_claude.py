@@ -36,6 +36,9 @@ class HeadlessClaudeRunner:
                 provider=Provider.CLAUDE,
                 in_process=True,
                 schema_enforced=True,  # via --json-schema
+                # #73: the reference lane for a multi-agent REVIEW — the transport can fan a
+                # plan's finders/verifiers out as sub-calls within one dispatch (design §2/§5).
+                supports_plan=True,
                 status=SUPPORTED,
             )
         ]

@@ -26,7 +26,7 @@ from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
-from .errors import CapacityExhausted, ContractError
+from .errors import CapacityExhausted, ContractError, NoRunnerError
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
 )
@@ -85,8 +85,8 @@ from .schemas.enums import (
     resolve_effort,
 )
 from .schemas.status import Run, Task, TaskRef
-from .schemas.work import LanePolicy, LaneUsed, StageResult, TokenUsage, WorkItem
-from .stages import STAGE_SPECS, render_prompt
+from .schemas.work import LanePolicy, LaneUsed, ReviewPlan, StageResult, TokenUsage, WorkItem
+from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
     apply_result,
     begin_stage,
@@ -293,6 +293,7 @@ class Engine:
         warm_retry: bool = False,
         progress_comments: bool = False,
         max_filed_followups: int | None = None,
+        review_workflow: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
@@ -306,9 +307,11 @@ class Engine:
         opts into mid-run progress commentary on the driving issue/PR (#64 — outward-facing, so
         default off). ``max_filed_followups`` (#196) sets a run-wide default cap on filed
         review follow-ups so every task in the run shares a non-default baseline without
-        repeating it per add_task; None inherits the engine constructor default. All default
-        off; the routers are DISTINCT levers (USD vs rate-limit headroom vs provider outage
-        vs failed-session reuse)."""
+        repeating it per add_task; None inherits the engine constructor default.
+        ``review_workflow`` (#73) opts REVIEW into the multi-agent find→verify panel on lanes
+        that can execute a plan — off by default, and cost/capacity policy can still veto it
+        per dispatch. All default off; the routers are DISTINCT levers (USD vs rate-limit
+        headroom vs provider outage vs failed-session reuse)."""
         if max_filed_followups is not None and max_filed_followups < 0:
             raise ContractError(
                 f"max_filed_followups must be >= 0, got {max_filed_followups} for run {run_id}"
@@ -321,6 +324,7 @@ class Engine:
             warm_retry=warm_retry,
             progress_comments=progress_comments,
             max_filed_followups=max_filed_followups,
+            review_workflow=review_workflow,
         )
         self.store.save_run(run)
         return run
@@ -771,6 +775,15 @@ class Engine:
             project_commands=self._project_commands(),
         )
         agent = self.project.agent_for(stage, spec.agent_role)
+        # Multi-agent REVIEW (#73): one gate, consulted only for a model-lane REVIEW. It
+        # re-reads the opt-in off the loaded Run doc and applies the lane/preset/capacity/
+        # budget vetoes; None (the default, and every other stage) dispatches the byte-
+        # identical plan-less path.
+        plan = (
+            None
+            if deterministic
+            else self._review_plan_for(task, stage=stage, run=run, lane=lane, util_pct=util_pct)
+        )
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -820,6 +833,10 @@ class Engine:
             # for projects that don't opt in) — a clean no-op there. Hash-excluded: derived
             # from the same durable context (port_base) the prompt is.
             env=self._port_env_for_task(task),
+            # #73: CONTENT, so it folds into content_hash (unlike cwd/context/env above).
+            # None on every non-workflow dispatch — which is what keeps the plan-less
+            # WorkItem/prompt/hash byte-identical to the pre-#73 shape.
+            plan=plan,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -902,6 +919,117 @@ class Engine:
         self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
         return work
+
+    # --- multi-agent REVIEW plan (#73) -----------------------------------------
+    def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:
+        """Measure the change under review with a bounded, best-effort ENGINE-lane git read
+        (``git diff --numstat <base_sha>..HEAD`` in the task's worktree).
+
+        This is the ONLY size signal the finder-set relaxation ladder may consult, precisely
+        because it is the engine's own measurement rather than anything a model reported about
+        its own work (an implementer that under-reports ``files_changed`` must not be able to
+        talk itself into a thinner review — design §1's ``DETERMINISTIC_ONLY_KEYS`` rule).
+
+        Returns None on ANY error, missing input, or unreadable output, and the caller then
+        applies NO relaxation — failing toward the full panel, i.e. more scrutiny. Called only
+        while building a plan, so the plan-less path performs zero extra I/O."""
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        if not (base_sha and worktree and Path(str(worktree)).is_dir()):
+            return None
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["git", "diff", "--numstat", f"{base_sha}..HEAD"],  # noqa: S607
+                cwd=str(worktree), capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        if proc.returncode != 0:
+            return None
+        files = lines = 0
+        for row in proc.stdout.splitlines():
+            cols = row.split("\t")
+            if len(cols) < 3:
+                continue
+            files += 1
+            # A binary file reports "-\t-\t<path>": it counts as a touched FILE but adds no
+            # line count — never inflate, never crash on the sentinel.
+            for col in cols[:2]:
+                if col.isdigit():
+                    lines += int(col)
+        return DiffStat(files=files, lines=lines)
+
+    def _review_plan_for(
+        self,
+        task: Task,
+        *,
+        stage: Stage,
+        run: Run,
+        lane: LanePolicy,
+        util_pct: float,
+    ) -> ReviewPlan | None:
+        """The single gate deciding whether THIS dispatch carries a multi-agent REVIEW plan.
+
+        Consulted only for a model-lane REVIEW stage. The opt-in is re-read from the LOADED
+        Run doc (``run.review_workflow``), never from engine memory — every CLI subcommand
+        rebuilds the Engine from constructor defaults, so a create-time-only setting would be
+        gone by the next subcommand (#206).
+
+        Vetoes, in order (each emits ``review_workflow_skipped`` with its reason, so a run
+        that opted in never silently gets the single-reviewer path):
+
+        - the resolved lane's descriptor does not declare ``supports_plan`` (codex has no
+          sub-agent primitive) — the plan is in ``content_hash``, so lane and hash must agree;
+        - the task's lane preset is MICRO/LITE (they exist to be cheap);
+        - capacity says this dispatch is not in the NORMAL band (under load, one reviewer);
+        - the run's remaining budget has thinned past the cost router's top band.
+
+        Returns the rendered plan, or None to dispatch the byte-identical plan-less path."""
+        if stage is not Stage.REVIEW or not run.review_workflow:
+            return None
+
+        def _veto(reason: str, **extra: object) -> None:
+            self.store.append_event(
+                run.run_id,
+                {"ts": _now(), "type": "review_workflow_skipped", "run_id": run.run_id,
+                 "task_id": task.task_id, "stage": stage.value, "reason": reason, **extra},
+            )
+
+        try:
+            supports_plan = self.registry.describe(lane).supports_plan
+        except NoRunnerError:
+            supports_plan = False
+        if not supports_plan:
+            _veto("lane_cannot_execute_plan",
+                  lane=f"{lane.execution_mode.value}:{lane.provider.value}")
+            return None
+        if task.execution_lane in (ExecutionLane.MICRO, ExecutionLane.LITE):
+            _veto("cheap_lane_preset", execution_lane=task.execution_lane.value)
+            return None
+        if self.capacity.dispatch_band(util_pct, self.capacity.downgrade_threshold) is not (
+            DispatchBand.NORMAL
+        ):
+            _veto("capacity_band", util_pct=util_pct)
+            return None
+        remaining = self._remaining_budget_fraction(run)
+        if self.cost_router.route(remaining).lane is not ExecutionLane.FULL:
+            _veto("budget_thinning", remaining_fraction=round(remaining, 4))
+            return None
+        return render_review_plan(
+            task_id=task.task_id,
+            title=task.title,
+            body=task.body,
+            learnings="\n".join(task.learnings),
+            context=task.context,
+            project_commands=self._project_commands(),
+            agent_for=self.project.agent_for,
+            # ENGINE-lane deterministic relaxation signals ONLY, passed explicitly so
+            # render_review_plan never has to reach into the model-writable context for them.
+            change_class=(
+                "docs-only" if task.context.get("change_class") == "docs-only" else None
+            ),
+            diff_stat=self._deterministic_diff_stat(task),
+        )
 
     def record(self, run_id: str, result: StageResult) -> dict:
         task = self.store.load_task(run_id, result.task_id)
