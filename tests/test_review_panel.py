@@ -342,6 +342,38 @@ def test_verifier_cap_bounds_the_calls_and_leaves_the_dropped_findings_blocking(
     assert review["approved"] is False
 
 
+def test_the_verifier_cap_spends_its_budget_on_the_most_severe_findings_first() -> None:
+    """The cap's ordering is ``(severity rank, fingerprint)`` so scarce verifier calls go to
+    ``critical`` before ``important``. Every other cap test uses ``_finding()``'s uniform
+    ``critical`` default, which exercises only the fingerprint tiebreak — sorting by
+    fingerprint ALONE would pass them. Mixing severities pins the rank component."""
+    # The descriptions are chosen so the FINGERPRINT order fights the SEVERITY order: the
+    # fingerprint is `file:description`, so "zz…" (critical) sorts AFTER "aa…" (important).
+    # Without this the two orders coincide and a fingerprint-only sort passes vacuously.
+    criticals = [_finding(f"zz crit {i:02d}", severity="critical") for i in range(_MAX_VERIFIERS)]
+    importants = [_finding(f"aa imp {i:02d}", severity="important") for i in range(4)]
+    # Interleaved on the wire, so ordering can only come from the sort, not arrival order.
+    findings = [x for pair in zip(importants, criticals, strict=False) for x in pair]
+    findings += criticals[len(importants) :]
+    transport = FakeTransport(
+        {"find:code": _findings_raw(*findings)},
+        default=_verdict_raw("unmatchable", "refuted"),
+    )
+
+    run_review_panel(_work(_plan("find:code")), transport)
+
+    verified = [w.prompt for w in transport.seen if (w.phase or "").startswith("verify:")]
+    assert len(verified) == _MAX_VERIFIERS
+    # The whole budget went to criticals; not one `important` displaced one.
+    assert all("- severity: critical" in p for p in verified)
+    assert {issue_fingerprint(f) for f in criticals} == {
+        line.split("- fingerprint: ")[1].splitlines()[0]
+        for p in verified
+        for line in p.splitlines()
+        if line.startswith("- fingerprint: ")
+    }
+
+
 def test_the_verify_prompt_is_mechanical_slot_substitution_only() -> None:
     plan = _plan("find:code")
     finding = _finding("off-by-one in the loop {not a slot}", file="loop.py", line=42)
@@ -358,7 +390,39 @@ def test_the_verify_prompt_is_mechanical_slot_substitution_only() -> None:
     assert "- severity: critical" in prompt
     assert "off-by-one in the loop {not a slot}" in prompt  # braces survive verbatim
     assert "### Where to look\nloop.py:42" in prompt
+    # No slot left unfilled. Sound only because THIS finding's own text contains neither
+    # token — see the test below for the case where it does.
     assert "{finding}" not in prompt and "{diff_hint}" not in prompt
+
+
+def test_a_finding_quoting_a_slot_name_survives_verbatim_and_is_not_re_substituted() -> None:
+    """Chained ``str.replace``s let a LATER slot's substitution re-scan text an EARLIER one
+    injected, so a finding whose description quotes ``{diff_hint}`` had it silently rewritten
+    into the where-to-look pointer. On-path, not hypothetical: this repo review-panels its own
+    source, and a finder discussing these placeholders writes them verbatim. The single-pass
+    render never revisits what it emitted, so BOTH slot names survive inside the finding."""
+    finding = _finding(
+        "the template's {diff_hint} slot is filled after {finding}, which corrupts it",
+        file="review_panel.py",
+        line=277,
+    )
+    transport = FakeTransport(
+        {"find:code": _findings_raw(finding)},
+        default=_verdict_raw(issue_fingerprint(finding), "confirmed"),
+    )
+
+    run_review_panel(_work(_plan("find:code")), transport)
+
+    prompt = next(w.prompt for w in transport.seen if w.phase == "verify:1")
+    # The description reaches the adversary exactly as the finder wrote it...
+    assert (
+        "- description: the template's {diff_hint} slot is filled after {finding}, "
+        "which corrupts it"
+    ) in prompt
+    # ...and the real slots were still filled: the pointer is the finding's own file:line,
+    # and it appears ONCE (the pre-fix chain also injected it into the description above).
+    assert "### Where to look\nreview_panel.py:277" in prompt
+    assert prompt.count("review_panel.py:277") == 1
 
 
 # --- failure directions: the verifier fails OPEN toward blocking -------------------------
