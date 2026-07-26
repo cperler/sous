@@ -29,7 +29,6 @@ from .transport import (
     stream_teeing_transport,
 )
 
-
 # JSON-Schema meta-keys the CLI's `--json-schema` validator cannot accept: it treats a
 # top-level `$schema`/`$id` as a `$ref` to resolve and fails closed —
 #   Error: --json-schema is not a valid JSON Schema: no schema with key or ref
