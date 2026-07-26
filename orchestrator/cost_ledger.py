@@ -25,13 +25,18 @@ records cannot both append. The ledger append is itself a crash boundary: an
 interrupted write (crash/ENOSPC) can leave a torn FINAL line, and the scan is
 self-healing for exactly that tear — ``record_rows`` truncates it under the lock and
 the converge pass re-appends the row the interrupted write lost, so the replay still
-converges instead of wedging every later ``record`` on a ``JSONDecodeError``. An
-undecodable line anywhere ELSE is real corruption and still raises (see ``_scan``).
+converges instead of wedging every later ``record`` on a ``JSONDecodeError``. A write
+interrupted at the content/newline boundary instead leaves a COMPLETE, decodable final
+line missing only its terminator — valid data, never truncated: ``record_rows``
+newline-terminates it in place before appending, so the next row cannot weld onto it
+(``record_rows`` enumerates why those two branches cover every interruption offset).
+An undecodable line anywhere ELSE is real corruption and still raises (see ``_scan``).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
@@ -117,7 +122,23 @@ class CostLedger:
         it BEFORE appending — appending onto torn bytes would weld the new row into
         them and turn a recoverable tear into real mid-file corruption — and the
         converge pass then re-appends the row the interrupted write lost. An
-        undecodable line anywhere but the tail still raises (see ``_scan``)."""
+        undecodable line anywhere but the tail still raises (see ``_scan``).
+
+        Together the truncate branch and the newline guard cover EVERY byte offset
+        at which an append (content bytes, then ``b"\\n"``) can be interrupted:
+
+        * 0 bytes persisted — the file is exactly its prior (clean) state;
+        * a strict prefix of the content — never valid JSON (a serialized object's
+          top-level closing brace is its FINAL byte, so every proper prefix has an
+          unclosed brace or string), hence undecodable and unterminated: the
+          torn-tail branch truncates it;
+        * all content bytes, terminator lost — complete VALID data: the newline
+          guard terminates it in place (never truncates — no good row destroyed);
+        * content + newline — the append completed; nothing to repair.
+
+        A multi-row (panel) append is a sequence of such writes, so an interruption
+        lands inside exactly one row's content-or-terminator window; earlier rows are
+        whole lines and the converge pass re-appends the rows that never landed."""
         if result.sub_calls:
             built = [
                 self._row(
@@ -150,6 +171,17 @@ class CostLedger:
                 # pass below re-appends whatever that interrupted write was carrying.
                 with self.path.open("r+b") as fh:
                     fh.truncate(torn_at)
+            elif self._tail_missing_newline():
+                # The OTHER interruption offset (#277 review cycle 2): the write
+                # persisted every content byte and lost ONLY the terminating newline
+                # (ENOSPC/crash can end a write at any offset, including len-1). The
+                # final line is complete, decodable, VALID data — so it must NOT be
+                # truncated (that would destroy a good row) — but appending onto it
+                # would weld the next row into one line: exactly the mid-file
+                # corruption ``_scan`` correctly refuses to heal, i.e. a permanent
+                # wedge. Terminate it in place before the append.
+                with self.path.open("ab") as fh:
+                    fh.write(b"\n")
             existing = [r for r in on_disk if r.get("work_item_id") == result.work_item_id]
             rows, to_append = self._converge(built, existing) if existing else (built, built)
             if to_append:
@@ -157,6 +189,23 @@ class CostLedger:
                     for row in to_append:
                         fh.write(json.dumps(row) + "\n")
         return rows
+
+    def _tail_missing_newline(self) -> bool:
+        """True when the ledger exists, is non-empty, and its last byte is not ``\\n``.
+
+        The write-side check for the interruption offset ``_scan`` cannot see: a final
+        line whose content fully persisted but whose terminator did not is decodable,
+        so it scans clean (``torn_at is None``) — yet appending onto it would weld two
+        rows into one line. Called only under ``record_rows``'s file lock, right before
+        the append, so the answer cannot go stale between check and write."""
+        try:
+            with self.path.open("rb") as fh:
+                if fh.seek(0, os.SEEK_END) == 0:  # empty file needs no terminator
+                    return False
+                fh.seek(-1, os.SEEK_END)
+                return fh.read(1) != b"\n"
+        except FileNotFoundError:
+            return False
 
     def existing_rows_for(self, work_item_id: str) -> list[dict]:
         """The rows already recorded for one dispatch, in file order (#277).

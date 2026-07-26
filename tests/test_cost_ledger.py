@@ -411,6 +411,30 @@ def test_rows_skips_torn_tail_without_repairing(tmp_path: Path) -> None:
     assert path.read_bytes() == before
 
 
+def test_unterminated_decodable_tail_is_terminated_not_welded(tmp_path: Path) -> None:
+    """Review cycle 2's wedge: an append can persist EVERY content byte and lose only
+    the trailing newline (ENOSPC/crash at the content/newline boundary). That final
+    line decodes, so ``_scan`` reports the file clean — the torn-tail branch never
+    fires — and an unguarded append would weld the next row onto it, producing the
+    newline-TERMINATED mid-file corruption the cycle-1 repair correctly refuses to
+    heal: a permanent, unrecoverable wedge. The guard must newline-terminate the
+    valid line in place (never truncate it — it is good data) before appending."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    path.write_bytes(raw[:-1])  # strip ONLY the terminator: all content persisted
+
+    ledger.record(make_result(work_item_id="wi-b", input=100))  # must not weld
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-b"]
+    # Physically two terminated lines: wi-a's row repaired in place, not destroyed.
+    text = path.read_text()
+    assert text.endswith("\n") and len(text.splitlines()) == 2
+    ledger.record(make_result(work_item_id="wi-c", input=100))  # still records
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-b", "wi-c"]
+
+
 def test_mid_file_undecodable_line_still_raises(tmp_path: Path) -> None:
     """Only the FINAL, unterminated line may be torn (the interrupted-append
     signature). An undecodable line anywhere else is real corruption and must raise —
