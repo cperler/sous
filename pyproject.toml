@@ -104,6 +104,7 @@ module = [
     "orchestrator.render",
     "orchestrator.retrospective",
     "orchestrator.retry",
+    "orchestrator.review_workflow",
     "orchestrator.routing",
     "orchestrator.scaffold",
     "orchestrator.scheduler",
