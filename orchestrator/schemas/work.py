@@ -225,6 +225,13 @@ class WorkItem(BaseModel):
     # like session_ref/cwd/context. None (the default) is a plan-less dispatch, which hashes
     # byte-identically to the pre-#73 formula.
     plan: ReviewPlan | None = None
+    # RUNNER-SCOPED sub-call discriminator (#73): the phase a panel driver stamps on the
+    # sub-WorkItems it derives from a plan-bearing item (``find:code``, ``verify:3``), so each
+    # sub-call's provider stream tees to its own file. Dispatch metadata like ``cwd``/
+    # ``session_ref`` — EXCLUDED from ``compute_content_hash`` (it names where a call's evidence
+    # lands, never what the work IS) — and NEVER set by the engine: the engine emits one
+    # WorkItem per dispatch and only the runner fans it out below the seam.
+    phase: str | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod

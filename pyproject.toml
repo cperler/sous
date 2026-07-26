@@ -131,6 +131,7 @@ module = [
     "adapters.execution.headless_claude",
     "adapters.execution.install_cache",
     "adapters.execution.interactive",
+    "adapters.execution.review_panel",
     "adapters.execution.runners",
     "adapters.execution.transport",
     "adapters.project",

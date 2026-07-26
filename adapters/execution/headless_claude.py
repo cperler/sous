@@ -5,20 +5,25 @@ StageResult. Unlike the interactive shim, this runs in-process, so the engine/sc
 can dispatch it directly (the headless run target). Under the anticipated billing
 change this lane bills credit/at API rates — a cost property of the (headless, claude)
 cell, not a prohibition.
+
+It is also the reference lane for the multi-agent REVIEW workflow (#73): a plan-bearing
+WorkItem is handed to ``review_panel.run_review_panel``, which fans the plan out into finder
+and verifier sub-calls over this same transport and returns one StageResult.
 """
 
 from __future__ import annotations
 
-from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
+from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .base import SUPPORTED, CapabilityDescriptor
+from .review_panel import run_review_panel
 from .transport import (
     RawResult,
     Transport,
     checkpointing_transport,
+    classify_raw,
     claude_cli_transport,
-    is_rate_limited,
     to_stage_result,
 )
 
@@ -44,16 +49,12 @@ class HeadlessClaudeRunner:
         ]
 
     def dispatch(self, work: WorkItem) -> StageResult:
+        # #73: a plan-bearing dispatch fans out below the seam (finders → dedupe → adversarial
+        # verify) and returns one StageResult carrying sub_results/sub_calls. Everything else
+        # takes the single-call path below, byte-for-byte as before — the plan-less path is the
+        # permanent fallback, not scaffolding.
+        if work.plan is not None:
+            return run_review_panel(work, self._transport)
         raw: RawResult = self._transport(work)
-        if raw.exit_code != 0 or raw.error:
-            if raw.exit_code == 124:
-                status = ResultStatus.TIMEOUT
-            elif is_rate_limited(raw):
-                status = ResultStatus.RATE_LIMITED  # engine retries on a cheaper model
-            else:
-                status = ResultStatus.FAILURE
-        elif raw.structured_output is None:
-            status = ResultStatus.SCHEMA_VIOLATION
-        else:
-            status = ResultStatus.SUCCESS
+        status = classify_raw(raw)  # engine retries RATE_LIMITED on a cheaper model
         return to_stage_result(work, raw, status, mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE)

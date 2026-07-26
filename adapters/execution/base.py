@@ -44,8 +44,9 @@ class CapabilityDescriptor(BaseModel):
     # attaches a plan only when the RESOLVED lane declares support, so the plan — which is
     # folded into ``content_hash`` — never disagrees with the lane that runs it. False for
     # codex (``codex exec`` has no sub-agent primitive) and for the deterministic ENGINE lane
-    # (no model at all). NOTE: until #73 parts 4/5 land, a supporting runner still IGNORES an
-    # attached plan and degrades gracefully to the single-reviewer dispatch — harmless,
+    # (no model at all). NOTE: headless×claude EXECUTES the plan (``review_panel``); the
+    # interactive×claude shim declares support but still IGNORES an attached plan and degrades
+    # gracefully to the single-reviewer dispatch until its branch lands (#262) — harmless,
     # because the whole path is behind the off-by-default ``Run.review_workflow`` flag.
     supports_plan: bool = False
     status: CellStatus = SUPPORTED
