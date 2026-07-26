@@ -17,6 +17,7 @@ import json
 from orchestrator.cost_ledger import _ATTRIBUTION_FIELDS, CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.work import SubCall, TokenUsage
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
@@ -39,6 +40,31 @@ def test_cost_ledger_row_surfaces_every_attribution_field(tmp_path, project) -> 
     eng.record("r1", make_result(eng.next_work("r1", "t1")))
     row = eng.ledger.rows()[-1]
     assert row.keys() >= _ATTRIBUTION_FIELDS
+
+
+def test_every_sub_call_ledger_row_surfaces_every_attribution_field(tmp_path, project) -> None:
+    """#73 §4: a plan-bearing dispatch writes one row PER SUB-CALL — each of those rows is a
+    model-call attribution record in its own right, so the parity set must hold on every one
+    of them (a sub-call row missing `effort`/`model`/`cost_usd` is the #151 gap, per call)."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    result = make_result(eng.next_work("r1", "t1")).model_copy(
+        update={
+            "sub_calls": (
+                SubCall(phase="find:code", model="claude-opus-5",
+                        usage=TokenUsage(input=100, output=10), duration_s=2.0),
+                SubCall(phase="verify:0", model="claude-sonnet-5",
+                        usage=TokenUsage(input=50, output=5), duration_s=1.0),
+            )
+        }
+    )
+    eng.record("r1", result)
+
+    rows = eng.ledger.rows()
+    assert [r["phase"] for r in rows] == ["find:code", "verify:0"]
+    for row in rows:
+        assert row.keys() >= _ATTRIBUTION_FIELDS
 
 
 def test_normal_stage_log_surfaces_every_attribution_field(tmp_path, project) -> None:

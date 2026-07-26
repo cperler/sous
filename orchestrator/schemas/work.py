@@ -99,6 +99,11 @@ class SubCall(BaseModel):
     duration_s: float
     session_id: str | None = None
     stream_file: str | None = None
+    # Corrective schema-retries the transport spent inside THIS sub-call (#32 semantics, one
+    # level down): a `_schema_retry_loop` run against one finder's output rides that finder's
+    # own count, so its ledger row — not the dispatch, and not a sibling sub-call — carries the
+    # extra turns (design §4). 0 on the first-try-valid path and on lanes without the loop.
+    schema_retries: int = 0
 
 
 def compute_content_hash(
