@@ -1,0 +1,558 @@
+"""#73 part 2: ``synthesize`` — the deterministic engine-side review fold, and its
+wiring into ``Engine.record``.
+
+This IS the verdict of the multi-agent REVIEW workflow, so it is tested exhaustively
+before any runner exists: a fake runner (``make_result(..., sub_results=...)``) drives the
+full engine path from day one.
+
+Design tests (b) — the pure fold, table-driven — and (c) — a fake-runner result recording
+identically to an equivalent hand-written single review, notice events, stage-log
+evidence, and convergence auto-approval on synthesized fingerprints across a fix cycle.
+"""
+
+from __future__ import annotations
+
+import json
+
+from orchestrator.cost_ledger import CostLedger
+from orchestrator.engine import Engine
+from orchestrator.review_workflow import (
+    FINGERPRINT_RULE,
+    LENS_ORDER,
+    issue_fingerprint,
+    synthesize,
+)
+from orchestrator.schemas.enums import Stage, TaskState
+from orchestrator.status_store import StatusStore
+from tests.conftest import make_result
+
+# --------------------------------------------------------------------------- helpers
+
+CRITICAL = {"severity": "critical", "file": "a.py", "line": 12,
+            "description": "breaks the invariant", "suggested_fix": "guard the None case"}
+IMPORTANT = {"severity": "important", "file": "b.py",
+             "description": "drops the error path"}
+SUGGESTION = {"severity": "suggestion", "file": "c.py", "description": "rename the helper"}
+
+
+def _panel(findings_by_lens: dict, verdicts: list | None = None) -> dict:
+    return {"findings_by_lens": findings_by_lens, "verdicts": verdicts or []}
+
+
+def _verdict(finding: object, verdict: str, reasoning: str = "checked the tree") -> dict:
+    return {"fingerprint": issue_fingerprint(finding), "verdict": verdict,
+            "reasoning": reasoning}
+
+
+def _kinds(notices: tuple[dict[str, str], ...]) -> list[str]:
+    return [n["notice"] for n in notices]
+
+
+def _engine(tmp_path, project, **kw) -> Engine:
+    return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"),
+                  project, **kw)
+
+
+def _advance_to_review(eng, run="r1", task="t1"):
+    """Drive intake→…→deliver green; return the REVIEW WorkItem."""
+    for _ in range(5):  # intake, scope, implement, test, deliver
+        eng.record(run, make_result(eng.next_work(run, task)))
+    w = eng.next_work(run, task)
+    assert w.stage is Stage.REVIEW
+    return w
+
+
+def _review_log(root, task="t1") -> dict:
+    """The most recent REVIEW stage-log payload — the durable record, which (unlike the
+    stage RECORD) survives a fix cycle re-opening the stage."""
+    return json.loads(sorted((root / "stages" / task).glob("*-review.json"))[-1].read_text())
+
+
+def _fix_cycle_back_to_review(eng, run="r1", task="t1"):
+    """implement→test→deliver again after a rejection; return the re-REVIEW WorkItem."""
+    for _ in range(3):
+        eng.record(run, make_result(eng.next_work(run, task)))
+    w = eng.next_work(run, task)
+    assert w.stage is Stage.REVIEW
+    return w
+
+
+# ---------------------------------------------------------------- (b) the pure fold
+
+
+def test_confirmed_critical_finding_rejects() -> None:
+    """The headline case: a finder raises a critical, the adversary fails to kill it,
+    the fold refuses approval and hands the finding through UNCHANGED so the fix cycle's
+    learnings/fingerprints read exactly as a single reviewer's would."""
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        [_verdict(CRITICAL, "confirmed", "reproduced it")],
+    ))
+    assert review["approved"] is False
+    assert review["issues"] == [CRITICAL]  # object identity of shape, not a re-render
+    assert review["non_blocking"] == []
+    assert review["tests_meaningful"] is True
+    assert notices == ()
+
+
+def test_all_refuted_approves_but_files_the_refutations() -> None:
+    """An adversary killing a finding must not silently erase it: the review approves,
+    and every refuted finding survives in non_blocking with the verifier's reasoning and
+    NO disposition (so evidence-out still files it — the false-negative loop stays open
+    to a human)."""
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}, "find:spec": {"findings": [IMPORTANT]}},
+        [_verdict(CRITICAL, "refuted", "the guard is three lines up"),
+         _verdict(IMPORTANT, "refuted", "the error path is covered by the decorator")],
+    ))
+    assert review["approved"] is True
+    assert review["issues"] == []
+    titles = [n["title"] for n in review["non_blocking"]]
+    assert titles == ["refuted: breaks the invariant", "refuted: drops the error path"]
+    assert "the guard is three lines up" in review["non_blocking"][0]["detail"]
+    assert "breaks the invariant" in review["non_blocking"][0]["detail"]  # the finding too
+    assert all("disposition" not in n for n in review["non_blocking"])
+    assert notices == ()
+
+
+def test_missing_verifier_leaves_the_finding_blocking() -> None:
+    """Fail toward scrutiny: verification may only REMOVE scrutiny it affirmatively
+    earned, so a finding nobody verified still blocks."""
+    review, notices = synthesize(_panel({"find:code": {"findings": [CRITICAL]}}))
+    assert review["approved"] is False
+    assert review["issues"] == [CRITICAL]
+    assert notices == ()
+
+
+def test_unmatchable_verdict_leaves_the_finding_blocking_and_notices() -> None:
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        [{"fingerprint": "some:other finding", "verdict": "refuted", "reasoning": "nope"}],
+    ))
+    assert review["issues"] == [CRITICAL]
+    assert review["approved"] is False
+    assert _kinds(notices) == ["verdict_without_finding"]
+
+
+def test_errored_verdict_value_leaves_the_finding_blocking_and_notices() -> None:
+    """A verifier that returns something other than confirmed/refuted (a timeout stub, a
+    schema-drifted 'error') cannot demote a finding."""
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        [{"fingerprint": issue_fingerprint(CRITICAL), "verdict": "error",
+          "reasoning": "the verifier timed out"}],
+    ))
+    assert review["issues"] == [CRITICAL]
+    assert review["approved"] is False
+    assert _kinds(notices) == ["unknown_verdict"]
+
+
+def test_malformed_verdicts_leave_findings_blocking_and_notice() -> None:
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        ["not an object", {"verdict": "refuted", "reasoning": "no fingerprint"}],
+    ))
+    assert review["issues"] == [CRITICAL]
+    assert _kinds(notices) == ["verdict_malformed", "verdict_malformed"]
+
+
+def test_duplicate_verdict_first_wins_and_notices() -> None:
+    """First verdict wins — a second verifier cannot re-litigate a confirmation into a
+    refutation (and the extra is recorded, not swallowed)."""
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        [_verdict(CRITICAL, "confirmed", "stands"), _verdict(CRITICAL, "refuted", "no it doesn't")],
+    ))
+    assert review["issues"] == [CRITICAL]
+    assert _kinds(notices) == ["duplicate_verdict"]
+
+
+def test_explicit_tests_meaningful_false_is_vacuous_with_zero_issues() -> None:
+    """The #13 strong form: find:tests is its own dispatch, and its explicit false is
+    vacuous even when every other lens is clean."""
+    review, notices = synthesize(_panel({
+        "find:code": {"findings": []},
+        "find:tests": {"findings": [], "tests_meaningful": False},
+    }))
+    assert review["issues"] == []
+    assert review["tests_meaningful"] is False
+    assert review["approved"] is False
+    assert notices == ()
+
+
+def test_omitted_tests_lens_folds_to_true_fail_open() -> None:
+    """Docs-only omits the lens entirely; fail-OPEN is preserved — only an explicit
+    false is vacuous."""
+    review, _ = synthesize(_panel({"find:code": {"findings": []}}))
+    assert review["tests_meaningful"] is True
+    assert review["approved"] is True
+
+    # ... and so does an omitted field on a present find:tests lens.
+    review2, _ = synthesize(_panel({"find:tests": {"findings": []}}))
+    assert review2["tests_meaningful"] is True
+
+
+def test_tests_meaningful_from_a_non_tests_lens_is_ignored_with_a_notice() -> None:
+    review, notices = synthesize(_panel({
+        "find:code": {"findings": [], "tests_meaningful": False},
+        "find:tests": {"findings": [], "tests_meaningful": True},
+    }))
+    assert review["tests_meaningful"] is True  # only find:tests judges tests
+    assert review["approved"] is True
+    assert _kinds(notices) == ["tests_meaningful_ignored"]
+
+
+def test_suggestions_are_non_blocking_and_approve() -> None:
+    review, notices = synthesize(_panel({"find:code": {"findings": [SUGGESTION]}}))
+    assert review["approved"] is True
+    assert review["issues"] == []
+    assert review["non_blocking"] == [
+        {"title": "rename the helper", "detail": "suggestion — c.py — rename the helper"}
+    ]
+    assert notices == ()
+
+
+def test_cross_lens_dedupe_and_stable_sort() -> None:
+    """Two lenses independently finding the same thing is agreement, not two issues; the
+    survivors sort by (severity rank, fingerprint) so the output — and therefore the
+    convergence fingerprint list — is byte-stable."""
+    other_critical = {"severity": "critical", "file": "a.py", "description": "aaa first"}
+    review, notices = synthesize(_panel({
+        "find:spec": {"findings": [IMPORTANT, CRITICAL]},
+        "find:code": {"findings": [dict(CRITICAL), other_critical]},
+    }))
+    assert review["issues"] == [other_critical, CRITICAL, IMPORTANT]  # critical(a<b), then important
+    assert notices == ()
+
+
+def test_fingerprint_matching_is_normalized() -> None:
+    """A verifier that re-wrote the finding's whitespace/case still addresses it — both
+    sides run the named ``fingerprint-v1`` rule."""
+    assert FINGERPRINT_RULE == "fingerprint-v1"
+    noisy = {"fingerprint": "A.PY:Breaks   THE\tinvariant", "verdict": "refuted",
+             "reasoning": "already guarded"}
+    review, notices = synthesize(_panel({"find:code": {"findings": [CRITICAL]}}, [noisy]))
+    assert review["issues"] == []
+    assert review["approved"] is True
+    assert notices == ()
+
+
+def test_shuffled_lens_order_folds_identically() -> None:
+    """The walk is driven by LENS_ORDER, never by the input dict's key order."""
+    lenses = {
+        "find:tests": {"findings": [], "tests_meaningful": True},
+        "find:code": {"findings": [CRITICAL], "improvement": {"title": "from code"}},
+        "find:spec": {"findings": [IMPORTANT], "improvement": {"title": "from spec"}},
+    }
+    forward, n1 = synthesize(_panel(lenses))
+    reversed_, n2 = synthesize(_panel(dict(reversed(list(lenses.items())))))
+    assert json.dumps(forward) == json.dumps(reversed_)
+    assert _kinds(n1) == _kinds(n2) == ["improvement_dropped"]
+
+
+def test_repeated_folds_are_byte_identical() -> None:
+    panel = _panel(
+        {"find:code": {"findings": [CRITICAL, SUGGESTION]},
+         "find:spec": {"findings": [IMPORTANT]},
+         "find:tests": {"findings": [], "tests_meaningful": True}},
+        [_verdict(IMPORTANT, "refuted", "covered")],
+    )
+    first, n1 = synthesize(panel)
+    second, n2 = synthesize(panel)
+    assert json.dumps(first) == json.dumps(second)
+    assert n1 == n2
+
+
+def test_improvement_and_retrospective_take_the_first_in_lens_order() -> None:
+    review, notices = synthesize(_panel({
+        "find:tests": {"findings": [], "retrospective": {"title": "tests lesson"}},
+        "find:spec": {"findings": [], "improvement": {"title": "spec idea"},
+                      "retrospective": {"title": "spec lesson"}},
+        "find:code": {"findings": [], "improvement": {"title": "code idea"}},
+    }))
+    assert review["improvement"] == {"title": "code idea"}
+    assert review["retrospective"] == {"title": "spec lesson"}
+    assert _kinds(notices) == ["improvement_dropped", "retrospective_dropped"]
+
+
+def test_absent_improvement_and_retrospective_keys_are_omitted() -> None:
+    """Matching today's single-reviewer shape: the keys simply are not there."""
+    review, _ = synthesize(_panel({"find:code": {"findings": []}}))
+    assert set(review) == {"approved", "issues", "non_blocking", "tests_meaningful"}
+
+
+def test_tolerates_unvalidated_lane_shapes() -> None:
+    """The panel's input is model-authored and only schema-shaped; a malformed lens must
+    never raise out of record(). Everything skipped is noticed, never swallowed."""
+    review, notices = synthesize(_panel({
+        "find:code": {"findings": ["a plain string finding", "  ", 17,
+                                   {"file": "x.py", "description": "  "}]},
+        "find:spec": ["not an object"],
+        "find:design": {"findings": "not a list"},
+    }))
+    assert review["issues"] == ["a plain string finding"]  # blocking by default
+    assert review["approved"] is False
+    assert _kinds(notices) == [
+        "finding_skipped", "finding_skipped", "finding_skipped",  # blank / 17 / no description
+        "lens_payload_malformed",
+        "lens_findings_malformed",
+    ]
+
+
+def test_unknown_severity_blocks_and_notices() -> None:
+    """Fail toward scrutiny again: an unrecognized severity is not a licence to skip."""
+    review, notices = synthesize(_panel(
+        {"find:code": {"findings": [{"severity": "nit", "description": "unranked"}]}}
+    ))
+    assert review["issues"] == [{"severity": "nit", "description": "unranked"}]
+    assert _kinds(notices) == ["unknown_severity"]
+
+
+def test_missing_severity_blocks_silently() -> None:
+    """A severity-less finding is a legitimate schema shape (only ``description`` is
+    required), so it blocks WITHOUT a notice — the notice budget is for surprises."""
+    bare = {"file": "z.py", "description": "no severity given"}
+    review, notices = synthesize(_panel({"find:code": {"findings": [bare]}}))
+    assert review["issues"] == [bare]
+    assert notices == ()
+
+
+def test_unknown_lens_folds_after_the_known_ones_with_a_notice() -> None:
+    review, notices = synthesize(_panel({
+        "find:security": {"findings": [], "improvement": {"title": "from the new lens"}},
+        "find:code": {"findings": [], "improvement": {"title": "from code"}},
+    }))
+    assert review["improvement"] == {"title": "from code"}  # known lenses win precedence
+    assert _kinds(notices) == ["unknown_lens", "improvement_dropped"]
+
+
+def test_malformed_sub_results_root_folds_to_an_empty_panel() -> None:
+    for bad in ("nope", [1, 2], 7):
+        review, notices = synthesize(bad)
+        assert review == {"approved": True, "issues": [], "non_blocking": [],
+                          "tests_meaningful": True}
+        assert _kinds(notices) == ["sub_results_malformed"]
+    empty, notices = synthesize({})
+    assert empty["approved"] is True and notices == ()
+
+
+def test_lens_order_is_the_designed_one() -> None:
+    assert LENS_ORDER == ("find:code", "find:spec", "find:design", "find:tests")
+
+
+# ------------------------------------------- (c) the fake runner through Engine.record
+
+
+def _equivalent(fold_review: dict) -> dict:
+    """What a single hand-written reviewer would have had to return for the same verdict."""
+    return fold_review
+
+
+def test_synthesized_rejection_records_identically_to_a_hand_written_review(
+    tmp_path, project
+) -> None:
+    """Design test (c): the workflow is invisible above the seam. A fake runner returning
+    sub_results and a hand-written single review that says the same thing must produce
+    the same outcome, task state, next stage, learnings and convergence fingerprints."""
+    panel = _panel({"find:code": {"findings": [CRITICAL]},
+                    "find:tests": {"findings": [], "tests_meaningful": True}},
+                   [_verdict(CRITICAL, "confirmed", "reproduced it")])
+    folded, _ = synthesize(panel)
+
+    eng_a = _engine(tmp_path / "a", project)
+    eng_a.create_run("r1")
+    eng_a.add_task("r1", "t1")
+    out_a = eng_a.record("r1", make_result(_advance_to_review(eng_a), sub_results=panel))
+
+    eng_b = _engine(tmp_path / "b", project)
+    eng_b.create_run("r1")
+    eng_b.add_task("r1", "t1")
+    out_b = eng_b.record(
+        "r1", make_result(_advance_to_review(eng_b), structured_output=_equivalent(folded))
+    )
+
+    assert out_a["outcome"] == out_b["outcome"] == "review_rejected_fix_cycle"
+    assert out_a["task_state"] == out_b["task_state"] == "retrying"
+    assert out_a["next_stage"] == out_b["next_stage"] == "implement"
+    task_a, task_b = eng_a.store.load_task("r1", "t1"), eng_b.store.load_task("r1", "t1")
+    assert task_a.learnings == task_b.learnings
+    assert task_a.last_review_rejection == task_b.last_review_rejection
+    assert task_a.last_review_rejection == [issue_fingerprint(CRITICAL)]
+    assert task_a.review_cycles == task_b.review_cycles == 1
+    # the fold's output — not the (absent) runner output — is what the engine recorded
+    # (the REVIEW stage record itself is back to PENDING: the fix cycle re-opened it)
+    assert _review_log(tmp_path / "a")["structured_output"] == folded
+
+
+def test_synthesized_approval_records_identically_and_completes(tmp_path, project) -> None:
+    panel = _panel({"find:code": {"findings": [CRITICAL]},
+                    "find:tests": {"findings": [], "tests_meaningful": True}},
+                   [_verdict(CRITICAL, "refuted", "the guard is three lines up")])
+    folded, _ = synthesize(panel)
+    assert folded["approved"] is True
+
+    eng_a = _engine(tmp_path / "a", project)
+    eng_a.create_run("r1")
+    eng_a.add_task("r1", "t1")
+    out_a = eng_a.record("r1", make_result(_advance_to_review(eng_a), sub_results=panel))
+
+    eng_b = _engine(tmp_path / "b", project)
+    eng_b.create_run("r1")
+    eng_b.add_task("r1", "t1")
+    out_b = eng_b.record(
+        "r1", make_result(_advance_to_review(eng_b), structured_output=_equivalent(folded))
+    )
+    assert out_a["outcome"] == out_b["outcome"] == "task_completed"
+    assert eng_a.store.load_task("r1", "t1").state is TaskState.COMPLETED
+    # the refuted finding still reached evidence-out as a follow-up (never erased)
+    filed = [f["title"] for f in project.task_source.followups]
+    assert any(t.startswith("refuted: breaks the invariant") for t in filed)
+
+
+def test_synthesis_notices_land_in_the_event_stream(tmp_path, project) -> None:
+    """The fold is pure and sink-free (#235/#201); the engine call site is what emits."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel(
+        {"find:code": {"findings": [CRITICAL]}},
+        [{"fingerprint": "nothing:matches this", "verdict": "sideways", "reasoning": "?"}],
+    )
+    eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
+    emitted = [e for e in eng.store.read_events("r1") if e["type"] == "review_synthesis_notice"]
+    assert [e["notice"] for e in emitted] == ["unknown_verdict", "verdict_without_finding"]
+    assert all(e["stage"] == "review" and e["task_id"] == "t1" for e in emitted)
+    assert all(e["detail"] for e in emitted)
+
+
+def test_runner_supplied_output_is_superseded_by_the_fold_not_silently(
+    tmp_path, project
+) -> None:
+    """A runner that ALSO self-reports a verdict does not get to keep it — that is the
+    synthesizer-model hole the fold closes — but the override is audited."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel({"find:code": {"findings": [CRITICAL]}})
+    out = eng.record("r1", make_result(
+        _advance_to_review(eng), sub_results=panel,
+        structured_output={"approved": True, "issues": []},  # the runner's own verdict
+    ))
+    assert out["outcome"] == "review_rejected_fix_cycle"  # the panel's finding still blocks
+    notices = [e["notice"] for e in eng.store.read_events("r1")
+               if e["type"] == "review_synthesis_notice"]
+    assert notices == ["runner_output_superseded"]
+
+
+def test_stage_log_keeps_the_raw_panel_and_the_folded_verdict(tmp_path, project) -> None:
+    """Raw sub_results are the evidence; the folded review is the verdict everything
+    downstream consumed. The durable record carries both."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel({"find:code": {"findings": [CRITICAL]}},
+                   [_verdict(CRITICAL, "confirmed", "reproduced it")])
+    eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
+    logs = sorted((tmp_path / "stages" / "t1").glob("*-review.json"))
+    payload = json.loads(logs[-1].read_text())
+    assert payload["sub_results"] == panel
+    assert payload["structured_output"] == synthesize(panel)[0]
+
+
+def test_plan_less_review_stage_log_has_no_sub_results_key(tmp_path, project) -> None:
+    """Regression guard: the non-synthesized path's payload stays byte-identical."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(_advance_to_review(eng),
+                                 structured_output={"approved": True, "issues": []}))
+    payload = json.loads(sorted((tmp_path / "stages" / "t1").glob("*-review.json"))[-1].read_text())
+    assert "sub_results" not in payload
+    assert payload["structured_output"] == {"approved": True, "issues": []}
+
+
+def test_convergence_auto_approval_fires_on_synthesized_fingerprints(tmp_path, project) -> None:
+    """Design test (c), second half: a fix cycle driven entirely by the panel. The
+    re-review surfacing no NET-NEW finding converges — the convergence math is untouched,
+    it just reads fingerprints the fold produced."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel({"find:code": {"findings": [IMPORTANT]},
+                    "find:tests": {"findings": [], "tests_meaningful": True}},
+                   [_verdict(IMPORTANT, "confirmed", "still there")])
+    out = eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert eng.store.load_task("r1", "t1").last_review_rejection == [issue_fingerprint(IMPORTANT)]
+
+    # The fix didn't fully land, but the panel found nothing NEW: a subset re-review.
+    out2 = eng.record("r1", make_result(_fix_cycle_back_to_review(eng), sub_results=panel))
+    assert out2["outcome"] == "task_completed"
+    verdicts = [e for e in eng.store.read_events("r1") if e["type"] == "review_verdict"]
+    assert verdicts[-1]["kind"] == "converged_auto_approved"
+
+
+def test_net_new_synthesized_finding_does_not_converge(tmp_path, project) -> None:
+    """The other side of the guard: a re-review that surfaces a finding the first
+    rejection did not have is NOT converged."""
+    eng = _engine(tmp_path, project, max_review_cycles=2)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    first = _panel({"find:code": {"findings": [IMPORTANT]}},
+                   [_verdict(IMPORTANT, "confirmed", "still there")])
+    eng.record("r1", make_result(_advance_to_review(eng), sub_results=first))
+    second = _panel({"find:code": {"findings": [IMPORTANT]},
+                     "find:spec": {"findings": [{"severity": "important", "file": "d.py",
+                                                 "description": "net-new finding"}]}})
+    out = eng.record("r1", make_result(_fix_cycle_back_to_review(eng), sub_results=second))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert eng.store.load_task("r1", "t1").review_cycles == 2
+
+
+def test_synthesized_vacuous_tests_rejects_through_the_engine(tmp_path, project) -> None:
+    """The #13 gate reads the fold's ``tests_meaningful`` exactly as a single reviewer's."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel({"find:code": {"findings": []},
+                    "find:tests": {"findings": [], "tests_meaningful": False}})
+    out = eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert "independent test-validate" in eng.store.load_task("r1", "t1").learnings[-1]
+
+
+def test_policy_findings_still_override_a_synthesized_approval(tmp_path, project) -> None:
+    """Ordering guard: the fold runs BEFORE _merge_policy_findings, so a deterministic
+    project policy gate still overrides an approved panel (a model — or a panel — can
+    never skip a policy gate)."""
+    project.review_findings = lambda worktree=None: [  # type: ignore[attr-defined]
+        {"description": "policy: e2e coverage missing", "file": "e2e/"}
+    ]
+    # max_review_cycles=0 parks instead of re-opening REVIEW, so the merged output the
+    # verdict was read from survives on the stage record for inspection.
+    eng = _engine(tmp_path, project, max_review_cycles=0)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    panel = _panel({"find:code": {"findings": [CRITICAL]}},
+                   [_verdict(CRITICAL, "refuted", "already guarded")])
+    out = eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
+    assert out["outcome"] == "review_rejected_held"
+    review = eng.store.load_task("r1", "t1").stages[Stage.REVIEW].output
+    assert review["approved"] is False
+    assert [i["description"] for i in review["issues"]] == ["policy: e2e coverage missing"]
+    # the refuted panel finding is still carried for a human, not erased by the merge
+    assert any(n["title"].startswith("refuted:") for n in review["non_blocking"])
+
+
+def test_ledger_still_writes_one_row_for_a_sub_results_bearing_result(tmp_path, project) -> None:
+    """Part-2 boundary: one row per StageResult is unchanged here — one-row-per-sub-call
+    is part 3 (#73 design §4), and this pins that this part did not quietly change it."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _advance_to_review(eng)
+    before = len(eng.ledger.rows())
+    eng.record("r1", make_result(w, sub_results=_panel({"find:code": {"findings": []}})))
+    rows = eng.ledger.rows()
+    assert len(rows) == before + 1
+    assert rows[-1]["stage"] == "review" and rows[-1]["attempt"] == 0
