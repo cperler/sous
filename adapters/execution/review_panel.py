@@ -36,6 +36,7 @@ not a lenient one. The engine's existing retry machinery re-dispatches the full 
 
 from __future__ import annotations
 
+import re
 import time
 
 from orchestrator.review_workflow import FINGERPRINT_RULE, LENS_ORDER, issue_fingerprint
@@ -275,11 +276,24 @@ def _verify_prompt(template: str, fingerprint: str, finding: object) -> str:
 
     Mechanical substitution only — never authorship (the ``_corrective_prompt`` precedent):
     the runner renders the finding it was handed and the file:line it already carries, and
-    writes not one word of instruction. Plain ``str.replace`` rather than ``str.format`` so a
-    finding containing braces cannot break (or reach into) the template."""
-    return template.replace("{finding}", _finding_block(fingerprint, finding)).replace(
-        "{diff_hint}", _diff_hint(finding)
-    )
+    writes not one word of instruction. Not ``str.format``, so a finding containing braces
+    cannot break the template.
+
+    ONE pass, not chained ``str.replace``s: chaining lets a LATER placeholder's substitution
+    re-scan text an EARLIER one just injected, so a finding whose description contains the
+    literal ``{diff_hint}`` would have it silently rewritten (found by the #73 panel
+    reviewing this very module — a finder discussing these placeholders writes them
+    verbatim, so the trigger is on-path, not hypothetical). A single ``re.sub`` walks the
+    template once and never revisits what it emitted, which is what makes the finding text
+    survive VERBATIM in both directions rather than only for non-placeholder braces."""
+    values = {"finding": _finding_block(fingerprint, finding), "diff_hint": _diff_hint(finding)}
+    return _SLOT_RE.sub(lambda m: values[m.group(1)], template)
+
+
+# Only the slots this runner fills. An unknown ``{...}`` in the template is left ALONE rather
+# than KeyError-ing: the template is engine-authored, and a prompt with one stray brace beats
+# a dispatch that dies at render time.
+_SLOT_RE = re.compile(r"\{(finding|diff_hint)\}")
 
 
 def _finding_block(fingerprint: str, finding: object) -> str:
