@@ -1081,6 +1081,27 @@ class Engine:
         return dispatched
 
     def record(self, run_id: str, result: StageResult) -> dict:
+        """Fold a runner's ``StageResult`` into the task and charge the cost ledger.
+
+        Crash-idempotent (#277) — replaying the same result after a crash at any
+        point converges instead of double-counting. Persistence ORDER: (1) lock-free
+        lease pre-validation (cheap replay reject before any side effect); (2) the
+        idempotent ledger charge (keyed on ``(work_item_id, phase)`` — a replay
+        answers from the on-disk rows); (3) ONE locked transaction via
+        ``commit_task_events``: authoritative lease re-validation on the fresh doc,
+        the task transition, per-stage log/markdown (atomic overwrites on the
+        just-claimed stage counter), audit events appended events-first (the
+        ``stage_recorded`` batch is deduped on replay), and the task doc written
+        LAST — the single durable commit point, because clearing the dispatch lease
+        is what makes a replay rejectable, so everything observable must already be
+        on disk when it clears. Everything after (index/ref-state/progress/alerts)
+        is re-derivable best-effort.
+
+        Returns a summary dict (outcome, task_state, stage, cost_usd,
+        lane_attributed, next_stage). Raises ``ContractError`` when ``result`` does
+        not match the outstanding dispatch lease (stale/duplicate/wrong stage-model-
+        attempt-run) — of two concurrent duplicate records exactly one commits.
+        """
         task = self.store.load_task(run_id, result.task_id)
         # Optimistic pre-validation OUTSIDE the lock (#277): reject an ordinary stale/
         # replayed result cheaply BEFORE the first side effect (the ledger row). The
