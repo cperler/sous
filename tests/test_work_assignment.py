@@ -220,13 +220,16 @@ def test_stageresult_with_sub_results_and_sub_calls_round_trips() -> None:
         "sub_results": {"findings_by_lens": {"find:code": []}, "verdicts": []},
         "sub_calls": (
             SubCall(phase="find:code", model="claude-opus-5",
-                    usage=TokenUsage(input=10, output=5), duration_s=1.5,
+                    usage=TokenUsage(input=10, output=5), duration_s=1.5, schema_retries=2,
                     session_id="s1", stream_file="stages/t/review-attempt0.find:code.stream.jsonl"),
         ),
     })
     dumped = r.model_dump(mode="json")
     assert StageResult.model_validate(dumped).model_dump(mode="json") == dumped
     assert StageResult.model_validate(dumped).sub_calls[0].phase == "find:code"
+    # Retries spent inside a sub-call ride that sub-call (design §4) and default to 0.
+    assert StageResult.model_validate(dumped).sub_calls[0].schema_retries == 2
+    assert SubCall(phase="verify:0", model="claude-opus-5", duration_s=0.1).schema_retries == 0
 
 
 def test_review_findings_fingerprint_matches_review_issue() -> None:
