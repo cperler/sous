@@ -39,6 +39,15 @@ class CapabilityDescriptor(BaseModel):
     provider: Provider
     in_process: bool  # False = served externally (the interactive Workflow shim)
     schema_enforced: bool = False
+    # #73: can this cell EXECUTE a ``WorkItem.plan`` (fan a multi-agent REVIEW out below the
+    # seam)? A lane capability flag in the same spirit as ``EXPLICIT_EMPTY``: ``next_work``
+    # attaches a plan only when the RESOLVED lane declares support, so the plan — which is
+    # folded into ``content_hash`` — never disagrees with the lane that runs it. False for
+    # codex (``codex exec`` has no sub-agent primitive) and for the deterministic ENGINE lane
+    # (no model at all). NOTE: until #73 parts 4/5 land, a supporting runner still IGNORES an
+    # attached plan and degrades gracefully to the single-reviewer dispatch — harmless,
+    # because the whole path is behind the off-by-default ``Run.review_workflow`` flag.
+    supports_plan: bool = False
     status: CellStatus = SUPPORTED
 
     @property
@@ -119,6 +128,7 @@ def default_registry() -> Registry:
             provider=Provider.CLAUDE,
             in_process=False,
             schema_enforced=True,
+            supports_plan=True,  # the Workflow shim has agent()/parallel() (#73 design §5)
             status=SUPPORTED,
         )
     )

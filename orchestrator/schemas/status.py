@@ -351,6 +351,16 @@ class Run(_StatusModel):
     # run-level override (fall through to the engine default). Additive field: pre-#196 run
     # docs load with the default, no SCHEMA_VERSION bump.
     max_filed_followups: int | None = None
+    # Multi-agent find→verify REVIEW workflow (#73): when True, a model-lane REVIEW dispatch
+    # on a plan-capable lane carries a ``ReviewPlan`` (independent finder lenses + adversarial
+    # verify) instead of the single mega-prompt reviewer. Default OFF — the plan-less path is
+    # the permanent fallback, not scaffolding, and the design gates defaulting-on behind live
+    # eval evidence. MUST live here rather than on the Engine: every CLI subcommand rebuilds
+    # the Engine from constructor defaults, so a create-time-only setting would be gone by the
+    # next subcommand — ``next_work`` re-reads it off this doc at the dispatch boundary (#206).
+    # Cost/capacity policy may still veto it per dispatch. Additive field: pre-#73 run docs
+    # load with the default, no SCHEMA_VERSION bump.
+    review_workflow: bool = False
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""
