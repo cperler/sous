@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
@@ -348,6 +350,81 @@ def test_record_replay_partial_prior_rows_appends_only_missing_phases(tmp_path: 
     on_disk = ledger.rows()
     assert len(on_disk) == 3
     assert [r["phase"] for r in on_disk] == ["find:code", "find:tests", "verify:3"]
+
+
+# --- torn-final-line self-healing (#277 fix cycle 1) ------------------------------
+
+
+def test_record_replay_after_mid_panel_torn_append_converges(tmp_path: Path) -> None:
+    """Failure injection at the ledger append itself: the panel's final row is torn
+    mid-write (crash/ENOSPC — a partial line with no terminating newline). The replay
+    must converge to the FULL row set — surviving rows kept as-is, the torn row
+    truncated under the lock and re-appended — not wedge every later record() on a
+    ``JSONDecodeError``."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    # The tear: rows 1-2 landed whole; row 3's append was interrupted mid-line.
+    path.write_text(lines[0] + "\n" + lines[1] + "\n" + lines[2][: len(lines[2]) // 2])
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    # The surviving prior rows are the ORIGINALS, not re-priced copies.
+    assert rows[0] == json.loads(lines[0]) and rows[1] == json.loads(lines[1])
+    # Physically repaired: every line decodes, newline-terminated, no duplicates.
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    assert [json.loads(line)["phase"] for line in raw.splitlines()] == [
+        "find:code", "find:tests", "verify:3"
+    ]
+
+
+def test_torn_tail_from_another_dispatch_does_not_wedge_record(tmp_path: Path) -> None:
+    """The wedge the review rejected: after a torn append, every subsequent record()
+    for the run used to raise scanning the file. A later DIFFERENT dispatch must
+    record cleanly (repairing the tail), and the torn call's own replay then
+    re-appends its lost row — genuinely convergent, no human file surgery."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"work_item_id": "wi-b", "cost_')  # wi-b's append, interrupted
+
+    ledger.record(make_result(work_item_id="wi-c", input=100))  # must not raise
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-c"]
+    ledger.record(make_result(work_item_id="wi-b", input=100))  # wi-b's replay
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-c", "wi-b"]
+
+
+def test_rows_skips_torn_tail_without_repairing(tmp_path: Path) -> None:
+    """``rows()`` is a read: it tolerates the torn tail (reporting and the engine's
+    replay pre-check keep working) but does NOT rewrite the file — only the locked
+    record path truncates."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(input=100))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"torn')
+    before = path.read_bytes()
+    assert len(ledger.rows()) == 1
+    assert path.read_bytes() == before
+
+
+def test_mid_file_undecodable_line_still_raises(tmp_path: Path) -> None:
+    """Only the FINAL, unterminated line may be torn (the interrupted-append
+    signature). An undecodable line anywhere else is real corruption and must raise —
+    silently skipping it would mask damage as convergence."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0][: len(lines[0]) // 2] + "\n" + lines[1] + "\n")
+    with pytest.raises(json.JSONDecodeError):
+        ledger.rows()
+    with pytest.raises(json.JSONDecodeError):
+        ledger.record(make_result(work_item_id="wi-c", input=100))
 
 
 def test_distinct_work_items_still_append_normally(tmp_path: Path) -> None:

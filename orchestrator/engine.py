@@ -1087,7 +1087,9 @@ class Engine:
         point converges instead of double-counting. Persistence ORDER: (1) lock-free
         lease pre-validation (cheap replay reject before any side effect); (2) the
         idempotent ledger charge (keyed on ``(work_item_id, phase)`` — a replay
-        answers from the on-disk rows); (3) ONE locked transaction via
+        answers from the on-disk rows, and the append boundary self-heals a torn
+        trailing line from its own interrupted write, see ``CostLedger.record_rows``);
+        (3) ONE locked transaction via
         ``commit_task_events``: authoritative lease re-validation on the fresh doc,
         the task transition, per-stage log/markdown (atomic overwrites on the
         just-claimed stage counter), audit events appended events-first (the

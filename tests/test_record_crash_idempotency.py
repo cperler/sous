@@ -16,6 +16,7 @@ the same model call again).
 
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -142,6 +143,47 @@ def test_crash_at_task_doc_write_after_ledger_and_events_replay_converges(
 
     eng.record("r1", result)  # the replay the issue showed double-counting
     _assert_converged(eng, work)
+    nxt = eng.next_work("r1", "t1")
+    assert nxt is not None and nxt.stage is Stage.TEST
+
+
+def test_crash_mid_ledger_append_leaving_torn_line_replay_converges(
+    tmp_path, project, monkeypatch
+) -> None:
+    """Failure injection AT the ledger-append boundary itself (#277 fix cycle 1): the
+    interrupted write (crash/ENOSPC) leaves a torn trailing line. Before the fix the
+    replay did not converge — it WEDGED: every later record() for the run raised
+    ``JSONDecodeError`` scanning the file. Now the locked scan truncates the tear and
+    the replay re-appends the lost row."""
+    eng = _engine(tmp_path, project)
+    work = _implement_dispatch(eng)
+    result = make_result(work)
+
+    orig = CostLedger.record_rows
+    state = {"armed": True}
+
+    def torn_append(self, res, **kw):
+        rows = orig(self, res, **kw)
+        if state["armed"]:
+            state["armed"] = False
+            # Rewind the just-appended final line to a partial write and crash — the
+            # on-disk shape an interruption mid-``fh.write`` leaves behind.
+            *keep, last = self.path.read_bytes().splitlines(keepends=True)
+            self.path.write_bytes(b"".join(keep) + last[: len(last) // 2])
+            raise Boom("ledger append torn")
+        return rows
+
+    monkeypatch.setattr(CostLedger, "record_rows", torn_append)
+    with pytest.raises(Boom):
+        eng.record("r1", result)
+    assert eng.store.load_task("r1", "t1").pending_work_item_id == work.id
+
+    eng.record("r1", result)  # replay after restart
+    _assert_converged(eng, work)
+    # The tear was physically repaired: every ledger line decodes again.
+    raw = eng.ledger.path.read_text()
+    assert raw.endswith("\n")
+    assert len([json.loads(line) for line in raw.splitlines()]) == 3  # intake+scope+implement
     nxt = eng.next_work("r1", "t1")
     assert nxt is not None and nxt.stage is Stage.TEST
 
