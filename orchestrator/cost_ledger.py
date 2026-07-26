@@ -4,10 +4,17 @@ EVERY model call gets exactly one row. ``record`` is the only entry point and it
 always writes, so there is no code path that runs a model without a ledger row —
 the as-built bug was that the one-shot path bypassed ``record_stage_invocation``.
 
+The unit is the model CALL, not the dispatch (#73 design §4): a plan-bearing dispatch
+whose result carries ``sub_calls`` (each finder / verifier of a review panel) writes one
+row PER SUB-CALL — sharing the dispatch's ``work_item_id``/stage/attempt and discriminated
+by ``phase`` — and NO aggregate row on top. Sums are the report's job; a double-counted
+aggregate is worse than one more row to add up. Without ``sub_calls`` the dispatch is
+itself the single call and the row is exactly what it always was.
+
 Pricing is authoritative: the cost written is computed from the engine's single
 ``model_table`` (the same table used everywhere), NOT from the runner-supplied
-``StageResult.cost_usd``. A runner cannot under- or over-report spend; the
-engine's table is the single source of truth.
+``StageResult.cost_usd`` (nor a ``SubCall``'s self-reported usage pricing). A runner
+cannot under- or over-report spend; the engine's table is the single source of truth.
 """
 
 from __future__ import annotations
@@ -17,7 +24,7 @@ from pathlib import Path
 
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
 from .schemas.enums import STAGE_ORDER
-from .schemas.work import StageResult
+from .schemas.work import StageResult, TokenUsage
 
 # Pipeline-execution rank for a stage's string value (#154): lets by_effort() order
 # groups in the natural INTAKE→SCOPE→IMPLEMENT→TEST→DELIVER→REVIEW sequence instead of
@@ -53,17 +60,85 @@ class CostLedger:
         self._by_effort_cache_key: tuple[int, int] | None = None
 
     def record(self, result: StageResult, *, duration_s: float | None = None) -> dict:
-        """Append exactly one JSONL row for this invocation and return it.
+        """Append this invocation's JSONL row(s) and return the DISPATCH-level view.
+
+        One row per model call (see the module docstring): the plain path writes exactly
+        one row and returns it, unchanged; a ``sub_calls``-bearing result writes one row
+        per sub-call and returns a non-persisted aggregate over them (``cost_usd`` = Σ
+        sub-calls) for the caller that attributes one number to the stage.
 
         Cost is recomputed from ``model_table`` (authoritative) — the runner's
         ``result.cost_usd`` is deliberately ignored. ``duration_s`` is the engine-
         measured wall time of the dispatch (dispatch->record).
         """
-        usage = result.token_usage
+        rows = self.record_rows(result, duration_s=duration_s)
+        # Keyed on the RESULT's shape, not on ``len(rows)``: a one-sub-call panel must
+        # still answer with the aggregate view, so a caller never has to guess whether the
+        # dict it got back is a persisted row or a sum.
+        if result.sub_calls:
+            return self._dispatch_view(result, rows, duration_s=duration_s)
+        return rows[0]
+
+    def record_rows(
+        self, result: StageResult, *, duration_s: float | None = None
+    ) -> list[dict]:
+        """Append one JSONL row per MODEL CALL in this dispatch and return them (#73 §4).
+
+        ``result.sub_calls`` empty/absent -> a single dispatch row, byte-identical to the
+        pre-#73 ledger line (no ``phase`` key at all). Otherwise one row per ``SubCall``,
+        each priced on its OWN model and usage, and deliberately no aggregate row — the
+        report sums; the ledger must never double-count."""
+        if result.sub_calls:
+            rows = [
+                self._row(
+                    result,
+                    model=sub.model,
+                    usage=sub.usage,
+                    duration_s=sub.duration_s,
+                    schema_retries=sub.schema_retries,
+                    phase=sub.phase,
+                )
+                for sub in result.sub_calls
+            ]
+        else:
+            rows = [
+                self._row(
+                    result,
+                    model=result.model,
+                    usage=result.token_usage,
+                    duration_s=duration_s,
+                    schema_retries=result.schema_retries,
+                    phase=None,
+                )
+            ]
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as fh:
+            for row in rows:
+                fh.write(json.dumps(row) + "\n")
+        return rows
+
+    def _row(
+        self,
+        result: StageResult,
+        *,
+        model: str,
+        usage: TokenUsage,
+        duration_s: float | None,
+        schema_retries: int,
+        phase: str | None,
+    ) -> dict:
+        """Build one ledger row for a single model call within ``result``.
+
+        Everything but ``model``/``usage``/``duration_s``/``schema_retries``/``phase`` is
+        dispatch-level and therefore shared by every row of the same call — notably
+        ``work_item_id``, ``stage`` and ``attempt``, which is what lets a report re-group a
+        multi-call dispatch into one stage with an internal breakdown. ``phase`` is
+        APPENDED LAST and only when set, so a plain (single-call) row is byte-identical to
+        the pre-#73 line."""
         # Tolerant pricing: an unknown model id (e.g. a new provider model not yet in the
         # table) must NOT raise — every call still gets exactly one row. An unpriced call
         # is flagged (priced=False) and costed at 0.0, the same tolerance analysis() has.
-        cost, priced = self.model_table.try_cost_usd(result.model, usage)
+        cost, priced = self.model_table.try_cost_usd(model, usage)
         # HONESTY flag: the interactive lane cannot meter per-call usage in-session, so
         # its zero-token rows are UNMETERED (cost unknown), not free. Metered lanes and
         # the deterministic engine lane (genuinely $0) stay metered=True. Renderers use
@@ -78,7 +153,7 @@ class CostLedger:
             "task_id": result.task_id,
             "stage": result.stage.value,
             "attempt": result.attempt,
-            "model": result.model,
+            "model": model,
             # #96: the reasoning effort the dispatch ran at, alongside model — so a cost
             # report can split spend by effort as well as tier. None on effort-less rows.
             "effort": result.effort,
@@ -96,12 +171,51 @@ class CostLedger:
             "work_item_id": result.work_item_id,
             # Corrective schema-retries the transport spent salvaging this call's output (#32).
             # Almost always 0; a non-zero value flags an invocation that cost extra model turns.
-            "schema_retries": result.schema_retries,
+            # On a sub-call row this is that SUB-CALL's own retry count: a `_schema_retry_loop`
+            # spent inside one finder rides that finder's row, not the dispatch's.
+            "schema_retries": schema_retries,
         }
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as fh:
-            fh.write(json.dumps(row) + "\n")
+        if phase is not None:
+            row["phase"] = phase
         return row
+
+    def _dispatch_view(
+        self, result: StageResult, rows: list[dict], *, duration_s: float | None
+    ) -> dict:
+        """Aggregate the just-written sub-call ``rows`` into a dispatch-level dict.
+
+        NOT written to the ledger — writing it would be exactly the double-count #73 §4
+        forbids. It exists only for the caller that needs ONE number per dispatch (the
+        engine attributes ``cost_usd`` to the stage log and the task doc), and it is a
+        pure sum of the rows on disk, so ``view["cost_usd"] == Σ rows``. Token/retry
+        counts sum likewise; ``duration_s`` stays the ENGINE-measured dispatch wall time
+        (summing sub-call durations would over-count concurrent finders). ``priced`` /
+        ``metered`` are ``all(...)``: one unpriced or unmetered sub-call means the
+        aggregate understates the dispatch, and saying so is the honest direction."""
+        view = self._row(
+            result,
+            model=result.model,
+            usage=result.token_usage,
+            duration_s=duration_s,
+            schema_retries=result.schema_retries,
+            phase=None,
+        )
+        view.update(
+            {
+                "input_tokens": sum(r["input_tokens"] for r in rows),
+                "output_tokens": sum(r["output_tokens"] for r in rows),
+                "cache_read_tokens": sum(r["cache_read_tokens"] for r in rows),
+                "cache_write_tokens": sum(r["cache_write_tokens"] for r in rows),
+                "cost_usd": round(sum(r["cost_usd"] for r in rows), 6),
+                "priced": all(r["priced"] for r in rows),
+                "metered": all(r["metered"] for r in rows),
+                "schema_retries": sum(r["schema_retries"] for r in rows),
+                # How many ledger rows this dispatch actually wrote — present only on the
+                # (non-persisted) view, so a caller can tell an aggregate from a real row.
+                "sub_calls": len(rows),
+            }
+        )
+        return view
 
     def rows(self) -> list[dict]:
         """Read back every recorded row."""

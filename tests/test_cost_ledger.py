@@ -13,7 +13,7 @@ from pathlib import Path
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
-from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage
+from orchestrator.schemas.work import LaneUsed, StageResult, SubCall, TokenUsage
 
 
 def make_result(
@@ -172,6 +172,199 @@ def test_no_bypass_two_results_two_rows(tmp_path: Path) -> None:
     summary = ledger.summary()
     assert summary["total_invocations"] == 2
     assert len(ledger.rows()) == 2
+
+
+# --- sub-call rows (#73 design §4) ------------------------------------------------
+
+
+def _panel_result(**kw) -> StageResult:
+    """A plan-bearing REVIEW result: 3 model calls inside ONE dispatch (2 finders + a
+    verifier), each with its own model/usage/duration — the shape §4's ledger rows split."""
+    base = make_result(
+        model="claude-opus-5",
+        stage=Stage.REVIEW,
+        work_item_id="wi-panel",
+        input=0,
+        output=0,
+        **kw,
+    )
+    return base.model_copy(
+        update={
+            "sub_calls": (
+                SubCall(phase="find:code", model="claude-opus-5",
+                        usage=TokenUsage(input=1_000_000), duration_s=12.0),
+                SubCall(phase="find:tests", model="claude-sonnet-5",
+                        usage=TokenUsage(input=1_000_000), duration_s=9.0,
+                        schema_retries=2),
+                SubCall(phase="verify:3", model="claude-sonnet-5",
+                        usage=TokenUsage(output=1_000_000), duration_s=4.0),
+            )
+        }
+    )
+
+
+def test_sub_calls_write_one_row_each_sharing_work_item_and_no_aggregate(
+    tmp_path: Path,
+) -> None:
+    """Design test (d): one row per sub-call, all sharing work_item_id/stage/attempt,
+    distinct phases — and NO aggregate row on top (that would double-count)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(_panel_result(), duration_s=13.0)
+
+    rows = ledger.rows()
+    assert len(rows) == 3
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    # No aggregate row: every written row IS a sub-call row.
+    assert all("phase" in r for r in rows)
+    # The dispatch-level identity is shared, so a report can regroup them as one stage.
+    assert {r["work_item_id"] for r in rows} == {"wi-panel"}
+    assert {r["stage"] for r in rows} == {"review"}
+    assert {r["attempt"] for r in rows} == {0}
+    assert {r["run_id"] for r in rows} == {"run-1"}
+    # Per-sub-call attribution, not the dispatch's: model, usage and duration differ.
+    assert [r["model"] for r in rows] == [
+        "claude-opus-5", "claude-sonnet-5", "claude-sonnet-5"
+    ]
+    assert [r["duration_s"] for r in rows] == [12.0, 9.0, 4.0]
+    # A schema-retry loop inside ONE finder rides that finder's row only.
+    assert [r["schema_retries"] for r in rows] == [0, 2, 0]
+    # File is genuinely three JSONL lines (no hidden fourth).
+    assert len((tmp_path / "stage-costs.jsonl").read_text().strip().splitlines()) == 3
+
+
+def test_sub_call_rows_priced_per_sub_call_model_from_the_table(tmp_path: Path) -> None:
+    """Each row is priced from the engine table on ITS OWN model+usage — a panel that
+    mixes tiers is not billed at the dispatch's model."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(_panel_result())
+    rows = ledger.rows()
+    assert rows[0]["cost_usd"] == DEFAULT_MODEL_TABLE.cost_usd(
+        "claude-opus-5", TokenUsage(input=1_000_000)
+    )
+    assert rows[1]["cost_usd"] == DEFAULT_MODEL_TABLE.cost_usd(
+        "claude-sonnet-5", TokenUsage(input=1_000_000)
+    )
+    assert rows[2]["cost_usd"] == DEFAULT_MODEL_TABLE.cost_usd(
+        "claude-sonnet-5", TokenUsage(output=1_000_000)
+    )
+    # Pricing the whole dispatch at the dispatch model would give a different number —
+    # this is the mis-attribution the per-sub-call rows exist to prevent.
+    assert rows[1]["cost_usd"] != DEFAULT_MODEL_TABLE.cost_usd(
+        "claude-opus-5", TokenUsage(input=1_000_000)
+    )
+
+
+def test_sub_calls_summary_total_equals_sum_of_sub_calls(tmp_path: Path) -> None:
+    """Design test (d): cost-summary total == Σ sub-calls, with no double-count. A single
+    dispatch counts as 3 invocations because 3 model calls actually ran."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    view = ledger.record(_panel_result(), duration_s=13.0)
+
+    rows = ledger.rows()
+    expected = round(sum(r["cost_usd"] for r in rows), 6)
+    summary = ledger.summary()
+    assert summary["total_cost_usd"] == expected
+    assert summary["total_invocations"] == 3
+    assert ledger.metered_spend() == expected
+    # The returned dispatch view sums the rows exactly — and is NOT itself a row.
+    assert view["cost_usd"] == expected
+    assert view["sub_calls"] == 3
+    assert view["input_tokens"] == 2_000_000 and view["output_tokens"] == 1_000_000
+    assert view["schema_retries"] == 2
+    assert view["duration_s"] == 13.0  # engine-measured dispatch wall time, not 25.0
+    assert "phase" not in view
+    # Recording nothing further: the view was never appended (still 3 lines).
+    assert len(ledger.rows()) == 3
+    # Per-model rollup splits the panel by tier rather than billing it all to the dispatch model.
+    assert summary["by_model"]["claude-opus-5"]["invocations"] == 1
+    assert summary["by_model"]["claude-sonnet-5"]["invocations"] == 2
+
+
+def test_sub_call_rows_regroup_as_one_stage_in_analysis(tmp_path: Path) -> None:
+    """`cost-report` groups by stage/task over the shared dispatch fields, so a workflow
+    review reads as ONE stage whose internal breakdown is visible in the raw rows."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(_panel_result())
+    analysis = ledger.analysis()
+    assert list(analysis["by_stage"]) == ["review"]
+    assert analysis["by_stage"]["review"]["invocations"] == 3
+    assert analysis["by_stage"]["review"]["cost_usd"] == analysis["total_cost_usd"]
+    assert list(analysis["by_task"]) == ["task-1"]
+
+
+def test_empty_sub_calls_tuple_still_writes_the_dispatch_row(tmp_path: Path) -> None:
+    """Defensive: a result carrying an EMPTY sub_calls tuple must not vanish from the
+    ledger — the every-call invariant beats the sub-call split."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    result = make_result(model="claude-opus-5", input=1_000_000).model_copy(
+        update={"sub_calls": ()}
+    )
+    row = ledger.record(result)
+    assert row["cost_usd"] == 5.0
+    assert len(ledger.rows()) == 1
+    assert "phase" not in ledger.rows()[0]
+    assert "sub_calls" not in row  # an empty tuple is the plain path, not a 0-row panel
+
+
+def test_single_sub_call_still_returns_the_aggregate_view(tmp_path: Path) -> None:
+    """The return shape keys on the RESULT (has sub_calls?), not on the row count — a
+    one-finder panel answers with the same aggregate view a three-finder one does."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    result = make_result(model="claude-opus-5", input=0).model_copy(
+        update={
+            "sub_calls": (
+                SubCall(phase="find:code", model="claude-opus-5",
+                        usage=TokenUsage(input=1_000_000), duration_s=3.0),
+            )
+        }
+    )
+    view = ledger.record(result, duration_s=4.0)
+    assert view["sub_calls"] == 1 and "phase" not in view
+    assert view["cost_usd"] == 5.0 == ledger.rows()[0]["cost_usd"]
+    assert view["duration_s"] == 4.0 and ledger.rows()[0]["duration_s"] == 3.0
+    assert len(ledger.rows()) == 1 and ledger.rows()[0]["phase"] == "find:code"
+
+
+def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> None:
+    """Regression: a result with no sub_calls writes exactly ONE row, byte-identical to
+    the pre-#73 line — same keys, same order, no `phase`. This literal is the pre-change
+    output; if the sub-call split ever leaks into the plain path, it fails here."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    result = make_result(
+        model="claude-sonnet-5",
+        stage=Stage.REVIEW,
+        execution_mode=ExecutionMode.INTERACTIVE,
+        input=10, output=20, cache_read=30, cache_write=40,
+        attempt=2,
+        run_id="run-X", task_id="task-X", work_item_id="wi-X",
+        completed_at="2026-06-20T12:34:56Z",
+    )
+    row = ledger.record(result, duration_s=1.2345)
+    expected = {
+        "ts": "2026-06-20T12:34:56Z",
+        "run_id": "run-X",
+        "task_id": "task-X",
+        "stage": "review",
+        "attempt": 2,
+        "model": "claude-sonnet-5",
+        "effort": None,
+        "provider": "claude",
+        "lane": "interactive",
+        "input_tokens": 10,
+        "output_tokens": 20,
+        "cache_read_tokens": 30,
+        "cache_write_tokens": 40,
+        "cost_usd": DEFAULT_MODEL_TABLE.cost_usd("claude-sonnet-5", result.token_usage),
+        "priced": True,
+        "metered": True,
+        "duration_s": 1.234,
+        "status": "success",
+        "work_item_id": "wi-X",
+        "schema_retries": 0,
+    }
+    assert row == expected
+    assert list(row) == list(expected)  # key ORDER, not just membership
+    assert (tmp_path / "stage-costs.jsonl").read_text() == json.dumps(expected) + "\n"
 
 
 def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
