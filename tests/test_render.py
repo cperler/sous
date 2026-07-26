@@ -191,6 +191,55 @@ def test_render_stage_titled_findings_are_readable_blocks() -> None:
     assert "  - **Do the thing**" in md and "    because reasons" in md
 
 
+def _panel_stage_payload(panel_summary: dict | None) -> dict:
+    payload = {
+        "stage": "review", "task_id": "#9", "attempt": 0, "status": "success",
+        "outcome": "stage_completed", "model": "m", "lane_used": {}, "cost_usd": 0.1,
+        "structured_output": {"approved": False, "issues": []},
+        "raw_output": None, "error": None, "completed_at": "t",
+    }
+    if panel_summary is not None:
+        payload["panel_summary"] = panel_summary
+    return payload
+
+
+def test_render_stage_surfaces_the_review_panel() -> None:
+    """#285: the panel's raw sub_results were persisted and never read by a human. The
+    stage Markdown now answers the two questions they encode — did each lens earn its cost,
+    and did the panel verify what it found."""
+    md = render_stage(_panel_stage_payload({
+        "lenses": {"find:code": {"total": 3, "unique": 2, "shared": 1},
+                   "find:spec": {"total": 1, "unique": 0, "shared": 1}},
+        "finders": 2, "findings": 3, "agreed": 1, "verifiers": 3,
+        "verdicts": {"confirmed": 1, "refuted": 1}, "inconclusive": 1,
+        "cap_hit": True, "cap_dropped": 4,
+        "notices": [{"notice": "verifier_cap", "detail": "12 findings exceed the cap",
+                     "count": 4}],
+    }))
+    assert "## Review panel" in md
+    assert "- Fan-out: 2 finder(s), 3 verifier(s)" in md
+    assert "- Findings: 3 distinct, 1 raised by 2+ lenses (agreement)" in md
+    assert "- Verdicts: 1 confirmed, 1 refuted, 1 inconclusive" in md
+    assert "**Verifier cap hit** — 4 blocking finding(s) went unverified" in md
+    assert "| find:code | 3 | 2 | 1 |" in md and "| find:spec | 1 | 0 | 1 |" in md
+    assert "`verifier_cap` — 12 findings exceed the cap" in md
+
+
+def test_render_stage_has_no_panel_section_without_a_panel_summary() -> None:
+    """A single-reviewer review has no panel, so it gets no section — the section's
+    presence is the honest per-dispatch marker, exactly like the payload key's."""
+    assert "## Review panel" not in render_stage(_panel_stage_payload(None))
+
+
+def test_render_stage_panel_section_survives_a_foreign_shaped_summary() -> None:
+    """Stage logs are durable and replayable: a summary written by another engine version
+    must render honestly (``?`` for a counter it cannot read), never raise."""
+    md = render_stage(_panel_stage_payload({"lenses": "not a table", "findings": "many"}))
+    assert "## Review panel" in md
+    assert "- Findings: ? distinct, ? raised by 2+ lenses (agreement)" in md
+    assert "| Lens |" not in md  # nothing to tabulate
+
+
 def test_render_task_index_lists_six_stages() -> None:
     t = Task(task_id="#9", run_id="r1", created_at="x", updated_at="x", title="Demo")
     md = render_task_index(t)

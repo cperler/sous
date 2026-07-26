@@ -378,10 +378,67 @@ def render_stage(payload: dict) -> str:
         lines += ["", f"**Error:** {payload['error']}"]
     if payload.get("structured_output") is not None:
         lines += ["", "## Result", "", *_render_struct(payload["structured_output"])]
+    if isinstance(payload.get("panel_summary"), dict):
+        lines += ["", *_render_panel_summary(payload["panel_summary"])]
     if payload.get("raw_output"):
         lines += ["", "## Commentary", "", *_commentary(str(payload["raw_output"]), payload)]
     lines.append("")
     return "\n".join(lines)
+
+
+def _render_panel_summary(summary: dict) -> list[str]:
+    """The ``## Review panel`` section of a stage record (#285).
+
+    Present only when the stage log carries a ``panel_summary`` — i.e. a multi-agent REVIEW
+    dispatch the engine folded; a single-reviewer review has no such section at all. The
+    point is the question the raw ``sub_results`` never answered for a human: did each lens
+    earn its cost (unique vs. shared findings, how often lenses agreed), and did the panel
+    actually verify what it found (verdict tallies, the cap, inconclusive verifiers)?
+
+    Defensive on every key: a stage log is a durable, replayable artifact, so a summary
+    written by an older/newer engine must render rather than raise."""
+    raw_lenses = summary.get("lenses")
+    lenses: dict = raw_lenses if isinstance(raw_lenses, dict) else {}
+    raw_verdicts = summary.get("verdicts")
+    verdicts: dict = raw_verdicts if isinstance(raw_verdicts, dict) else {}
+    lines = [
+        "## Review panel",
+        "",
+        f"- Fan-out: {_num(summary, 'finders')} finder(s), {_num(summary, 'verifiers')} "
+        "verifier(s)",
+        f"- Findings: {_num(summary, 'findings')} distinct, "
+        f"{_num(summary, 'agreed')} raised by 2+ lenses (agreement)",
+        f"- Verdicts: {_num(verdicts, 'confirmed')} confirmed, "
+        f"{_num(verdicts, 'refuted')} refuted, "
+        f"{_num(summary, 'inconclusive')} inconclusive",
+    ]
+    if summary.get("cap_hit"):
+        lines.append(
+            f"- **Verifier cap hit** — {_num(summary, 'cap_dropped')} blocking finding(s) "
+            "went unverified (they stay blocking)"
+        )
+    if lenses:
+        lines += ["", "| Lens | Findings | Unique | Shared |", "|---|---:|---:|---:|"]
+        lines += [
+            f"| {lens} | {_num(row, 'total')} | {_num(row, 'unique')} | {_num(row, 'shared')} |"
+            for lens, row in lenses.items()
+            if isinstance(row, dict)
+        ]
+    notices = summary.get("notices")
+    if isinstance(notices, list) and notices:
+        lines += ["", "**Runner notices**", ""]
+        lines += [
+            f"- `{n.get('notice', '?')}` — {n.get('detail', '')}"
+            for n in notices if isinstance(n, dict)
+        ]
+    return lines
+
+
+def _num(source: dict, key: str) -> int | str:
+    """One counter from a (possibly foreign-shaped) summary dict — the value if it is a
+    plain integer, else ``?`` so a malformed record renders honestly instead of lying."""
+    value = source.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) else "?"
 
 
 def _stream_pointer(payload: dict) -> str | None:

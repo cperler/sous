@@ -284,7 +284,7 @@ def test_dedupe_order_follows_the_folds_lens_walk() -> None:
     assert [p for p in transport.phases if p.startswith("verify:")] == ["verify:1"]
     verify_prompt = next(w.prompt for w in transport.seen if w.phase == "verify:1")
     assert "- line: 1" in verify_prompt  # find:design's object — the fold keeps the same one
-    review, _ = synthesize(result.sub_results)
+    review, _, _ = synthesize(result.sub_results)
     assert review["issues"] == [_finding("dup", line=1)]
 
 
@@ -336,10 +336,17 @@ def test_verifier_cap_bounds_the_calls_and_leaves_the_dropped_findings_blocking(
     assert len(verifier_phases) == _MAX_VERIFIERS
     cap_notice = next(n for n in result.sub_results["notices"] if n["notice"] == "verifier_cap")
     assert f"{len(findings)} blocking findings" in cap_notice["detail"]
+    # #268: the count rides STRUCTURALLY, not only in the prose — the engine-side fold reads
+    # the declared extra and must never regex a detail string to recover it.
+    assert cap_notice["count"] == len(findings) - _MAX_VERIFIERS
     # Nothing was verified away, so the fold still blocks on every one of them.
-    review, _ = synthesize(result.sub_results)
-    assert len(review["issues"]) == len(findings)
-    assert review["approved"] is False
+    folded = synthesize(result.sub_results)
+    assert len(folded.review["issues"]) == len(findings)
+    assert folded.review["approved"] is False
+    # …and the panel telemetry says so, from the runner's declared count (#285).
+    assert folded.panel_summary["cap_hit"] is True
+    assert folded.panel_summary["cap_dropped"] == len(findings) - _MAX_VERIFIERS
+    assert folded.panel_summary["verifiers"] == _MAX_VERIFIERS  # every call was inconclusive
 
 
 def test_the_verifier_cap_spends_its_budget_on_the_most_severe_findings_first() -> None:
@@ -440,7 +447,7 @@ def test_verifier_error_leaves_the_finding_blocking() -> None:
         RawResult(None, exit_code=1, error="boom", raw_output="")
     )
     assert sub_results["verdicts"] == []
-    review, _ = synthesize(sub_results)
+    review, _, _ = synthesize(sub_results)
     assert review["approved"] is False and len(review["issues"]) == 1
     assert [c.phase for c in sub_calls] == ["find:code", "verify:1"]  # spend still attributed
 
@@ -481,7 +488,7 @@ def test_a_refutation_the_verifier_earned_does_demote_the_finding() -> None:
 
     result = run_review_panel(_work(plan), transport)
 
-    review, _ = synthesize(result.sub_results)
+    review, _, _ = synthesize(result.sub_results)
     assert review["approved"] is True and review["issues"] == []
     assert review["non_blocking"][0]["title"].startswith("refuted:")
 
