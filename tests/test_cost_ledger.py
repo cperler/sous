@@ -435,6 +435,133 @@ def test_unterminated_decodable_tail_is_terminated_not_welded(tmp_path: Path) ->
     assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-b", "wi-c"]
 
 
+def test_mid_panel_unterminated_row_replay_converges(tmp_path: Path) -> None:
+    """The MULTI-ROW variant of the content/newline-boundary offset: a panel append
+    interrupted after row 2's final content byte — row 1 whole, row 2 complete but
+    unterminated, row 3 never persisted. The guard must terminate row 2 in place
+    (good data, never truncated) and the converge pass re-append ONLY row 3."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0] + "\n" + lines[1])  # row 2 unterminated, row 3 lost
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    # Rows 1-2 are the ORIGINAL on-disk rows — repaired/kept, not re-priced copies.
+    assert rows[0] == json.loads(lines[0]) and rows[1] == json.loads(lines[1])
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    assert [json.loads(line)["phase"] for line in raw.splitlines()] == [
+        "find:code", "find:tests", "verify:3"
+    ]
+
+
+def test_panel_losing_only_final_terminator_replay_restores_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """Interruption at the very last byte of a panel append: every row's content
+    persisted, only the FINAL newline lost. The replay must append no rows — the
+    guard restores the terminator and the converge pass finds every phase on disk —
+    leaving the file byte-identical to the uninterrupted original."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    clean = path.read_bytes()
+    path.write_bytes(clean[:-1])  # strip ONLY the final terminator
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    assert path.read_bytes() == clean  # newline restored, nothing re-appended
+
+
+def test_newline_guard_never_fires_on_clean_or_empty_file(tmp_path: Path) -> None:
+    """The guard's no-op cases: a pre-existing ZERO-BYTE file and a clean newline-
+    terminated multi-row file must gain no stray blank line (and no crash on the
+    empty-file seek) — the guard writes only when a terminator is genuinely missing."""
+    path = tmp_path / "stage-costs.jsonl"
+    path.write_bytes(b"")  # exists but empty: no terminator needed, no seek crash
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    first = path.read_bytes()
+    assert not first.startswith(b"\n") and first.endswith(b"\n")
+    assert len(first.decode().splitlines()) == 1
+
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    before = path.read_bytes()
+    ledger.record(make_result(work_item_id="wi-c", input=100))
+    after = path.read_bytes()
+    # Exactly one new terminated line, appended directly onto the clean bytes.
+    assert after.startswith(before)
+    added = after[len(before):]
+    assert json.loads(added)["work_item_id"] == "wi-c" and added.endswith(b"\n")
+
+
+def test_no_strict_prefix_of_a_serialized_row_decodes(tmp_path: Path) -> None:
+    """The premise the torn-tail truncate branch rests on (``record_rows``'s offset
+    enumeration): a strict prefix of a row's content is NEVER valid JSON, so every
+    mid-content interruption is caught by the decode-failure branch. True because a
+    row serializes as a JSON object whose closing brace is its final byte; this test
+    pins that against writer drift (e.g. a future bare-scalar row, whose prefixes
+    could decode and would silently scan clean as a wrong row)."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(_panel_result())
+    for line in path.read_text().splitlines():
+        assert line.startswith("{") and line.endswith("}")
+        for i in range(1, len(line)):
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(line[:i])
+
+
+def test_newline_guard_runs_under_the_append_lock(tmp_path: Path, monkeypatch) -> None:
+    """The tail check-then-repair must be atomic with the append (same file lock):
+    a racy check would let two record() calls both observe a missing terminator and
+    double-repair or weld. Instrumented so each concurrent call waits at a barrier
+    inside the guard: under the lock the second caller cannot arrive until the first
+    finishes, so the barrier must ALWAYS time out — an overlap means the check
+    escaped the lock."""
+    import threading
+
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    raw = path.read_bytes()
+    path.write_bytes(raw[:-1])  # unterminated tail: the guard has real work to do
+
+    barrier = threading.Barrier(2)
+    overlaps: list[bool] = []
+    original = CostLedger._tail_missing_newline
+
+    def instrumented(self: CostLedger) -> bool:
+        try:
+            barrier.wait(timeout=0.3)
+            overlaps.append(True)  # two calls inside the guarded section at once
+        except threading.BrokenBarrierError:
+            barrier.reset()  # lone arrival timed out: mutual exclusion held
+        return original(self)
+
+    monkeypatch.setattr(CostLedger, "_tail_missing_newline", instrumented)
+    threads = [
+        threading.Thread(
+            target=ledger.record, args=(make_result(work_item_id=w, input=100),)
+        )
+        for w in ("wi-b", "wi-c")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not overlaps
+    text = path.read_text()
+    lines = text.splitlines()
+    assert text.endswith("\n") and "" not in lines  # no double-repair blank line
+    assert {json.loads(line)["work_item_id"] for line in lines} == {
+        "wi-a", "wi-b", "wi-c"
+    }
+
+
 def test_mid_file_undecodable_line_still_raises(tmp_path: Path) -> None:
     """Only the FINAL, unterminated line may be torn (the interrupted-append
     signature). An undecodable line anywhere else is real corruption and must raise —
