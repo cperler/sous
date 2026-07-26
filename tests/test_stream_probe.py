@@ -154,6 +154,40 @@ def test_stream_basename_appends_a_retry_suffix_only_when_retrying() -> None:
         "stages/42/implement-attempt0.retry1.stream.jsonl"
 
 
+def test_stream_basename_inserts_a_sanitized_phase_segment(tmp_path) -> None:
+    """#73: each review-panel sub-call owns its own stream file, named by its phase. The
+    segment is sanitized colon-free (a deliberate deviation from the design doc's literal
+    ``<phase>`` spelling, like ``safe_task_dirname``); a phase-less call is unchanged."""
+    assert stream_basename("review", 0, phase="find:code") == "review-attempt0.find-code"
+    assert stream_basename("review", 0, 2, phase="verify:3") == "review-attempt0.verify-3.retry2"
+    assert stream_basename("review", 0, phase=None) == "review-attempt0"  # unchanged
+    assert stream_relpath("#42", "review", 1, phase="find:tests") == \
+        "stages/42/review-attempt1.find-tests.stream.jsonl"
+
+
+def test_find_current_stream_follows_the_live_sub_call_across_phases(tmp_path) -> None:
+    """#73: a panel's phase files all share one (attempt, retry) key, so the tail/probe
+    tiebreaks on mtime — otherwise ``orchestrator tail`` would follow whichever name the glob
+    yielded rather than the sub-call that is actually live."""
+    import os
+
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    for i, phase in enumerate(("find:code", "find:spec", "verify:1")):
+        p = d / stream_filename("review", 0, phase=phase)
+        p.write_text(f"{phase}\n")
+        os.utime(p, (100 + i, 100 + i))
+    assert find_current_stream(tmp_path, "#42", "review").name == \
+        "review-attempt0.verify-1.stream.jsonl"
+    # A schema-retry sub-call of ANY phase still outranks every base-name file (retry sorts
+    # before mtime), so the corrective call in flight is what a tail follows.
+    retry = d / stream_filename("review", 0, 1, phase="find:code")
+    retry.write_text("corrective\n")
+    os.utime(retry, (50, 50))
+    assert find_current_stream(tmp_path, "#42", "review").name == \
+        "review-attempt0.find-code.retry1.stream.jsonl"
+
+
 def test_find_current_stream_prefers_highest_retry_within_an_attempt(tmp_path) -> None:
     # #70: with a base + retry sub-call file present, the probe/tail follows the newest sub-call.
     d = stages_dir(tmp_path, "#42")

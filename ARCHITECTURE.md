@@ -42,7 +42,8 @@ reverse.
 - **Two adapter families.** `adapters/execution/` = how/where a call runs (the interactive
   `interactive.py` shim, `headless_claude.py`, `codex.py`, and the deterministic
   `deterministic_setup.py` / `deterministic_test.py` / `deterministic_deliver.py`; wired by
-  `base.py` + `runners.py`, dispatched through `transport.py`). `adapters/project/` = what a
+  `base.py` + `runners.py`, dispatched through `transport.py`, with `review_panel.py` fanning
+  a plan-bearing REVIEW out into finder/verifier sub-calls below the seam). `adapters/project/` = what a
   repo supplies (commands, test taxonomy, agent roster, task source): `base.py` is the
   contract, `heysoo/` and `selfhost/` are the in-repo reference adapters, `github_issues.py`
   a shared task source. A new external project's adapter lives in **its own repo** under

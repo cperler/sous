@@ -25,7 +25,7 @@ from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as _JSONSchemaError
 
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
-from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
+from orchestrator.schemas.work import LaneUsed, StageResult, SubCall, TokenUsage, WorkItem
 from orchestrator.status_store import safe_task_dirname
 from orchestrator.stream_probe import (
     claude_final_text,
@@ -373,11 +373,11 @@ def _tee_streams(root: Path, work: WorkItem, raw: RawResult) -> dict | None:
     d.mkdir(parents=True, exist_ok=True)
     files: dict = {}
     if raw.raw_output is not None:
-        p = d / stream_filename(work.stage.value, work.attempt)
+        p = d / stream_filename(work.stage.value, work.attempt, phase=work.phase)
         p.write_text(raw.raw_output, encoding="utf-8")
         files["stream"] = str(p.relative_to(root))
     if raw.raw_stderr:
-        p = d / stderr_filename(work.stage.value, work.attempt)
+        p = d / stderr_filename(work.stage.value, work.attempt, phase=work.phase)
         p.write_text(raw.raw_stderr, encoding="utf-8")
         files["stderr"] = str(p.relative_to(root))
     return files or None
@@ -488,12 +488,17 @@ def _streaming_stream_files(
     file (post-hoc — stderr isn't the live-tail surface) and return both paths RELATIVE to the
     run root. Both writes are best-effort; a stdout stream with no content is still recorded so
     a probe/tail finds the (empty) file the stage owns. ``retry`` (>=1) selects the schema-retry
-    sub-call's ``.retry<K>`` name so each corrective sub-call's stream is its own file (#70)."""
-    files: dict = {"stream": stream_relpath(work.task_id, work.stage.value, work.attempt, retry)}
+    sub-call's ``.retry<K>`` name so each corrective sub-call's stream is its own file (#70);
+    ``work.phase`` (#73) inserts the review-panel sub-call's own segment before it."""
+    files: dict = {
+        "stream": stream_relpath(
+            work.task_id, work.stage.value, work.attempt, retry, phase=work.phase
+        )
+    }
     if stderr:
         try:
             p = _stream_dir(root, work.task_id) / stderr_filename(
-                work.stage.value, work.attempt, retry
+                work.stage.value, work.attempt, retry, phase=work.phase
             )
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(stderr, encoding="utf-8")
@@ -504,6 +509,24 @@ def _streaming_stream_files(
     return files
 
 
+def classify_raw(raw: RawResult) -> ResultStatus:
+    """The success policy every claude-lane dispatch (single call or review-panel sub-call)
+    classifies with — extracted from ``HeadlessClaudeRunner.dispatch`` so the panel's
+    short-circuit reports the SAME status the equivalent single dispatch would (#73): a
+    timeout is a TIMEOUT, a rate-limit is RATE_LIMITED (the engine re-dispatches cheaper),
+    any other transport error is a FAILURE, and an exit-0 call with no structured output
+    (the schema-retry loop exhausted) is a SCHEMA_VIOLATION."""
+    if raw.exit_code != 0 or raw.error:
+        if raw.exit_code == 124:
+            return ResultStatus.TIMEOUT
+        if is_rate_limited(raw):
+            return ResultStatus.RATE_LIMITED
+        return ResultStatus.FAILURE
+    if raw.structured_output is None:
+        return ResultStatus.SCHEMA_VIOLATION
+    return ResultStatus.SUCCESS
+
+
 def to_stage_result(
     work: WorkItem,
     raw: RawResult,
@@ -511,8 +534,16 @@ def to_stage_result(
     *,
     mode: ExecutionMode,
     provider: Provider,
+    sub_results: dict | None = None,
+    sub_calls: tuple[SubCall, ...] | None = None,
 ) -> StageResult:
-    """Build the engine-facing StageResult from a runner's RawResult + verdict."""
+    """Build the engine-facing StageResult from a runner's RawResult + verdict.
+
+    ``sub_results``/``sub_calls`` (#73) are populated only by a plan-bearing dispatch that
+    fanned out below the seam: the raw, unfolded panel output the engine's deterministic
+    synthesis consumes, and one ``SubCall`` per model call inside the dispatch so the ledger
+    can write a row each. Both default to None, so every single-call dispatch builds exactly
+    the pre-#73 StageResult."""
     # StageResult.structured_output is dict|None; a non-dict payload (list/scalar)
     # is coerced to None here (the raw text is preserved in raw_output).
     structured = raw.structured_output if isinstance(raw.structured_output, dict) else None
@@ -538,6 +569,8 @@ def to_stage_result(
         stream_files=raw.stream_files,
         schema_retries=raw.schema_retries,
         persona_injected=raw.persona_injected,
+        sub_results=sub_results,
+        sub_calls=sub_calls,
         token_usage=raw.usage,
         completed_at=datetime.now(UTC).isoformat(),
     )
@@ -948,7 +981,7 @@ def claude_cli_transport(
         try:
             if root is not None:  # == streaming; narrows root for the _stream_dir calls below
                 tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                    work.stage.value, work.attempt, retry
+                    work.stage.value, work.attempt, retry, phase=work.phase
                 )
                 returncode, stdout, stderr = _run_teed(
                     argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
@@ -1237,7 +1270,7 @@ def codex_cli_transport(
             try:
                 if root is not None:
                     tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                        work.stage.value, work.attempt, retry
+                        work.stage.value, work.attempt, retry, phase=work.phase
                     )
                     returncode, stdout, stderr = _run_teed(
                         argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
