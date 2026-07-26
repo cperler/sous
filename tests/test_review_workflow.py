@@ -569,6 +569,7 @@ def test_ledger_still_writes_one_row_for_a_sub_results_bearing_result(tmp_path, 
 # contract makes sufficient: the summary is a function of that input and nothing else.
 
 ONLY_CODE = {"severity": "critical", "file": "d.py", "description": "code alone"}
+ONLY_DESIGN = {"severity": "critical", "file": "e.py", "description": "design gap alone"}
 
 
 def _panel_with_notices(findings_by_lens: dict, verdicts: list | None = None,
@@ -642,17 +643,31 @@ def test_panel_summary_counts_a_coerced_verdict_as_confirmed() -> None:
 
 def test_panel_summary_is_byte_stable_and_independent_of_lens_dict_order() -> None:
     """Same determinism contract as ``review`` itself: replay must reproduce the recorded
-    summary exactly, and a differently-ordered findings_by_lens is the SAME panel."""
+    summary exactly, and a differently-ordered findings_by_lens is the SAME panel.
+
+    ``find:spec`` and ``find:design`` are the one pair where ``LENS_ORDER``
+    (``code, spec, design, tests``) and alphabetical order actually diverge — every other
+    lens pair happens to sort the same way either method is applied, so a fixture missing
+    this pair cannot distinguish "sorted by name" from "walk order" and proves nothing about
+    which one ``_panel_summary`` actually uses. Both lenses carry a distinct finding so each
+    key is genuinely present in ``summary["lenses"]``, not just in the input.
+    """
     lenses = {
         "find:tests": {"findings": [dict(CRITICAL)], "tests_meaningful": True},
         "find:code": {"findings": [CRITICAL, ONLY_CODE]},
+        "find:design": {"findings": [ONLY_DESIGN]},
         "find:spec": {"findings": [IMPORTANT]},
     }
     first = synthesize(_panel(lenses)).panel_summary
     again = synthesize(_panel(lenses)).panel_summary
     reordered = synthesize(_panel(dict(reversed(list(lenses.items()))))).panel_summary
     assert json.dumps(first) == json.dumps(again) == json.dumps(reordered)
-    assert list(first["lenses"]) == ["find:code", "find:spec", "find:tests"]  # sorted keys
+    # Sorted by lens NAME (the documented contract), not LENS_ORDER: "design" < "spec"
+    # alphabetically even though LENS_ORDER walks spec before design. If ``_panel_summary``
+    # ever switched to preserving walk order instead, this would need to become
+    # ["find:code", "find:spec", "find:design", "find:tests"] — and say so explicitly.
+    assert list(first["lenses"]) == ["find:code", "find:design", "find:spec", "find:tests"]
+    assert sorted(LENS_ORDER) != list(LENS_ORDER)  # the divergence this test exists to catch
 
 
 def test_panel_summary_never_leaks_into_review_json() -> None:
