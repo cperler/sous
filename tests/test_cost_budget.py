@@ -356,6 +356,37 @@ def test_scheduler_run_pauses_when_budget_exhausted(tmp_path) -> None:
     assert "run_paused" in [k for k, _ in proj.notifications]
 
 
+def test_ledger_rows_are_filtered_per_run(tmp_path) -> None:
+    # #281 defense in depth: a ledger holding ANOTHER run's rows (the legacy shared-store
+    # layout, or any mis-rooted ledger) must not leak into a run's status/cost summaries
+    # nor its --budget-usd hard-PAUSE decision — every aggregation filters on the row's
+    # run_id before summing. Two runs, one store/ledger, $1.00 metered each.
+    eng = _engine(tmp_path)
+    for rid in ("r1", "r2"):
+        eng.create_run(rid, ExecutionLane.FULL, budget_usd=1.5)
+        eng.add_task(rid, "t1")
+        _advance(eng, run=rid)  # intake — $0 engine stage
+        _advance(eng, tokens=_SCOPE_1USD, run=rid)  # scope — $1.00 metered
+
+    # the SHARED ledger holds $2.00 across 4 calls…
+    assert eng.ledger.metered_spend() == 2.0
+    assert len(eng.ledger.rows()) == 4
+    # …but each run reports ONLY its own calls and spend (the #281 repro reported both).
+    for rid in ("r1", "r2"):
+        status = eng.status(rid)
+        assert status["cost"]["total_invocations"] == 2
+        assert status["cost"]["total_cost_usd"] == 1.0
+        assert status["lane_audit"]["total_calls"] == 2
+        assert status["budget"]["spent_usd"] == 1.0
+        assert status["budget"]["exhausted"] is False
+
+    # budget gate: r1's own $1.00 < its $1.50 budget, so it keeps dispatching — the other
+    # run's spend (which would push the unfiltered total to $2.00 >= $1.50) is ignored.
+    work = eng.next_work("r1", "t1")
+    assert work is not None and work.stage is Stage.IMPLEMENT
+    assert eng.store.load_run("r1").state.value == "running"
+
+
 def test_status_budget_none_without_budget(tmp_path) -> None:
     eng = _engine(tmp_path)
     eng.create_run("r1", ExecutionLane.FULL)

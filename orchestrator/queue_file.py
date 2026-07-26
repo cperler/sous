@@ -10,23 +10,34 @@ existing, already-resumable ``Scheduler.run``.
 Two halves live here:
 
 * ``QueueFile`` — a thin, project-agnostic abstraction over the queue JSON. Every
-  mutation (``append`` at the tail, the single consumer's ``pop_head`` / ``requeue_head``)
-  is a read-modify-write of the whole array, so each is guarded by an exclusive advisory
-  lock (``fcntl.flock``, mkdir-spin fallback) and finished with an atomic temp-file +
-  ``os.replace``. The lock is what makes concurrent producers safe: §1.8's bare append
-  assumed a single enqueuer, but two parallel cron ``--enqueue`` invocations would
-  otherwise both read the old array and one entry would be lost — the lock serializes
-  them instead. Malformed content raises the typed ``QueueError``.
-* ``drive_queue`` — the unattended loop. It pops the head batch, derives a STABLE run id
-  from ``enqueued_at`` (so a crashed-then-restarted driver reuses the same run rather than
-  forking a duplicate), creates-or-reuses that run, adds each task in listed order, then
-  hands the run to ``Scheduler.run``. On an ingest failure the batch is re-prepended
-  (``requeue_head``) so nothing is silently dropped. Between batches it idle-waits, polling
-  every ``poll_interval_s`` up to ``idle_timeout_s`` before exiting.
+  mutation (``append`` at the tail, the consumer's ``claim_head`` / ``complete_head`` /
+  ``unclaim_head``) is a read-modify-write of the whole array, so each is guarded by an
+  exclusive advisory lock (``fcntl.flock``, mkdir-spin fallback) and finished with an
+  atomic temp-file + ``os.replace``. The lock is what makes concurrent producers safe:
+  §1.8's bare append assumed a single enqueuer, but two parallel cron ``--enqueue``
+  invocations would otherwise both read the old array and one entry would be lost — the
+  lock serializes them instead. Malformed content raises the typed ``QueueError``.
+* ``drive_queue`` — the unattended loop, built on a CLAIM-IN-PLACE protocol (#279): the
+  head entry is never popped before the work is durably done. The consumer stamps the
+  head with ``claim = {run_id, owner, claimed_at}`` in one atomic write — the entry STAYS
+  in the queue, so no kill window (SIGKILL, power loss) can ever remove the only durable
+  representation of the batch. The claim names the derived run id BEFORE any run state
+  exists, so a restarted consumer always knows which run a claimed entry became: a head
+  claimed by this ``owner`` is adopted (its recorded ``claim.run_id`` is resumed, not
+  re-derived), a head claimed by a DIFFERENT owner raises ``QueueError`` (two-consumer
+  exclusion). Ingestion then creates-or-reuses that run and adds each task in listed
+  order, ``Scheduler.run`` drives it to terminal, and only THEN is the entry removed
+  (``complete_head``, which verifies the claim still matches). On an ingest failure the
+  claim is stripped in place (``unclaim_head``) so the same head is retried next launch —
+  nothing is silently dropped. Between batches it idle-waits, polling every
+  ``poll_interval_s`` up to ``idle_timeout_s`` before exiting.
 
 The engine is never touched directly for model work — ``drive_queue`` only calls the same
-public ``create_run`` / ``add_task`` / ``Scheduler.run`` surface a supervisor would, so it
-stays project-agnostic and inherits every engine guarantee (idempotent adds, resumability).
+public ``create_or_reuse_run`` / ``add_task`` / ``Scheduler.run`` surface a supervisor
+would, so it stays project-agnostic and inherits every engine guarantee (idempotent adds,
+resumability). Each claimed entry gets a FRESH engine from the caller's ``engine_factory``
+rooted at that run's own store (#281), so no two derived runs ever share a status store,
+cost ledger, or stage-log tree.
 """
 
 from __future__ import annotations
@@ -94,6 +105,19 @@ def _validate_entry(entry: Any, where: str) -> dict:
     enqueued_at = entry.get("enqueued_at")
     if not isinstance(enqueued_at, str) or not enqueued_at.strip():
         raise QueueError(f"{where}: `enqueued_at` must be a non-empty timestamp string")
+    claim = entry.get("claim")
+    if claim is not None:
+        # An in-place consumer claim (#279): {run_id, owner, claimed_at}, all non-empty
+        # strings. Optional — an unclaimed entry simply has no `claim` key.
+        if not isinstance(claim, dict):
+            raise QueueError(
+                f"{where}: `claim` must be a JSON object or absent, "
+                f"got {type(claim).__name__}"
+            )
+        for field in ("run_id", "owner", "claimed_at"):
+            value = claim.get(field)
+            if not isinstance(value, str) or not value.strip():
+                raise QueueError(f"{where}: `claim.{field}` must be a non-empty string")
     return entry
 
 
@@ -106,9 +130,15 @@ class QueueFile:
     (``.lock`` sentinel next to the queue) for its full read→write span: this is what keeps
     concurrent enqueuers safe. §1.8 originally called ``append`` "lock-free" on a
     single-producer assumption, but two parallel cron ``--enqueue`` runs would each read
-    the old array and lose one entry without the lock. ``pop_head`` / ``requeue_head`` are
-    the single unattended consumer's dequeue and its undo; they take the same lock so they
-    never race a producer either.
+    the old array and lose one entry without the lock.
+
+    The consumer side is a CLAIM-IN-PLACE protocol (#279), not pop-then-requeue: an entry
+    is only ever removed AFTER its derived run reached terminal. ``claim_head`` stamps the
+    head with ``{run_id, owner, claimed_at}`` in one atomic write (the entry stays queued —
+    no kill window between dequeue and durable run state can lose the batch),
+    ``complete_head`` pops the head only when its claim matches the caller, and
+    ``unclaim_head`` strips a matching claim so a failed ingest is retried. All three take
+    the same lock so they never race a producer either.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -192,30 +222,90 @@ class QueueFile:
     def peek_head(self) -> dict | None:
         """Return the head batch without removing it, or ``None`` when the queue is empty.
 
-        Intentionally *not* locked: safe only under the single-consumer assumption. With
-        multiple concurrent consumers a stale read is possible — the head may be popped by
-        another consumer between this peek and any follow-up action."""
+        Intentionally *not* locked: a peek is only a hint. Any follow-up mutation
+        (``claim_head`` / ``complete_head`` / ``unclaim_head``) re-reads and re-verifies
+        the head under the exclusive lock, so a stale peek can never act on the wrong
+        entry — a racing consumer's claim surfaces there as a typed ``QueueError``."""
         entries = self.read()
         return entries[0] if entries else None
 
-    def pop_head(self) -> dict | None:
-        """Remove and return the head batch (FIFO dequeue), or ``None`` when empty. Takes
-        ``_with_lock`` so the read→write can't race a concurrent producer's append."""
+    @staticmethod
+    def _check_ids(owner: str, run_id: str, verb: str) -> None:
+        """Both halves of a claim identity must be real strings — an empty owner or run id
+        would stamp (or match) a claim that no restarted consumer could ever adopt."""
+        if not isinstance(owner, str) or not owner.strip():
+            raise QueueError(f"cannot {verb}: `owner` must be a non-empty string")
+        if not isinstance(run_id, str) or not run_id.strip():
+            raise QueueError(f"cannot {verb}: `run_id` must be a non-empty string")
+
+    def claim_head(self, owner: str, run_id: str) -> dict:
+        """Stamp the head entry with ``claim = {run_id, owner, claimed_at}`` in ONE atomic
+        write and return the claimed entry. The entry STAYS in the queue — claiming is
+        in-place, so at no instant is the batch's only durable representation gone (#279).
+        Idempotent for the same ``(owner, run_id)`` (a consumer that crashed between claim
+        and ingest re-claims its own head); a head already claimed by anyone else raises
+        ``QueueError`` and the queue is untouched. An empty queue also raises — the caller
+        peeked a head, so a vanished one is a broken single-consumer assumption."""
+        self._check_ids(owner, run_id, "claim_head")
         with self._with_lock():
             entries = self.read()
             if not entries:
-                return None
-            head, rest = entries[0], entries[1:]
-            self._write(rest)
+                raise QueueError("cannot claim_head: queue is empty")
+            head = entries[0]
+            claim = head.get("claim")
+            if claim is not None:
+                if claim["owner"] == owner and claim["run_id"] == run_id:
+                    return head  # already ours — idempotent re-claim after a crash
+                raise QueueError(
+                    f"cannot claim_head: head is already claimed by owner "
+                    f"{claim['owner']!r} for run {claim['run_id']!r}"
+                )
+            head = {
+                **head,
+                "claim": {"run_id": run_id, "owner": owner, "claimed_at": _utc_now_iso()},
+            }
+            self._write([head, *entries[1:]])
         return head
 
-    def requeue_head(self, entry: dict) -> None:
-        """Re-prepend ``entry`` to the front of the queue (the ingest-failure undo, so a
-        popped-then-unprocessable batch is retried first, not dropped). Locked so the
-        read→write can't race a concurrent producer's append."""
-        _validate_entry(entry, "requeued entry")
+    def complete_head(self, owner: str, run_id: str) -> dict:
+        """Remove and return the head entry — but ONLY if its claim matches
+        ``(owner, run_id)``. This is the terminal dequeue of the claim protocol: it runs
+        after the derived run reached a terminal state, so removing the entry never drops
+        the batch's only durable representation. A missing head, an unclaimed head, or a
+        claim held by someone else raises ``QueueError`` (the queue is untouched)."""
+        self._check_ids(owner, run_id, "complete_head")
         with self._with_lock():
-            self._write([entry, *self.read()])
+            head = self._matching_head(owner, run_id, "complete_head")
+            self._write(self.read()[1:])
+        return head
+
+    def unclaim_head(self, owner: str, run_id: str) -> dict:
+        """Strip a matching claim off the head entry IN PLACE and return the (now
+        unclaimed) entry — the ingest-failure undo: the entry stays at the head, ready to
+        be re-claimed and retried on the next launch. A missing/unclaimed head or a claim
+        held by someone else raises ``QueueError`` (the queue is untouched)."""
+        self._check_ids(owner, run_id, "unclaim_head")
+        with self._with_lock():
+            head = self._matching_head(owner, run_id, "unclaim_head")
+            head = {k: v for k, v in head.items() if k != "claim"}
+            self._write([head, *self.read()[1:]])
+        return head
+
+    def _matching_head(self, owner: str, run_id: str, verb: str) -> dict:
+        """The head entry, verified (under the caller's lock) to be claimed by exactly
+        ``(owner, run_id)``. Raises ``QueueError`` naming what actually holds it."""
+        entries = self.read()
+        if not entries:
+            raise QueueError(f"cannot {verb}: queue is empty")
+        claim = entries[0].get("claim")
+        if claim is None:
+            raise QueueError(f"cannot {verb}: head entry is not claimed")
+        if claim["owner"] != owner or claim["run_id"] != run_id:
+            raise QueueError(
+                f"cannot {verb}: head claim (owner {claim['owner']!r}, run "
+                f"{claim['run_id']!r}) does not match (owner {owner!r}, run {run_id!r})"
+            )
+        return entries[0]
 
 
 def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
@@ -226,27 +316,18 @@ def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
     return f"{prefix}-{stamp}" if stamp else prefix
 
 
-def _run_exists(engine: Engine, run_id: str) -> bool:
-    """True iff ``run_id`` has a loadable run doc. Only a genuine not-found returns False;
-    an unreadable or corrupt-JSON run doc raises (``StatusNotFoundError`` is the narrow
-    not-found signal, so I/O and parse errors are NOT swallowed as "run absent" — #112).
-    Used to REPORT whether ``drive_queue`` created the run, not to guard the create:
-    ingestion goes through ``Engine.create_or_reuse_run``, which does its own
-    exists-check under the run write lock (#280)."""
-    return engine.store.run_exists(run_id)
-
-
 def _ingest_batch(
     engine: Engine, entry: dict, run_id: str, *, lane: ExecutionLane
-) -> list[str]:
-    """Create-or-reuse ``run_id`` and add each of the batch's tasks in listed order. Fully
-    idempotent so a requeued/restarted ingest converges: an existing run is reused and an
-    already-added task is skipped (mirrors ``batch_plan.apply_plan``'s per-task add loop,
-    minus the DAG — a queue entry is a flat task list with no encoded edges). Reuse goes
-    through the EXPLICIT ``create_or_reuse_run`` (#280) so a stable run id can never be
+) -> tuple[list[str], bool]:
+    """Create-or-reuse ``run_id`` and add each of the batch's tasks in listed order,
+    returning ``(added_task_ids, run_was_created)``. Fully idempotent so a restarted
+    ingest converges: an existing run is reused (``created=False``) and an already-added
+    task is skipped (mirrors ``batch_plan.apply_plan``'s per-task add loop, minus the
+    DAG — a queue entry is a flat task list with no encoded edges). Reuse goes through
+    the EXPLICIT ``create_or_reuse_run`` (#280) so a stable run id can never be
     re-created over live state, and a corrupt run doc surfaces as an error rather than
     being silently replaced."""
-    run, _created = engine.create_or_reuse_run(run_id, lane)
+    run, created = engine.create_or_reuse_run(run_id, lane)
     already = {ref.task_id for ref in run.task_refs}
     added: list[str] = []
     for task_id in entry["tasks"]:
@@ -254,14 +335,20 @@ def _ingest_batch(
             continue
         engine.add_task(run_id, task_id)
         added.append(task_id)
-    return added
+    return added, created
+
+
+#: Per-run construction seam (#281): given a derived run id, return a FRESH ``Engine``
+#: (and its registry-backed ``Runner``) rooted at that run's OWN store — never a shared
+#: one. ``drive_queue`` calls it once per claimed entry.
+EngineFactory = Callable[[str], tuple[Engine, Runner]]
 
 
 def drive_queue(
-    engine: Engine,
     queue: QueueFile,
-    runner: Runner,
+    engine_factory: EngineFactory,
     *,
+    owner: str = "default",
     lane: ExecutionLane = ExecutionLane.FULL,
     util_pct: float = 0.0,
     util_provider: Callable[[], float] | None = None,
@@ -273,20 +360,36 @@ def drive_queue(
 ) -> dict:
     """Drain the queue one batch at a time, driving each to terminal via ``Scheduler.run``.
 
-    The unattended (cron) loop:
+    The unattended (cron) loop, restart-safe at every boundary (#279):
 
     1. Peek the head batch. If the queue is empty, idle-wait: poll every ``poll_interval_s``
        up to ``idle_timeout_s`` (using ``sleeper``), then exit. Without a ``sleeper`` the
        loop returns immediately when the queue drains (the caller owns re-invocation).
-    2. Pop the head and ingest it (create-or-reuse a stable run id, add its tasks). On any
-       ingest failure the batch is re-prepended (``requeue_head``) and the failure is
-       re-raised — nothing is silently dropped and the same head is retried next launch.
-    3. Drive the ingested run through ``Scheduler.run`` (inheriting its resumability,
-       capacity-wait, circuit breaker) and record the per-run final status.
+    2. Claim the head IN PLACE: derive the stable run id and ``claim_head(owner, run_id)``
+       — one atomic write that records which run this entry becomes while the entry stays
+       queued (no kill window can remove the batch's only durable representation). A head
+       already claimed by THIS owner is a crash leftover: its recorded ``claim.run_id`` is
+       adopted (not re-derived) and resumed. A head claimed by a DIFFERENT owner raises
+       ``QueueError`` — two consumers must never process the same entry.
+    3. Build a fresh per-run engine+runner via ``engine_factory(run_id)`` (#281) and
+       ingest the batch (create-or-reuse the run, add its tasks — idempotent, so a
+       restart after partial ingest converges). On any ingest failure the claim is
+       stripped (``unclaim_head``) and the failure re-raised — the entry stays at the
+       head and is retried next launch, never silently dropped.
+    4. Drive the run through ``Scheduler.run`` (inheriting its resumability,
+       capacity-wait, circuit breaker); only once it returns is the entry removed via
+       ``complete_head`` (which re-verifies the claim), and the per-run final status
+       recorded. A death mid-scheduler leaves the claimed entry, so a restart resumes
+       the run rather than losing it.
+
+    ``owner`` is a STABLE consumer identity (not a pid): a SIGKILLed consumer relaunched
+    with the same owner id reclaims and resumes its own stale claims.
 
     Returns a structured summary: ``{batches_processed, runs_created, runs[...],
     idle_timed_out}`` where each ``runs`` row is ``{run_id, tasks, added, final_state}``.
     """
+    if not isinstance(owner, str) or not owner.strip():
+        raise QueueError("drive_queue: `owner` must be a non-empty string")
     runs: list[dict] = []
     created = 0
     idle_waited = 0
@@ -306,36 +409,48 @@ def drive_queue(
             continue
 
         idle_waited = 0  # a batch arrived — reset the idle clock
-        entry = queue.pop_head()
-        if entry is None:
-            # peek saw a head; a single consumer means pop cannot miss it. If it does,
-            # the queue was mutated concurrently — surface it instead of proceeding on
-            # None (a bare `assert` would be stripped under `python -O`).
+        claim = head.get("claim")
+        if claim is None:
+            # The claim names the derived run id BEFORE any run state exists, so a
+            # restart at any later boundary knows which run this entry became.
+            run_id = run_id_for(head, prefix=run_id_prefix)
+            head = queue.claim_head(owner, run_id)
+        elif claim["owner"] == owner:
+            # Crash leftover from a previous launch of THIS consumer: adopt the recorded
+            # run id (never re-derive — the claim is the durable name binding) and resume.
+            run_id = claim["run_id"]
+        else:
             raise QueueError(
-                "queue head vanished between peek_head and pop_head "
-                "(concurrent mutation of a single-consumer queue?)"
+                f"queue head is claimed by another consumer (owner {claim['owner']!r}, "
+                f"run {claim['run_id']!r}); refusing to process it"
             )
-        run_id = run_id_for(entry, prefix=run_id_prefix)
-        existed = _run_exists(engine, run_id)
+
+        # #281: a FRESH engine rooted at this run's own store — constructed only after
+        # the claim fixed the run id, once per claimed entry.
+        engine, runner = engine_factory(run_id)
         try:
-            added = _ingest_batch(engine, entry, run_id, lane=lane)
+            added, created_now = _ingest_batch(engine, head, run_id, lane=lane)
         except Exception as exc:
-            # Ingest failed — put the batch back at the head so it is retried first, then
-            # surface the failure (re-processing the same bad head in a loop would spin).
-            queue.requeue_head(entry)
+            # Ingest failed — strip the claim so the entry (still at the head) is retried
+            # next launch, then surface the failure (looping on the same bad head would spin).
+            queue.unclaim_head(owner, run_id)
             raise QueueError(
-                f"failed to ingest batch {entry['tasks']} (run {run_id}); re-queued at head: {exc}"
+                f"failed to ingest batch {head['tasks']} (run {run_id}); "
+                f"claim released, entry stays queued: {exc}"
             ) from exc
-        if not existed:
+        if created_now:
             created += 1
 
         status = Scheduler(engine, max_concurrent=max_concurrent).run(
             run_id, runner, util_pct=util_pct, util_provider=util_provider, sleeper=sleeper,
         )
+        # Terminal (or scheduler-returned) — only NOW is the entry dequeued, and only if
+        # our claim still holds.
+        queue.complete_head(owner, run_id)
         runs.append({
             "run_id": run_id,
-            "tasks": entry["tasks"],
-            "branch": entry.get("branch"),
+            "tasks": head["tasks"],
+            "branch": head.get("branch"),
             "added": added,
             "final_state": status.get("run_state"),
         })
