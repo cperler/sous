@@ -270,18 +270,17 @@ def test_run_exists_raises_on_corrupt_run_doc(tmp_path) -> None:
 
 def test_ingest_batch_does_not_recreate_over_a_corrupt_run(tmp_path) -> None:
     # #112 at the caller: with a corrupt run doc, _ingest_batch must surface the error
-    # instead of silently create_run-ing over it. Guard create_run to prove it isn't called.
+    # instead of silently writing a fresh run over it. Since #280 the run doc on disk is
+    # the proof — creation refuses on path existence (under the write lock), so the
+    # corrupt bytes must come back untouched.
     repo = _repo(tmp_path)
     eng = _engine(tmp_path, E2EProject(repo_root=str(repo)))
     eng.create_run("r1", ExecutionLane.FULL)
     eng.store._run_path("r1").write_text("not json at all", encoding="utf-8")
 
-    def _fail(*a, **k):
-        raise AssertionError("create_run must not run over a corrupt existing run")
-
-    eng.create_run = _fail  # type: ignore[method-assign]
     with pytest.raises(StatusStoreError):
         _ingest_batch(eng, make_entry(["t1"]), "r1", lane=ExecutionLane.FULL)
+    assert eng.store._run_path("r1").read_text(encoding="utf-8") == "not json at all"
 
 
 # --- drive_queue: requeue on ingest failure ---------------------------------------

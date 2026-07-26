@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any
 
 from .engine import Engine
-from .errors import OrchestratorError, StatusNotFoundError
+from .errors import OrchestratorError
 from .scheduler import Runner, Scheduler
 from .schemas.enums import ExecutionLane
 
@@ -230,13 +230,10 @@ def _run_exists(engine: Engine, run_id: str) -> bool:
     """True iff ``run_id`` has a loadable run doc. Only a genuine not-found returns False;
     an unreadable or corrupt-JSON run doc raises (``StatusNotFoundError`` is the narrow
     not-found signal, so I/O and parse errors are NOT swallowed as "run absent" — #112).
-    Swallowing them would let ``_ingest_batch`` re-``create_run`` over partially-valid,
-    on-disk state."""
-    try:
-        engine.store.load_run(run_id)
-        return True
-    except StatusNotFoundError:
-        return False
+    Used to REPORT whether ``drive_queue`` created the run, not to guard the create:
+    ingestion goes through ``Engine.create_or_reuse_run``, which does its own
+    exists-check under the run write lock (#280)."""
+    return engine.store.run_exists(run_id)
 
 
 def _ingest_batch(
@@ -245,10 +242,11 @@ def _ingest_batch(
     """Create-or-reuse ``run_id`` and add each of the batch's tasks in listed order. Fully
     idempotent so a requeued/restarted ingest converges: an existing run is reused and an
     already-added task is skipped (mirrors ``batch_plan.apply_plan``'s per-task add loop,
-    minus the DAG — a queue entry is a flat task list with no encoded edges)."""
-    if not _run_exists(engine, run_id):
-        engine.create_run(run_id, lane)
-    run = engine.store.load_run(run_id)
+    minus the DAG — a queue entry is a flat task list with no encoded edges). Reuse goes
+    through the EXPLICIT ``create_or_reuse_run`` (#280) so a stable run id can never be
+    re-created over live state, and a corrupt run doc surfaces as an error rather than
+    being silently replaced."""
+    run, _created = engine.create_or_reuse_run(run_id, lane)
     already = {ref.task_id for ref in run.task_refs}
     added: list[str] = []
     for task_id in entry["tasks"]:

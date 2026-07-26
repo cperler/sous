@@ -24,7 +24,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .errors import StatusNotFoundError, StatusStoreError
+from .errors import RunExistsError, StatusNotFoundError, StatusStoreError
 from .schemas.enums import SCHEMA_VERSION
 from .schemas.status import Run, Task
 
@@ -176,6 +176,33 @@ class StatusStore:
         # locked read-modify-write (the unlocked path was a lost-update race).
         with self.with_lock(self._run_path(run.run_id)):
             self._write_run(run)
+
+    def create_run_doc(self, run: Run) -> None:
+        """Write a run doc that must not already exist, raising ``RunExistsError`` if it
+        does (#280). The exists-check and the write happen under the SAME run lock that
+        every other run writer takes, so two concurrent creators cannot both see "absent"
+        and race a second one over the first's document."""
+        path = self._run_path(run.run_id)
+        with self.with_lock(path):
+            if path.exists():
+                raise RunExistsError(
+                    f"run {run.run_id} already exists at {path}; "
+                    "refusing to overwrite it (choose a new run id)"
+                )
+            self._write_run(run)
+
+    def run_exists(self, run_id: str) -> bool:
+        """True iff ``run_id`` has a loadable run doc. Only a genuine not-found returns
+        False; an unreadable or corrupt-JSON run doc raises (``StatusNotFoundError`` is
+        the narrow not-found signal, so I/O and parse errors are NOT swallowed as "run
+        absent" — #112). Callers use this to *report* on a run's presence; they must not
+        use it to guard a create (that check-then-write is racy — ``create_run_doc``
+        does the check under the write lock)."""
+        try:
+            self.load_run(run_id)
+            return True
+        except StatusNotFoundError:
+            return False
 
     def load_run(self, run_id: str) -> Run:
         return Run.model_validate(self._read_json(self._run_path(run_id)))

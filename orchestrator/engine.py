@@ -26,7 +26,7 @@ from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
-from .errors import CapacityExhausted, ContractError, NoRunnerError
+from .errors import CapacityExhausted, ContractError, NoRunnerError, RunExistsError
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
 )
@@ -311,7 +311,14 @@ class Engine:
         ``review_workflow`` (#73) opts REVIEW into the multi-agent find→verify panel on lanes
         that can execute a plan — off by default, and cost/capacity policy can still veto it
         per dispatch. All default off; the routers are DISTINCT levers (USD vs rate-limit
-        headroom vs provider outage vs failed-session reuse)."""
+        headroom vs provider outage vs failed-session reuse).
+
+        Re-initializing an EXISTING run id is refused with ``RunExistsError`` (#280):
+        replacing the run doc would orphan the run's task documents (they stay on disk
+        while dropping out of ``task_refs``) and erase its dependency graph, state and
+        settings. There is deliberately no force/overwrite variant — a new run id is the
+        answer, and run logs are the human's to prune. Callers that genuinely want
+        create-or-reuse (queue ingestion) call ``create_or_reuse_run``."""
         if max_filed_followups is not None and max_filed_followups < 0:
             raise ContractError(
                 f"max_filed_followups must be >= 0, got {max_filed_followups} for run {run_id}"
@@ -326,8 +333,76 @@ class Engine:
             max_filed_followups=max_filed_followups,
             review_workflow=review_workflow,
         )
-        self.store.save_run(run)
+        self.store.create_run_doc(run)
         return run
+
+    #: The run-level settings ``create_or_reuse_run`` treats as IMMUTABLE — a reuse that
+    #: asks for different values is a different run, so it raises instead of silently
+    #: handing back a run configured some other way. Kept in sync with ``create_run``'s
+    #: parameters by the #206 persistence guard test.
+    _REUSE_IMMUTABLE_SETTINGS = (
+        "lane", "budget_usd", "route_by_cost", "route_by_capacity",
+        "cross_provider_fallback", "warm_retry", "progress_comments",
+        "max_filed_followups", "review_workflow",
+    )
+
+    def create_or_reuse_run(
+        self,
+        run_id: str,
+        lane: ExecutionLane = ExecutionLane.FULL,
+        *,
+        budget_usd: float | None = None,
+        route_by_cost: bool = False,
+        route_by_capacity: bool = False,
+        cross_provider_fallback: bool = False,
+        warm_retry: bool = False,
+        progress_comments: bool = False,
+        max_filed_followups: int | None = None,
+        review_workflow: bool = False,
+    ) -> tuple[Run, bool]:
+        """The EXPLICIT idempotent create (#280). Returns ``(run, created)``: the freshly
+        created run with ``created=True``, or the already-persisted run with
+        ``created=False`` — never a replacement, so an existing run's task refs,
+        dependency graph, state and settings survive a repeated ingest.
+
+        Reuse is only idempotent when it asks for the SAME run: the requested immutable
+        settings are compared against the persisted ones and a mismatch raises
+        ``ContractError`` listing the diffs, rather than handing back a run configured
+        differently from what the caller asked for. A corrupt/unreadable run doc
+        propagates as ``StatusStoreError`` — it is never treated as "absent" (#112)."""
+        requested: dict[str, object] = dict(
+            lane=lane, budget_usd=budget_usd, route_by_cost=route_by_cost,
+            route_by_capacity=route_by_capacity,
+            cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
+            progress_comments=progress_comments,
+            max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+        )
+        try:
+            created = self.create_run(
+                run_id, lane, budget_usd=budget_usd, route_by_cost=route_by_cost,
+                route_by_capacity=route_by_capacity,
+                cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
+                progress_comments=progress_comments,
+                max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+            )
+        except RunExistsError:
+            pass
+        else:
+            return created, True
+        # Existing doc — load it (a corrupt doc raises here, as it must) and verify the
+        # caller is asking for the run that is actually on disk.
+        existing = self.store.load_run(run_id)
+        diffs = [
+            f"{name}: requested {requested[name]!r} != persisted {getattr(existing, name)!r}"
+            for name in self._REUSE_IMMUTABLE_SETTINGS
+            if requested[name] != getattr(existing, name)
+        ]
+        if diffs:
+            raise ContractError(
+                f"run {run_id} already exists with different settings; "
+                f"refusing to reuse it: {'; '.join(diffs)}"
+            )
+        return existing, False
 
     def add_task(
         self,

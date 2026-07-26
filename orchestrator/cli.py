@@ -965,14 +965,24 @@ def main(argv: list[str] | None = None) -> int:
         util_pct, _ = resolve_util(args.util)
 
     if args.cmd == "init-run":
-        run = eng.create_run(args.run, ExecutionLane(args.lane),
-                             budget_usd=args.budget_usd, route_by_cost=args.route_by_cost,
-                             route_by_capacity=args.route_by_capacity,
-                             cross_provider_fallback=args.cross_provider_fallback,
-                             warm_retry=args.warm_retry,
-                             progress_comments=args.progress_comments,
-                             max_filed_followups=args.max_filed_followups,
-                             review_workflow=args.review_workflow)
+        from .errors import RunExistsError
+
+        try:
+            run = eng.create_run(args.run, ExecutionLane(args.lane),
+                                 budget_usd=args.budget_usd,
+                                 route_by_cost=args.route_by_cost,
+                                 route_by_capacity=args.route_by_capacity,
+                                 cross_provider_fallback=args.cross_provider_fallback,
+                                 warm_retry=args.warm_retry,
+                                 progress_comments=args.progress_comments,
+                                 max_filed_followups=args.max_filed_followups,
+                                 review_workflow=args.review_workflow)
+        except RunExistsError as exc:
+            # Refuse loudly and write NOTHING (#280): re-initializing an existing run id
+            # would orphan its task docs and erase its refs/DAG/state/settings.
+            _emit({"ok": False, "error": f"{exc}. Pick a new --run id "
+                                         "(there is no overwrite of an existing run)."})
+            return 1
         _emit({"created_run": run.run_id, "lane": run.lane.value,
                "budget_usd": run.budget_usd, "route_by_cost": run.route_by_cost,
                "route_by_capacity": run.route_by_capacity,
