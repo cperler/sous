@@ -54,6 +54,53 @@ class TokenUsage(BaseModel):
     cache_write: int = 0
 
 
+class FinderSpec(BaseModel):
+    """One independent finder lens in a multi-agent REVIEW plan (#73 design §1).
+
+    Each finder is a fully engine-rendered prompt for a single lens
+    (correctness/spec/design/tests); the runner dispatches them blind to each other and
+    validates every sub-call against ``schema_ref`` (``review_findings``). ``agent`` is the
+    persona the runner injects (None => the base reviewer persona)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    lens: str
+    prompt: str  # fully rendered by the engine, like WorkItem.prompt
+    agent: str | None = None
+    schema_ref: str
+
+
+class ReviewPlan(BaseModel):
+    """The engine-authored, runner-executed plan for a multi-agent REVIEW (#73 design §1).
+
+    CONTENT, not routing: it is part of what the work *is* (which finders run, how findings
+    are verified and deduped), so it folds into ``compute_content_hash`` and two dispatches
+    with different finder sets are different work. It is explicitly NOT routing metadata like
+    ``session_ref``/``cwd`` and must NOT join any content-hash exclusion set."""
+
+    model_config = ConfigDict(frozen=True)
+
+    finders: tuple[FinderSpec, ...]
+    verify_template: str  # prompt template with mechanical slots the runner fills per finding
+    verify_schema_ref: str
+    dedupe_rule: str
+
+
+class SubCall(BaseModel):
+    """One model sub-call inside a single dispatch (#73 design §2/§4) — a finder or a
+    verifier — so no model call is unattributed even below the WorkItem seam. The ledger
+    writes one row per SubCall (priced from the engine model_table, never this self-report)."""
+
+    model_config = ConfigDict(frozen=True)
+
+    phase: str  # discriminator, e.g. "find:code" / "verify:3"
+    model: ModelId
+    usage: TokenUsage = Field(default_factory=TokenUsage)
+    duration_s: float
+    session_id: str | None = None
+    stream_file: str | None = None
+
+
 def compute_content_hash(
     *,
     stage: Stage,
@@ -63,6 +110,7 @@ def compute_content_hash(
     lane_policy: LanePolicy,
     attempt: int,
     effort: Effort | None = None,
+    plan: ReviewPlan | None = None,
 ) -> str:
     """Idempotency key for a dispatch.
 
@@ -74,12 +122,20 @@ def compute_content_hash(
     prompt at a different reasoning effort is a different call. It is appended ONLY when
     set, so an effort-less dispatch hashes byte-identically to the pre-#96 formula and an
     in-flight pre-#96 lease still verifies on record.
+
+    ``plan`` (#73) is CONTENT, folded the same append-only way: a REVIEW dispatch's finder
+    set is part of what the work *is*, so two plans with different finders yield different
+    hashes. It is appended ONLY when set — a plan-less dispatch hashes byte-identically to
+    the pre-#73 formula WITHOUT any exclusion (plan is NOT routing metadata like
+    session_ref/cwd and must never join a content-hash exclusion set — design §1 Identity).
     """
 
     lane = f"{lane_policy.execution_mode.value}:{lane_policy.provider.value}"
     parts = [stage.value, prompt, schema_ref, model, lane, str(attempt)]
     if effort is not None:
         parts.append(effort)
+    if plan is not None:
+        parts.append(plan.model_dump_json())
     blob = "\x1f".join(parts)
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()
 
@@ -158,6 +214,12 @@ class WorkItem(BaseModel):
     # like cwd/context — it is excluded from content_hash: it never changes a dispatch's
     # identity. None (the default) means "inherit the process env unchanged".
     env: dict[str, str] | None = None
+    # Multi-agent REVIEW plan (#73 design §1): the finder set + verify/dedupe rules the
+    # runner executes below the seam. CONTENT, not routing — folded into content_hash so
+    # two dispatches with different finder sets are different work; explicitly NOT excluded
+    # like session_ref/cwd/context. None (the default) is a plan-less dispatch, which hashes
+    # byte-identically to the pre-#73 formula.
+    plan: ReviewPlan | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -184,6 +246,7 @@ class WorkItem(BaseModel):
         salvage_anchor: str | None = None,
         context: dict | None = None,
         env: dict[str, str] | None = None,
+        plan: ReviewPlan | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -197,6 +260,7 @@ class WorkItem(BaseModel):
                 lane_policy=lane_policy,
                 attempt=attempt,
                 effort=effort,
+                plan=plan,
             ),
             effort=effort,
             agent=agent,
@@ -216,6 +280,7 @@ class WorkItem(BaseModel):
             salvage_anchor=salvage_anchor,
             context=context,
             env=env,
+            plan=plan,
             created_at=created_at,
         )
 
@@ -281,6 +346,16 @@ class StageResult(BaseModel):
     # it never feeds a verdict or a transition. None on the claude lane (persona arrives via the
     # CLI's ``--agent``) and when no agent resolved.
     persona_injected: dict | None = None
+    # Multi-agent REVIEW sub-call output (#73 design §2), populated only by a plan-bearing
+    # dispatch:
+    #   sub_results: the raw, UNFOLDED panel output ``{findings_by_lens, verdicts}`` the
+    #     engine's deterministic synthesis fold consumes at record() to produce canonical
+    #     review.json. None on every non-workflow dispatch.
+    #   sub_calls: one SubCall per model call inside the dispatch (each finder / verifier),
+    #     so no model call is unattributed below the seam — the ledger writes one row per
+    #     SubCall. None on single-call dispatches.
+    sub_results: dict | None = None
+    sub_calls: tuple[SubCall, ...] | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     cost_usd: float | None = None
     pricing_ref: str | None = None

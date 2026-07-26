@@ -17,6 +17,10 @@ from orchestrator.schemas.stage_schemas import load_stage_schema
 
 KIT = Path(__file__).resolve().parent.parent / "templates" / "project-default"
 STAGE_REFS = ("intake", "scope", "implement", "test", "deliver", "review")
+# Sub-call schemas for the multi-agent REVIEW workflow (#73) — not stage refs in
+# STAGE_SPECS, but mirrored into the kit like the stage schemas so codex validation and
+# any project override resolve identically.
+SUBCALL_REFS = ("review_findings", "review_verdict")
 
 
 def _manifest() -> dict:
@@ -50,7 +54,7 @@ def test_manifest_hooks_and_skills_resolve() -> None:
 
 def test_kit_schemas_match_canonical() -> None:
     # The seeded schema copies must equal the engine's canonical contracts (codex validation).
-    for ref in STAGE_REFS:
+    for ref in (*STAGE_REFS, *SUBCALL_REFS):
         seeded = json.loads((KIT / "schemas" / f"{ref}.json").read_text())
         assert seeded == load_stage_schema(ref), f"{ref}.json drifted from the canonical schema"
         Draft202012Validator.check_schema(seeded)
