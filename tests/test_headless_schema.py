@@ -230,3 +230,72 @@ def test_build_registry_injected_transport_beats_schema_provider() -> None:
     )
     reg.resolve(_work().lane_policy).dispatch(_work())
     assert sentinel_calls == ["wi-1"]
+
+
+# --- #282: the argv the real CLI parses -----------------------------------------------
+# Asserted at the ARGV level. The bug that shipped with #256 was invisible to every test in
+# this file because they all stub `subprocess.run` and never let the real binary parse
+# `--json-schema` — so the payload's *shape* was never checked, only its plumbing.
+
+def test_schema_json_provider_strips_meta_keys_the_cli_rejects() -> None:
+    """`claude -p --json-schema` fails closed on a top-level `$schema`/`$id` — it resolves
+    them as a `$ref` and errors "no schema with key or ref …", killing the dispatch before
+    any model call. Canonical stage schemas are Draft 2020-12 docs and all carry `$schema`,
+    so without this strip the headless lane cannot dispatch ANY stage (#282). The interactive
+    lane has always stripped these in `workflow_shim.js::sanitizeSchema`."""
+    canonical = {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://example.invalid/review.json",
+        "title": "review",
+        "type": "object",
+        "properties": {"approved": {"type": "boolean"}},
+        "required": ["approved"],
+    }
+    emitted = json.loads(_schema_json_provider(lambda ref: canonical)("review"))
+
+    assert "$schema" not in emitted
+    assert "$id" not in emitted
+    # Stripping must not weaken the contract — everything else survives verbatim.
+    assert emitted["type"] == "object"
+    assert emitted["required"] == ["approved"]
+    assert emitted["properties"] == {"approved": {"type": "boolean"}}
+    assert emitted["title"] == "review"
+
+
+def test_every_canonical_stage_schema_survives_the_provider() -> None:
+    """The real schemas through the real provider: none may reach the CLI carrying a
+    meta-key. Guards the whole stage surface, so a newly added schema cannot reintroduce
+    #282 by being written the same (correct) way as every existing one."""
+    from pathlib import Path
+
+    from orchestrator.schemas.stage_schemas import load_stage_schema
+
+    provider = _schema_json_provider(load_stage_schema)
+    refs = sorted(p.stem for p in Path("orchestrator/schemas/stages").glob("*.json"))
+    assert refs, "no stage schemas found — this guard would be vacuous"
+    for ref in refs:
+        emitted = json.loads(provider(ref))
+        assert "$schema" not in emitted, f"{ref}.json would be rejected by --json-schema"
+        assert "$id" not in emitted, f"{ref}.json would be rejected by --json-schema"
+
+
+def test_claude_cli_argv_carries_a_meta_key_free_schema() -> None:
+    """End of the wire: whatever lands after `--json-schema` in the argv the transport builds
+    must be a schema the CLI accepts."""
+    from orchestrator.schemas.stage_schemas import load_stage_schema
+
+    calls: list = []
+    transport = claude_cli_transport(_schema_json_provider(load_stage_schema))
+    import adapters.execution.transport as T
+
+    orig = T.subprocess.run
+    T.subprocess.run = _stub_json_run(calls, {"structured_output": {"approved": True}})
+    try:
+        transport(_work(schema_ref="review"))
+    finally:
+        T.subprocess.run = orig
+
+    argv = calls[0]
+    assert "--json-schema" in argv
+    schema = json.loads(argv[argv.index("--json-schema") + 1])
+    assert "$schema" not in schema and "$id" not in schema

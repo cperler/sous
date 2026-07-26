@@ -30,6 +30,24 @@ from .transport import (
 )
 
 
+# JSON-Schema meta-keys the CLI's `--json-schema` validator cannot accept: it treats a
+# top-level `$schema`/`$id` as a `$ref` to resolve and fails closed —
+#   Error: --json-schema is not a valid JSON Schema: no schema with key or ref
+#          "https://json-schema.org/draft/2020-12/schema"
+# — which kills the dispatch at argv parsing, before any model call. Every canonical stage
+# schema carries `$schema` (they are Draft 2020-12 documents), so WITHOUT this strip the
+# headless lane cannot dispatch ANY stage (#282). The interactive lane has always done this
+# in `run_targets/workflow_shim.js::sanitizeSchema`; this is its headless twin, and the two
+# must keep stripping the same keys or the lanes diverge on what they will accept.
+_SCHEMA_META_KEYS = ("$schema", "$id")
+
+
+def _without_meta_keys(schema: dict) -> dict:
+    """Top-level meta-keys removed; everything else (including nested `$ref`/`$defs`, which
+    the validator resolves fine) untouched. Shallow by design — only the ROOT keys break it."""
+    return {k: v for k, v in schema.items() if k not in _SCHEMA_META_KEYS}
+
+
 def _schema_json_provider(schema_for: SchemaProvider) -> Callable[[str], str | None]:
     """Adapt a project's ``schema_for(ref) -> dict`` into the inline-JSON callable
     ``claude_cli_transport`` needs for ``--json-schema`` (the CLI takes the schema JSON
@@ -42,7 +60,7 @@ def _schema_json_provider(schema_for: SchemaProvider) -> Callable[[str], str | N
     def json_for(ref: str) -> str | None:
         if ref not in cache:
             schema = schema_for(ref) if schema_for is not None else None
-            cache[ref] = json.dumps(schema) if schema is not None else None
+            cache[ref] = json.dumps(_without_meta_keys(schema)) if schema is not None else None
         return cache[ref]
 
     return json_for
