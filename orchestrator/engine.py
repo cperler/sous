@@ -10,6 +10,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 from __future__ import annotations
 
 import contextlib
+import math
 import os
 import re
 import subprocess
@@ -112,6 +113,23 @@ def _in_future(iso: str | None) -> bool:
         return datetime.fromisoformat(iso) > datetime.now(UTC)
     except ValueError:
         return False
+
+
+def _validated_budget(value: float | None, *, field: str, run_id: str) -> float | None:
+    """Contract-check an explicit USD budget: ``None`` (no cap) or a finite amount > 0.
+
+    A zero/negative/NaN/inf budget is a caller error, not a policy. It used to be stored
+    verbatim and then divided by in the soft-warning branch of ``_budget_hard_stop``,
+    so ``budget_usd=0`` crashed the first dispatch with ZeroDivisionError and a negative
+    cap parked the run instantly (#274). Rejected at the write boundary instead, so no
+    Run doc ever carries an unusable cap."""
+    if value is None:
+        return None
+    if not math.isfinite(value) or value <= 0:
+        raise ContractError(
+            f"{field} must be a finite USD amount > 0, got {value!r} for run {run_id}"
+        )
+    return float(value)
 
 
 # Bounded output tail for the trunk gate (#229): a failing verification command can spew
@@ -296,7 +314,8 @@ class Engine:
         review_workflow: bool = False,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
-        ``budget_soft_fraction``, hard PAUSE at/after the budget — #34); ``route_by_cost``
+        ``budget_soft_fraction``, hard PAUSE at/after the budget — #34; must be a finite
+        amount > 0 when given, an unusable cap is rejected here — #274); ``route_by_cost``
         enables cost-aware lane routing for un-pinned tasks; ``route_by_capacity`` enables
         capacity-aware model downgrade of fresh dispatches under high utilization (#12);
         ``cross_provider_fallback`` enables codex→claude fallthrough when the codex provider is
@@ -316,6 +335,7 @@ class Engine:
             raise ContractError(
                 f"max_filed_followups must be >= 0, got {max_filed_followups} for run {run_id}"
             )
+        budget_usd = _validated_budget(budget_usd, field="budget_usd", run_id=run_id)
         run = Run(
             run_id=run_id, created_at=_now(), updated_at=_now(), lane=lane,
             state=RunState.RUNNING, budget_usd=budget_usd, route_by_cost=route_by_cost,
@@ -2169,11 +2189,16 @@ class Engine:
         exhausted would immediately re-pause at the next dispatch (spend is still over the
         cap). So when the run is currently over budget, an unpause resolves it honestly:
           - ``raise_budget_to=X`` sets a NEW, higher ceiling and re-arms the soft warning
-            (the human granted more budget — proceed until the new cap);
+            (the human granted more budget — proceed until the new cap). Same contract as
+            ``create_run``'s budget: a finite amount > 0, rejected here rather than stored
+            as an unusable cap (#274);
           - otherwise the human is explicitly overriding the cap, so it is REMOVED
             (``budget_usd=None``) — no further hard stops this run.
         A breaker/other pause (not over budget) leaves the budget untouched, unless
         ``raise_budget_to`` is given explicitly."""
+        raise_budget_to = _validated_budget(
+            raise_budget_to, field="raise_budget_to", run_id=run_id
+        )
         run = self.store.load_run(run_id)
         if run.state is not RunState.PAUSED:
             raise ContractError(f"run {run_id} is not paused (state {run.state.value})")
