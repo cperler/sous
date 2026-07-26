@@ -63,6 +63,7 @@ from .render import (
 )
 from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
+from .review_workflow import issue_fingerprint, synthesize
 from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
     LANE_DETERMINISTIC_STAGES,
@@ -972,6 +973,37 @@ class Engine:
             result if gate_error is None
             else result.model_copy(update={"status": ResultStatus.FAILURE, "error": gate_error})
         )
+        # Multi-agent REVIEW synthesis (#73 design §3): a plan-bearing dispatch returns the
+        # raw panel output in ``sub_results`` and leaves ``structured_output`` to the engine.
+        # Fold it into canonical review.json HERE — deterministically, with no model call —
+        # so everything downstream (policy merge, verdict, convergence, evidence-out) reads
+        # the same shape it always has and needs no knowledge of the workflow.
+        synthesized: dict | None = None
+        if (
+            effective.stage is Stage.REVIEW
+            and effective.status is ResultStatus.SUCCESS
+            and effective.sub_results is not None
+        ):
+            synthesized, notices = synthesize(effective.sub_results)
+            if effective.structured_output is not None:
+                # The fold owns ``output`` for a plan-bearing review (design §2). A runner
+                # that ALSO self-reported a verdict does not get to keep it — that is the
+                # synthesizer-model hole the fold exists to close — but the override is
+                # never silent.
+                notices = (*notices, {
+                    "notice": "runner_output_superseded",
+                    "detail": "the runner returned both sub_results and a structured_output; "
+                              "the deterministic fold owns review.json",
+                })
+            effective = effective.model_copy(update={"structured_output": synthesized})
+            # Pure fold, engine-owned I/O (#235/#201): the fold returns what it dropped or
+            # coerced; the call site is what emits.
+            for notice in notices:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "review_synthesis_notice", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice},
+                )
         # Deterministic project policy gates (#65): merge the adapter's review_findings
         # into a completed REVIEW result BEFORE the verdict is read — the old
         # merge_e2e_policy_review_finding semantics (a blocking deterministic finding
@@ -1149,6 +1181,15 @@ class Engine:
             "error": effective.error,
             "completed_at": result.completed_at,
         }
+        # #73: the panel's RAW, unfolded output is the evidence (which lens found what, what
+        # each verifier argued); the folded review is the verdict everything else consumed,
+        # so the durable record carries both. Both writes are conditional — a plan-less
+        # review's payload stays byte-identical, and a plan-bearing result the fold did NOT
+        # run on (a FAILED review) keeps its own structured_output.
+        if result.sub_results is not None:
+            payload["sub_results"] = result.sub_results
+        if synthesized is not None:
+            payload["structured_output"] = synthesized
         seq = task.stage_counter
         self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
         self.store.write_stage_markdown(result.task_id, seq, result.stage.value, render_stage(payload))
@@ -1402,12 +1443,13 @@ class Engine:
     def _issue_fingerprint(issue: object) -> str:
         """Stable convergence key for one blocking issue (#15, ports the as-built
         ``file:description`` fingerprint, OC:993-999): normalized so cosmetic rewording
-        of the same finding still matches."""
-        if isinstance(issue, dict):
-            base = f"{str(issue.get('file') or '').strip()}:{str(issue.get('description') or '').strip()}"
-        else:
-            base = str(issue)
-        return re.sub(r"\s+", " ", base).casefold()[:160]
+        of the same finding still matches.
+
+        The rule itself now lives in ``review_workflow.issue_fingerprint`` (named
+        ``fingerprint-v1`` on a ``ReviewPlan``) because the multi-agent panel must
+        normalize identically to address a verdict at a finding (#73); this stays as the
+        engine's spelling of the same call so convergence math reads unchanged."""
+        return issue_fingerprint(issue)
 
     def _review_verdict(self, result: StageResult, task: Task) -> dict | None:
         """Interpret a completed REVIEW stage's verdict; None when there is nothing to act

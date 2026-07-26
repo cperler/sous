@@ -134,15 +134,22 @@ def make_result(
     session_ref: str | None = None,
     checkpoint: dict | None = None,
     salvage: dict | None = None,
+    sub_results: dict | None = None,
 ) -> StageResult:
     """Simulate a runner's StageResult answering a WorkItem. The lane defaults to the
     WorkItem's own policy (so a deterministic engine-lane stage records as engine:none),
-    honoring an explicit mode/provider override when a test needs one."""
+    honoring an explicit mode/provider override when a test needs one.
+
+    ``sub_results`` is the multi-agent REVIEW fake runner (#73): a plan-bearing dispatch
+    returns the raw panel output and leaves ``structured_output`` to the engine's fold, so
+    passing it suppresses the default-output fill — this drives the full engine path with
+    no real workflow runner in existence yet."""
     mode = mode if mode is not None else work.lane_policy.execution_mode
     provider = provider if provider is not None else work.lane_policy.provider
-    if structured_output is None and status is ResultStatus.SUCCESS:
+    if structured_output is None and status is ResultStatus.SUCCESS and sub_results is None:
         structured_output = _default_output(work.stage)
     return StageResult(
+        sub_results=sub_results,
         session_ref=session_ref,
         checkpoint=checkpoint,
         salvage=salvage,
