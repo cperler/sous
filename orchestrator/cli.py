@@ -953,6 +953,11 @@ def main(argv: list[str] | None = None) -> int:
         util_provider = _auto_util_provider() if args.util == "auto" else None
 
         def _queue_engine(run_id: str) -> tuple[Engine, Runner]:
+            """The ``EngineFactory`` for this drain (#281): a FRESH engine + runner
+            rooted at ``<--root>/<run_id>/``, so the derived run's StatusStore,
+            CostLedger, and stage logs never mix with another run's. Called by
+            ``drive_queue`` once per claimed entry, only after the claim has fixed
+            ``run_id``."""
             root = Path(args.root) / run_id
             root.mkdir(parents=True, exist_ok=True)
             project = load_project(args.project)
