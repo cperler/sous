@@ -15,6 +15,13 @@ Pricing is authoritative: the cost written is computed from the engine's single
 ``model_table`` (the same table used everywhere), NOT from the runner-supplied
 ``StageResult.cost_usd`` (nor a ``SubCall``'s self-reported usage pricing). A runner
 cannot under- or over-report spend; the engine's table is the single source of truth.
+
+Recording is IDEMPOTENT on the durable key ``(work_item_id, phase)`` (#277): a
+dispatch's work_item_id is unique per model call (sub-calls share it, discriminated
+by ``phase``), so replaying the same StageResult after a crash mid-``Engine.record``
+converges on the rows already on disk instead of charging the call twice. The
+scan-then-append runs under an exclusive file lock so two concurrent duplicate
+records cannot both append.
 """
 
 from __future__ import annotations
@@ -25,6 +32,7 @@ from pathlib import Path
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
 from .schemas.enums import STAGE_ORDER
 from .schemas.work import StageResult, TokenUsage
+from .status_store import file_lock
 
 # Pipeline-execution rank for a stage's string value (#154): lets by_effort() order
 # groups in the natural INTAKE→SCOPE→IMPLEMENT→TEST→DELIVER→REVIEW sequence instead of
@@ -69,7 +77,9 @@ class CostLedger:
 
         Cost is recomputed from ``model_table`` (authoritative) — the runner's
         ``result.cost_usd`` is deliberately ignored. ``duration_s`` is the engine-
-        measured wall time of the dispatch (dispatch->record).
+        measured wall time of the dispatch (dispatch->record). Idempotent (#277):
+        replaying a result whose rows are already on disk answers from those rows
+        (the view recomputed over them) without appending — see ``record_rows``.
         """
         rows = self.record_rows(result, duration_s=duration_s)
         # Keyed on the RESULT's shape, not on ``len(rows)``: a one-sub-call panel must
@@ -87,9 +97,16 @@ class CostLedger:
         ``result.sub_calls`` empty/absent -> a single dispatch row, byte-identical to the
         pre-#73 ledger line (no ``phase`` key at all). Otherwise one row per ``SubCall``,
         each priced on its OWN model and usage, and deliberately no aggregate row — the
-        report sums; the ledger must never double-count."""
+        report sums; the ledger must never double-count.
+
+        Idempotent on ``(work_item_id, phase)`` (#277): rows already on disk for this
+        dispatch are returned as-is and NOT re-appended, so a replay after a crash
+        mid-``Engine.record`` (ledger row committed, task doc not) converges. A partial
+        prior write (some of a panel's sub-call rows) appends only the missing phases.
+        The scan-then-append is atomic under an exclusive lock on the ledger file, so
+        two concurrent duplicate records cannot both append the same call."""
         if result.sub_calls:
-            rows = [
+            built = [
                 self._row(
                     result,
                     model=sub.model,
@@ -101,7 +118,7 @@ class CostLedger:
                 for sub in result.sub_calls
             ]
         else:
-            rows = [
+            built = [
                 self._row(
                     result,
                     model=result.model,
@@ -112,10 +129,51 @@ class CostLedger:
                 )
             ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row) + "\n")
+        with file_lock(self.path):
+            existing = self.existing_rows_for(result.work_item_id)
+            rows, to_append = self._converge(built, existing) if existing else (built, built)
+            if to_append:
+                with self.path.open("a", encoding="utf-8") as fh:
+                    for row in to_append:
+                        fh.write(json.dumps(row) + "\n")
         return rows
+
+    def existing_rows_for(self, work_item_id: str) -> list[dict]:
+        """The rows already recorded for one dispatch, in file order (#277).
+
+        The replay-detection read: ``Engine.record`` uses a non-empty answer as the
+        signal that a PRIOR record attempt already charged this dispatch (and so its
+        audit events may also already be on disk). O(rows) over the JSONL — the same
+        read every aggregation here performs, and a run's ledger stays small (one row
+        per model call)."""
+        return [row for row in self.rows() if row.get("work_item_id") == work_item_id]
+
+    @staticmethod
+    def _converge(built: list[dict], existing: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Fold freshly-built rows onto the dispatch's rows already on disk.
+
+        Returns ``(rows, to_append)``: ``rows`` is the built list with each row replaced
+        by its on-disk counterpart when one exists (same ``phase`` key; duplicates of a
+        phase pair up positionally), preserving the ORIGINAL priced/timestamped row;
+        ``to_append`` is the subset of built rows with no counterpart — the missing
+        phases of a partial prior write. A full prior write appends nothing."""
+        by_phase: dict[str | None, list[dict]] = {}
+        for row in existing:
+            by_phase.setdefault(row.get("phase"), []).append(row)
+        used: dict[str | None, int] = {}
+        rows: list[dict] = []
+        to_append: list[dict] = []
+        for row in built:
+            key = row.get("phase")
+            i = used.get(key, 0)
+            prior = by_phase.get(key, [])
+            if i < len(prior):
+                rows.append(prior[i])
+                used[key] = i + 1
+            else:
+                rows.append(row)
+                to_append.append(row)
+        return rows, to_append
 
     def _row(
         self,

@@ -306,6 +306,59 @@ def test_empty_sub_calls_tuple_still_writes_the_dispatch_row(tmp_path: Path) -> 
     assert "sub_calls" not in row  # an empty tuple is the plain path, not a 0-row panel
 
 
+# --- crash-replay idempotency on (work_item_id, phase) (#277) --------------------
+
+
+def test_record_replay_plain_row_converges(tmp_path: Path) -> None:
+    """Replaying the SAME StageResult (a crash between the ledger append and the
+    task-doc commit) answers from the on-disk row and appends nothing."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    result = make_result(model="claude-opus-5", input=1_000_000)
+    first = ledger.record(result)
+    replay = ledger.record(result)
+    assert replay == first  # the ORIGINAL row, not a re-priced copy
+    assert len(ledger.rows()) == 1  # the model call is charged exactly once
+    assert ledger.summary()["total_invocations"] == 1
+
+
+def test_record_replay_panel_converges(tmp_path: Path) -> None:
+    """A sub_calls panel replay converges per (work_item_id, phase): still one row per
+    sub-call, and the recomputed dispatch view sums the SAME on-disk rows."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    first = ledger.record(_panel_result(), duration_s=13.0)
+    replay = ledger.record(_panel_result(), duration_s=13.0)
+    assert len(ledger.rows()) == 3  # not 6
+    assert replay["cost_usd"] == first["cost_usd"]
+    assert replay["sub_calls"] == 3
+    assert ledger.summary()["total_invocations"] == 3
+
+
+def test_record_replay_partial_prior_rows_appends_only_missing_phases(tmp_path: Path) -> None:
+    """A crash MID-append (some of a panel's rows on disk) replays to exactly the full
+    set: the surviving prior row is kept as-is and only the missing phases append."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0] + "\n")  # simulate: only the first sub-call row survived
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    assert rows[0] == json.loads(lines[0])  # the prior row, untouched
+    on_disk = ledger.rows()
+    assert len(on_disk) == 3
+    assert [r["phase"] for r in on_disk] == ["find:code", "find:tests", "verify:3"]
+
+
+def test_distinct_work_items_still_append_normally(tmp_path: Path) -> None:
+    """The idempotency key is the dispatch id — different dispatches of the same
+    stage/model/usage must never converge onto each other."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    assert len(ledger.rows()) == 2
+
+
 def test_single_sub_call_still_returns_the_aggregate_view(tmp_path: Path) -> None:
     """The return shape keys on the RESULT (has sub_calls?), not on the row count — a
     one-finder panel answers with the same aggregate view a three-finder one does."""
@@ -369,9 +422,11 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
 
 def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
-    r1 = make_result(model="claude-opus-5", input=1_000_000, output=0)
-    r2 = make_result(model="claude-opus-5", input=0, output=1_000_000)
-    r3 = make_result(model="claude-sonnet-5", input=1_000_000, output=0)
+    # Distinct work_item_ids: each is a distinct model call, and recording is
+    # idempotent on (work_item_id, phase) — a reused id would converge, not append (#277).
+    r1 = make_result(model="claude-opus-5", input=1_000_000, output=0, work_item_id="wi-1")
+    r2 = make_result(model="claude-opus-5", input=0, output=1_000_000, work_item_id="wi-2")
+    r3 = make_result(model="claude-sonnet-5", input=1_000_000, output=0, work_item_id="wi-3")
     for r in (r1, r2, r3):
         ledger.record(r)
 

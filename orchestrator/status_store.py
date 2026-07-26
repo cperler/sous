@@ -41,6 +41,41 @@ def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
 
 
+@contextmanager
+def file_lock(path: Path) -> Iterator[None]:
+    """Exclusive advisory lock keyed on ``path`` (flock, with mkdir-spin fallback).
+
+    Module-level so writers OUTSIDE the status store can share the exact same
+    locking contract on their own files — the cost ledger's scan-then-append
+    idempotency (#277) needs the same mutual exclusion the status docs get.
+    """
+    path = Path(path)
+    if _HAVE_FCNTL:
+        lock_file = path.with_name(f"{path.name}.lock")
+        fh = open(lock_file, "w")  # noqa: SIM115 - held across the yield
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+            yield
+        finally:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+    else:  # pragma: no cover - exercised only without fcntl
+        lock_dir = path.with_name(f"{path.name}.lockdir")
+        while True:
+            try:
+                os.mkdir(lock_dir)
+                break
+            except FileExistsError:
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            with contextlib.suppress(OSError):
+                os.rmdir(lock_dir)
+
+
 def safe_task_dirname(task_id: str) -> str:
     """The filesystem-safe directory component for a task's per-stage log tree
     (``stages/<safe>/``). Extracted so the execution adapters that tee raw provider
@@ -91,32 +126,8 @@ class StatusStore:
     @contextmanager
     def with_lock(self, path: Path) -> Iterator[None]:
         """Exclusive lock keyed on ``path`` (flock, with mkdir-spin fallback)."""
-
-        path = Path(path)
-        if _HAVE_FCNTL:
-            lock_file = path.with_name(f"{path.name}.lock")
-            fh = open(lock_file, "w")  # noqa: SIM115 - held across the yield
-            try:
-                fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
-                yield
-            finally:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-                finally:
-                    fh.close()
-        else:  # pragma: no cover - exercised only without fcntl
-            lock_dir = path.with_name(f"{path.name}.lockdir")
-            while True:
-                try:
-                    os.mkdir(lock_dir)
-                    break
-                except FileExistsError:
-                    time.sleep(0.01)
-            try:
-                yield
-            finally:
-                with contextlib.suppress(OSError):
-                    os.rmdir(lock_dir)
+        with file_lock(path):
+            yield
 
     def sweep_locks(self) -> int:
         """Delete the ``.lock``/``.lockdir`` sentinels under the run dir; return the count.

@@ -84,7 +84,7 @@ from .schemas.enums import (
     effort_below,
     resolve_effort,
 )
-from .schemas.status import Run, Task, TaskRef
+from .schemas.status import Run, StageRecord, Task, TaskRef
 from .schemas.work import LanePolicy, LaneUsed, ReviewPlan, StageResult, TokenUsage, WorkItem
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
@@ -1031,11 +1031,26 @@ class Engine:
             diff_stat=self._deterministic_diff_stat(task),
         )
 
-    def record(self, run_id: str, result: StageResult) -> dict:
-        task = self.store.load_task(run_id, result.task_id)
-        # A result is only valid against the WorkItem currently outstanding for this
-        # task. No outstanding dispatch (pending is None) => a replay/duplicate; reject
-        # so a stale result can never be re-folded into an already-advanced stage.
+    @staticmethod
+    def _validate_result_lease(task: Task, run_id: str, result: StageResult) -> StageRecord:
+        """Validate ``result`` against the task's outstanding dispatch lease; returns the
+        dispatched stage record, raising ``ContractError`` on any mismatch.
+
+        A result is only valid against the WorkItem currently outstanding for this
+        task. No outstanding dispatch (pending is None) => a replay/duplicate; reject
+        so a stale result can never be re-folded into an already-advanced stage.
+        content_hash is an echoed string; the result still carries its OWN
+        stage/model/attempt/run_id, and those drive pricing (result.model) and which
+        stage record we fold into (result.stage). Bind them to what was actually
+        dispatched so a buggy runner or hand-edited result can't complete the wrong
+        stage or price the wrong model. task.current_stage is the dispatched stage
+        (begin_stage set it; a dispatch is outstanding).
+
+        Called TWICE per ``record`` (#277): once lock-free as the cheap early reject
+        (BEFORE the first side effect, the ledger row), and again on the freshly-loaded
+        doc inside the locked commit — the authoritative check that makes two
+        concurrent duplicate records mutually exclusive (the loser sees the cleared
+        lease under the lock and raises)."""
         if task.pending_work_item_id is None:
             raise ContractError(
                 f"no dispatch outstanding for task {result.task_id} — refusing replayed result "
@@ -1047,12 +1062,6 @@ class Engine:
             )
         if result.content_hash != task.pending_content_hash:
             raise ContractError("result content_hash does not match the dispatched WorkItem")
-        # content_hash is an echoed string; the result still carries its OWN
-        # stage/model/attempt/run_id, and those drive pricing (result.model) and which
-        # stage record we fold into (result.stage). Bind them to what was actually
-        # dispatched so a buggy runner or hand-edited result can't complete the wrong
-        # stage or price the wrong model. task.current_stage is the dispatched stage
-        # (begin_stage set it; a dispatch is outstanding).
         if result.run_id != run_id:
             raise ContractError(f"result run_id {result.run_id} != dispatched {run_id}")
         dispatched_stage = task.current_stage
@@ -1069,6 +1078,15 @@ class Engine:
             raise ContractError(
                 f"result attempt {result.attempt} != dispatched {dispatched.attempt}"
             )
+        return dispatched
+
+    def record(self, run_id: str, result: StageResult) -> dict:
+        task = self.store.load_task(run_id, result.task_id)
+        # Optimistic pre-validation OUTSIDE the lock (#277): reject an ordinary stale/
+        # replayed result cheaply BEFORE the first side effect (the ledger row). The
+        # authoritative re-validation runs on the freshly-loaded doc inside the locked
+        # commit below.
+        dispatched = self._validate_result_lease(task, run_id, result)
 
         # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
         # and the engine share one model table; compute once, in the ledger). Wall time
@@ -1083,6 +1101,14 @@ class Engine:
                 )
             except ValueError:
                 duration_s = None
+        # #277 crash-idempotency: a non-empty ``existing_rows_for`` answer means a PRIOR
+        # record attempt already charged this dispatch and then crashed before the
+        # task-doc commit (the lease is still held, so pre-validation passed) — this
+        # call is a replay that must CONVERGE, not duplicate. The ledger itself is
+        # idempotent on (work_item_id, phase), so ``record`` answers from the on-disk
+        # rows without appending; the flag additionally gates the stage_recorded
+        # event dedupe at the commit below.
+        replayed_after_charge = bool(self.ledger.existing_rows_for(result.work_item_id))
         cost = self.ledger.record(result, duration_s=duration_s)["cost_usd"]
 
         # Attributed/clean iff the lane actually used is a sanctioned (registered) cell.
@@ -1101,6 +1127,11 @@ class Engine:
             result if gate_error is None
             else result.model_copy(update={"status": ResultStatus.FAILURE, "error": gate_error})
         )
+        # #277: every audit event this record produces is COLLECTED here and appended
+        # events-first inside the single locked commit below (``commit_task_events``),
+        # with the task doc written last as the one durable commit point — so a crash
+        # can never persist a task transition whose events are not already on disk.
+        events: list[dict] = []
         # Multi-agent REVIEW synthesis (#73 design §3): a plan-bearing dispatch returns the
         # raw panel output in ``sub_results`` and leaves ``structured_output`` to the engine.
         # Fold it into canonical review.json HERE — deterministically, with no model call —
@@ -1125,13 +1156,12 @@ class Engine:
                 })
             effective = effective.model_copy(update={"structured_output": synthesized})
             # Pure fold, engine-owned I/O (#235/#201): the fold returns what it dropped or
-            # coerced; the call site is what emits.
-            for notice in notices:
-                self.store.append_event(
-                    run_id,
-                    {"ts": _now(), "type": "review_synthesis_notice", "run_id": run_id,
-                     "task_id": effective.task_id, "stage": effective.stage.value, **notice},
-                )
+            # coerced; the call site is what emits (into the atomic commit batch, #277).
+            events.extend(
+                {"ts": _now(), "type": "review_synthesis_notice", "run_id": run_id,
+                 "task_id": effective.task_id, "stage": effective.stage.value, **notice}
+                for notice in notices
+            )
         # Deterministic project policy gates (#65): merge the adapter's review_findings
         # into a completed REVIEW result BEFORE the verdict is read — the old
         # merge_e2e_policy_review_finding semantics (a blocking deterministic finding
@@ -1155,200 +1185,288 @@ class Engine:
         # two "the (codex) provider is out" signals #7 falls through on: a runner-reported
         # PROVIDER_UNAVAILABLE (CLI missing / auth), OR a floor rate-limit whose wait budget is
         # spent. It stays None while a cooldown wait remains (that is not exhaustion yet).
-        cooldown_until: str | None = None
-        provider_out_reason: str | None = None
-        if effective.status is ResultStatus.PROVIDER_UNAVAILABLE:
-            provider_out_reason = effective.error or "provider reported unavailable"
-        elif effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
-            if task.rate_limit_waits < self.max_rate_limit_waits:
-                cooldown_until = (
-                    datetime.now(UTC) + timedelta(seconds=self.rate_limit_cooldown_s)
-                ).isoformat()
-            else:
-                provider_out_reason = (
-                    "rate-limited with no cheaper fallback available and the "
-                    f"cooldown budget exhausted ({task.rate_limit_waits} waits)"
-                )
-
-        # Cross-provider fallthrough (#7): opt-in, one-way (codex→claude), once per stage. When
-        # a CODEX dispatch's same-provider options are exhausted (provider_out_reason set) and
-        # the run consented (cross_provider_fallback), re-route this stage's NEXT dispatch to the
-        # equivalent claude lane instead of failing/parking. Keyed off the lane ACTUALLY used
-        # (ground truth), so a claude result never falls through — no ping-pong.
+        # Decided inside the locked commit below, where the wait budget reads the FRESH doc.
+        # The run doc is loaded lock-free HERE, before the task lock — the run LOCK is
+        # never taken inside the task lock (established ordering).
         run = self.store.load_run(run_id)
-        do_fallthrough = (
-            provider_out_reason is not None
-            and run.cross_provider_fallback
-            and result.lane_used.provider is Provider.CODEX
-            and result.stage not in task.fallthrough_stages
-        )
-        if provider_out_reason is not None and not do_fallthrough:
-            # No fallthrough (flag off / not codex / already fell through once): a provider-out
-            # signal degrades to a normal FAILURE — retry within the provider, then fail out,
-            # exactly as before #7 existed. Idempotent for a rate-limit already FAILURE-shaped;
-            # the meaningful conversion is PROVIDER_UNAVAILABLE → FAILURE.
-            effective = effective.model_copy(update={
-                "status": ResultStatus.FAILURE, "error": provider_out_reason,
-            })
 
-        task.pending_work_item_id = None
-        task.pending_content_hash = None
-
-        outcome: str
+        # Decision/mutation state the locked commit captures (nonlocal) for the
+        # post-commit effects and the return value (#277).
+        outcome = ""
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
-        if do_fallthrough:
-            # do_fallthrough implies provider_out_reason is not None (see above); assert it so
-            # the reason: str parameter type-checks without laundering the None through.
-            assert provider_out_reason is not None
-            outcome = self._apply_fallthrough(task, result, provider_out_reason)
-        elif effective.status is ResultStatus.RATE_LIMITED:
-            # Transient: re-queue the stage (RUNNING marker keeps the attempt) — either
-            # immediately on a cheaper model, or after a cooldown on the original one.
-            # No apply_result/learnings/breaker, but cost is recorded.
-            rec = task.stages[result.stage]
-            rec.status = StageStatus.RUNNING
-            rec.completed_at = None
-            rec.error = None
-            task.state = TaskState.RETRYING
-            task.updated_at = _now()
-            # Rate-limit is a salvageable KIND (SALVAGEABLE_FAILURE_STATUSES): if the
-            # attempt committed real work before the 429, keep it in place so the seamless
-            # re-queue (cheaper model / post-cooldown) builds on it instead of resetting to
-            # the checkpoint. Same cap as the failure path (#59).
-            self._apply_salvage(task, effective)
-            if cooldown_until is None:
-                task.pending_fallback_model = fallback_model
-                outcome = "stage_rate_limited_fallback"
-            else:
-                task.rate_limit_waits += 1
-                task.not_before = cooldown_until
-                outcome = "stage_rate_limited_cooldown"
-        else:
-            pr_field_notices = apply_result(task, effective, now=_now(), cost_usd=cost)
-            # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
-            # the fold is no longer invisible — surface each drop as a warning-grade audit
-            # event, mirroring effort_downgraded/model_downgraded ('never silent').
-            for notice in pr_field_notices:
-                self.store.append_event(
-                    run_id,
-                    {"ts": _now(), "type": "pr_field_dropped", "run_id": run_id,
-                     "task_id": effective.task_id, "stage": effective.stage.value, **notice},
-                )
-            if effective.status is ResultStatus.SUCCESS:
-                task.error_signatures = []  # streak resets on a clean stage
-                task.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
-                task.infra_resets = 0  # ... and the infra-reset budget (#14)
-                task.salvage_count = 0  # ... and the salvage-keep budget (#59)
-                task.salvage_in_place = False  # a clean stage leaves nothing to keep
-                # Session chaining (design pass §2): reuse across SUCCESSFUL stage
-                # transitions only. A runner that reports no ref leaves the prior one
-                # in place (resuming a slightly-stale session is safe: prompts are
-                # self-contained and a dead session cold-starts in the transport).
-                if effective.session_ref:
-                    task.session_ref = effective.session_ref
-                    # Tag the ref with the provider that produced it (#9) so a later stage
-                    # on the other provider won't try to resume a foreign session.
-                    task.session_provider = effective.lane_used.provider
-                # Checkpoint anchor (design pass §3): SUCCESS only — a failed or
-                # gate-vetoed attempt's commits must never become a reset target.
-                if effective.checkpoint:
-                    task.last_checkpoint = effective.checkpoint
-                # Feasibility gate (issue #45): a completed SCOPE stage that explicitly
-                # reports feasible=false parks the task at the human approval gate rather
-                # than advancing to implement a no-op. apply_result already folded
-                # blocked_reason into task.context (CONTEXT_KEYS[SCOPE]); we reuse the
-                # non-terminal BLOCKED_ON_HUMAN state (park-for-human) — an autonomous
-                # hard-close is deferred to its own issue. Fail-open (see helper).
-                scope_blocked_reason = self._scope_not_feasible(effective)
-                # Review gate: a completed REVIEW that explicitly reports approved=false
-                # must never fall through to task_completed (the old system's strongest
-                # quality loop — restored as a bounded fix cycle; issue #15 keeps the
-                # convergence-auto-approval refinement).
-                review_verdict = self._review_verdict(effective, task)
-                if scope_blocked_reason is not None:
-                    task.state = TaskState.BLOCKED_ON_HUMAN
-                    outcome = "scope_not_feasible_held"
-                elif review_verdict is not None and review_verdict["kind"] == "rejected":
-                    outcome = self._apply_review_rejection(task, review_verdict)
-                elif is_done(task):
-                    task.state = TaskState.COMPLETED
-                    outcome = "task_completed"
-                else:
-                    task.state = TaskState.RUNNING
-                    outcome = "stage_completed"
-            else:
-                # Session fate on a failure is decided inside _handle_failure (it has the
-                # infra classification + the salvage decision the warm-retry policy needs).
-                # Default: clear (design pass §2 fresh-after-failure). Warm retry (#8) keeps
-                # it only when the run opted in AND the failure was mechanical AND the
-                # worktree still matches the session — see _settle_failed_session.
-                outcome = self._handle_failure(task, effective, run=run)
+        cooldown_until: str | None = None
+        provider_out_reason: str | None = None
 
-        # Durable per-stage log (JSON contract) + human-readable Markdown alongside.
-        task.stage_counter += 1
-        payload = {
-            "work_item_id": result.work_item_id,
-            "stage": result.stage.value,
-            "task_id": result.task_id,
-            "attempt": result.attempt,
-            "status": effective.status.value,
-            "outcome": outcome,
-            "model": result.model,
-            "effort": result.effort,  # #96: the reasoning effort the dispatch ran at
-            "lane_used": result.lane_used.model_dump(),
-            "cost_usd": cost,
-            "session_ref": result.session_ref,
-            "checkpoint": result.checkpoint,
-            "salvage": result.salvage,
-            "salvage_kept": task.salvage_in_place,
-            "stream_files": result.stream_files,  # #56: raw provider stdout/stderr on disk
-            "persona_injected": result.persona_injected,  # #74: codex worktree AGENTS.md persona
-            "structured_output": result.structured_output,
-            "raw_output": result.raw_output,
-            "error": effective.error,
-            "completed_at": result.completed_at,
-        }
-        # #73: the panel's RAW, unfolded output is the evidence (which lens found what, what
-        # each verifier argued); the folded review is the verdict everything else consumed,
-        # so the durable record carries both. Both writes are conditional — a plan-less
-        # review's payload stays byte-identical, and a plan-bearing result the fold did NOT
-        # run on (a FAILED review) keeps its own structured_output.
-        if result.sub_results is not None:
-            payload["sub_results"] = result.sub_results
-        if synthesized is not None:
-            payload["structured_output"] = synthesized
-        seq = task.stage_counter
-        self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
-        self.store.write_stage_markdown(result.task_id, seq, result.stage.value, render_stage(payload))
-        self.store.save_task(task)
+        def _commit(t: Task) -> None:
+            nonlocal effective, outcome, scope_blocked_reason, review_verdict
+            nonlocal cooldown_until, provider_out_reason
+            # Authoritative lease validation under the task lock (#277): the whole
+            # validate→transition sequence is one read-modify-write on the fresh doc,
+            # so of two concurrent duplicate records exactly one clears the lease —
+            # the loser sees it already cleared here and gets the ContractError replay
+            # rejection (after the idempotent ledger call, before any task mutation).
+            self._validate_result_lease(t, run_id, result)
+            if effective.status is ResultStatus.PROVIDER_UNAVAILABLE:
+                provider_out_reason = effective.error or "provider reported unavailable"
+            elif effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
+                if t.rate_limit_waits < self.max_rate_limit_waits:
+                    cooldown_until = (
+                        datetime.now(UTC) + timedelta(seconds=self.rate_limit_cooldown_s)
+                    ).isoformat()
+                else:
+                    provider_out_reason = (
+                        "rate-limited with no cheaper fallback available and the "
+                        f"cooldown budget exhausted ({t.rate_limit_waits} waits)"
+                    )
+
+            # Cross-provider fallthrough (#7): opt-in, one-way (codex→claude), once per
+            # stage. When a CODEX dispatch's same-provider options are exhausted
+            # (provider_out_reason set) and the run consented (cross_provider_fallback),
+            # re-route this stage's NEXT dispatch to the equivalent claude lane instead
+            # of failing/parking. Keyed off the lane ACTUALLY used (ground truth), so a
+            # claude result never falls through — no ping-pong.
+            do_fallthrough = (
+                provider_out_reason is not None
+                and run.cross_provider_fallback
+                and result.lane_used.provider is Provider.CODEX
+                and result.stage not in t.fallthrough_stages
+            )
+            if provider_out_reason is not None and not do_fallthrough:
+                # No fallthrough (flag off / not codex / already fell through once): a
+                # provider-out signal degrades to a normal FAILURE — retry within the
+                # provider, then fail out, exactly as before #7 existed. Idempotent for a
+                # rate-limit already FAILURE-shaped; the meaningful conversion is
+                # PROVIDER_UNAVAILABLE → FAILURE.
+                effective = effective.model_copy(update={
+                    "status": ResultStatus.FAILURE, "error": provider_out_reason,
+                })
+
+            t.pending_work_item_id = None
+            t.pending_content_hash = None
+
+            if do_fallthrough:
+                # do_fallthrough implies provider_out_reason is not None (see above);
+                # assert it so the reason: str parameter type-checks without laundering
+                # the None through.
+                assert provider_out_reason is not None
+                outcome = self._apply_fallthrough(t, result, provider_out_reason)
+            elif effective.status is ResultStatus.RATE_LIMITED:
+                # Transient: re-queue the stage (RUNNING marker keeps the attempt) — either
+                # immediately on a cheaper model, or after a cooldown on the original one.
+                # No apply_result/learnings/breaker, but cost is recorded.
+                rec = t.stages[result.stage]
+                rec.status = StageStatus.RUNNING
+                rec.completed_at = None
+                rec.error = None
+                t.state = TaskState.RETRYING
+                t.updated_at = _now()
+                # Rate-limit is a salvageable KIND (SALVAGEABLE_FAILURE_STATUSES): if the
+                # attempt committed real work before the 429, keep it in place so the seamless
+                # re-queue (cheaper model / post-cooldown) builds on it instead of resetting to
+                # the checkpoint. Same cap as the failure path (#59).
+                self._apply_salvage(t, effective)
+                if cooldown_until is None:
+                    t.pending_fallback_model = fallback_model
+                    outcome = "stage_rate_limited_fallback"
+                else:
+                    t.rate_limit_waits += 1
+                    t.not_before = cooldown_until
+                    outcome = "stage_rate_limited_cooldown"
+            else:
+                pr_field_notices = apply_result(t, effective, now=_now(), cost_usd=cost)
+                # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
+                # the fold is no longer invisible — surface each drop as a warning-grade audit
+                # event, mirroring effort_downgraded/model_downgraded ('never silent').
+                events.extend(
+                    {"ts": _now(), "type": "pr_field_dropped", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice}
+                    for notice in pr_field_notices
+                )
+                if effective.status is ResultStatus.SUCCESS:
+                    t.error_signatures = []  # streak resets on a clean stage
+                    t.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
+                    t.infra_resets = 0  # ... and the infra-reset budget (#14)
+                    t.salvage_count = 0  # ... and the salvage-keep budget (#59)
+                    t.salvage_in_place = False  # a clean stage leaves nothing to keep
+                    # Session chaining (design pass §2): reuse across SUCCESSFUL stage
+                    # transitions only. A runner that reports no ref leaves the prior one
+                    # in place (resuming a slightly-stale session is safe: prompts are
+                    # self-contained and a dead session cold-starts in the transport).
+                    if effective.session_ref:
+                        t.session_ref = effective.session_ref
+                        # Tag the ref with the provider that produced it (#9) so a later stage
+                        # on the other provider won't try to resume a foreign session.
+                        t.session_provider = effective.lane_used.provider
+                    # Checkpoint anchor (design pass §3): SUCCESS only — a failed or
+                    # gate-vetoed attempt's commits must never become a reset target.
+                    if effective.checkpoint:
+                        t.last_checkpoint = effective.checkpoint
+                    # Feasibility gate (issue #45): a completed SCOPE stage that explicitly
+                    # reports feasible=false parks the task at the human approval gate rather
+                    # than advancing to implement a no-op. apply_result already folded
+                    # blocked_reason into task.context (CONTEXT_KEYS[SCOPE]); we reuse the
+                    # non-terminal BLOCKED_ON_HUMAN state (park-for-human) — an autonomous
+                    # hard-close is deferred to its own issue. Fail-open (see helper).
+                    scope_blocked_reason = self._scope_not_feasible(effective)
+                    # Review gate: a completed REVIEW that explicitly reports approved=false
+                    # must never fall through to task_completed (the old system's strongest
+                    # quality loop — restored as a bounded fix cycle; issue #15 keeps the
+                    # convergence-auto-approval refinement).
+                    review_verdict = self._review_verdict(effective, t)
+                    if scope_blocked_reason is not None:
+                        t.state = TaskState.BLOCKED_ON_HUMAN
+                        outcome = "scope_not_feasible_held"
+                    elif review_verdict is not None and review_verdict["kind"] == "rejected":
+                        outcome = self._apply_review_rejection(t, review_verdict)
+                    elif is_done(t):
+                        t.state = TaskState.COMPLETED
+                        outcome = "task_completed"
+                    else:
+                        t.state = TaskState.RUNNING
+                        outcome = "stage_completed"
+                else:
+                    # Session fate on a failure is decided inside _handle_failure (it has the
+                    # infra classification + the salvage decision the warm-retry policy needs).
+                    # Default: clear (design pass §2 fresh-after-failure). Warm retry (#8) keeps
+                    # it only when the run opted in AND the failure was mechanical AND the
+                    # worktree still matches the session — see _settle_failed_session.
+                    outcome = self._handle_failure(t, effective, run=run)
+            # The per-stage log sequence is claimed under the same lock as the mutation,
+            # so a replay recomputes the SAME seq (the counter only persists with the doc).
+            t.stage_counter += 1
+
+        def _stage_events(t: Task) -> list[dict]:
+            # Runs under the SAME task lock, after the mutation and before the task-doc
+            # write. The durable per-stage log (JSON contract) + human-readable Markdown
+            # are (re)written first — atomic overwrites keyed on the just-claimed stage
+            # counter, so a crash-replay converges on the same paths — then the audit
+            # batch is returned for commit_task_events' events-first append (task doc
+            # LAST, the single durable commit point).
+            payload = {
+                "work_item_id": result.work_item_id,
+                "stage": result.stage.value,
+                "task_id": result.task_id,
+                "attempt": result.attempt,
+                "status": effective.status.value,
+                "outcome": outcome,
+                "model": result.model,
+                "effort": result.effort,  # #96: the reasoning effort the dispatch ran at
+                "lane_used": result.lane_used.model_dump(),
+                "cost_usd": cost,
+                "session_ref": result.session_ref,
+                "checkpoint": result.checkpoint,
+                "salvage": result.salvage,
+                "salvage_kept": t.salvage_in_place,
+                "stream_files": result.stream_files,  # #56: raw provider stdout/stderr on disk
+                "persona_injected": result.persona_injected,  # #74: codex worktree AGENTS.md persona
+                "structured_output": result.structured_output,
+                "raw_output": result.raw_output,
+                "error": effective.error,
+                "completed_at": result.completed_at,
+            }
+            # #73: the panel's RAW, unfolded output is the evidence (which lens found what,
+            # what each verifier argued); the folded review is the verdict everything else
+            # consumed, so the durable record carries both. Both writes are conditional — a
+            # plan-less review's payload stays byte-identical, and a plan-bearing result the
+            # fold did NOT run on (a FAILED review) keeps its own structured_output.
+            if result.sub_results is not None:
+                payload["sub_results"] = result.sub_results
+            if synthesized is not None:
+                payload["structured_output"] = synthesized
+            seq = t.stage_counter
+            self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
+            self.store.write_stage_markdown(
+                result.task_id, seq, result.stage.value, render_stage(payload)
+            )
+            # Audit the cross-provider fallthrough (#7): the run consented and codex was
+            # out, so the stage's NEXT dispatch is re-routed to claude — from→to + why.
+            if outcome == "provider_fallthrough":
+                events.append(
+                    {"ts": _now(), "type": "provider_fallthrough", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "from": Provider.CODEX.value, "to": Provider.CLAUDE.value,
+                     "reason": provider_out_reason,
+                     "attempt": result.attempt}
+                )
+            # Audit a cooldown park: when the task may dispatch again, and how much of the
+            # wait budget is spent — so a stalled-looking run explains itself in the events.
+            if outcome == "stage_rate_limited_cooldown":
+                events.append(
+                    {"ts": _now(), "type": "rate_limit_cooldown", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "not_before": t.not_before,
+                     "waits_used": t.rate_limit_waits,
+                     "waits_budget": self.max_rate_limit_waits}
+                )
+            # Audit the review verdict alongside the generic stage record: what the reviewer
+            # rejected (or auto-approved as suggestions-only) and how it was disposed of.
+            if review_verdict is not None:
+                events.append(
+                    {"ts": _now(), "type": "review_verdict", "run_id": run_id,
+                     "task_id": result.task_id, "kind": review_verdict["kind"],
+                     "disposition": review_verdict.get("disposition"),
+                     "issues": review_verdict["issues_text"],
+                     "review_cycles": t.review_cycles}
+                )
+            # Audit the WHY of a feasibility park alongside the generic stage record, so the
+            # event stream shows the blocked_reason that routed the task to the human gate.
+            if scope_blocked_reason is not None:
+                events.append(
+                    {"ts": _now(), "type": "scope_not_feasible", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "blocked_reason": scope_blocked_reason}
+                )
+            # The generic stage record goes LAST in the batch (#277): its presence in
+            # events.jsonl therefore proves the whole batch landed, making it the replay
+            # dedupe key below — a crash mid-batch re-appends (duplicating at worst an
+            # auxiliary audit line) rather than ever losing an event.
+            events.append(
+                {
+                    "ts": _now(),
+                    "type": "stage_recorded",
+                    "run_id": run_id,
+                    "task_id": result.task_id,
+                    "stage": result.stage.value,
+                    "attempt": result.attempt,
+                    # #175: stamp the closed lease so the events-balance audit can join a
+                    # `stage_recorded` back to its opening `stage_dispatched` by work_item_id
+                    # (lease_superseded/dispatch_abandoned already carry it) — the join key
+                    # that turns the #142 hand-count into an automated orphan check.
+                    "work_item_id": result.work_item_id,
+                    "effort": result.effort,  # #96: audit alongside model/lane
+                    "status": effective.status.value,
+                    "outcome": outcome,
+                    "lane": result.lane_used.execution_mode.value,
+                    "provider": result.lane_used.provider.value,
+                    "cost_usd": cost,
+                    "task_state": t.state.value,
+                }
+            )
+            # #277 replay convergence: when a PRIOR record attempt both charged the
+            # ledger AND appended this dispatch's `stage_recorded` (it crashed at the
+            # task-doc write, the only boundary left), the batch is already durable —
+            # append nothing and let the doc commit converge the task state. The scan
+            # runs only on the replay-candidate path, so the common case pays nothing.
+            if replayed_after_charge and any(
+                ev.get("type") == "stage_recorded"
+                and ev.get("work_item_id") == result.work_item_id
+                for ev in self.store.read_events(run_id)
+            ):
+                return []
+            return events
+
+        # #277: ONE transaction boundary — the lease re-check + task transition run under
+        # the task lock, the audit events append FIRST (each atomic), and the task doc is
+        # written LAST as the single durable commit point (the commit_task_events pattern,
+        # #174/#199). The idempotent ledger row and the idempotent per-stage artifacts
+        # land before that point; everything after it (index/ref-state/progress and the
+        # run-level effects below) is re-derivable best-effort.
+        task = self.store.commit_task_events(run_id, result.task_id, _commit, _stage_events)
         self.store.write_task_index(result.task_id, render_task_index(task))
         # cost-summary.md is written at run finalization and on status() — NOT on
         # every record (that re-read the whole ledger each time: O(N^2) on long runs).
         self._set_ref_state(run_id, result.task_id, task.state)
-        self.store.append_event(
-            run_id,
-            {
-                "ts": _now(),
-                "type": "stage_recorded",
-                "run_id": run_id,
-                "task_id": result.task_id,
-                "stage": result.stage.value,
-                "attempt": result.attempt,
-                # #175: stamp the closed lease so the events-balance audit can join a
-                # `stage_recorded` back to its opening `stage_dispatched` by work_item_id
-                # (lease_superseded/dispatch_abandoned already carry it) — the join key that
-                # turns the #142 hand-count into an automated orphan check.
-                "work_item_id": result.work_item_id,
-                "effort": result.effort,  # #96: audit alongside model/lane
-                "status": effective.status.value,
-                "outcome": outcome,
-                "lane": result.lane_used.execution_mode.value,
-                "provider": result.lane_used.provider.value,
-                "cost_usd": cost,
-                "task_state": task.state.value,
-            },
-        )
         # Mid-run progress commentary (#64): upsert the living progress comment/PR-body
         # section on the driving issue/PR at this stage boundary (opt-in, throttled,
         # best-effort). A rate-limit re-queue and a cross-provider fallthrough are NOT
@@ -1356,48 +1474,6 @@ class Engine:
         # running/next picture doesn't flicker.
         if not outcome.startswith("stage_rate_limited") and outcome != "provider_fallthrough":
             self._maybe_publish_progress(run_id, task)
-        # Audit the cross-provider fallthrough (#7): the run consented and codex was out, so
-        # the stage's NEXT dispatch is re-routed to claude — record from→to + why.
-        if outcome == "provider_fallthrough":
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "provider_fallthrough", "run_id": run_id,
-                 "task_id": result.task_id, "stage": result.stage.value,
-                 "from": Provider.CODEX.value, "to": Provider.CLAUDE.value,
-                 "reason": provider_out_reason,
-                 "attempt": result.attempt},
-            )
-        # Audit a cooldown park: when the task may dispatch again, and how much of the
-        # wait budget is spent — so a stalled-looking run explains itself in the events.
-        if outcome == "stage_rate_limited_cooldown":
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "rate_limit_cooldown", "run_id": run_id,
-                 "task_id": result.task_id, "stage": result.stage.value,
-                 "not_before": task.not_before,
-                 "waits_used": task.rate_limit_waits,
-                 "waits_budget": self.max_rate_limit_waits},
-            )
-        # Audit the review verdict alongside the generic stage record: what the reviewer
-        # rejected (or auto-approved as suggestions-only) and how the engine disposed of it.
-        if review_verdict is not None:
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "review_verdict", "run_id": run_id,
-                 "task_id": result.task_id, "kind": review_verdict["kind"],
-                 "disposition": review_verdict.get("disposition"),
-                 "issues": review_verdict["issues_text"],
-                 "review_cycles": task.review_cycles},
-            )
-        # Audit the WHY of a feasibility park alongside the generic stage record, so the
-        # event stream shows the blocked_reason that routed the task to the human gate.
-        if scope_blocked_reason is not None:
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "scope_not_feasible", "run_id": run_id,
-                 "task_id": result.task_id, "stage": result.stage.value,
-                 "blocked_reason": scope_blocked_reason},
-            )
         # Alerting (#55) + post-transition run-level effects. A terminal FAILURE routes
         # through the SHARED ``_finalize_task_terminal`` helper (#133) — the same one the
         # operator finalize paths (``reject``/``abandon``) use — so ALL post-terminal
