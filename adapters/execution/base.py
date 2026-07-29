@@ -49,6 +49,16 @@ class CapabilityDescriptor(BaseModel):
     # gracefully to the single-reviewer dispatch until its branch lands (#262) — harmless,
     # because the whole path is behind the off-by-default ``Run.review_workflow`` flag.
     supports_plan: bool = False
+    # #272: does this cell TRANSLATE a ``WorkItem.tool_policy`` into a real provider
+    # restriction (claude ``--disallowedTools``, codex ``--sandbox``)? A lane capability flag
+    # in the same spirit as ``supports_plan``, but read for HONESTY rather than gating: the
+    # engine attaches the stage's posture regardless and emits ONE warning-grade
+    # ``tool_policy_unenforced`` event when the resolved lane declares False, so a read-only
+    # REVIEW that is only a prompt convention on that lane is never silently assumed to be
+    # enforced. False for the interactive shim (``run_targets/workflow_shim.js`` passes no
+    # tool restriction on its ``agent()`` call — pairs with #262) and for the deterministic
+    # ENGINE lane (no model, hence no toolset to narrow).
+    enforces_tool_policy: bool = False
     status: CellStatus = SUPPORTED
 
     @property

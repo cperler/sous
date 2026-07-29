@@ -173,7 +173,12 @@ def _sub_item(
 
     ``id``/``content_hash`` are deliberately inherited: they identify the DISPATCH (which is
     what the engine leases and what the ledger rows share), and nothing below the seam reads
-    them. A sub-item never crosses the seam."""
+    them. A sub-item never crosses the seam.
+
+    ``tool_policy`` is deliberately inherited too, and must NOT join the strip list above
+    (#272): every finder and verifier of a panel is the same read-and-report posture as the
+    dispatch itself, and a FULL panel is up to 4 finders plus 8 verifiers — stripping it would
+    quietly re-open the hole for 12 agents at once instead of one."""
     return work.model_copy(update={
         "prompt": prompt,
         "schema_ref": schema_ref,

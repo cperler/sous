@@ -13,7 +13,7 @@ from dataclasses import dataclass
 
 from .model_table import Role
 from .schemas.enums import STAGE_ORDER, Effort, Stage
-from .schemas.work import FinderSpec, ReviewPlan
+from .schemas.work import FinderSpec, ReviewPlan, ToolPolicy
 
 
 @dataclass(frozen=True)
@@ -41,6 +41,13 @@ class StageSpec:
     # deterministic stage — the ENGINE lane has no model to throttle). A per-task
     # effort pin overrides this, mirroring how model_pin overrides model_role.
     effort: Effort | None = None
+    # Tool posture a model-lane dispatch of this stage runs under (#272), stated in the
+    # engine's provider-neutral vocabulary and translated per execution adapter (exactly
+    # like ``effort``). None = the historical everything-allowed posture, which every
+    # non-REVIEW stage keeps: ``implement`` legitimately edits files, ``test`` fixes
+    # regressions. Only REVIEW declares one, because only REVIEW's contract is
+    # read-and-report.
+    tool_policy: ToolPolicy | None = None
 
 
 # The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
@@ -139,6 +146,14 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="review",
         timeout_s=600,  # read the PR + judge
         effort=Effort.MEDIUM,  # careful judgment over a bounded diff (#96)
+        # #272: the only stage with a declared tool posture. A reviewer must not be able to
+        # mutate the tree it is judging — otherwise the verdict is about a tree the reviewer
+        # changed, and that write is invisible in the diff the implement-stage commit
+        # produced. Command execution is RETAINED deliberately (the issue's explicit
+        # trade-off): an adversarial verifier refutes a finding by running the suite.
+        # Inherited by every finder and verifier sub-call of a review panel — up to 12
+        # agents per review since #73 — via ``review_panel._sub_item``.
+        tool_policy=ToolPolicy(allow_file_writes=False),
         template=(
             "Review the PR (see pr_url in the context above) against the task goal and "
             "code quality. Assess the goal criterion-by-criterion and check for "

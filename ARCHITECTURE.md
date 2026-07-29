@@ -49,6 +49,22 @@ reverse.
   a shared task source. A new external project's adapter lives in **its own repo** under
   `<repo>/.orchestration/` (loaded by path, contract-version-checked) or ships as a package
   registering an `orchestrator.project_adapters` entry point.
+- **Per-stage tool posture, translated per lane** (#272). `StageSpec.tool_policy` declares what
+  a stage's dispatch may *do* in the engine's own provider-neutral words (`allow_file_writes`,
+  `allow_command_execution`) — never a claude tool name — and each transport translates it:
+  claude `--disallowedTools Write,Edit,NotebookEdit`, codex `--sandbox read-only` (on the
+  resume call too, so continuity can't revert the posture). Only **REVIEW** declares one:
+  writes denied, **command execution deliberately retained**, because an adversarial verifier
+  refutes a finding by running the suite. Panel finders/verifiers inherit it. `--disallowedTools`
+  is genuinely enforced under `--dangerously-skip-permissions` (the tool is absent from the
+  toolset, not merely prompted) — and that flag deliberately **stays**: headless dispatch is
+  non-interactive by construction, there is no human to answer a prompt and a prompt would hang
+  the run, so the fix narrows the toolset rather than restoring interactive gating. A lane that
+  cannot translate the posture (the interactive shim) declares
+  `CapabilityDescriptor.enforces_tool_policy = False` and the engine emits one warning-grade
+  `tool_policy_unenforced` event per dispatch, so declared-but-unenforced is never silent.
+  Because the posture is derived from the stage and lane (both already hashed), it is dispatch
+  metadata excluded from `content_hash` like `cwd`/`session_ref`.
 
 ## The pipeline
 
