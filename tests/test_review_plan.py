@@ -12,6 +12,7 @@ Design: docs/reviews/2026-07-09-fable-design-73-review-workflow.md §1/§5 (test
 
 from __future__ import annotations
 
+import json
 import subprocess
 
 from adapters.execution.base import (
@@ -25,7 +26,13 @@ from orchestrator.capacity import CapacityPolicy
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.routing import Router
-from orchestrator.schemas.enums import ExecutionLane, ExecutionMode, Provider, Stage
+from orchestrator.schemas.enums import (
+    ExecutionLane,
+    ExecutionMode,
+    Provider,
+    ResultStatus,
+    Stage,
+)
 from orchestrator.schemas.work import LanePolicy, TokenUsage, compute_content_hash
 from orchestrator.stages import DiffStat, render_prompt, render_review_plan
 from orchestrator.status_store import StatusStore
@@ -48,6 +55,32 @@ def _lenses(plan) -> list[str]:
 
 def _engine(tmp_path, project, **kw) -> Engine:
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"), project, **kw)
+
+
+def _plan_capable_registry() -> Registry:
+    """A registry whose headless×claude cell really executes plans — since #288 the ONLY
+    cell that declares ``supports_plan`` (the interactive shim ignores ``wi.plan``, #262)."""
+    reg = Registry()
+    for mode, provider, plans in (
+        (ExecutionMode.HEADLESS, Provider.CLAUDE, True),
+        (ExecutionMode.ENGINE, Provider.NONE, False),
+    ):
+        reg.register_external(CapabilityDescriptor(
+            execution_mode=mode, provider=provider, in_process=True,
+            schema_enforced=True, supports_plan=plans, status=SUPPORTED,
+        ))
+    return reg
+
+
+def _panel_engine(tmp_path, project, **kw) -> Engine:
+    """An engine on the one lane a panel can actually ride (headless×claude).
+
+    Every veto below the lane check is only reachable from here: on the DEFAULT
+    interactive×claude lane ``lane_cannot_execute_plan`` vetoes first (#288), which is itself
+    pinned by ``test_the_default_interactive_lane_cannot_carry_a_plan``."""
+    kw.setdefault("registry", _plan_capable_registry())
+    kw.setdefault("router", Router(execution_mode=ExecutionMode.HEADLESS))
+    return _engine(tmp_path, project, **kw)
 
 
 def _drive_to_review(eng, *, run="r1", task="t1", util_pct=0.0):
@@ -227,6 +260,9 @@ def test_two_finder_sets_yield_two_content_hashes() -> None:
 # --- the lane capability flag (#73 design §5) -------------------------------------------
 
 def test_only_plan_capable_cells_declare_supports_plan() -> None:
+    """#288: the flag means "this runner EXECUTES a plan", not "this runner could". A cell
+    that over-promises does not degrade gracefully — it degrades SILENTLY, because the engine
+    has nothing to veto and so emits no ``review_workflow_skipped``."""
     reg = build_registry()
     claude_headless = reg.describe(
         _lane(ExecutionMode.HEADLESS, Provider.CLAUDE)
@@ -234,11 +270,14 @@ def test_only_plan_capable_cells_declare_supports_plan() -> None:
     codex_headless = reg.describe(_lane(ExecutionMode.HEADLESS, Provider.CODEX))
     interactive = reg.describe(_lane(ExecutionMode.INTERACTIVE, Provider.CLAUDE))
     engine_lane = reg.describe(_lane(ExecutionMode.ENGINE, Provider.NONE))
-    assert claude_headless.supports_plan and interactive.supports_plan
+    assert claude_headless.supports_plan  # run_review_panel: the one lane that fans out
     assert not codex_headless.supports_plan  # no sub-agent primitive
     assert not engine_lane.supports_plan  # no model at all
+    # workflow_shim.js has agent()/parallel() but NO plan-execution branch (#262) — until it
+    # grows one the descriptor must say so, or the panel silently never runs.
+    assert not interactive.supports_plan
     # The 3a default registry declares the same for its interactive cell.
-    assert default_registry().describe(
+    assert not default_registry().describe(
         _lane(ExecutionMode.INTERACTIVE, Provider.CLAUDE)
     ).supports_plan
 
@@ -272,12 +311,14 @@ def test_flag_off_dispatches_a_byte_identical_plan_less_review(tmp_path, project
 
 
 def test_flag_on_attaches_a_plan_and_changes_the_hash(tmp_path, project) -> None:
-    off = _engine(tmp_path / "off", project)
+    # BOTH engines on the plan-capable lane, so the only difference between the two hashes is
+    # the plan itself (the lane_policy is part of the hash blob too).
+    off = _panel_engine(tmp_path / "off", project)
     off.create_run("r1")
     off.add_task("r1", "t1")
     plain = _drive_to_review(off)
 
-    on = _engine(tmp_path / "on", project)
+    on = _panel_engine(tmp_path / "on", project)
     on.create_run("r1", review_workflow=True)
     on.add_task("r1", "t1")
     w = _drive_to_review(on)
@@ -293,7 +334,7 @@ def test_flag_on_attaches_a_plan_and_changes_the_hash(tmp_path, project) -> None
 
 
 def test_no_plan_rides_a_non_review_stage(tmp_path, project) -> None:
-    eng = _engine(tmp_path, project)
+    eng = _panel_engine(tmp_path, project)
     eng.create_run("r1", review_workflow=True)
     eng.add_task("r1", "t1")
     seen = {}
@@ -340,7 +381,7 @@ def test_codex_lane_never_carries_a_plan(tmp_path, project) -> None:
 def test_micro_and_lite_presets_never_use_the_panel(tmp_path, project) -> None:
     """They exist to be cheap — a 3-agent panel is exactly what they opted out of."""
     for lane in (ExecutionLane.MICRO, ExecutionLane.LITE):
-        eng = _engine(tmp_path / lane.value, project)
+        eng = _panel_engine(tmp_path / lane.value, project)
         eng.create_run("r1", lane, review_workflow=True)
         eng.add_task("r1", "t1")
         w = _drive_to_review(eng)
@@ -349,7 +390,7 @@ def test_micro_and_lite_presets_never_use_the_panel(tmp_path, project) -> None:
 
 
 def test_a_loaded_api_falls_back_to_the_single_reviewer(tmp_path, project) -> None:
-    eng = _engine(tmp_path, project)
+    eng = _panel_engine(tmp_path, project)
     eng.create_run("r1", review_workflow=True)
     eng.add_task("r1", "t1")
     # 75% util is inside the DOWNGRADE band (>= 70, < the 90 wait gate).
@@ -361,12 +402,12 @@ def test_a_loaded_api_falls_back_to_the_single_reviewer(tmp_path, project) -> No
 def test_a_thinning_budget_falls_back_to_the_single_reviewer(tmp_path, project) -> None:
     """A panel is 3–4 model calls where one would do; a run down to its last few percent
     of budget spends that on shipping, not on scrutiny."""
-    fat = _engine(tmp_path / "fat", project)
+    fat = _panel_engine(tmp_path / "fat", project)
     fat.create_run("r1", review_workflow=True, budget_usd=10.0)
     fat.add_task("r1", "t1")
     assert _drive_to_review(fat).plan is not None  # plenty of budget: the panel runs
 
-    eng = _engine(tmp_path / "thin", project)
+    eng = _panel_engine(tmp_path / "thin", project)
     eng.create_run("r1", review_workflow=True, budget_usd=1.0)
     eng.add_task("r1", "t1")
     # SCOPE runs on the deep-reason tier at $5/Mtok input: 190k input tokens ≈ $0.95, which
@@ -379,18 +420,181 @@ def test_a_thinning_budget_falls_back_to_the_single_reviewer(tmp_path, project) 
     assert _skip_reasons(eng) == ["budget_thinning"]
 
 
+# --- #288: a requested panel that never ran must leave a trace ---------------------------
+#
+# The silent-degradation hole: a lane declaring ``supports_plan`` whose runner ignores
+# ``wi.plan`` returns no ``sub_results``, so the engine's fold is skipped, the runner's own
+# single-reviewer output is accepted verbatim, and NOTHING recorded that a panel was asked
+# for and not delivered — a `review_workflow: true` run produced reviews byte-indistinguishable
+# from single-reviewer ones (the #261 defect class).
+
+
+def _not_executed(eng, run="r1") -> list[dict]:
+    return [e for e in eng.store.read_events(run)
+            if e.get("type") == "review_plan_not_executed"]
+
+
+def _review_log(root, task="t1") -> dict:
+    """The most recent REVIEW stage-log payload — the durable per-dispatch record."""
+    return json.loads(sorted((root / "stages" / task).glob("*-review.json"))[-1].read_text())
+
+
+def test_a_plan_ignoring_runner_leaves_a_durable_machine_readable_trace(tmp_path, project):
+    """Acceptance (a): event + stage-log marker, and NO ``panel_summary`` to be miscounted."""
+    eng = _panel_engine(tmp_path, project)
+    eng.create_run("r1", review_workflow=True)
+    eng.add_task("r1", "t1")
+    w = _drive_to_review(eng)
+    assert w.plan is not None  # a panel WAS requested
+    assert eng.store.load_task("r1", "t1").pending_plan is True  # …and durably remembered
+
+    eng.record("r1", make_result(w))  # the plan-ignoring runner: no sub_results
+
+    events = _not_executed(eng)
+    assert len(events) == 1
+    ev = events[0]
+    assert ev["level"] == "warning"  # warning-grade, not an error: a degraded review is a review
+    assert ev["stage"] == "review" and ev["work_item_id"] == w.id
+    assert ev["lane"] == "headless:claude"  # names the lane that lied
+    assert ev["attempt"] == w.attempt and ev["status"] == "success"
+
+    payload = _review_log(tmp_path)
+    assert payload["review_plan_not_executed"] is True
+    assert "panel_summary" not in payload  # absence, now PAIRED with a positive marker
+    assert "sub_results" not in payload
+    # …and the review itself is untouched: the verdict is still the one the runner reported.
+    assert payload["structured_output"]["approved"] is True
+    assert payload["status"] == "success"
+    # The human-readable stage record says so too (no stage-log spelunking required).
+    md = sorted((tmp_path / "stages" / "t1").glob("*-review.md"))[-1].read_text()
+    assert "Panel requested but NOT executed" in md
+
+
+def test_a_panel_that_did_run_emits_no_marker(tmp_path, project) -> None:
+    """Acceptance (b): no false positives — a plan-bearing dispatch that returns panel
+    output folds as always and carries neither the event nor the stage-log marker."""
+    eng = _panel_engine(tmp_path, project)
+    eng.create_run("r1", review_workflow=True)
+    eng.add_task("r1", "t1")
+    w = _drive_to_review(eng)
+    eng.record("r1", make_result(w, sub_results={
+        "findings_by_lens": {"find:code": {"findings": []}}, "verdicts": [],
+    }))
+    assert _not_executed(eng) == []
+    payload = _review_log(tmp_path)
+    assert "review_plan_not_executed" not in payload
+    assert payload["panel_summary"]["finders"] == 1  # the fold ran
+    assert eng.status("r1")["review_panel"]["plan_not_executed"] == 0
+
+
+def test_a_plan_less_review_never_trips_the_marker(tmp_path, project) -> None:
+    """The permanent fallback stays quiet: no plan was dispatched, so a review with no
+    sub_results is exactly what was asked for and the payload stays byte-identical."""
+    eng = _engine(tmp_path, project)  # flag off, default lane
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    w = _drive_to_review(eng)
+    assert w.plan is None
+    eng.record("r1", make_result(w))
+    assert _not_executed(eng) == []
+    assert "review_plan_not_executed" not in _review_log(tmp_path)
+
+
+def test_a_rate_limited_plan_bearing_review_is_not_flagged(tmp_path, project) -> None:
+    """The provider never ran the WorkItem (the stage goes back on the wire, attempt intact),
+    so its plan's non-execution is not a fact about the runner — flagging it would cry wolf
+    on a run whose retry does execute the panel."""
+    eng = _panel_engine(tmp_path, project)
+    eng.create_run("r1", review_workflow=True)
+    eng.add_task("r1", "t1")
+    w = _drive_to_review(eng)
+    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED))
+    assert _not_executed(eng) == []
+    assert eng.status("r1")["review_panel"]["clean"] is True
+
+
+def test_the_default_interactive_lane_cannot_carry_a_plan(tmp_path, project) -> None:
+    """Acceptance (c): the honest path. On the interactive lane the descriptor now says it
+    cannot execute a plan, so the existing veto fires — a visible skip instead of a review
+    that merely looks like a panel's."""
+    eng = _engine(tmp_path, project)  # default registry + router: interactive×claude
+    eng.create_run("r1", review_workflow=True)
+    eng.add_task("r1", "t1")
+    w = _drive_to_review(eng)
+    assert w.plan is None
+    assert _skip_reasons(eng) == ["lane_cannot_execute_plan"]
+
+    audit = eng.status("r1")["review_panel"]
+    assert audit["clean"] is False  # the operator's --review-workflow bought nothing here
+    assert audit["workflow_skipped"] == 1
+    assert audit["workflow_skipped_by_reason"] == {"lane_cannot_execute_plan": 1}
+    assert audit["plan_not_executed"] == 0  # the OTHER path: nothing was dispatched to ignore
+
+
+def test_status_tallies_plan_not_executed_per_task(tmp_path, project) -> None:
+    """Acceptance: visible from a poll, per task, without opening a stage log."""
+    eng = _panel_engine(tmp_path, project)
+    eng.create_run("r1", review_workflow=True)
+    for task in ("t1", "t2"):
+        eng.add_task("r1", task)
+        eng.record("r1", make_result(_drive_to_review(eng, task=task)))
+    audit = eng.status("r1")["review_panel"]
+    assert audit["clean"] is False
+    assert audit["plan_not_executed"] == 2
+    assert audit["plan_not_executed_by_task"] == {"t1": 1, "t2": 1}
+    assert audit["notices"] == 0 and audit["workflow_skipped"] == 0
+
+
+def test_the_dispatched_plan_marker_never_outlives_its_lease(tmp_path, project) -> None:
+    """Acceptance (d): ``pending_plan`` is set with the lease and cleared with it — by
+    ``record`` and by ``abandon`` — so it can never mis-attribute a LATER dispatch."""
+    eng = _panel_engine(tmp_path, project)
+    eng.create_run("r1", review_workflow=True)
+    eng.add_task("r1", "t1")
+    # Every pre-REVIEW dispatch is plan-less, and the marker stays False throughout.
+    while (w := eng.next_work("r1", "t1")) is not None and w.stage is not Stage.REVIEW:
+        assert eng.store.load_task("r1", "t1").pending_plan is False
+        eng.record("r1", make_result(w))
+    assert w is not None and w.plan is not None
+    assert eng.store.load_task("r1", "t1").pending_plan is True
+    eng.record("r1", make_result(w))
+    assert eng.store.load_task("r1", "t1").pending_plan is False  # cleared with the lease
+
+    # …and the abandon path clears it too (a stuck plan-bearing dispatch).
+    eng2 = _panel_engine(tmp_path / "abandoned", project)
+    eng2.create_run("r1", review_workflow=True)
+    eng2.add_task("r1", "t1")
+    assert _drive_to_review(eng2).plan is not None
+    assert eng2.store.load_task("r1", "t1").pending_plan is True
+    eng2.abandon("r1", "t1", reason="stuck", force=True)
+    assert eng2.store.load_task("r1", "t1").pending_plan is False
+
+
+def test_pending_plan_defaults_false_on_a_pre_change_task_doc(tmp_path, project) -> None:
+    """Additive field: a task doc written before #288 loads with the marker off, which reads
+    as 'no plan was dispatched' — no false marker on an in-flight upgrade."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    path = tmp_path / "status-r1-t1.json"
+    stripped = path.read_text().replace('"pending_plan": false,', "")
+    assert stripped != path.read_text()  # the field really was there to strip
+    path.write_text(stripped)
+    assert eng.store.load_task("r1", "t1").pending_plan is False
+
+
 # --- persistence across the CLI process boundary (#206) ---------------------------------
 
 def test_review_workflow_survives_a_create_then_separate_subcommand(tmp_path, project) -> None:
     """The #206 invariant: every CLI subcommand rebuilds the Engine from constructor
     DEFAULTS, so the opt-in must be re-read off the Run doc at the dispatch boundary."""
-    creator = _engine(tmp_path, project)
+    creator = _panel_engine(tmp_path, project)
     creator.create_run("r1", review_workflow=True)
     creator.add_task("r1", "t1")
     assert creator.store.load_run("r1").review_workflow is True
 
     # A FRESH Engine, exactly as `cli._engine` builds one — nothing carried in memory.
-    fresh = _engine(tmp_path, project)
+    fresh = _panel_engine(tmp_path, project)
     w = _drive_to_review(fresh)
     assert w.plan is not None
     assert _lenses(w.plan) == ["find:code", "find:spec", "find:tests"]
@@ -451,7 +655,7 @@ def test_diff_stat_is_none_when_it_cannot_be_measured(tmp_path, project) -> None
 def test_capacity_policy_band_edge_is_the_one_the_gate_uses(tmp_path, project) -> None:
     """A project that widens the NORMAL band widens the panel's eligibility with it —
     the gate reads the injected CapacityPolicy, not a hardcoded 70."""
-    eng = _engine(tmp_path, project, capacity=CapacityPolicy(downgrade_threshold=85.0))
+    eng = _panel_engine(tmp_path, project, capacity=CapacityPolicy(downgrade_threshold=85.0))
     eng.create_run("r1", review_workflow=True)
     eng.add_task("r1", "t1")
     w = _drive_to_review(eng, util_pct=75.0)

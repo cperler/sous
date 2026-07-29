@@ -39,15 +39,20 @@ class CapabilityDescriptor(BaseModel):
     provider: Provider
     in_process: bool  # False = served externally (the interactive Workflow shim)
     schema_enforced: bool = False
-    # #73: can this cell EXECUTE a ``WorkItem.plan`` (fan a multi-agent REVIEW out below the
-    # seam)? A lane capability flag in the same spirit as ``EXPLICIT_EMPTY``: ``next_work``
-    # attaches a plan only when the RESOLVED lane declares support, so the plan — which is
-    # folded into ``content_hash`` — never disagrees with the lane that runs it. False for
-    # codex (``codex exec`` has no sub-agent primitive) and for the deterministic ENGINE lane
-    # (no model at all). NOTE: headless×claude EXECUTES the plan (``review_panel``); the
-    # interactive×claude shim declares support but still IGNORES an attached plan and degrades
-    # gracefully to the single-reviewer dispatch until its branch lands (#262) — harmless,
-    # because the whole path is behind the off-by-default ``Run.review_workflow`` flag.
+    # #73: does this cell's runner ACTUALLY execute a ``WorkItem.plan`` (fan a multi-agent
+    # REVIEW out below the seam and return the panel output in ``sub_results``)? A lane
+    # capability flag in the same spirit as ``EXPLICIT_EMPTY``: ``next_work`` attaches a plan
+    # only when the RESOLVED lane declares support, so the plan — which is folded into
+    # ``content_hash`` — never disagrees with the lane that runs it.
+    #
+    # #288: the flag describes BEHAVIOR, not intent. Declaring True for a runner that ignores
+    # the plan does not degrade gracefully — it degrades SILENTLY, because the engine has
+    # nothing to skip and so emits no ``review_workflow_skipped``; the honest path is to
+    # declare False and let the veto fire. Today only headless×claude qualifies
+    # (``review_panel.run_review_panel``). False for the interactive×claude shim
+    # (``run_targets/workflow_shim.js`` has no plan-execution branch yet — flip it back to
+    # True in the SAME PR that lands one, #262), for codex (``codex exec`` has no sub-agent
+    # primitive), and for the deterministic ENGINE lane (no model at all).
     supports_plan: bool = False
     status: CellStatus = SUPPORTED
 
@@ -129,7 +134,9 @@ def default_registry() -> Registry:
             provider=Provider.CLAUDE,
             in_process=False,
             schema_enforced=True,
-            supports_plan=True,  # the Workflow shim has agent()/parallel() (#73 design §5)
+            # #288: the shim has agent()/parallel() but no plan-execution branch yet, and a
+            # flag that over-promises degrades silently. Flip to True with #262.
+            supports_plan=False,
             status=SUPPORTED,
         )
     )

@@ -176,14 +176,20 @@ workflow review reads as one stage with a visible internal breakdown.
 ## 5. Lanes and selection
 
 - **headless×claude** — reference implementation (transport-level, §2).
-- **interactive×claude** — `workflow_shim.js` grows a per-WorkItem branch: a
-  plan-bearing item runs finders via its existing `agent()`/`parallel()` primitives
-  (this is precisely the "shim grows stage-internal fan-out support" trigger the issue
-  named), fills verify slots mechanically, and returns the same
-  `sub_results`/`sub_calls` StageResult shape. It does **no folding** — synthesis
-  happens in Python when the supervisor persists via `orchestrator record`, so the two
-  lanes share one implementation. The interactive≡headless conformance test extends to
-  a plan-bearing review.
+- **interactive×claude** — *planned, NOT built (#262).* `workflow_shim.js` is to grow a
+  per-WorkItem branch: a plan-bearing item runs finders via its existing
+  `agent()`/`parallel()` primitives (this is precisely the "shim grows stage-internal
+  fan-out support" trigger the issue named), fills verify slots mechanically, and returns
+  the same `sub_results`/`sub_calls` StageResult shape. It would do **no folding** —
+  synthesis happens in Python when the supervisor persists via `orchestrator record`, so
+  the two lanes share one implementation, and the interactive≡headless conformance test
+  extends to a plan-bearing review.
+  **Until that branch lands the cell declares `supports_plan=False`** (#288): having the
+  primitives is not executing the plan, and a descriptor that over-promises does not
+  degrade gracefully — it degrades *silently*, since the engine has nothing to veto and so
+  emits no `review_workflow_skipped`. Declaring False routes through the honest
+  `lane_cannot_execute_plan` veto instead. Flip it back to True in the same PR that lands
+  plan execution. **Today headless×claude is the only lane a panel actually runs on.**
 - **codex** — v1 ignores the plan and dispatches the single-reviewer prompt (codex exec
   has no sub-agent primitive). `next_work` therefore only attaches a plan when the
   resolved lane supports it (a runner capability flag in the execution registry, like
@@ -279,10 +285,20 @@ inside the EXISTING lens walk:
 | `notices` | the normalized runner notices; the engine emits one `review_panel_notice` per entry |
 
 Its **presence is the honest per-dispatch panel marker**: the fold only runs on a
-plan-bearing REVIEW, so a single-reviewer review (everything today's interactive lane
-produces — the shim ignores `wi.plan`, #288/#262) and a FAILED panel carry no
-`panel_summary` key at all. Nothing leaks into `review.json`, whose keys and finding
-objects are unchanged.
+plan-bearing REVIEW, so a single-reviewer review (everything the interactive lane produces
+— the shim ignores `wi.plan`, so that lane no longer receives one at all, #288/#262) and a
+FAILED panel carry no `panel_summary` key at all. Nothing leaks into `review.json`, whose
+keys and finding objects are unchanged.
+
+Absence alone was ambiguous, though, and #288 closed that: when a dispatch DID carry a plan
+and the result came back with no `sub_results`, the stage log gets the positive marker
+`review_plan_not_executed: true` (rendered as a `## Review panel` "requested but NOT
+executed" line) and the run gets a warning-grade `review_plan_not_executed` event naming the
+lane. `Task.pending_plan` — set with the dispatch lease, cleared with it — is what lets
+`record()` tell "no panel was asked for" from "a panel was asked for and the runner ignored
+it". Status-neutral by design: a degraded review is still a review, so the marker fails
+toward honesty rather than toward failing the stage. It is withheld for `RATE_LIMITED` /
+`PROVIDER_UNAVAILABLE`, where the provider never ran the WorkItem at all.
 
 **The runner-notice contract** (`review_workflow.RUNNER_NOTICE_EXTRAS`, declared at the
 seam, documented in both module docstrings): `{"notice": kind, "detail": prose}` plus the
@@ -295,11 +311,17 @@ model-authored notice list.
 
 **Where it shows up.** `render_stage` gains a `## Review panel` section (lens table,
 agreement, verdict tallies, cap flag, runner notices); `Engine.status()` gains a compact
-`review_panel` block (counts by notice kind, per task, `clean`) derived from the events —
-from the SAME single `events.jsonl` read now shared with `events_audit`. The
-`review_panel_notice` events are warning-grade (`level: "warning"`) and ride the same
+`review_panel` block derived from the events — from the SAME single `events.jsonl` read now
+shared with `events_audit`. That block covers all three degradations (#288): notices by kind
+and per task (the panel ran but fell short), `plan_not_executed` (+ per task — a panel was
+requested and no panel came back), and `workflow_skipped_by_reason` (the engine's own honest
+declines: `lane_cannot_execute_plan`, `cheap_lane_preset`, `capacity_band`,
+`budget_thinning`). Any of the three sets `clean: false` — the operator's `--review-workflow`
+did not buy what it asked for somewhere in this run. The `review_panel_notice` and
+`review_plan_not_executed` events are warning-grade (`level: "warning"`) and ride the same
 event batch as `stage_recorded`, so the #277 replay dedupe covers them; no second dedupe
-was invented.
+was invented. A plan-bearing `stage_dispatched` also stamps `plan: true` + `plan_lenses`, so
+the "was a panel requested here?" half of the join is in the timeline too.
 
 **Explicitly out of scope** (filed, not silently dropped): per-finding `found_by`
 attribution inside `review.json` — the canonical findings keep passing through the fold

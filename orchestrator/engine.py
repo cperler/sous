@@ -182,6 +182,13 @@ _UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop", "fixup"})
 # the defect, so the safe default (reset to the checkpoint) stands.
 SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RATE_LIMITED})
 
+# #288: the statuses that mean the provider never actually ran the dispatched WorkItem —
+# the stage goes back on the wire with its attempt intact. A plan-bearing REVIEW that comes
+# back like this is NOT evidence that the runner ignored its plan, so the
+# ``review_plan_not_executed`` marker is withheld for them (no crying wolf on a run whose
+# retry does execute the panel).
+_PLAN_UNRUN_STATUSES = frozenset({ResultStatus.RATE_LIMITED, ResultStatus.PROVIDER_UNAVAILABLE})
+
 # Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
 # rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
 # is too noisy to act on, so the band falls back to the flat downgrade_threshold (today's
@@ -956,6 +963,9 @@ class Engine:
             t.state = TaskState.RUNNING
             t.pending_work_item_id = work.id
             t.pending_content_hash = work.content_hash
+            # #288: remember that THIS dispatch carried a panel plan, so record() can tell a
+            # runner that ignored it (no sub_results) from a review nobody asked a panel of.
+            t.pending_plan = work.plan is not None
             t.pending_fallback_model = None  # consumed into this dispatch's model
             t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
             t.salvage_in_place = False  # consumed: this dispatch honored (or ignored) it
@@ -1008,6 +1018,13 @@ class Engine:
             if superseded_lease is not None:
                 event["resume"] = True
                 event["supersedes"] = superseded_lease
+            # #288: a plan-bearing REVIEW dispatch says so in the timeline, with the lens set
+            # it asked for — so "was a panel requested here?" is answerable from events.jsonl
+            # alone, and the matching `review_plan_not_executed` (if any) has an opening half.
+            # Conditional so every plan-less dispatch event stays byte-identical.
+            if work.plan is not None:
+                event["plan"] = True
+                event["plan_lenses"] = [f.lens for f in work.plan.finders]
             evs.append(event)
             return evs
 
@@ -1205,6 +1222,10 @@ class Engine:
         # authoritative re-validation runs on the freshly-loaded doc inside the locked
         # commit below.
         dispatched = self._validate_result_lease(task, run_id, result)
+        # #288: read the dispatched-plan marker BEFORE the locked commit clears it with the
+        # lease. Safe off the pre-lock doc precisely because the lease matched: the fresh-doc
+        # re-validation under the lock rejects anything that is not this same dispatch.
+        plan_dispatched = task.pending_plan
 
         # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
         # and the engine share one model table; compute once, in the ledger). Wall time
@@ -1298,6 +1319,36 @@ class Engine:
                  "stage": effective.stage.value, **notice}
                 for notice in panel_summary["notices"]
             )
+        # #288: the fold gate above is silent about its OWN complement. A lane whose
+        # descriptor claims ``supports_plan`` but whose runner ignores ``work.plan`` returns
+        # no ``sub_results``, so the fold is skipped, the runner's self-reported review is
+        # accepted verbatim, and nothing anywhere records that a panel was requested and not
+        # delivered — a run configured ``review_workflow: true`` produced reviews
+        # byte-indistinguishable from single-reviewer ones (the #261 defect class: a skipped
+        # check that leaves no trace is a false record). ``task.pending_plan`` is the durable
+        # half of the dispatch that answers it; the lease pre-validation above already proved
+        # this result belongs to that dispatch. Warning-grade and status-neutral: a degraded
+        # review is still a review, so we fail toward honesty, not toward failing the stage.
+        #
+        # RATE_LIMITED / PROVIDER_UNAVAILABLE are excluded because the provider never ran
+        # this WorkItem at all (the stage goes back on the wire, attempt intact) — the plan's
+        # non-execution there is not a fact about the runner, and flagging it would make the
+        # audit cry wolf on a run whose retry does execute the panel.
+        review_plan_not_executed = (
+            plan_dispatched
+            and effective.stage is Stage.REVIEW
+            and effective.sub_results is None
+            and effective.status not in _PLAN_UNRUN_STATUSES
+        )
+        if review_plan_not_executed:
+            events.append(
+                {"ts": _now(), "type": "review_plan_not_executed", "level": "warning",
+                 "run_id": run_id, "task_id": result.task_id, "stage": result.stage.value,
+                 "attempt": result.attempt, "work_item_id": result.work_item_id,
+                 "lane": f"{result.lane_used.execution_mode.value}:"
+                         f"{result.lane_used.provider.value}",
+                 "status": effective.status.value}
+            )
         # Deterministic project policy gates (#65): merge the adapter's review_findings
         # into a completed REVIEW result BEFORE the verdict is read — the old
         # merge_e2e_policy_review_finding semantics (a blocking deterministic finding
@@ -1380,6 +1431,7 @@ class Engine:
 
             t.pending_work_item_id = None
             t.pending_content_hash = None
+            t.pending_plan = False  # #288: the plan marker never outlives its lease
 
             if do_fallthrough:
                 # do_fallthrough implies provider_out_reason is not None (see above);
@@ -1516,6 +1568,13 @@ class Engine:
             # above: a plan-less review's payload stays byte-identical.
             if panel_summary is not None:
                 payload["panel_summary"] = panel_summary
+            # #288: pair ``panel_summary``'s ABSENCE with a positive marker. Absence alone is
+            # ambiguous (no panel asked for vs. asked for and not delivered), which is exactly
+            # how a plan-ignoring lane produced a review indistinguishable from a
+            # single-reviewer one. Conditional like the three above: a review nobody planned a
+            # panel for keeps a byte-identical payload.
+            if review_plan_not_executed:
+                payload["review_plan_not_executed"] = True
             seq = t.stage_counter
             self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
             self.store.write_stage_markdown(
@@ -2838,6 +2897,7 @@ class Engine:
         def _abandon(t: Task) -> None:
             t.pending_work_item_id = None
             t.pending_content_hash = None
+            t.pending_plan = False  # #288: the plan marker never outlives its lease
             t.pending_fallback_model = None
             d = t.stages[stage]
             d.status = StageStatus.FAILED
@@ -3028,40 +3088,63 @@ class Engine:
             # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
             # automatically at every poll / batch completion instead of by hand-count.
             "events_audit": self.events_audit(run_id, events=events),
-            # #268/#285: what the review panels had to cap or give up on, so a capped or
-            # inconclusive review is visible from a poll instead of only inside a stage log.
+            # #268/#285/#288: what the review panels had to cap or give up on — and whether a
+            # requested panel ran at all — so a degraded review is visible from a poll
+            # instead of only inside a stage log.
             "review_panel": self.review_panel_audit(run_id, events=events),
         }
 
     def review_panel_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
-        """Compact per-run view of the multi-agent REVIEW panels' runner notices (#268).
+        """Compact per-run view of how the multi-agent REVIEW panels actually went (#268/#288).
 
-        The panel already recorded WHY it fell short — a verifier cap it hit, a verifier that
-        came back inconclusive, a dedupe rule it did not recognize — but only inside the
-        stage log, where nothing polling the run would ever look. Derived here from the
-        ``review_panel_notice`` events (the engine emits one per normalized runner notice at
-        record time), so this stays a read of the durable audit trail rather than a second
-        source of truth: counts by notice kind overall, plus the tasks flagged and by what.
+        Three degradations, all derived from the SAME single events read (no second source of
+        truth), so a run that asked for panels and got something thinner says so from a poll
+        instead of only inside a stage log:
 
-        ``clean`` is False as soon as ANY panel notice exists — every kind means the review
-        was thinner than the plan asked for, which is precisely the signal a human polling a
-        batch needs (the findings themselves stay blocking either way)."""
+        - ``notices``/``by_notice``/``by_task`` — the panel ran but fell short of its plan (a
+          verifier cap it hit, an inconclusive verifier, an unrecognized dedupe rule), one
+          ``review_panel_notice`` event per normalized runner notice;
+        - ``plan_not_executed``/``plan_not_executed_by_task`` (#288) — a plan-bearing REVIEW
+          dispatch came back with no panel output at all, i.e. the lane declared
+          ``supports_plan`` and its runner ignored the plan. Without this the review is
+          byte-indistinguishable from a single-reviewer one;
+        - ``workflow_skipped``/``workflow_skipped_by_reason`` — the engine itself declined to
+          attach a plan (``review_workflow_skipped``: the lane cannot execute one, a cheap
+          lane preset, capacity, a thinning budget).
+
+        ``clean`` is False as soon as ANY of the three appears: each means the operator's
+        ``review_workflow`` opt-in did not buy what it asked for somewhere in this run, which
+        is precisely the signal a human polling a batch needs (findings stay blocking either
+        way, and no verdict is changed by any of this)."""
         events = self.store.read_events(run_id) if events is None else events
         by_notice: dict[str, int] = {}
         by_task: dict[str, dict[str, int]] = {}
+        not_executed_by_task: dict[str, int] = {}
+        skipped_by_reason: dict[str, int] = {}
         for ev in events:
-            if ev.get("type") != "review_panel_notice":
-                continue
-            kind = str(ev.get("notice") or "unknown")
-            by_notice[kind] = by_notice.get(kind, 0) + 1
+            kind_of = ev.get("type")
             task_id = str(ev.get("task_id") or "unknown")
-            by_task.setdefault(task_id, {})
-            by_task[task_id][kind] = by_task[task_id].get(kind, 0) + 1
+            if kind_of == "review_panel_notice":
+                kind = str(ev.get("notice") or "unknown")
+                by_notice[kind] = by_notice.get(kind, 0) + 1
+                by_task.setdefault(task_id, {})
+                by_task[task_id][kind] = by_task[task_id].get(kind, 0) + 1
+            elif kind_of == "review_plan_not_executed":
+                not_executed_by_task[task_id] = not_executed_by_task.get(task_id, 0) + 1
+            elif kind_of == "review_workflow_skipped":
+                reason = str(ev.get("reason") or "unknown")
+                skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
         return {
             "notices": sum(by_notice.values()),
             "by_notice": dict(sorted(by_notice.items())),
             "by_task": {t: dict(sorted(k.items())) for t, k in sorted(by_task.items())},
-            "clean": not by_notice,
+            # #288: a panel was requested and the runner did not deliver one.
+            "plan_not_executed": sum(not_executed_by_task.values()),
+            "plan_not_executed_by_task": dict(sorted(not_executed_by_task.items())),
+            # The engine's own honest declines to attach a plan, by reason.
+            "workflow_skipped": sum(skipped_by_reason.values()),
+            "workflow_skipped_by_reason": dict(sorted(skipped_by_reason.items())),
+            "clean": not (by_notice or not_executed_by_task or skipped_by_reason),
         }
 
     def lane_audit(self, run_id: str, *, rows: list[dict] | None = None) -> dict:

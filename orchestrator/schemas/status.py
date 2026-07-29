@@ -188,6 +188,13 @@ class Task(_StatusModel):
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
     pending_content_hash: str | None = None
+    # #288: did the outstanding dispatch carry a multi-agent REVIEW ``plan``? The engine
+    # needs this at RECORD time to tell "no panel was asked for" from "a panel was asked
+    # for and the runner ignored it" — the WorkItem itself is not persisted, so without
+    # this marker a plan-ignoring lane produces a review byte-indistinguishable from a
+    # single-reviewer one. Set/cleared with the lease (never outlives it). Additive: a
+    # pre-#288 task doc loads False, which reads as "no plan was dispatched".
+    pending_plan: bool = False
     # Set when a rate-limited dispatch re-queues the current stage on a cheaper model;
     # consumed by the next next_work() for this stage (graceful fallback).
     pending_fallback_model: str | None = None
