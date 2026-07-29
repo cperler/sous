@@ -201,28 +201,55 @@ def test_cli_tail_follow_prints_appended_lines(tmp_path, capsys, monkeypatch) ->
 
 
 def test_cli_enqueue_and_run_queue(tmp_path, capsys) -> None:
-    # #1: the `enqueue` producer appends a batch (no engine), and `run-queue` drains it
-    # in-process (headless) to terminal, deriving the run id from the batch's enqueued_at.
+    # #1: the `enqueue` producer appends batches (no engine), and `run-queue` drains them
+    # in-process (headless) to terminal, deriving each run id from the batch's enqueued_at.
+    # TWO batches SHARING a task id prove the #281 isolation model: each derived run gets
+    # its own self-contained store nested under --root, so ledgers and stage artifacts
+    # never collide and per-run reporting counts only that run's calls.
     queue = tmp_path / "queue.json"
     out = _run(capsys, "enqueue", "--queue-file", str(queue),
                "--tasks", "#42,#43", "--branch", "batch-a")
     assert out["ok"] is True
     assert out["enqueued"]["tasks"] == ["#42", "#43"]
     assert out["enqueued"]["branch"] == "batch-a"
+    out2 = _run(capsys, "enqueue", "--queue-file", str(queue),
+                "--tasks", "#42", "--branch", "batch-b")  # #42 appears in BOTH batches
+    assert out2["ok"] is True
 
-    # run-queue drains the batch in-process, deriving one run and driving it to terminal.
-    # (FakeProject has no real headless model, so the run terminates failed — the point of
-    # this CLI test is the enqueue->ingest->drive->dequeue WIRING; the scripted-lane e2e in
-    # test_queue_file covers a green completion.)
+    # run-queue drains both batches in-process, one derived run each.
+    # (FakeProject has no real headless model, so the runs terminate failed — the point of
+    # this CLI test is the enqueue->claim->ingest->drive->complete WIRING; the
+    # scripted-lane e2e in test_queue_file covers a green completion.)
     summary = _run(capsys, "--root", str(tmp_path), "--project", "tests.fakeproject",
                    "run-queue", "--queue-file", str(queue))
-    assert summary["batches_processed"] == 1
-    assert summary["runs_created"] == 1
+    assert summary["batches_processed"] == 2
+    assert summary["runs_created"] == 2
     assert summary["runs"][0]["tasks"] == ["#42", "#43"]
-    assert summary["runs"][0]["final_state"] in ("completed", "failed")
+    assert summary["runs"][1]["tasks"] == ["#42"]
+    assert all(r["final_state"] in ("completed", "failed") for r in summary["runs"])
 
-    # the queue drained to empty after the single pass (the head was dequeued).
+    # the queue drained to empty (each head was completed after its run went terminal).
     assert json.loads(queue.read_text()) == []
+
+    # #281: two SELF-CONTAINED run dirs nested under --root — own run doc, own ledger,
+    # own stages/ tree for the shared task id (no cross-run overwrite possible).
+    rid1, rid2 = (r["run_id"] for r in summary["runs"])
+    assert rid1 != rid2
+    for rid in (rid1, rid2):
+        run_root = tmp_path / rid
+        assert (run_root / f"status-{rid}.json").is_file()  # per-run store, nested
+        rows = [json.loads(line) for line in
+                (run_root / "stage-costs.jsonl").read_text().splitlines() if line.strip()]
+        assert rows and all(row["run_id"] == rid for row in rows)  # ledger holds ONLY its run
+
+    # per-run status (rebuilt CLI engine over the nested root) reports only its own calls.
+    for rid in (rid1, rid2):
+        status = _run(capsys, "--root", str(tmp_path), "--run", rid,
+                      "--project", "tests.fakeproject", "status")
+        rows = [json.loads(line) for line in
+                (tmp_path / rid / "stage-costs.jsonl").read_text().splitlines() if line.strip()]
+        assert status["cost"]["total_invocations"] == len(rows)
+        assert status["lane_audit"]["total_calls"] == len(rows)
 
 
 # --- #94: `dashboard --serve` wires the read-only web skin (no blocking serve_forever) ---

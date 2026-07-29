@@ -13,10 +13,13 @@ Three operational modes share this CLI:
 * **Unattended queue drain** (``enqueue`` + ``run-queue``) — a cron-friendly
   front door for the headless lane. ``enqueue`` atomically appends a batch entry
   to a ``ralph-queue.json``-style queue file (no engine needed). ``run-queue``
-  drains the queue batch-by-batch: each entry becomes a stable run id (derived
-  from ``enqueued_at``) that is created-or-reused and then driven to terminal
-  through ``Scheduler.run``. On an ingest failure the batch is re-prepended so
-  nothing is silently dropped. See ``orchestrator.queue_file`` for the contract.
+  drains the queue batch-by-batch under the claim-in-place protocol (#279): each
+  entry becomes a stable run id (derived from ``enqueued_at``) recorded as an
+  in-place claim on the entry, created-or-reused, and driven to terminal through
+  ``Scheduler.run`` — only then is the entry dequeued, so no process death can
+  lose a batch. Each derived run gets its OWN nested store under ``--root``
+  (#281); the queue file and learnings KB stay at the shared root. See
+  ``orchestrator.queue_file`` for the contract.
 
 The CLI never calls a model. All model-level work is delegated to the execution
 lane runners wired into the engine registry.
@@ -161,8 +164,9 @@ def _engine(args: argparse.Namespace) -> Engine:
     project adapter, ``Router``, and execution-lane ``Registry`` in one shot.
 
     Execution mode is derived from ``--mode`` but overridden to
-    ``HEADLESS`` for ``run-headless`` and ``run-queue`` — those commands drive
-    the engine in-process and must never open an interactive session.
+    ``HEADLESS`` for ``run-headless`` — that command drives the engine in-process
+    and must never open an interactive session. (``run-queue`` no longer routes
+    through here: it builds one engine PER derived run via its own factory, #281.)
     """
     from .status_store import StatusStore
 
@@ -184,8 +188,8 @@ def _engine(args: argparse.Namespace) -> Engine:
 
     # Config-only execution mode (interactive×claude default; headless = in-process).
     mode = ExecutionMode(getattr(args, "mode", "interactive"))
-    if args.cmd in ("run-headless", "run-queue"):
-        mode = ExecutionMode.HEADLESS  # these commands drive in-process; force the lane
+    if args.cmd == "run-headless":
+        mode = ExecutionMode.HEADLESS  # drives in-process; force the lane
     provider = Provider(args.provider) if getattr(args, "provider", None) else None
     interactive = mode is ExecutionMode.INTERACTIVE and provider is not Provider.CODEX
     # Codex full-validation AND the headless×claude --json-schema both need the project's
@@ -369,6 +373,10 @@ def main(argv: list[str] | None = None) -> int:
     rq.add_argument("--wait", action="store_true",
                     help="idle-wait on an empty queue and sleep through capacity/cooldown "
                          "stalls (the cron/daemon mode); default is a single drain pass")
+    rq.add_argument("--owner", default="default",
+                    help="stable consumer identity for the claim protocol (#279): a "
+                         "restarted consumer with the same owner resumes its own stale "
+                         "claims; a head claimed by a different owner is refused")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
     sl = sub.add_parser("statusline",
                         help="one-line 5h/7d utilization for the Claude Code status bar "
@@ -938,25 +946,59 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.cmd == "run-queue":
         # Unattended (cron) entrypoint (#1): drain the queue file batch-by-batch, driving
-        # each derived run in-process (headless). Needs --root/--project to build the engine
-        # (like run-headless) but NOT --run — run ids are derived from each batch's
-        # enqueued_at, so one launch can process many runs.
+        # each derived run in-process (headless). Needs --root/--project but NOT --run —
+        # run ids are derived from each batch's enqueued_at, so one launch can process
+        # many runs. Deliberately NOT via _engine(args): a single pre-built engine would
+        # share one StatusStore/CostLedger across every derived run (#281), so instead a
+        # factory builds a FRESH engine per claimed entry, rooted at <root>/<run_id>/ —
+        # the same runs-root nesting _resolve_store_root gives per-run commands. The
+        # queue file and the learnings KB (<root>/learnings-kb.jsonl) stay at the shared
+        # --root, so enqueue producers and kb/dashboard discovery are unchanged.
         import time
 
         from adapters.execution.runners import registry_runner
 
         from .queue_file import QueueError, QueueFile, drive_queue
+        from .scheduler import Runner
+        from .status_store import StatusStore
 
         if not args.root or not args.project:
             p.error("--root and --project are required for run-queue")
-        eng = _engine(args)
         from .usage_probe import resolve_util
 
         util_pct, _ = resolve_util(args.util)
         util_provider = _auto_util_provider() if args.util == "auto" else None
+
+        def _queue_engine(run_id: str) -> tuple[Engine, Runner]:
+            """The ``EngineFactory`` for this drain (#281): a FRESH engine + runner
+            rooted at ``<--root>/<run_id>/``, so the derived run's StatusStore,
+            CostLedger, and stage logs never mix with another run's. Called by
+            ``drive_queue`` once per claimed entry, only after the claim has fixed
+            ``run_id``."""
+            root = Path(args.root) / run_id
+            root.mkdir(parents=True, exist_ok=True)
+            project = load_project(args.project)
+            provider = Provider(args.provider) if getattr(args, "provider", None) else None
+            schema_provider = getattr(project, "schema_for", None)
+            registry = build_registry(
+                include_interactive=False,  # run-queue drives in-process (forced HEADLESS)
+                headless_schema_provider=schema_provider,
+                codex_schema_provider=schema_provider,
+                setup_project=project,
+                run_log_root=root,  # #56/#281: stages/<task>/ logs nest per run
+            )
+            router = Router(
+                execution_mode=ExecutionMode.HEADLESS, orchestrator_provider=provider
+            )
+            eng = Engine(
+                StatusStore(root), CostLedger(root / "stage-costs.jsonl"), project,
+                router=router, registry=registry,
+            )
+            return eng, registry_runner(registry)
+
         try:
             summary = drive_queue(
-                eng, QueueFile(args.queue_file), registry_runner(eng.registry),
+                QueueFile(args.queue_file), _queue_engine, owner=args.owner,
                 lane=ExecutionLane(args.lane), util_pct=util_pct,
                 util_provider=util_provider,
                 sleeper=time.sleep if args.wait else None,
@@ -1042,8 +1084,6 @@ def main(argv: list[str] | None = None) -> int:
         # single source of truth for "deterministic", so it covers per-task opt-ins without
         # re-deriving from STAGE_SPECS. The headless scheduler dispatches these itself via
         # the registry, so this drain is the interactive lane's equivalent.
-        from .schemas.enums import ExecutionMode
-
         # --resume applies only to the FIRST call — the one recovering a lease a crashed
         # supervisor left held (#50). Any deterministic stages drained afterward are fresh
         # dispatches with no outstanding lease, so they take the normal path.
@@ -1133,14 +1173,17 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"watch": "done", "run_id": args.run, "run_state": final["run_state"],
                "progress": final["progress"]})
     elif args.cmd == "cost-report":
+        # #281 defense in depth: report over THIS run's rows only, so a shared/legacy
+        # ledger holding other runs' rows can't inflate the breakdown.
+        run_rows = eng.run_rows(args.run)
         if args.by_effort:
             # AC#4 (#167): a no-Python-required readable surface — render by_effort()'s
             # pipeline-ordered spend/retry/failure-rate table instead of dumping raw JSON.
             from .render import render_by_effort
 
-            print(render_by_effort(args.run, eng.ledger.by_effort()))
+            print(render_by_effort(args.run, eng.ledger.by_effort(rows=run_rows)))
         else:
-            _emit(eng.ledger.analysis())
+            _emit(eng.ledger.analysis(rows=run_rows))
     elif args.cmd == "retrospective":
         _emit(eng.retrospective(args.run))
     else:  # pragma: no cover

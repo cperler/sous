@@ -2377,7 +2377,8 @@ class Engine:
         if run.state is not RunState.PAUSED:
             raise ContractError(f"run {run_id} is not paused (state {run.state.value})")
         over_budget = (
-            run.budget_usd is not None and self.ledger.metered_spend() >= run.budget_usd
+            run.budget_usd is not None
+            and self.ledger.metered_spend(rows=self.run_rows(run_id)) >= run.budget_usd
         )
 
         def _mut(r: Run) -> None:
@@ -2397,13 +2398,22 @@ class Engine:
         )
         return self.store.load_run(run_id)
 
+    # --- per-run ledger attribution (#281) -------------------------------------
+    def run_rows(self, run_id: str) -> list[dict]:
+        """Ledger rows attributed to ``run_id`` only. Every row carries ``run_id``
+        (``cost_ledger._row``), so per-run reporting and budget maths filter BEFORE
+        summing — defense in depth (#281): a ledger that (wrongly, or from a legacy
+        shared-store layout) holds another run's rows can no longer inflate this run's
+        cost summary or lane audit, nor corrupt its ``--budget-usd`` hard-PAUSE decision."""
+        return [row for row in self.ledger.rows() if row.get("run_id") == run_id]
+
     # --- per-run cost budget (#34) ---------------------------------------------
     def _remaining_budget_fraction(self, run: Run) -> float:
         """Fraction of the run's budget still unspent (metered), clamped to [0, 1].
         1.0 when no budget is set (cost routing then always picks the top band)."""
         if not run.budget_usd:
             return 1.0
-        spent = self.ledger.metered_spend()
+        spent = self.ledger.metered_spend(rows=self.run_rows(run.run_id))
         return max(0.0, min(1.0, (run.budget_usd - spent) / run.budget_usd))
 
     # --- capacity-aware model downgrade (#12) ----------------------------------
@@ -2464,7 +2474,7 @@ class Engine:
         budget = run.budget_usd
         if budget is None:
             return False
-        spent = self.ledger.metered_spend()
+        spent = self.ledger.metered_spend(rows=self.run_rows(run_id))
         if spent >= self.budget_soft_fraction * budget and not run.budget_warning_sent:
             self.store.update_run(
                 run_id, lambda r: setattr(r, "budget_warning_sent", True)
@@ -2500,7 +2510,9 @@ class Engine:
         if run.budget_usd is None:
             return None
         budget = run.budget_usd
-        spent = self.ledger.metered_spend(rows=rows)
+        spent = self.ledger.metered_spend(
+            rows=self.run_rows(run.run_id) if rows is None else rows
+        )
         return {
             "budget_usd": budget,
             "spent_usd": round(spent, 4),
@@ -2963,8 +2975,9 @@ class Engine:
                     }
             tasks[ref.task_id] = task_status
         # One ledger read shared by the summary, the audit, and the cost-summary.md
-        # refresh (status() used to read the ledger twice).
-        rows = self.ledger.rows()
+        # refresh (status() used to read the ledger twice) — filtered to THIS run's rows
+        # (#281 defense in depth), so a shared/legacy ledger can't inflate the report.
+        rows = self.run_rows(run_id)
         summary = self.ledger.summary(rows=rows)
         budget = self._budget_status(run, rows)  # #34: None unless a budget is set
         self.store.write_run_artifact(
@@ -2997,7 +3010,7 @@ class Engine:
         cells, so the audit holds for headless/codex once those runners are
         registered. The failure mode it catches is a hidden/unattributed call —
         not a deliberately-selected lane (target.md §4: attribution, not abstinence)."""
-        rows = self.ledger.rows() if rows is None else rows
+        rows = self.run_rows(run_id) if rows is None else rows
         sanctioned = {f"{m.value}:{p.value}" for (m, p) in self.registry.sanctioned()}
         by_lane: dict[str, int] = {}
         unattributed = 0
@@ -3898,8 +3911,9 @@ class Engine:
                  "summary": f"run {run_id} finalized {new_state.value} — "
                             f"{progress.completed}/{progress.total} tasks completed"},
             )
-        # Final cost artifacts (the per-record write was removed for O(N^2)).
-        rows = self.ledger.rows()
+        # Final cost artifacts (the per-record write was removed for O(N^2)) — this
+        # run's rows only (#281 defense in depth).
+        rows = self.run_rows(run_id)
         self.store.write_run_artifact(
             "cost-summary.md",
             render_cost_summary(
