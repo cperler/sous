@@ -13,6 +13,7 @@ from orchestrator.state_machine import (
     _MAX_CONTEXT_BYTES,
     _MAX_ITEM_STR,
     _MAX_LIST,
+    _MAX_PLAN_ITEM_STR,
     _MAX_STR,
     CONTEXT_KEYS,
     _absorb_outputs,
@@ -73,6 +74,131 @@ def test_fold_is_tolerant_of_missing_keys() -> None:
     res = make_result_stub(Stage.SCOPE, {"feasible": True})  # no "plan" key
     _absorb_outputs(task, res)
     assert task.context == {}  # nothing to fold, no crash
+
+
+# --- #289: caps are by FIELD MEANING, and never silent ---------------------------------
+def _prose_plan(n: int, chars: int = 800) -> list[str]:
+    """A realistic SCOPE plan: n ordered prose subtask instructions, each `chars` long,
+    with the caveat that matters LAST (exactly what the 500-char cap used to delete)."""
+    tail = " — minding the existing task-lock -> events-lock ordering."
+    return [
+        f"Subtask {i}: " + ("w" * (chars - len(tail) - len(f"Subtask {i}: "))) + tail
+        for i in range(n)
+    ]
+
+
+def test_scope_plan_subtasks_survive_the_fold_intact() -> None:
+    """#289 acceptance: a 9-subtask plan well under the 16KB ceiling reaches the context
+    BYTE-IDENTICAL. Before the fix each >500-char subtask was cut mid-sentence, losing the
+    trailing caveats, with no space pressure whatsoever."""
+    from orchestrator.schemas.status import Task
+
+    plan = _prose_plan(9)
+    assert all(len(s) > _MAX_ITEM_STR for s in plan)  # every subtask beat the old cap
+    assert _context_bytes({"plan": plan}) < _MAX_CONTEXT_BYTES  # ~3.6KB: no space pressure
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(Stage.SCOPE, {"plan": plan}))
+    assert task.context["plan"] == plan  # every subtask intact, tail caveat included
+    assert not any("[truncated]" in s for s in task.context["plan"])
+    assert notices.truncations == [] and notices.evictions == []  # nothing to report
+
+
+def test_oversized_plan_subtask_truncates_with_a_notice() -> None:
+    """#289 acceptance: a genuinely oversized subtask IS still bounded — and the fold
+    RETURNS a notice naming the field, the element and how many chars went (the engine
+    turns it into a context_value_truncated event)."""
+    from orchestrator.schemas.status import Task
+
+    over = "z" * (_MAX_PLAN_ITEM_STR + 600)
+    plan = ["fine subtask", over]
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(Stage.SCOPE, {"plan": plan}))
+    assert task.context["plan"][0] == "fine subtask"  # the in-budget sibling is untouched
+    assert task.context["plan"][1].endswith("[truncated]")
+    assert len(notices.truncations) == 1
+    (notice,) = notices.truncations
+    assert notice["field"] == "plan"
+    assert notice["part"] == "item[1]"  # names WHICH subtask was cut
+    assert notice["kept_chars"] == _MAX_PLAN_ITEM_STR
+    assert notice["dropped_chars"] == 600
+
+
+def test_non_plan_list_items_keep_the_default_item_cap() -> None:
+    """#289 raises the cap for `plan` by FIELD MEANING — it must not raise the default for
+    incidental list values (review findings, file paths), which stay at _MAX_ITEM_STR."""
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    issues = ["y" * (_MAX_ITEM_STR + 120)]
+    notices = _absorb_outputs(task, make_result_stub(Stage.REVIEW, {"issues": issues}))
+    assert task.context["issues"][0].endswith("[truncated]")
+    assert len(task.context["issues"][0]) == _MAX_ITEM_STR + len(" … [truncated]")
+    (notice,) = notices.truncations
+    assert notice["field"] == "issues" and notice["dropped_chars"] == 120
+
+
+def test_whole_string_truncation_returns_a_notice() -> None:
+    """#289: the whole-string cap (_MAX_STR) reports what it cut too, not just list items."""
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.IMPLEMENT, {"summary": "s" * (_MAX_STR + 77), "files_changed": []}))
+    (notice,) = notices.truncations
+    assert notice["field"] == "summary" and notice["part"] == "value"
+    assert notice["kept_chars"] == _MAX_STR and notice["dropped_chars"] == 77
+
+
+def test_list_tail_truncation_returns_a_notice() -> None:
+    """#289: dropping the tail of an over-long list is reported as an item COUNT."""
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.SCOPE, {"plan": [f"step-{i}" for i in range(_MAX_LIST + 5)]}))
+    assert len(task.context["plan"]) == _MAX_LIST + 1  # kept + the "… (N more)" marker
+    (notice,) = notices.truncations
+    assert notice["field"] == "plan" and notice["part"] == "list_tail"
+    assert notice["kept_items"] == _MAX_LIST and notice["dropped_items"] == 5
+
+
+def test_bigger_plan_cap_still_respects_the_context_ceiling() -> None:
+    """#289: the raised per-item cap is NOT unbounded growth — the whole-context ceiling
+    still binds, and the eviction it performs is itself reported (never silent)."""
+    from orchestrator.schemas.status import Task
+
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    _absorb_outputs(task, make_result_stub(Stage.INTAKE, {"branch": "b", "worktree": "/wt"}))
+    huge_plan = _prose_plan(6, chars=_MAX_PLAN_ITEM_STR)  # ~24KB > the 16KB ceiling
+    assert _context_bytes({"plan": huge_plan}) > _MAX_CONTEXT_BYTES
+    notices = _absorb_outputs(task, make_result_stub(Stage.SCOPE, {"plan": huge_plan}))
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    assert "plan" not in task.context  # the fat key is shed
+    assert task.context["branch"] == "b"  # intake survives
+    assert [n["field"] for n in notices.evictions] == ["plan"]  # the loss is reported
+    assert notices.evictions[0]["bytes"] > _MAX_CONTEXT_BYTES
+
+
+def test_implement_prompt_carries_the_full_scope_plan(tmp_path, project) -> None:
+    """#289 end-to-end acceptance: a 9-subtask prose plan reaches the DISPATCHED implement
+    prompt intact — the live failure was the implementer reading a plan whose caveats had
+    been cut before it ever saw them."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    plan = _prose_plan(9)
+    while (w := eng.next_work("r1", "t1")) is not None:
+        if w.stage is Stage.IMPLEMENT:
+            # the model lane reads the PROMPT (WorkItem.context is for engine-lane runners)
+            for subtask in plan:
+                assert subtask in w.prompt  # each subtask rendered WHOLE, caveat and all
+            assert "[truncated]" not in w.prompt
+            assert eng.store.load_task("r1", "t1").context["plan"] == plan  # durable too
+            return
+        output = {"feasible": True, "plan": plan} if w.stage is Stage.SCOPE else None
+        eng.record("r1", make_result(w, structured_output=output))
+    raise AssertionError("implement stage never dispatched")
 
 
 def test_string_and_list_values_are_capped() -> None:

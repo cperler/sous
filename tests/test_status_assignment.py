@@ -99,8 +99,8 @@ def test_deliver_fold_returns_drop_notice_for_malformed_pr_value() -> None:
     ))
     assert task.pr_number is None  # dropped value stays unset
     assert task.pr_url == "https://example.test/pr/7"  # valid sibling still folds
-    assert len(notices) == 1  # exactly one drop, for the malformed field
-    (notice,) = notices
+    assert len(notices.pr_fields) == 1  # exactly one drop, for the malformed field
+    (notice,) = notices.pr_fields
     assert notice["field"] == "pr_number"
     assert notice["value"] == "''"  # repr keeps the empty-string type visible
     assert notice["reason"]  # a non-empty, bounded reason string
@@ -117,7 +117,7 @@ def test_deliver_fold_returns_no_notice_when_all_pr_values_valid() -> None:
     notices = _absorb_outputs(task, make_result_stub(
         Stage.DELIVER, {"pr_number": 42, "pr_url": "https://example.test/pr/42"},
     ))
-    assert notices == []
+    assert notices.pr_fields == []
     assert task.pr_number == 42
     assert task.pr_url == "https://example.test/pr/42"
 
