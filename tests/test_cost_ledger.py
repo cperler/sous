@@ -10,6 +10,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
@@ -306,6 +308,285 @@ def test_empty_sub_calls_tuple_still_writes_the_dispatch_row(tmp_path: Path) -> 
     assert "sub_calls" not in row  # an empty tuple is the plain path, not a 0-row panel
 
 
+# --- crash-replay idempotency on (work_item_id, phase) (#277) --------------------
+
+
+def test_record_replay_plain_row_converges(tmp_path: Path) -> None:
+    """Replaying the SAME StageResult (a crash between the ledger append and the
+    task-doc commit) answers from the on-disk row and appends nothing."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    result = make_result(model="claude-opus-5", input=1_000_000)
+    first = ledger.record(result)
+    replay = ledger.record(result)
+    assert replay == first  # the ORIGINAL row, not a re-priced copy
+    assert len(ledger.rows()) == 1  # the model call is charged exactly once
+    assert ledger.summary()["total_invocations"] == 1
+
+
+def test_record_replay_panel_converges(tmp_path: Path) -> None:
+    """A sub_calls panel replay converges per (work_item_id, phase): still one row per
+    sub-call, and the recomputed dispatch view sums the SAME on-disk rows."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    first = ledger.record(_panel_result(), duration_s=13.0)
+    replay = ledger.record(_panel_result(), duration_s=13.0)
+    assert len(ledger.rows()) == 3  # not 6
+    assert replay["cost_usd"] == first["cost_usd"]
+    assert replay["sub_calls"] == 3
+    assert ledger.summary()["total_invocations"] == 3
+
+
+def test_record_replay_partial_prior_rows_appends_only_missing_phases(tmp_path: Path) -> None:
+    """A crash MID-append (some of a panel's rows on disk) replays to exactly the full
+    set: the surviving prior row is kept as-is and only the missing phases append."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0] + "\n")  # simulate: only the first sub-call row survived
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    assert rows[0] == json.loads(lines[0])  # the prior row, untouched
+    on_disk = ledger.rows()
+    assert len(on_disk) == 3
+    assert [r["phase"] for r in on_disk] == ["find:code", "find:tests", "verify:3"]
+
+
+# --- torn-final-line self-healing (#277 fix cycle 1) ------------------------------
+
+
+def test_record_replay_after_mid_panel_torn_append_converges(tmp_path: Path) -> None:
+    """Failure injection at the ledger append itself: the panel's final row is torn
+    mid-write (crash/ENOSPC — a partial line with no terminating newline). The replay
+    must converge to the FULL row set — surviving rows kept as-is, the torn row
+    truncated under the lock and re-appended — not wedge every later record() on a
+    ``JSONDecodeError``."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    # The tear: rows 1-2 landed whole; row 3's append was interrupted mid-line.
+    path.write_text(lines[0] + "\n" + lines[1] + "\n" + lines[2][: len(lines[2]) // 2])
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    # The surviving prior rows are the ORIGINALS, not re-priced copies.
+    assert rows[0] == json.loads(lines[0]) and rows[1] == json.loads(lines[1])
+    # Physically repaired: every line decodes, newline-terminated, no duplicates.
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    assert [json.loads(line)["phase"] for line in raw.splitlines()] == [
+        "find:code", "find:tests", "verify:3"
+    ]
+
+
+def test_torn_tail_from_another_dispatch_does_not_wedge_record(tmp_path: Path) -> None:
+    """The wedge the review rejected: after a torn append, every subsequent record()
+    for the run used to raise scanning the file. A later DIFFERENT dispatch must
+    record cleanly (repairing the tail), and the torn call's own replay then
+    re-appends its lost row — genuinely convergent, no human file surgery."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"work_item_id": "wi-b", "cost_')  # wi-b's append, interrupted
+
+    ledger.record(make_result(work_item_id="wi-c", input=100))  # must not raise
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-c"]
+    ledger.record(make_result(work_item_id="wi-b", input=100))  # wi-b's replay
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-c", "wi-b"]
+
+
+def test_rows_skips_torn_tail_without_repairing(tmp_path: Path) -> None:
+    """``rows()`` is a read: it tolerates the torn tail (reporting and the engine's
+    replay pre-check keep working) but does NOT rewrite the file — only the locked
+    record path truncates."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(input=100))
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"torn')
+    before = path.read_bytes()
+    assert len(ledger.rows()) == 1
+    assert path.read_bytes() == before
+
+
+def test_unterminated_decodable_tail_is_terminated_not_welded(tmp_path: Path) -> None:
+    """Review cycle 2's wedge: an append can persist EVERY content byte and lose only
+    the trailing newline (ENOSPC/crash at the content/newline boundary). That final
+    line decodes, so ``_scan`` reports the file clean — the torn-tail branch never
+    fires — and an unguarded append would weld the next row onto it, producing the
+    newline-TERMINATED mid-file corruption the cycle-1 repair correctly refuses to
+    heal: a permanent, unrecoverable wedge. The guard must newline-terminate the
+    valid line in place (never truncate it — it is good data) before appending."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    raw = path.read_bytes()
+    assert raw.endswith(b"\n")
+    path.write_bytes(raw[:-1])  # strip ONLY the terminator: all content persisted
+
+    ledger.record(make_result(work_item_id="wi-b", input=100))  # must not weld
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-b"]
+    # Physically two terminated lines: wi-a's row repaired in place, not destroyed.
+    text = path.read_text()
+    assert text.endswith("\n") and len(text.splitlines()) == 2
+    ledger.record(make_result(work_item_id="wi-c", input=100))  # still records
+    assert [r["work_item_id"] for r in ledger.rows()] == ["wi-a", "wi-b", "wi-c"]
+
+
+def test_mid_panel_unterminated_row_replay_converges(tmp_path: Path) -> None:
+    """The MULTI-ROW variant of the content/newline-boundary offset: a panel append
+    interrupted after row 2's final content byte — row 1 whole, row 2 complete but
+    unterminated, row 3 never persisted. The guard must terminate row 2 in place
+    (good data, never truncated) and the converge pass re-append ONLY row 3."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0] + "\n" + lines[1])  # row 2 unterminated, row 3 lost
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    # Rows 1-2 are the ORIGINAL on-disk rows — repaired/kept, not re-priced copies.
+    assert rows[0] == json.loads(lines[0]) and rows[1] == json.loads(lines[1])
+    raw = path.read_text()
+    assert raw.endswith("\n")
+    assert [json.loads(line)["phase"] for line in raw.splitlines()] == [
+        "find:code", "find:tests", "verify:3"
+    ]
+
+
+def test_panel_losing_only_final_terminator_replay_restores_byte_identical(
+    tmp_path: Path,
+) -> None:
+    """Interruption at the very last byte of a panel append: every row's content
+    persisted, only the FINAL newline lost. The replay must append no rows — the
+    guard restores the terminator and the converge pass finds every phase on disk —
+    leaving the file byte-identical to the uninterrupted original."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(_panel_result())
+    clean = path.read_bytes()
+    path.write_bytes(clean[:-1])  # strip ONLY the final terminator
+
+    rows = ledger.record_rows(_panel_result())
+    assert [r["phase"] for r in rows] == ["find:code", "find:tests", "verify:3"]
+    assert path.read_bytes() == clean  # newline restored, nothing re-appended
+
+
+def test_newline_guard_never_fires_on_clean_or_empty_file(tmp_path: Path) -> None:
+    """The guard's no-op cases: a pre-existing ZERO-BYTE file and a clean newline-
+    terminated multi-row file must gain no stray blank line (and no crash on the
+    empty-file seek) — the guard writes only when a terminator is genuinely missing."""
+    path = tmp_path / "stage-costs.jsonl"
+    path.write_bytes(b"")  # exists but empty: no terminator needed, no seek crash
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    first = path.read_bytes()
+    assert not first.startswith(b"\n") and first.endswith(b"\n")
+    assert len(first.decode().splitlines()) == 1
+
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    before = path.read_bytes()
+    ledger.record(make_result(work_item_id="wi-c", input=100))
+    after = path.read_bytes()
+    # Exactly one new terminated line, appended directly onto the clean bytes.
+    assert after.startswith(before)
+    added = after[len(before):]
+    assert json.loads(added)["work_item_id"] == "wi-c" and added.endswith(b"\n")
+
+
+def test_no_strict_prefix_of_a_serialized_row_decodes(tmp_path: Path) -> None:
+    """The premise the torn-tail truncate branch rests on (``record_rows``'s offset
+    enumeration): a strict prefix of a row's content is NEVER valid JSON, so every
+    mid-content interruption is caught by the decode-failure branch. True because a
+    row serializes as a JSON object whose closing brace is its final byte; this test
+    pins that against writer drift (e.g. a future bare-scalar row, whose prefixes
+    could decode and would silently scan clean as a wrong row)."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(_panel_result())
+    for line in path.read_text().splitlines():
+        assert line.startswith("{") and line.endswith("}")
+        for i in range(1, len(line)):
+            with pytest.raises(json.JSONDecodeError):
+                json.loads(line[:i])
+
+
+def test_newline_guard_runs_under_the_append_lock(tmp_path: Path, monkeypatch) -> None:
+    """The tail check-then-repair must be atomic with the append (same file lock):
+    a racy check would let two record() calls both observe a missing terminator and
+    double-repair or weld. Instrumented so each concurrent call waits at a barrier
+    inside the guard: under the lock the second caller cannot arrive until the first
+    finishes, so the barrier must ALWAYS time out — an overlap means the check
+    escaped the lock."""
+    import threading
+
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    raw = path.read_bytes()
+    path.write_bytes(raw[:-1])  # unterminated tail: the guard has real work to do
+
+    barrier = threading.Barrier(2)
+    overlaps: list[bool] = []
+    original = CostLedger._tail_missing_newline
+
+    def instrumented(self: CostLedger) -> bool:
+        try:
+            barrier.wait(timeout=0.3)
+            overlaps.append(True)  # two calls inside the guarded section at once
+        except threading.BrokenBarrierError:
+            barrier.reset()  # lone arrival timed out: mutual exclusion held
+        return original(self)
+
+    monkeypatch.setattr(CostLedger, "_tail_missing_newline", instrumented)
+    threads = [
+        threading.Thread(
+            target=ledger.record, args=(make_result(work_item_id=w, input=100),)
+        )
+        for w in ("wi-b", "wi-c")
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not overlaps
+    text = path.read_text()
+    lines = text.splitlines()
+    assert text.endswith("\n") and "" not in lines  # no double-repair blank line
+    assert {json.loads(line)["work_item_id"] for line in lines} == {
+        "wi-a", "wi-b", "wi-c"
+    }
+
+
+def test_mid_file_undecodable_line_still_raises(tmp_path: Path) -> None:
+    """Only the FINAL, unterminated line may be torn (the interrupted-append
+    signature). An undecodable line anywhere else is real corruption and must raise —
+    silently skipping it would mask damage as convergence."""
+    path = tmp_path / "stage-costs.jsonl"
+    ledger = CostLedger(path)
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    lines = path.read_text().splitlines()
+    path.write_text(lines[0][: len(lines[0]) // 2] + "\n" + lines[1] + "\n")
+    with pytest.raises(json.JSONDecodeError):
+        ledger.rows()
+    with pytest.raises(json.JSONDecodeError):
+        ledger.record(make_result(work_item_id="wi-c", input=100))
+
+
+def test_distinct_work_items_still_append_normally(tmp_path: Path) -> None:
+    """The idempotency key is the dispatch id — different dispatches of the same
+    stage/model/usage must never converge onto each other."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    ledger.record(make_result(work_item_id="wi-a", input=100))
+    ledger.record(make_result(work_item_id="wi-b", input=100))
+    assert len(ledger.rows()) == 2
+
+
 def test_single_sub_call_still_returns_the_aggregate_view(tmp_path: Path) -> None:
     """The return shape keys on the RESULT (has sub_calls?), not on the row count — a
     one-finder panel answers with the same aggregate view a three-finder one does."""
@@ -369,9 +650,11 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
 
 def test_summary_aggregates_per_model_and_totals(tmp_path: Path) -> None:
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
-    r1 = make_result(model="claude-opus-5", input=1_000_000, output=0)
-    r2 = make_result(model="claude-opus-5", input=0, output=1_000_000)
-    r3 = make_result(model="claude-sonnet-5", input=1_000_000, output=0)
+    # Distinct work_item_ids: each is a distinct model call, and recording is
+    # idempotent on (work_item_id, phase) — a reused id would converge, not append (#277).
+    r1 = make_result(model="claude-opus-5", input=1_000_000, output=0, work_item_id="wi-1")
+    r2 = make_result(model="claude-opus-5", input=0, output=1_000_000, work_item_id="wi-2")
+    r3 = make_result(model="claude-sonnet-5", input=1_000_000, output=0, work_item_id="wi-3")
     for r in (r1, r2, r3):
         ledger.record(r)
 

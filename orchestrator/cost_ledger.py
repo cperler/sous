@@ -15,16 +15,34 @@ Pricing is authoritative: the cost written is computed from the engine's single
 ``model_table`` (the same table used everywhere), NOT from the runner-supplied
 ``StageResult.cost_usd`` (nor a ``SubCall``'s self-reported usage pricing). A runner
 cannot under- or over-report spend; the engine's table is the single source of truth.
+
+Recording is IDEMPOTENT on the durable key ``(work_item_id, phase)`` (#277): a
+dispatch's work_item_id is unique per model call (sub-calls share it, discriminated
+by ``phase``), so replaying the same StageResult after a crash mid-``Engine.record``
+converges on the rows already on disk instead of charging the call twice. The
+scan-then-append runs under an exclusive file lock so two concurrent duplicate
+records cannot both append. The ledger append is itself a crash boundary: an
+interrupted write (crash/ENOSPC) can leave a torn FINAL line, and the scan is
+self-healing for exactly that tear — ``record_rows`` truncates it under the lock and
+the converge pass re-appends the row the interrupted write lost, so the replay still
+converges instead of wedging every later ``record`` on a ``JSONDecodeError``. A write
+interrupted at the content/newline boundary instead leaves a COMPLETE, decodable final
+line missing only its terminator — valid data, never truncated: ``record_rows``
+newline-terminates it in place before appending, so the next row cannot weld onto it
+(``record_rows`` enumerates why those two branches cover every interruption offset).
+An undecodable line anywhere ELSE is real corruption and still raises (see ``_scan``).
 """
 
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
 from .schemas.enums import STAGE_ORDER
 from .schemas.work import StageResult, TokenUsage
+from .status_store import file_lock
 
 # Pipeline-execution rank for a stage's string value (#154): lets by_effort() order
 # groups in the natural INTAKE→SCOPE→IMPLEMENT→TEST→DELIVER→REVIEW sequence instead of
@@ -69,7 +87,9 @@ class CostLedger:
 
         Cost is recomputed from ``model_table`` (authoritative) — the runner's
         ``result.cost_usd`` is deliberately ignored. ``duration_s`` is the engine-
-        measured wall time of the dispatch (dispatch->record).
+        measured wall time of the dispatch (dispatch->record). Idempotent (#277):
+        replaying a result whose rows are already on disk answers from those rows
+        (the view recomputed over them) without appending — see ``record_rows``.
         """
         rows = self.record_rows(result, duration_s=duration_s)
         # Keyed on the RESULT's shape, not on ``len(rows)``: a one-sub-call panel must
@@ -87,9 +107,40 @@ class CostLedger:
         ``result.sub_calls`` empty/absent -> a single dispatch row, byte-identical to the
         pre-#73 ledger line (no ``phase`` key at all). Otherwise one row per ``SubCall``,
         each priced on its OWN model and usage, and deliberately no aggregate row — the
-        report sums; the ledger must never double-count."""
+        report sums; the ledger must never double-count.
+
+        Idempotent on ``(work_item_id, phase)`` (#277): rows already on disk for this
+        dispatch are returned as-is and NOT re-appended, so a replay after a crash
+        mid-``Engine.record`` (ledger row committed, task doc not) converges. A partial
+        prior write (some of a panel's sub-call rows) appends only the missing phases.
+        The scan-then-append is atomic under an exclusive lock on the ledger file, so
+        two concurrent duplicate records cannot both append the same call.
+
+        Self-healing for a torn tail: a crash/ENOSPC mid-append can leave a partial
+        FINAL line (an append is content-then-newline, so a torn line never has its
+        terminating newline). The locked scan detects exactly that tear and truncates
+        it BEFORE appending — appending onto torn bytes would weld the new row into
+        them and turn a recoverable tear into real mid-file corruption — and the
+        converge pass then re-appends the row the interrupted write lost. An
+        undecodable line anywhere but the tail still raises (see ``_scan``).
+
+        Together the truncate branch and the newline guard cover EVERY byte offset
+        at which an append (content bytes, then ``b"\\n"``) can be interrupted:
+
+        * 0 bytes persisted — the file is exactly its prior (clean) state;
+        * a strict prefix of the content — never valid JSON (a serialized object's
+          top-level closing brace is its FINAL byte, so every proper prefix has an
+          unclosed brace or string), hence undecodable and unterminated: the
+          torn-tail branch truncates it;
+        * all content bytes, terminator lost — complete VALID data: the newline
+          guard terminates it in place (never truncates — no good row destroyed);
+        * content + newline — the append completed; nothing to repair.
+
+        A multi-row (panel) append is a sequence of such writes, so an interruption
+        lands inside exactly one row's content-or-terminator window; earlier rows are
+        whole lines and the converge pass re-appends the rows that never landed."""
         if result.sub_calls:
-            rows = [
+            built = [
                 self._row(
                     result,
                     model=sub.model,
@@ -101,7 +152,7 @@ class CostLedger:
                 for sub in result.sub_calls
             ]
         else:
-            rows = [
+            built = [
                 self._row(
                     result,
                     model=result.model,
@@ -112,10 +163,86 @@ class CostLedger:
                 )
             ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self.path.open("a", encoding="utf-8") as fh:
-            for row in rows:
-                fh.write(json.dumps(row) + "\n")
+        with file_lock(self.path):
+            on_disk, torn_at = self._scan()
+            if torn_at is not None:
+                # Repair the tear before the append lands on top of it: truncate drops
+                # ONLY the undecodable partial tail (byte-offset precise), the converge
+                # pass below re-appends whatever that interrupted write was carrying.
+                with self.path.open("r+b") as fh:
+                    fh.truncate(torn_at)
+            elif self._tail_missing_newline():
+                # The OTHER interruption offset (#277 review cycle 2): the write
+                # persisted every content byte and lost ONLY the terminating newline
+                # (ENOSPC/crash can end a write at any offset, including len-1). The
+                # final line is complete, decodable, VALID data — so it must NOT be
+                # truncated (that would destroy a good row) — but appending onto it
+                # would weld the next row into one line: exactly the mid-file
+                # corruption ``_scan`` correctly refuses to heal, i.e. a permanent
+                # wedge. Terminate it in place before the append.
+                with self.path.open("ab") as fh:
+                    fh.write(b"\n")
+            existing = [r for r in on_disk if r.get("work_item_id") == result.work_item_id]
+            rows, to_append = self._converge(built, existing) if existing else (built, built)
+            if to_append:
+                with self.path.open("a", encoding="utf-8") as fh:
+                    for row in to_append:
+                        fh.write(json.dumps(row) + "\n")
         return rows
+
+    def _tail_missing_newline(self) -> bool:
+        """True when the ledger exists, is non-empty, and its last byte is not ``\\n``.
+
+        The write-side check for the interruption offset ``_scan`` cannot see: a final
+        line whose content fully persisted but whose terminator did not is decodable,
+        so it scans clean (``torn_at is None``) — yet appending onto it would weld two
+        rows into one line. Called only under ``record_rows``'s file lock, right before
+        the append, so the answer cannot go stale between check and write."""
+        try:
+            with self.path.open("rb") as fh:
+                if fh.seek(0, os.SEEK_END) == 0:  # empty file needs no terminator
+                    return False
+                fh.seek(-1, os.SEEK_END)
+                return fh.read(1) != b"\n"
+        except FileNotFoundError:
+            return False
+
+    def existing_rows_for(self, work_item_id: str) -> list[dict]:
+        """The rows already recorded for one dispatch, in file order (#277).
+
+        The replay-detection read: ``Engine.record`` uses a non-empty answer as the
+        signal that a PRIOR record attempt already charged this dispatch (and so its
+        audit events may also already be on disk). O(rows) over the JSONL — the same
+        read every aggregation here performs, and a run's ledger stays small (one row
+        per model call)."""
+        return [row for row in self.rows() if row.get("work_item_id") == work_item_id]
+
+    @staticmethod
+    def _converge(built: list[dict], existing: list[dict]) -> tuple[list[dict], list[dict]]:
+        """Fold freshly-built rows onto the dispatch's rows already on disk.
+
+        Returns ``(rows, to_append)``: ``rows`` is the built list with each row replaced
+        by its on-disk counterpart when one exists (same ``phase`` key; duplicates of a
+        phase pair up positionally), preserving the ORIGINAL priced/timestamped row;
+        ``to_append`` is the subset of built rows with no counterpart — the missing
+        phases of a partial prior write. A full prior write appends nothing."""
+        by_phase: dict[str | None, list[dict]] = {}
+        for row in existing:
+            by_phase.setdefault(row.get("phase"), []).append(row)
+        used: dict[str | None, int] = {}
+        rows: list[dict] = []
+        to_append: list[dict] = []
+        for row in built:
+            key = row.get("phase")
+            i = used.get(key, 0)
+            prior = by_phase.get(key, [])
+            if i < len(prior):
+                rows.append(prior[i])
+                used[key] = i + 1
+            else:
+                rows.append(row)
+                to_append.append(row)
+        return rows, to_append
 
     def _row(
         self,
@@ -218,11 +345,45 @@ class CostLedger:
         return view
 
     def rows(self) -> list[dict]:
-        """Read back every recorded row."""
+        """Read back every recorded row (fully-decodable lines; a torn tail is skipped).
+
+        Read-only view of ``_scan``: a torn FINAL line — the signature of an append
+        interrupted by a crash/ENOSPC — is tolerated (skipped, not repaired; only the
+        locked ``record_rows`` path truncates), so readers like ``Engine.record``'s
+        replay pre-check and ``summary()`` keep working after such a crash instead of
+        raising until a human repairs the file by hand. An undecodable line anywhere
+        else still raises — mid-file corruption must never be silently skipped."""
+        return self._scan()[0]
+
+    def _scan(self) -> tuple[list[dict], int | None]:
+        """Parse the ledger JSONL, tolerating exactly a torn FINAL line (#277).
+
+        Returns ``(rows, torn_at)``: the decoded rows in file order, and the byte
+        offset where a torn trailing line begins (``None`` when the file is clean or
+        absent). A tear is recognized ONLY as the very last content of the file with
+        no terminating newline — an append writes content-then-newline, so an
+        interrupted append can never leave a newline after its partial bytes. Any
+        other undecodable line is real corruption and raises ``JSONDecodeError``
+        (never silently skipped: mid-file damage must surface, not be masked)."""
         if not self.path.exists():
-            return []
-        with self.path.open("r", encoding="utf-8") as fh:
-            return [json.loads(line) for line in fh if line.strip()]
+            return [], None
+        data = self.path.read_bytes()
+        rows: list[dict] = []
+        pos = 0
+        while pos < len(data):
+            nl = data.find(b"\n", pos)
+            line = data[pos:] if nl == -1 else data[pos:nl]
+            if line.strip():
+                try:
+                    rows.append(json.loads(line))
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    if nl == -1:  # final line, unterminated: the torn-append signature
+                        return rows, pos
+                    raise
+            if nl == -1:
+                break
+            pos = nl + 1
+        return rows, None
 
     def summary(self, rows: list[dict] | None = None) -> dict:
         """Aggregate the ledger: totals plus per-model, per-effort, and ENGINE-lane rollups.
