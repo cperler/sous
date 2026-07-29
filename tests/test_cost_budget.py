@@ -19,6 +19,7 @@ from orchestrator.cost_policy import (
     estimate_to_usd,
 )
 from orchestrator.engine import Engine
+from orchestrator.errors import ContractError, StatusNotFoundError
 from orchestrator.render import render_cost_summary
 from orchestrator.schemas.enums import (
     LANE_DETERMINISTIC_STAGES,
@@ -164,6 +165,63 @@ def test_unpause_with_raise_budget_sets_new_ceiling(tmp_path) -> None:
     assert resumed.budget_warning_sent is False  # re-armed against the new cap
     work = eng.next_work("r1", "t1")  # $1.00 spent < $5.00 -> dispatches
     assert work is not None and work.stage is Stage.IMPLEMENT
+
+
+# --- per-run budget: unusable caps rejected at the boundary (#274) ---------------
+
+_BAD_BUDGETS = [0.0, -1.0, float("nan"), float("inf"), float("-inf")]
+
+
+@pytest.mark.parametrize("bad", _BAD_BUDGETS)
+def test_create_run_rejects_unusable_budget(tmp_path, bad) -> None:
+    # A zero cap used to be stored verbatim and then divided by in the soft-warning
+    # branch of the first dispatch -> ZeroDivisionError out of next_work; a negative one
+    # parked the run instantly. Both are caller errors: reject BEFORE any state is written.
+    eng = _engine(tmp_path)
+    with pytest.raises(ContractError):
+        eng.create_run("r1", ExecutionLane.FULL, budget_usd=bad)
+    with pytest.raises(StatusNotFoundError):
+        eng.store.load_run("r1")  # nothing persisted
+
+
+def test_create_run_accepts_tiny_positive_budget_and_dispatches(tmp_path) -> None:
+    # The guard must not swallow legitimately small caps: a positive budget still yields
+    # work (and the existing soft-warning/hard-pause behavior) rather than raising.
+    eng = _engine(tmp_path)
+    run = eng.create_run("r1", ExecutionLane.FULL, budget_usd=0.0001)
+    assert run.budget_usd == 0.0001
+    eng.add_task("r1", "t1")
+    assert eng.next_work("r1", "t1") is not None  # no ZeroDivisionError, no instant pause
+
+
+@pytest.mark.parametrize("bad", _BAD_BUDGETS)
+def test_unpause_rejects_unusable_raise_budget(tmp_path, bad) -> None:
+    eng = _drive_to_pause(tmp_path, NotifyProject())
+    eng.next_work("r1", "t1")  # trip the pause
+    with pytest.raises(ContractError):
+        eng.unpause_run("r1", raise_budget_to=bad)
+    run = eng.store.load_run("r1")
+    assert run.state.value == "paused" and run.budget_usd == 0.5  # untouched
+
+
+def test_cli_init_run_rejects_nonpositive_budget(tmp_path) -> None:
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+    with pytest.raises(SystemExit):  # argparse rejects it before the engine
+        main([*base, "init-run", "--lane", "full", "--budget-usd", "0"])
+    with pytest.raises(SystemExit):
+        main([*base, "init-run", "--lane", "full", "--budget-usd", "-3"])
+    with pytest.raises(SystemExit):
+        main([*base, "init-run", "--lane", "full", "--budget-usd", "nan"])
+    assert not list(tmp_path.glob("status-*.json"))  # no run doc written
+
+
+def test_cli_unpause_rejects_nonpositive_raise_budget(tmp_path) -> None:
+    eng = _drive_to_pause(tmp_path, NotifyProject())
+    eng.next_work("r1", "t1")  # trip the pause
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+    with pytest.raises(SystemExit):
+        main([*base, "unpause", "--raise-budget", "0"])
+    assert eng.store.load_run("r1").state.value == "paused"
 
 
 def test_unmetered_interactive_rows_never_count(tmp_path) -> None:

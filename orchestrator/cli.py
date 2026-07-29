@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -42,6 +43,21 @@ from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
 from .schemas.work import StageResult
+
+
+def _budget_usd(raw: str) -> float:
+    """argparse type for a USD budget flag: a finite amount > 0 (#274).
+
+    Mirrors the Engine-side contract (``_validated_budget``) at the parse boundary so a
+    ``--budget-usd 0`` is a clean usage error instead of an engine traceback (a zero cap
+    used to crash the first dispatch with ZeroDivisionError)."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a number") from None
+    if not math.isfinite(value) or value <= 0:
+        raise argparse.ArgumentTypeError(f"must be a finite USD amount > 0, got {raw}")
+    return value
 
 
 def _auto_util_provider() -> Callable[[], float]:
@@ -233,9 +249,9 @@ def main(argv: list[str] | None = None) -> int:
 
     ir = sub.add_parser("init-run")
     ir.add_argument("--lane", default="full")
-    ir.add_argument("--budget-usd", type=float, default=None,
+    ir.add_argument("--budget-usd", type=_budget_usd, default=None,
                     help="per-run metered-spend budget in USD (#34): a soft warning at "
-                         "80%%, a hard PAUSE at/after the budget")
+                         "80%%, a hard PAUSE at/after the budget. Must be > 0")
     ir.add_argument("--route-by-cost", action="store_true",
                     help="enable cost-aware lane routing: un-pinned tasks get a cheaper "
                          "lane preset as the remaining budget thins")
@@ -370,9 +386,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--note", default="", help="what is being approved")
     up = sub.add_parser("unpause", help="release a PAUSED run (e.g. after the batch circuit "
                                         "breaker tripped and the systemic cause is fixed)")
-    up.add_argument("--raise-budget", type=float, default=None,
+    up.add_argument("--raise-budget", type=_budget_usd, default=None,
                     help="on a budget-exhausted pause (#34): resume with this NEW budget "
-                         "ceiling (re-arms the soft warning). Omit to drop the cap entirely")
+                         "ceiling (re-arms the soft warning), must be > 0. Omit to drop "
+                         "the cap entirely")
     rj = sub.add_parser("reject", help="confirm-and-close a held infeasible task (writes the rejection artifact)")
     rj.add_argument("--task", required=True)
     rj.add_argument("--by", required=True, help="who is rejecting")
