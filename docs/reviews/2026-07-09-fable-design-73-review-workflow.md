@@ -247,3 +247,61 @@ from day one.
 4. **Finder cap:** the set is fixed at ≤4 by construction; if project adapters later
    want custom lenses, that is a `ProjectConfig` hook (`review_lenses`?) — do not build
    it speculatively.
+
+---
+
+## Delivered after the design pass — panel telemetry (#285) and the runner-notice contract (#268)
+
+The design shipped §2's raw `sub_results` (`findings_by_lens` / `verdicts` / `notices`)
+into the stage log and **nothing ever read them**: `render.py` surfaced no panel
+structure, and the most decision-relevant signal — how often two lenses independently
+found the same thing — was not recorded at all (`synthesize`'s dedupe `continue` is
+cross-lens agreement, and it was discarded). #285 closes that; #268 (folded in, closed
+with it) makes the runner's own notices first-class events instead of stage-log-only.
+
+**`synthesize` now returns `SynthesisResult(review, notices, panel_summary)`** — a
+`NamedTuple`, so `[0]`/`[1]` indexing and unpacking keep working. The fold stays pure:
+`panel_summary` is RETURNED, and `Engine.record()` persists it (the #201 precedent),
+inside the single #277 commit boundary. Rejected alternative: a separate
+`summarize_panel(sub_results)`; no caller churn, but it duplicates the lens/severity/
+verdict walk, which is the drift the module's single-walk rule exists to prevent.
+
+`panel_summary` (fixed key order, `lenses` sorted — byte-stable per panel), computed
+inside the EXISTING lens walk:
+
+| key | meaning |
+|---|---|
+| `lenses` | per lens: `total` fingerprints raised, `unique` to it, `shared` with another lens — whether that lens earned its cost |
+| `findings` / `agreed` | distinct fingerprints; how many **>= 2 lenses** independently raised |
+| `finders` / `verifiers` | derived: `len(findings_by_lens)` and `len(verdicts) + inconclusive` (`sub_calls` are not visible to the fold) |
+| `verdicts` | `{confirmed, refuted}` over the INDEXED verdicts, i.e. after first-wins dedupe and the fail-toward-scrutiny coercions |
+| `inconclusive` / `cap_hit` / `cap_dropped` | from the runner notices |
+| `notices` | the normalized runner notices; the engine emits one `review_panel_notice` per entry |
+
+Its **presence is the honest per-dispatch panel marker**: the fold only runs on a
+plan-bearing REVIEW, so a single-reviewer review (everything today's interactive lane
+produces — the shim ignores `wi.plan`, #288/#262) and a FAILED panel carry no
+`panel_summary` key at all. Nothing leaks into `review.json`, whose keys and finding
+objects are unchanged.
+
+**The runner-notice contract** (`review_workflow.RUNNER_NOTICE_EXTRAS`, declared at the
+seam, documented in both module docstrings): `{"notice": kind, "detail": prose}` plus the
+declared NUMERIC extras for that kind — today `verifier_cap.count`. `detail` is for
+humans; the fold reads declared extras and never parses prose, so re-wording a notice can
+never silently change a number engine-side. An unknown kind passes through (a new runner
+signal reaches the event stream before the table learns to tally it); a malformed entry is
+skipped with a `review_synthesis_notice`, never raised — `record()` cannot be broken by a
+model-authored notice list.
+
+**Where it shows up.** `render_stage` gains a `## Review panel` section (lens table,
+agreement, verdict tallies, cap flag, runner notices); `Engine.status()` gains a compact
+`review_panel` block (counts by notice kind, per task, `clean`) derived from the events —
+from the SAME single `events.jsonl` read now shared with `events_audit`. The
+`review_panel_notice` events are warning-grade (`level: "warning"`) and ride the same
+event batch as `stage_recorded`, so the #277 replay dedupe covers them; no second dedupe
+was invented.
+
+**Explicitly out of scope** (filed, not silently dropped): per-finding `found_by`
+attribution inside `review.json` — the canonical findings keep passing through the fold
+unchanged, so "which lens found this one" stays derivable only from the raw
+`sub_results`.

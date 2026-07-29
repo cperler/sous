@@ -32,6 +32,18 @@ blocking — verification may only remove scrutiny it has affirmatively earned. 
 (after its own schema-retry loop) is different: it short-circuits the whole panel and fails
 the dispatch with that call's classified status, because a missing lens is a missing review,
 not a lenient one. The engine's existing retry machinery re-dispatches the full plan.
+
+**The runner-notice contract** (#268, declared engine-side in
+``review_workflow.RUNNER_NOTICE_EXTRAS``). Everything this runner had to cap, drop, or give
+up on rides ``sub_results["notices"]`` as ``{"notice": kind, "detail": prose}`` plus the
+NUMERIC extras declared for that kind — today ``verifier_cap`` carries ``count`` (how many
+blocking findings went unverified). ``detail`` is for humans only: the fold reads the
+declared extras and never parses prose, so a wording change here can never silently change
+a number engine-side. The engine normalizes this list, folds it into ``panel_summary``, and
+emits one warning-grade ``review_panel_notice`` event per entry — so "this review only
+verified 8 of 12 blocking findings" is visible from ``status`` without opening a stage log.
+A kind the engine's table does not know is still carried through, so a NEW notice kind
+here reaches the event stream before the engine learns to tally it.
 """
 
 from __future__ import annotations
@@ -79,7 +91,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
     if plan is None:  # pragma: no cover - the caller gates on `work.plan is not None`
         raise ValueError("run_review_panel requires a plan-bearing WorkItem")
 
-    notices: list[dict[str, str]] = []
+    notices: list[dict[str, object]] = []
     sub_calls: list[SubCall] = []
     findings_by_lens: dict[str, dict] = {}
 
@@ -103,6 +115,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
             f"{len(queue)} blocking findings exceed the {_MAX_VERIFIERS}-verifier cap — "
             f"{len(dropped)} unverified (they stay BLOCKING): "
             + ", ".join(fp for fp, _ in dropped),
+            count=len(dropped),
         ))
         queue = queue[:_MAX_VERIFIERS]
 
@@ -234,7 +247,7 @@ def _is_blocking(finding: object) -> bool:
 
 def _verify_queue(
     findings_by_lens: dict[str, dict], dedupe_rule: str
-) -> tuple[list[tuple[str, object]], list[dict[str, str]]]:
+) -> tuple[list[tuple[str, object]], list[dict[str, object]]]:
     """The deduped, ordered ``(fingerprint, finding)`` queue the verifiers work through.
 
     Dedupe honours the plan's ``dedupe_rule``: ``fingerprint-v1`` is
@@ -245,7 +258,7 @@ def _verify_queue(
 
     Ordering is (severity rank, fingerprint) — deterministic, so the verifier cap always bites
     the same findings for the same panel output."""
-    notices: list[dict[str, str]] = []
+    notices: list[dict[str, object]] = []
     dedupe = dedupe_rule == FINGERPRINT_RULE
     if not dedupe:
         notices.append(_notice(
@@ -429,11 +442,19 @@ def _sum_usage(sub_calls: list[SubCall]) -> TokenUsage:
     )
 
 
-def _notice(kind: str, detail: str) -> dict[str, str]:
+def _notice(kind: str, detail: str, **extras: int) -> dict[str, object]:
     """One panel notice — what the RUNNER dropped or refused to swallow silently, carried on
-    ``sub_results["notices"]`` into the stage log (the fold emits its own, engine-side)."""
+    ``sub_results["notices"]`` into the stage log and (since #268) into the event stream.
+
+    ``detail`` is prose FOR HUMANS. Anything a consumer must compute on rides as a declared
+    numeric ``extra`` instead: the engine-side contract
+    (``review_workflow.RUNNER_NOTICE_EXTRAS``) reads only declared keys and must never regex
+    a detail string to recover a number. Adding an extra therefore means declaring it on
+    both sides of the seam — today only ``verifier_cap.count`` (findings left unverified
+    past ``_MAX_VERIFIERS``)."""
     return {
         "notice": kind,
         "detail": detail if len(detail) <= _MAX_NOTICE_DETAIL
         else detail[:_MAX_NOTICE_DETAIL] + " … [truncated]",
+        **extras,
     }

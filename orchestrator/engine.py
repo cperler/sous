@@ -1256,12 +1256,18 @@ class Engine:
         # so everything downstream (policy merge, verdict, convergence, evidence-out) reads
         # the same shape it always has and needs no knowledge of the workflow.
         synthesized: dict | None = None
+        # #285: the fold's per-dispatch panel telemetry, persisted beside the raw
+        # sub_results below. None (and therefore ABSENT from the payload) whenever the fold
+        # did not run — a single-reviewer or failed-panel review has no panel to summarize,
+        # and the key's presence is exactly that honest marker.
+        panel_summary: dict | None = None
         if (
             effective.stage is Stage.REVIEW
             and effective.status is ResultStatus.SUCCESS
             and effective.sub_results is not None
         ):
-            synthesized, notices = synthesize(effective.sub_results)
+            folded = synthesize(effective.sub_results)
+            synthesized, notices, panel_summary = folded
             if effective.structured_output is not None:
                 # The fold owns ``output`` for a plan-bearing review (design §2). A runner
                 # that ALSO self-reported a verdict does not get to keep it — that is the
@@ -1279,6 +1285,18 @@ class Engine:
                 {"ts": _now(), "type": "review_synthesis_notice", "run_id": run_id,
                  "task_id": effective.task_id, "stage": effective.stage.value, **notice}
                 for notice in notices
+            )
+            # #268: the RUNNER's own notices (verifier cap hit, an inconclusive verifier, an
+            # unknown dedupe rule) were persisted in the stage log and nowhere else, so
+            # "this review only verified 8 of 12 blocking findings" was invisible to status,
+            # the dashboard and alerting. They ride the SAME events list — hence the same
+            # #277 commit boundary and the same stage_recorded replay dedupe; no second
+            # dedupe, no write outside the transaction. An unknown notice kind still emits.
+            events.extend(
+                {"ts": _now(), "type": "review_panel_notice", "level": "warning",
+                 "run_id": run_id, "task_id": effective.task_id,
+                 "stage": effective.stage.value, **notice}
+                for notice in panel_summary["notices"]
             )
         # Deterministic project policy gates (#65): merge the adapter's review_findings
         # into a completed REVIEW result BEFORE the verdict is read — the old
@@ -1492,6 +1510,12 @@ class Engine:
                 payload["sub_results"] = result.sub_results
             if synthesized is not None:
                 payload["structured_output"] = synthesized
+            # #285: the panel's deterministic telemetry (per-lens totals, cross-lens
+            # agreement, verdict tallies, runner notices) — computed by the fold, persisted
+            # here, rendered by render_stage. Conditional for the same reason as the two
+            # above: a plan-less review's payload stays byte-identical.
+            if panel_summary is not None:
+                payload["panel_summary"] = panel_summary
             seq = t.stage_counter
             self.store.write_stage_log(result.task_id, seq, result.stage.value, payload)
             self.store.write_stage_markdown(
@@ -2990,6 +3014,9 @@ class Engine:
         # (safe only because the run is terminal — a mid-run poll leaves live locks alone).
         if run.state in TERMINAL_RUN_STATES:
             self.store.sweep_locks()
+        # ONE events.jsonl read shared by the lease audit and the panel block (#285) — the
+        # same discipline as the single ledger read above; status() is the cheap poll path.
+        events = self.store.read_events(run_id)
         return {
             "run_id": run_id,
             "run_state": run.state.value,
@@ -3000,7 +3027,41 @@ class Engine:
             "lane_audit": self.lane_audit(run_id, rows=rows),
             # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
             # automatically at every poll / batch completion instead of by hand-count.
-            "events_audit": self.events_audit(run_id),
+            "events_audit": self.events_audit(run_id, events=events),
+            # #268/#285: what the review panels had to cap or give up on, so a capped or
+            # inconclusive review is visible from a poll instead of only inside a stage log.
+            "review_panel": self.review_panel_audit(run_id, events=events),
+        }
+
+    def review_panel_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
+        """Compact per-run view of the multi-agent REVIEW panels' runner notices (#268).
+
+        The panel already recorded WHY it fell short — a verifier cap it hit, a verifier that
+        came back inconclusive, a dedupe rule it did not recognize — but only inside the
+        stage log, where nothing polling the run would ever look. Derived here from the
+        ``review_panel_notice`` events (the engine emits one per normalized runner notice at
+        record time), so this stays a read of the durable audit trail rather than a second
+        source of truth: counts by notice kind overall, plus the tasks flagged and by what.
+
+        ``clean`` is False as soon as ANY panel notice exists — every kind means the review
+        was thinner than the plan asked for, which is precisely the signal a human polling a
+        batch needs (the findings themselves stay blocking either way)."""
+        events = self.store.read_events(run_id) if events is None else events
+        by_notice: dict[str, int] = {}
+        by_task: dict[str, dict[str, int]] = {}
+        for ev in events:
+            if ev.get("type") != "review_panel_notice":
+                continue
+            kind = str(ev.get("notice") or "unknown")
+            by_notice[kind] = by_notice.get(kind, 0) + 1
+            task_id = str(ev.get("task_id") or "unknown")
+            by_task.setdefault(task_id, {})
+            by_task[task_id][kind] = by_task[task_id].get(kind, 0) + 1
+        return {
+            "notices": sum(by_notice.values()),
+            "by_notice": dict(sorted(by_notice.items())),
+            "by_task": {t: dict(sorted(k.items())) for t, k in sorted(by_task.items())},
+            "clean": not by_notice,
         }
 
     def lane_audit(self, run_id: str, *, rows: list[dict] | None = None) -> dict:

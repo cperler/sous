@@ -16,7 +16,7 @@ downstream (``_merge_policy_findings`` → ``_review_verdict`` → ``_apply_revi
 → evidence-out). The raw ``sub_results`` persist in the per-stage log as evidence; the
 folded review is what the status doc, the context plane, and the convergence math consume.
 
-**Why the signature is ``(review, notices)``, not the shorthand ``-> dict``.** Per the
+**Why the signature returns notices, not the shorthand ``-> dict``.** Per the
 repo's pure-fold norm (#235/#201), a fold that drops or coerces something observable
 RETURNS a notice of what it dropped and lets the engine call site emit the warning-grade
 event — the fold never gets an event sink of its own. The panel's input is model-authored
@@ -32,11 +32,37 @@ errored, went missing, returned an unmatchable fingerprint, or returned a verdic
 do not recognize leaves its finding in ``issues``. Refuted findings are never erased —
 they land in ``non_blocking`` prefixed ``refuted:`` with the verifier's reasoning, so
 evidence-out still files them for a human and the false-negative loop stays closed.
+
+**Panel telemetry (#285) and the runner-notice contract (#268).** The panel's raw material
+— which lens found what, how often lenses AGREED, what each verifier concluded, what the
+runner had to cap or give up on — used to be persisted and never read. ``synthesize`` now
+also returns ``panel_summary``: a small, deterministic dict computed inside the SAME lens
+walk (no second pass over ``sub_results`` — the module's anti-drift rule), carrying the
+cross-lens agreement the dedupe ``continue`` would otherwise discard. It is RETURNED, not
+written: the engine call site persists it next to ``sub_results`` and emits one
+``review_panel_notice`` event per normalized runner notice, so a capped or inconclusive
+review is visible from ``status``/the event stream instead of only inside a stage log.
+
+The runner-notice contract is declared HERE, at the seam (``RUNNER_NOTICE_EXTRAS``): a
+runner notice is ``{"notice": str, "detail": str}`` plus the numeric extras declared for
+its kind (today: ``verifier_cap.count``). The fold reads only declared keys and NEVER
+parses a detail string — the runner's prose is for humans, the extras are for the fold.
+An unknown notice kind still passes through (a new runner signal must not vanish); a
+malformed one is skipped with a fold notice.
+
+*Rejected alternative* (recorded per the design norm): a separate
+``summarize_panel(sub_results)`` function called beside ``synthesize``. It would have
+avoided every caller churn — but it duplicates the lens walk, the fingerprint dedupe, the
+severity default and the verdict indexing, which is exactly the drift this module's
+single-walk rule exists to prevent (two normalizations of one panel eventually disagree).
+Changing the return shape to a ``NamedTuple`` costs a mechanical caller update once and
+keeps ONE walk as the single source of truth.
 """
 
 from __future__ import annotations
 
 import re
+from typing import NamedTuple
 
 from .render import format_review_issue
 
@@ -62,6 +88,24 @@ _DEFAULT_SEVERITY = "important"
 _MAX_NOTICE_DETAIL = 200  # a notice's detail string, bounded like #201's drop notices
 _MAX_TITLE = 80  # a non_blocking title, matching _merge_policy_findings' advisory shape
 
+# --- the runner-notice contract (#268) ---------------------------------------------------
+# What a runner may put on ``sub_results["notices"]``, and which NUMERIC extras the fold
+# reads off each kind. Keys not declared here are not read: the fold must never regex a
+# ``detail`` string to recover a number, so any count a consumer needs is declared
+# structurally on BOTH sides of the seam (the producer is
+# ``adapters/execution/review_panel.py::_notice``). An unknown notice KIND is still carried
+# through with its notice/detail — a new runner signal reaches the event stream before this
+# table knows about it — it simply contributes no counters.
+RUNNER_NOTICE_EXTRAS: dict[str, tuple[str, ...]] = {
+    # how many blocking findings went unverified past the runner's verifier cap
+    "verifier_cap": ("count",),
+}
+
+# The runner notice kinds the summary counts. Kept as names (not a closed enum) because the
+# contract above is open: an unknown kind is reported, just not tallied.
+_NOTICE_VERIFIER_CAP = "verifier_cap"
+_NOTICE_VERIFIER_INCONCLUSIVE = "verifier_inconclusive"
+
 
 def issue_fingerprint(issue: object) -> str:
     """Stable convergence/dedupe key for one review finding — the named
@@ -78,7 +122,28 @@ def issue_fingerprint(issue: object) -> str:
     return re.sub(r"\s+", " ", base).casefold()[:160]
 
 
-def synthesize(sub_results: object) -> tuple[dict, tuple[dict[str, str], ...]]:
+class SynthesisResult(NamedTuple):
+    """What one fold of a panel produced.
+
+    A ``NamedTuple`` rather than a bare tuple so ``result.panel_summary`` documents itself
+    at every call site while ``[0]``/``[1]`` indexing and iteration keep working exactly as
+    before. All three fields are RETURNED data — the fold writes nothing and emits nothing
+    (#235/#201); the engine call site persists ``panel_summary`` and turns both notice
+    channels into events.
+
+    * ``review`` — canonical ``review.json``; the ONLY field anything downstream of the
+      review gate reads. Panel telemetry deliberately never leaks into it.
+    * ``notices`` — what the FOLD refused to swallow silently (``review_synthesis_notice``).
+    * ``panel_summary`` — deterministic per-dispatch panel telemetry (#285), including the
+      normalized RUNNER notices under ``["notices"]`` (``review_panel_notice``, #268).
+    """
+
+    review: dict
+    notices: tuple[dict[str, str], ...]
+    panel_summary: dict
+
+
+def synthesize(sub_results: object) -> SynthesisResult:
     """Fold one plan-bearing REVIEW's raw ``sub_results`` into canonical ``review.json``.
 
     Input (design §2): ``{"findings_by_lens": {lens: review_findings, ...},
@@ -105,8 +170,11 @@ def synthesize(sub_results: object) -> tuple[dict, tuple[dict[str, str], ...]]:
     8. ``improvement`` / ``retrospective`` = the first non-null in lens order, one each
        (the single-improvement/single-retrospective shape today's consumers expect);
        omitted entirely when no lens supplied one.
+    9. ``panel_summary`` = telemetry over the SAME walk (#285) — see ``_panel_summary``.
+       Its presence is the honest per-dispatch panel marker: the fold only runs on a
+       plan-bearing dispatch, so a single-reviewer (or failed-panel) review has none.
 
-    Returns ``(review, notices)`` — see the module docstring for why.
+    Returns a ``SynthesisResult`` — see the module docstring for why.
     """
 
     notices: list[dict[str, str]] = []
@@ -121,10 +189,15 @@ def synthesize(sub_results: object) -> tuple[dict, tuple[dict[str, str], ...]]:
 
     by_lens = _lens_map(root.get("findings_by_lens"), notices)
     verdicts = _index_verdicts(root.get("verdicts"), notices)
+    runner_notices = _runner_notices(root.get("notices"), notices)
 
     ranked: list[tuple[int, str, object]] = []
     non_blocking: list[dict[str, str]] = []
     seen: set[str] = set()
+    # #285: the fingerprints each lens raised, collected DURING the walk below — the only
+    # place cross-lens agreement is observable (the dedupe `continue` discards it, and a
+    # second pass over the raw input would be the drift this module forbids).
+    by_lens_fingerprints: dict[str, set[str]] = {}
     tests_meaningful: bool | None = None
     improvement: object = None
     retrospective: object = None
@@ -184,6 +257,7 @@ def synthesize(sub_results: object) -> tuple[dict, tuple[dict[str, str], ...]]:
                 ))
                 continue
             fingerprint = issue_fingerprint(finding)
+            by_lens_fingerprints.setdefault(lens, set()).add(fingerprint)
             if fingerprint in seen:  # cross-lens agreement: the contract, not a drop
                 continue
             seen.add(fingerprint)
@@ -215,7 +289,139 @@ def synthesize(sub_results: object) -> tuple[dict, tuple[dict[str, str], ...]]:
         review["improvement"] = improvement
     if retrospective is not None:
         review["retrospective"] = retrospective
-    return review, tuple(notices)
+    summary = _panel_summary(by_lens, by_lens_fingerprints, verdicts, runner_notices)
+    return SynthesisResult(review, tuple(notices), summary)
+
+
+def _panel_summary(
+    by_lens: dict[str, object],
+    by_lens_fingerprints: dict[str, set[str]],
+    verdicts: dict[str, dict[str, str]],
+    runner_notices: list[dict[str, object]],
+) -> dict:
+    """Deterministic panel telemetry for ONE dispatch (#285), from collected state only.
+
+    Every input is something the walk already produced, so this adds no second pass over
+    ``sub_results`` and cannot drift from the verdict the fold reached.
+
+    Shape (fixed key order; ``lenses`` sorted by lens name, so the dict is byte-stable for
+    a given panel regardless of the input dict's own ordering):
+
+    * ``lenses`` — per lens: ``total`` fingerprints it raised, how many were ``unique`` to
+      it, and how many it ``shared`` with another lens. This is the per-lens value signal
+      the issue asked for: a lens whose findings are all shared earned nothing on its own.
+      Only lenses that raised a finding the fold KEPT appear (a silent or all-malformed
+      lens has nothing to attribute) — ``finders`` below is where it is still counted.
+    * ``findings`` — distinct fingerprints across the panel; ``agreed`` — how many of those
+      **>= 2 lenses independently raised** (what the dedupe ``continue`` used to discard).
+    * ``finders`` — derived from the ``findings_by_lens`` KEYS, and ``verifiers`` from
+      ``len(verdicts) + inconclusive``. Both are derivations, not counts: ``sub_calls`` live
+      on the ``StageResult``, not in ``sub_results``, so the fold cannot see the real call
+      list. A lens that returned nothing still counts as a finder (it has a key); a verifier
+      that produced neither a verdict nor a notice is invisible here — which is why the
+      runner declares ``verifier_inconclusive`` rather than staying silent.
+    * ``verdicts`` — confirmed/refuted tallies over the INDEXED verdicts, i.e. after the
+      fold's coercions (an unrecognized verdict value counts as ``confirmed``, matching the
+      blocking outcome it produced) and after first-wins dedupe, so the tallies describe
+      what the verdict was actually computed from.
+    * ``inconclusive`` / ``cap_hit`` / ``cap_dropped`` — from the RUNNER notices, read via
+      the declared contract (``verifier_cap.count``), never by parsing prose.
+    * ``notices`` — the normalized runner notices verbatim; the engine emits one
+      ``review_panel_notice`` per entry (#268).
+    """
+    fingerprint_lenses: dict[str, int] = {}
+    for fingerprints in by_lens_fingerprints.values():
+        for fingerprint in fingerprints:
+            fingerprint_lenses[fingerprint] = fingerprint_lenses.get(fingerprint, 0) + 1
+
+    lenses: dict[str, dict[str, int]] = {}
+    for lens in sorted(by_lens_fingerprints):
+        fingerprints = by_lens_fingerprints[lens]
+        shared = sum(1 for fp in fingerprints if fingerprint_lenses[fp] > 1)
+        lenses[lens] = {
+            "total": len(fingerprints),
+            "unique": len(fingerprints) - shared,
+            "shared": shared,
+        }
+
+    tally = {"confirmed": 0, "refuted": 0}
+    for verdict in verdicts.values():
+        if verdict["verdict"] in tally:
+            tally[verdict["verdict"]] += 1
+
+    inconclusive = sum(
+        1 for n in runner_notices if n["notice"] == _NOTICE_VERIFIER_INCONCLUSIVE
+    )
+    cap_notices = [n for n in runner_notices if n["notice"] == _NOTICE_VERIFIER_CAP]
+    cap_dropped = 0
+    for cap in cap_notices:  # absent (old-shape/malformed) count => flagged, uncounted
+        dropped = cap.get("count")
+        if isinstance(dropped, int):
+            cap_dropped += dropped
+    return {
+        "lenses": lenses,
+        "finders": len(by_lens),
+        "findings": len(fingerprint_lenses),
+        "agreed": sum(1 for n in fingerprint_lenses.values() if n > 1),
+        "verifiers": len(verdicts) + inconclusive,
+        "verdicts": tally,
+        "inconclusive": inconclusive,
+        "cap_hit": bool(cap_notices),
+        "cap_dropped": cap_dropped,
+        "notices": runner_notices,
+    }
+
+
+def _runner_notices(raw: object, notices: list[dict[str, str]]) -> list[dict[str, object]]:
+    """Normalize ``sub_results["notices"]`` — what the RUNNER refused to swallow silently —
+    into the declared contract (see ``RUNNER_NOTICE_EXTRAS`` and the module docstring).
+
+    Tolerant in the same direction as everything else here: absent or non-list degrades to
+    empty, an unusable entry is SKIPPED with a fold notice, and nothing raises — a malformed
+    notice list must never break ``record()``. An unknown notice kind is kept intact (with
+    its notice/detail), so a runner signal this table has not learned about yet still
+    reaches the event stream instead of disappearing at the seam."""
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        notices.append(_notice(
+            "runner_notices_malformed",
+            f"sub_results notices is {type(raw).__name__}, not a list — no runner notice "
+            "was surfaced for this panel",
+        ))
+        return []
+    out: list[dict[str, object]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            notices.append(_notice(
+                "runner_notice_malformed",
+                f"runner notice {_bound(repr(entry))} is not an object — skipped",
+            ))
+            continue
+        kind = entry.get("notice")
+        if not isinstance(kind, str) or not kind.strip():
+            notices.append(_notice(
+                "runner_notice_malformed",
+                f"runner notice {_bound(repr(entry))} carries no notice kind — skipped",
+            ))
+            continue
+        kind = kind.strip()
+        item: dict[str, object] = {
+            "notice": kind,
+            "detail": _bound(str(entry.get("detail") or "").strip()),
+        }
+        for extra in RUNNER_NOTICE_EXTRAS.get(kind, ()):
+            value = entry.get(extra)
+            if isinstance(value, int) and not isinstance(value, bool):
+                item[extra] = value
+            elif value is not None:
+                notices.append(_notice(
+                    "runner_notice_extra_malformed",
+                    f"runner notice {kind!r} declared {extra} as a number but sent "
+                    f"{_bound(repr(value))} — the notice is kept, the count dropped",
+                ))
+        out.append(item)
+    return out
 
 
 def _notice(kind: str, detail: str) -> dict[str, str]:
