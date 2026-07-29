@@ -163,9 +163,10 @@ def synthesize(sub_results: object) -> SynthesisResult:
     5. ``non_blocking`` = suggestion findings, plus every refuted finding prefixed
        ``refuted:`` and carrying the verifier's reasoning. Disposition is deliberately
        absent so evidence-out files them (schema default: ``file``).
-    6. ``tests_meaningful`` = ``find:tests``'s report; only an explicit ``false`` is
-       vacuous (fail-OPEN preserved), so a docs-only plan that omits the lens folds to
-       ``true``.
+    6. ``tests_meaningful`` = ``find:tests``'s report VERBATIM, or ``null`` when no lens
+       supplied a boolean one; only an explicit ``false`` is vacuous (fail-OPEN preserved),
+       so a docs-only plan that omits the lens folds to ``null`` — "not judged", never a
+       synthesized ``true`` (#261).
     7. ``approved`` = ``issues`` empty AND tests not vacuous. Nothing else.
     8. ``improvement`` / ``retrospective`` = the first non-null in lens order, one each
        (the single-improvement/single-retrospective shape today's consumers expect);
@@ -283,7 +284,12 @@ def synthesize(sub_results: object) -> SynthesisResult:
         "approved": not issues and not vacuous,
         "issues": issues,
         "non_blocking": non_blocking,
-        "tests_meaningful": not vacuous,
+        # #261: the lens's OWN answer, or null when no lens judged it — never a synthesized
+        # `true`. `not vacuous` used to record an affirmative verdict on a panel where
+        # find:tests never ran (or abstained), i.e. a verification claim nobody made. The
+        # approve/reject math is unchanged: it reads `vacuous`, which is still
+        # `is False`-only, so a null keeps failing OPEN.
+        "tests_meaningful": tests_meaningful,
     }
     if improvement is not None:
         review["improvement"] = improvement

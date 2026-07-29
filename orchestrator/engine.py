@@ -93,8 +93,10 @@ from .state_machine import (
     begin_stage,
     is_done,
     next_stage,
+    no_model_test_surface,
     reset_for_fix_cycle,
     resume_point,
+    unjudged_tests_notice,
 )
 from .status_store import StatusStore
 from .stream_probe import probe_current_stream
@@ -1331,12 +1333,13 @@ class Engine:
         outcome = ""
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
+        test_validation: dict[str, object] | None = None
         cooldown_until: str | None = None
         provider_out_reason: str | None = None
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
-            nonlocal cooldown_until, provider_out_reason
+            nonlocal test_validation, cooldown_until, provider_out_reason
             # Authoritative lease validation under the task lock (#277): the whole
             # validate→transition sequence is one read-modify-write on the fresh doc,
             # so of two concurrent duplicate records exactly one clears the lease —
@@ -1450,6 +1453,12 @@ class Engine:
                     # quality loop — restored as a bounded fix cycle; issue #15 keeps the
                     # convergence-auto-approval refinement).
                     review_verdict = self._review_verdict(effective, t)
+                    # #261: did ANYTHING judge test-meaningfulness? The pure helper decides
+                    # (nothing judged it, or an explicit verdict the #41/#168 exemption
+                    # discarded); the event is emitted at the call site in _stage_events,
+                    # per the "pure fold returns what it dropped" convention. Observability
+                    # only — it never gates completion (fail-OPEN stays fail-OPEN).
+                    test_validation = unjudged_tests_notice(t, effective)
                     if scope_blocked_reason is not None:
                         t.state = TaskState.BLOCKED_ON_HUMAN
                         outcome = "scope_not_feasible_held"
@@ -1550,6 +1559,16 @@ class Engine:
                      "disposition": review_verdict.get("disposition"),
                      "issues": review_verdict["issues_text"],
                      "review_cycles": t.review_cycles}
+                )
+            # #261: nobody judged whether the tests are meaningful (or the reviewer's verdict
+            # was suppressed by the no-model-test-surface exemption). Warning-grade, so a run
+            # that skipped the #13 guarantee SAYS so instead of carrying a `tests_meaningful:
+            # true` nobody earned. Never blocking — the gates stay fail-OPEN.
+            if test_validation is not None:
+                events.append(
+                    {"ts": _now(), "type": "test_validation_skipped", "level": "warning",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value, **test_validation}
                 )
             # Audit the WHY of a feasibility park alongside the generic stage record, so the
             # event stream shows the blocked_reason that routed the task to the human gate.
@@ -1695,10 +1714,14 @@ class Engine:
         change. The runner is asked to self-report ``tests_meaningful``; if it explicitly
         reports ``false`` we veto (retry-with-learnings) rather than ship vacuous tests.
 
-        Fail-OPEN on a MISSING field: nothing enforces this soft field on the interactive/
-        headless lanes (no JSON schema), so a model that simply omits it must not dead-end
-        otherwise-green work — only an explicit ``false`` is a veto. (A stronger, schema-
-        or independent-reviewer-enforced version is tracked as issue #13.)"""
+        Fail-OPEN on a MISSING or NULL field: nothing enforces this soft field on the
+        interactive/headless lanes (no JSON schema), so a model that simply omits it — or a
+        runner that honestly reports ``null`` because it cannot judge meaningfulness (the
+        deterministic ENGINE lane, #261) — must not dead-end otherwise-green work. Only an
+        explicit ``false`` is a veto. An abstention here is not free, though: if REVIEW
+        abstains too, ``record`` emits a warning-grade ``test_validation_skipped`` event so
+        the run never *claims* a verification nobody performed. (A stronger, schema- or
+        independent-reviewer-enforced version is tracked as issue #13.)"""
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
@@ -1824,7 +1847,11 @@ class Engine:
         on the deterministic ENGINE lane (opted in via ``deterministic_stages``). A model
         cannot self-exempt: all three signals are fixed at ``add_task`` time. An explicit
         ``approved=false`` still rejects normally — the exemption covers only the vacuous-
-        tests criterion, never a substantive reviewer rejection."""
+        tests criterion, never a substantive reviewer rejection. When the exemption discards
+        an EXPLICIT reviewer ``false``, that suppression is no longer silent: ``record``
+        emits a warning-grade ``test_validation_skipped`` event for it (#261). An OMITTED /
+        null ``tests_meaningful`` still fails open here — and is likewise evented when the
+        TEST stage did not judge it either."""
         if result.stage is not Stage.REVIEW:
             return None
         out = result.structured_output or {}
@@ -1838,12 +1865,12 @@ class Engine:
         # the pipeline (micro) or opted into the deterministic $0 ENGINE runner (#33/#68), so no
         # model wrote/graded the tests the reviewer would be judging. An explicit `approved=false`
         # still rejects normally: this relaxes only the tests criterion, never a substantive reject.
-        no_model_test_surface = (
-            task.context.get("change_class") == "docs-only"
-            or Stage.TEST not in task.pipeline
-            or Stage.TEST in task.deterministic_stages
+        # The predicate itself is the pure ``state_machine.no_model_test_surface`` so the
+        # #261 test_validation_skipped notice reads the SAME exemption (it reports when this
+        # suppresses an explicit reviewer `false` — no second spelling to drift).
+        tests_vacuous = (
+            out.get("tests_meaningful") is False and not no_model_test_surface(task)
         )
-        tests_vacuous = out.get("tests_meaningful") is False and not no_model_test_surface
         if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")

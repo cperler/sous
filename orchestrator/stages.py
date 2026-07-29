@@ -253,10 +253,40 @@ _DOCS_ONLY_DIRECTIVE = (
 )
 
 
+# The #13/#168/#261 tests_meaningful directive for the single-reviewer REVIEW prompt.
+# Hoisted next to _DOCS_ONLY_DIRECTIVE for the same reason: one wording, one place.
+#
+# #261: the omission carve-out is scoped EXPLICITLY to a genuinely absent test surface. The
+# old wording ("Only set it when there ARE tests to judge … OMIT the field entirely") read as
+# broad permission to omit, and on a lite-lane task with 7 new tests the reviewer took it —
+# while the deterministic TEST runner was deferring to REVIEW. Each side deferred to the
+# other and nobody judged. So: state that an omission is recorded as "not judged" and
+# evented, never as a pass. The `false`-is-a-rejection warning stays (it is what #144/#168
+# exist for) — it just no longer doubles as an excuse to skip the judgment.
+_TESTS_MEANINGFUL_DIRECTIVE = (
+    "\n\n## Reporting tests_meaningful\n"
+    "JUDGE `tests_meaningful` whenever this change has tests you can read — including tests "
+    "it adds, changes, or should have added. That judgment is your job here: you are a "
+    "different agent from the one that wrote them, which is the whole point of the check. "
+    "OMIT the field ONLY when there is genuinely NO test surface: a docs/config-only change, "
+    "or nothing behavioral that any test could exercise.\n"
+    "An omission is recorded as **not judged** and is evented as a skipped verification — it "
+    "is NOT a pass, and it does not save you the work. But do not answer `false` merely "
+    "because a change has no tests to judge: a literal `false` reads as a rejection for "
+    "having vacuous tests and drives a fix cycle. `false` means \"there ARE tests and they "
+    "would NOT fail if this change regressed\"."
+)
+
+
 def _render_value(v: object) -> str:
     """One folded context value → a compact one-line-ish string for the prompt."""
     if isinstance(v, list):
         return "; ".join(str(x) for x in v) if v else "(none)"
+    if v is None:
+        # A folded null is an explicit ABSTENTION, not the string "None" (#261: the
+        # deterministic TEST runner reports `tests_meaningful: null` because it cannot judge
+        # meaningfulness). Render it as such so a downstream prompt reads it correctly.
+        return "(not reported)"
     return str(v)
 
 
@@ -355,11 +385,11 @@ def render_prompt(
       don't apply. The tag is set deterministically by the ENGINE-lane git diff, so a
       model cannot trigger this exemption by asserting it in its output.
 
-    - REVIEW (all tasks, #168): instructs the reviewer to OMIT ``tests_meaningful``
-      rather than answer ``false`` when there is no test surface to judge — belt-and-
-      suspenders with the engine's fail-open-on-omit behaviour in ``_review_verdict``.
-      A literal ``false`` on a no-test-surface change spuriously triggers the #13
-      independent-test-validate reject.
+    - REVIEW (all tasks, #168/#261): tells the reviewer to JUDGE ``tests_meaningful``
+      whenever there are tests to read, and to OMIT it — rather than answer ``false`` —
+      ONLY when the change has genuinely no test surface (a literal ``false`` there
+      spuriously triggers the #13 independent-test-validate reject, the #144 misfire).
+      An omission is stated to be recorded as "not judged" and evented, not a pass.
 
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
@@ -385,13 +415,7 @@ def render_prompt(
     # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal
     # `false` on a no-test-surface change is what spuriously kicked #144 into a fix cycle.
     if stage is Stage.REVIEW:
-        instruction += (
-            "\n\n## Reporting tests_meaningful\n"
-            "Only set `tests_meaningful` when there ARE tests to judge. If this change has no "
-            "test surface (e.g. a docs/config-only change, or nothing whose behavior tests "
-            "could exercise), OMIT the field entirely rather than answering `false` — a literal "
-            "`false` reads as a rejection for lacking meaningful tests."
-        )
+        instruction += _TESTS_MEANINGFUL_DIRECTIVE
     # #62: a frontend change (deterministic signal on files_changed folded from IMPLEMENT)
     # gets the design-review criteria block appended to the REVIEW prompt. Project-agnostic
     # wording; the heysoo-specific design tokens live in the adapter's design agent.
@@ -505,9 +529,12 @@ _LENS_TESTS = _Lens(
         "NOT your lens: correctness of the production code itself, spec conformance, and "
         "visual/design craft.\n"
         "Also return tests_meaningful (bool) — your verdict on whether the tests genuinely "
-        "cover this change. Only set it when there ARE tests to judge; OMIT the field "
-        "entirely when the change has no test surface (a literal false reads as a rejection "
-        "for lacking meaningful tests).\n"
+        "cover this change. JUDGE it whenever there are tests to read (including ones this "
+        "change adds or should have added); OMIT it ONLY when the change has genuinely no "
+        "test surface (docs/config-only, nothing behavioral). An omission is recorded as "
+        "'not judged' and evented as a skipped verification — it is not a pass. Do not "
+        "answer false merely because tests are absent: false means 'there ARE tests and they "
+        "would NOT fail if this change regressed', and it reads as a rejection.\n"
         + _FINDER_RETURN
     ),
 )

@@ -26,8 +26,8 @@
       }
     },
     "tests_meaningful": {
-      "type": "boolean",
-      "description": "the find:tests lens's independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false is vacuous; omitted/absent fails OPEN. Only the find:tests finder emits this."
+      "type": ["boolean", "null"],
+      "description": "the find:tests lens's independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false is vacuous; omitted/absent/null fails OPEN but folds to a null 'not judged' in review.json rather than a true (#261). Answer it whenever there are tests to read; abstain only when the change has genuinely no test surface. Only the find:tests finder emits this."
     },
     "improvement": {
       "type": "object",

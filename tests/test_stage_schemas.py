@@ -67,6 +67,36 @@ def test_codex_accepts_schema_conformant_output() -> None:
     assert runner.dispatch(_wi("test")).status is ResultStatus.SUCCESS
 
 
+def test_codex_accepts_a_null_tests_meaningful_but_not_an_omission() -> None:
+    """#261: `null` is the schema-blessed "I could not judge this" answer (what the
+    deterministic ENGINE-lane runner reports), so it must VALIDATE — while the key staying in
+    `required` keeps a codex model that simply OMITS the judgment a SCHEMA_VIOLATION. Both
+    halves matter: the honest abstention must be expressible without weakening the guarantee.
+    """
+    schema = load_stage_schema("test")
+    assert "tests_meaningful" in schema["required"]  # omission is still a contract violation
+    validator = Draft202012Validator(schema)
+    assert not list(validator.iter_errors({"passed": True, "failures": [],
+                                           "tests_meaningful": None}))
+    for judged in (True, False):
+        assert not list(validator.iter_errors({"passed": True, "failures": [],
+                                               "tests_meaningful": judged}))
+    assert list(validator.iter_errors({"passed": True, "failures": [],
+                                       "tests_meaningful": "maybe"}))  # still typed
+    runner = CodexRunner(
+        transport=lambda w: RawResult(
+            structured_output={"passed": True, "failures": [], "tests_meaningful": None}
+        ),
+        schema_provider=load_stage_schema,
+    )
+    assert runner.dispatch(_wi("test")).status is ResultStatus.SUCCESS
+    # The review-side contracts accept the same abstention (the fold emits null when no
+    # find:tests lens judged it).
+    for ref in ("review", "review_findings"):
+        prop = load_stage_schema(ref)["properties"]["tests_meaningful"]
+        assert prop["type"] == ["boolean", "null"]
+
+
 def test_codex_rejects_wrong_type_against_canonical() -> None:
     runner = CodexRunner(
         transport=lambda w: RawResult(
