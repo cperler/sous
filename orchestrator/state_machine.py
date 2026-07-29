@@ -9,6 +9,7 @@ schema makes the crash marker unambiguous.
 from __future__ import annotations
 
 import json
+from typing import NamedTuple
 
 from pydantic import ValidationError
 
@@ -96,6 +97,29 @@ def begin_stage(
     task.updated_at = now
 
 
+class FoldNotices(NamedTuple):
+    """What a fold DROPPED, returned to the caller instead of vanishing (#201/#289).
+
+    The fold layer is pure — it never emits — so each list here is a to-be-emitted audit
+    record the engine call site turns into one warning-grade event:
+
+    * ``pr_fields``   → ``pr_field_dropped``      (a malformed pr_* value, #201)
+    * ``truncations`` → ``context_value_truncated`` (a capped context value, #289)
+    * ``evictions``   → ``context_key_evicted``     (a ceiling-shed context key, #289)
+
+    Kept as three lists rather than one, so the call site needs no per-notice branching
+    and each event's payload stays a flat, self-describing shape."""
+
+    pr_fields: list[dict[str, str]]
+    truncations: list[dict[str, object]]
+    evictions: list[dict[str, object]]
+
+
+def _no_notices() -> FoldNotices:
+    """An empty FoldNotices (fresh lists — never a shared mutable default)."""
+    return FoldNotices(pr_fields=[], truncations=[], evictions=[])
+
+
 def apply_result(
     task: Task,
     result: StageResult,
@@ -103,13 +127,13 @@ def apply_result(
     now: str,
     cost_usd: float | None,
     iteration: int | None = None,
-) -> list[dict[str, str]]:
+) -> FoldNotices:
     """Fold a StageResult into the task's stage record (status + attribution).
 
-    Returns the pr_* drop notices produced by ``_absorb_outputs`` (empty on the
-    non-SUCCESS branch, which folds nothing) so the engine can emit a warning-grade
-    ``pr_field_dropped`` audit event — the fold itself stays a pure, sink-free function
-    and the caller owns the I/O (#201, honouring the 'never silent' convention)."""
+    Returns the drop notices produced by ``_absorb_outputs`` (all empty on the
+    non-SUCCESS branch, which folds nothing) so the engine can emit the warning-grade
+    audit events — the fold itself stays a pure, sink-free function and the caller owns
+    the I/O (#201/#289, honouring the 'never silent' convention)."""
     rec: StageRecord = task.stages[result.stage]
     rec.completed_at = now
     rec.model = result.model
@@ -127,11 +151,11 @@ def apply_result(
     if iteration is not None:
         rec.iteration = iteration
 
-    pr_field_notices: list[dict[str, str]] = []
+    notices = _no_notices()
     if result.status is ResultStatus.SUCCESS:
         rec.status = StageStatus.COMPLETED
         rec.error = None
-        pr_field_notices = _absorb_outputs(task, result)
+        notices = _absorb_outputs(task, result)
     else:
         rec.status = StageStatus.FAILED
         rec.error = result.error or result.status.value
@@ -139,7 +163,7 @@ def apply_result(
 
     task.current_stage = result.stage
     task.updated_at = now
-    return pr_field_notices
+    return notices
 
 
 # Engine-owned context-fold whitelist (2026-07-01 context-plane design note). Per stage,
@@ -174,35 +198,87 @@ DETERMINISTIC_ONLY_KEYS: frozenset[str] = frozenset({"change_class"})
 # Bounds so the context (fed into every later prompt) stays bounded regardless of what a
 # model returns. Deterministic (no wall-clock/random) → replay reproduces the same fold.
 _MAX_STR = 2000  # a single string value
-_MAX_ITEM_STR = 500  # a string element inside a list value
+_MAX_ITEM_STR = 500  # a string element inside a list value (the default per-item cap)
 _MAX_LIST = 40  # elements kept from a list value
 _MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
 _MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice (#201)
 
+# #289: the per-item cap is chosen by what a FIELD MEANS, not by the value's python type.
+# A SCOPE ``plan`` is an ordered list of prose subtask INSTRUCTIONS — routinely well over
+# 500 chars each, with the caveats in the tail — so the incidental-list-item cap (meant for
+# file paths / short findings) was cutting the highest-value sentence out of every dispatched
+# implement prompt, with no space pressure at all (a 9-subtask plan is ~3.6KB against a 16KB
+# ceiling). Plan items get a cap sized to the ceiling instead; the whole-context ceiling
+# below still binds, so this is not unbounded growth.
+_MAX_PLAN_ITEM_STR = 4000
+_ITEM_CAP_BY_KEY: dict[str, int] = {"plan": _MAX_PLAN_ITEM_STR}
 
-def _cap_item(x: object) -> object:
-    if isinstance(x, str) and len(x) > _MAX_ITEM_STR:
-        return x[:_MAX_ITEM_STR] + " … [truncated]"
-    return x
+
+def _item_cap(key: str) -> int:
+    """The per-item cap for a list value's string elements, by FIELD MEANING (#289)."""
+    return _ITEM_CAP_BY_KEY.get(key, _MAX_ITEM_STR)
 
 
-def _cap_value(v: object) -> object:
-    """Bound one folded value (string/list); scalars pass through unchanged."""
+def _cap_item(x: object, limit: int) -> tuple[object, int]:
+    """Bound one string element of a list value.
+
+    Returns ``(value, dropped_chars)`` — ``dropped_chars`` is 0 when nothing was cut, so
+    the caller can surface the truncation instead of losing it silently (#289)."""
+    if isinstance(x, str) and len(x) > limit:
+        return x[:limit] + " … [truncated]", len(x) - limit
+    return x, 0
+
+
+def _cap_value(key: str, v: object) -> tuple[object, list[dict[str, object]]]:
+    """Bound one folded value (string/list); scalars pass through unchanged.
+
+    Returns ``(value, notices)``: one bounded notice per thing this cap actually dropped
+    (a whole-string cut, a per-item cut naming the element index, or the list tail), each
+    naming the ``field`` and how much went. The function stays PURE — it emits nothing and
+    takes no sink; only the engine call site turns a notice into an audit event (#201/#289
+    'never silent' convention). Deterministic: no wall-clock/random, so replay reproduces
+    the same values AND the same notices."""
     if isinstance(v, str):
-        return v[:_MAX_STR] + " … [truncated]" if len(v) > _MAX_STR else v
+        if len(v) > _MAX_STR:
+            return v[:_MAX_STR] + " … [truncated]", [{
+                "field": key,
+                "part": "value",
+                "kept_chars": _MAX_STR,
+                "dropped_chars": len(v) - _MAX_STR,
+            }]
+        return v, []
     if isinstance(v, list):
-        capped = [_cap_item(x) for x in v[:_MAX_LIST]]
+        limit = _item_cap(key)
+        notices: list[dict[str, object]] = []
+        capped: list[object] = []
+        for index, item in enumerate(v[:_MAX_LIST]):
+            bounded, dropped_chars = _cap_item(item, limit)
+            capped.append(bounded)
+            if dropped_chars:
+                notices.append({
+                    "field": key,
+                    "part": f"item[{index}]",
+                    "kept_chars": limit,
+                    "dropped_chars": dropped_chars,
+                })
         if len(v) > _MAX_LIST:
-            capped.append(f"… ({len(v) - _MAX_LIST} more)")
-        return capped
-    return v  # bool / int / float / None
+            dropped_items = len(v) - _MAX_LIST
+            capped.append(f"… ({dropped_items} more)")
+            notices.append({
+                "field": key,
+                "part": "list_tail",
+                "kept_items": _MAX_LIST,
+                "dropped_items": dropped_items,
+            })
+        return capped, notices
+    return v, []  # bool / int / float / None
 
 
 def _context_bytes(context: dict) -> int:
     return len(json.dumps(context, default=str, ensure_ascii=False).encode("utf-8"))
 
 
-def _enforce_context_ceiling(task: Task) -> None:
+def _enforce_context_ceiling(task: Task) -> list[dict[str, object]]:
     """Keep task.context under the whole-context ceiling by a per-KEY size-weighted
     sweep, heaviest-first: each pass evicts the single folded key that weighs the most
     bytes, so a fat key is shed while its small stage-siblings survive (dropping a
@@ -211,15 +287,23 @@ def _enforce_context_ceiling(task: Task) -> None:
     Ties break reverse-pipeline (review's keys first, intake's last) then the fixed key
     order within that stage's ``CONTEXT_KEYS`` tuple — downstream stages need the earliest
     stages' context most. Deterministic: only json byte-lengths and the fixed enum/tuple
-    order decide, never context insertion order."""
+    order decide, never context insertion order.
+
+    Returns one bounded notice per EVICTED key (``field`` + the ``bytes`` it weighed),
+    in eviction order, so the caller can surface the loss as an audit event (#289). The
+    eviction ORDER and the resulting context are unchanged — this only stops the drop
+    from being invisible. Pure: no sink, no wall-clock."""
+    evicted: list[dict[str, object]] = []
     if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
-        return
+        return evicted
 
     # Advisory engine-injected context (prior_learnings, #72) is the first to shed under
     # pressure: it "may or may not apply", so durable stage-derived context outranks it.
     for key in ENGINE_INJECTED_KEYS:
         if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
-            return
+            return evicted
+        if key in task.context:
+            evicted.append({"field": key, "bytes": _context_bytes({key: task.context[key]})})
         task.context.pop(key, None)
 
     # A key's weight (json bytes of ``{key: value}``) depends only on that key's own value,
@@ -240,8 +324,11 @@ def _enforce_context_ceiling(task: Task) -> None:
 
     for key in ordered:
         if _context_bytes(task.context) <= _MAX_CONTEXT_BYTES:
-            return
+            return evicted
+        if key in task.context:
+            evicted.append({"field": key, "bytes": _context_bytes({key: task.context[key]})})
         task.context.pop(key, None)
+    return evicted
 
 
 def _bound_dropped_value(value: object) -> str:
@@ -265,19 +352,20 @@ def _short_validation_reason(exc: ValidationError) -> str:
     return reason
 
 
-def _absorb_outputs(task: Task, result: StageResult) -> list[dict[str, str]]:
+def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
     missing whitelisted key is skipped; a pr_* value that fails field validation is
     dropped rather than raised or stored, #172) and idempotent (a stage succeeds once;
     re-folding the same result yields the same values).
 
-    Returns a list of drop notices (one ``{field, value, reason}`` dict per dropped pr_*
-    value, empty when nothing was dropped) so the caller can surface each drop as an audit
-    event instead of losing it silently (#201). The fold stays pure — it emits nothing
-    itself."""
+    Returns a ``FoldNotices`` of everything this fold dropped — malformed pr_* values
+    (#201), values the per-field caps truncated and keys the whole-context ceiling
+    evicted (#289) — so the caller can surface each as an audit event instead of losing
+    it silently. The fold stays pure — it emits nothing itself."""
     out = result.structured_output or {}
     dropped: list[dict[str, str]] = []
+    truncations: list[dict[str, object]] = []
     # Dedicated pr_* fields stay: other consumers read them (_on_task_completed, status()).
     # Tolerant here too, per the #172 assignment convention: validate_assignment rejects a
     # malformed model-produced value (e.g. pr_number="") AT this write — skip it rather
@@ -304,9 +392,11 @@ def _absorb_outputs(task: Task, result: StageResult) -> list[dict[str, str]]:
         # ENGINE lane — a model result claiming it is ignored (dropped here).
         if key in DETERMINISTIC_ONLY_KEYS and not engine_lane:
             continue
-        task.context[key] = _cap_value(out[key])
-    _enforce_context_ceiling(task)
-    return dropped
+        bounded, cap_notices = _cap_value(key, out[key])
+        task.context[key] = bounded
+        truncations.extend(cap_notices)
+    evictions = _enforce_context_ceiling(task)
+    return FoldNotices(pr_fields=dropped, truncations=truncations, evictions=evictions)
 
 
 def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:

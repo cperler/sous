@@ -70,6 +70,75 @@ def test_pr_field_dropped_event_on_malformed_pr_value(tmp_path, project) -> None
     assert eng.store.load_task("r1", "t1").pr_url == "https://example.test/pr/9"
 
 
+def test_context_value_truncated_event_on_oversized_scope_plan(tmp_path, project) -> None:
+    """#289: a context value the fold had to cap emits a warning-grade
+    context_value_truncated event naming the field, the part and how much was dropped —
+    previously the only trace was a '… [truncated]' marker inside the next prompt, so a
+    downstream stage working from a degraded plan was invisible in the timeline."""
+    from orchestrator.state_machine import _MAX_PLAN_ITEM_STR
+
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    while (w := eng.next_work("r1", "t1")) is not None:
+        if w.stage is Stage.SCOPE:
+            eng.record("r1", make_result(w, structured_output={
+                "feasible": True,
+                "plan": ["in-budget subtask", "z" * (_MAX_PLAN_ITEM_STR + 250)],
+            }))
+        else:
+            eng.record("r1", make_result(w))
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    truncated = [e for e in events if e["type"] == "context_value_truncated"]
+    assert len(truncated) == 1, "exactly one truncation event, for the oversized subtask"
+    ev = truncated[0]
+    assert ev["run_id"] == "r1" and ev["task_id"] == "t1"
+    assert ev["stage"] == Stage.SCOPE.value
+    assert ev["field"] == "plan"
+    assert ev["part"] == "item[1]"
+    assert ev["dropped_chars"] == 250
+
+
+def test_in_budget_scope_plan_emits_no_truncation_event(tmp_path, project) -> None:
+    """#289: the common case is SILENT because nothing was dropped — a plan of >500-char
+    prose subtasks (the shape that used to be cut) folds whole and emits no event."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    plan = ["s" * 900, "t" * 1500, "u" * 800]
+    while (w := eng.next_work("r1", "t1")) is not None:
+        output = {"feasible": True, "plan": plan} if w.stage is Stage.SCOPE else None
+        eng.record("r1", make_result(w, structured_output=output))
+
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    assert not [e for e in events if e["type"] == "context_value_truncated"]
+    assert not [e for e in events if e["type"] == "context_key_evicted"]
+    assert eng.store.load_task("r1", "t1").context["plan"] == plan
+
+
+def test_context_key_evicted_event_when_the_ceiling_binds(tmp_path, project) -> None:
+    """#289: the whole-context ceiling still binds — and shedding a key is now reported
+    rather than silently shrinking every later prompt."""
+    from orchestrator.state_machine import _MAX_CONTEXT_BYTES, _context_bytes
+
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    huge_plan = ["p" * 3990 for _ in range(6)]  # ~24KB > the 16KB ceiling
+    while (w := eng.next_work("r1", "t1")) is not None:
+        output = {"feasible": True, "plan": huge_plan} if w.stage is Stage.SCOPE else None
+        eng.record("r1", make_result(w, structured_output=output))
+
+    task = eng.store.load_task("r1", "t1")
+    assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
+    events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
+    evicted = [e for e in events if e["type"] == "context_key_evicted"]
+    assert [e["field"] for e in evicted] == ["plan"]
+    assert evicted[0]["stage"] == Stage.SCOPE.value
+    assert evicted[0]["bytes"] > _MAX_CONTEXT_BYTES
+
+
 def test_finalize_sweeps_lock_sentinels_but_keeps_audit_trail(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")

@@ -41,8 +41,12 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   or truncates something that should be observable (the "never silent" convention), have
   the pure function *return* a notice of what it dropped and let the engine call site emit
   the warning-grade event. Pattern established by #201 (`_absorb_outputs` → `apply_result`
-  → engine emits `pr_field_dropped`); the natural next candidates are context-ceiling
-  eviction and value truncation in `_enforce_context_ceiling`/`_cap_value`.
+  → engine emits `pr_field_dropped`); #289 extended it to the whole context plane — the
+  fold returns a `FoldNotices` and the engine emits `context_value_truncated` (from
+  `_cap_value`/`_cap_item`) and `context_key_evicted` (from `_enforce_context_ceiling`).
+  #289 also fixed the cap that motivated it: per-item caps are chosen by FIELD MEANING
+  (`_ITEM_CAP_BY_KEY`), so a SCOPE `plan`'s prose subtasks are no longer cut at the
+  500-char incidental-list-item cap.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
   `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`

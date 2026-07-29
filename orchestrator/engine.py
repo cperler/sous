@@ -1410,14 +1410,29 @@ class Engine:
                     t.not_before = cooldown_until
                     outcome = "stage_rate_limited_cooldown"
             else:
-                pr_field_notices = apply_result(t, effective, now=_now(), cost_usd=cost)
+                fold_notices = apply_result(t, effective, now=_now(), cost_usd=cost)
                 # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
                 # the fold is no longer invisible — surface each drop as a warning-grade audit
                 # event, mirroring effort_downgraded/model_downgraded ('never silent').
                 events.extend(
                     {"ts": _now(), "type": "pr_field_dropped", "run_id": run_id,
                      "task_id": effective.task_id, "stage": effective.stage.value, **notice}
-                    for notice in pr_field_notices
+                    for notice in fold_notices.pr_fields
+                )
+                # #289: the context plane's own bounding is no longer silent either. A value
+                # the per-field cap truncated, or a key the whole-context ceiling evicted,
+                # degrades every LATER stage's prompt (the SCOPE plan a truncated fold handed
+                # the implementer read as implementer error, since nothing in events.jsonl
+                # said the plan had been cut). Each notice names the field and how much went.
+                events.extend(
+                    {"ts": _now(), "type": "context_value_truncated", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice}
+                    for notice in fold_notices.truncations
+                )
+                events.extend(
+                    {"ts": _now(), "type": "context_key_evicted", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice}
+                    for notice in fold_notices.evictions
                 )
                 if effective.status is ResultStatus.SUCCESS:
                     t.error_signatures = []  # streak resets on a clean stage
