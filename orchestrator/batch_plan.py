@@ -31,7 +31,8 @@ from jsonschema import Draft202012Validator
 
 from . import spec_intake
 from .errors import OrchestratorError
-from .schemas.enums import ExecutionLane, Stage
+from .model_table import provider_for_model, resolve_model_alias
+from .schemas.enums import ExecutionLane, Provider, Stage, resolve_effort
 
 _SCHEMA_PATH = Path(__file__).parent / "schemas" / "batch_plan.json"
 
@@ -80,10 +81,48 @@ def _internal_spec(plan: dict, plan_ids: set[str]) -> dict:
     }
 
 
+def _validate_pins(plan: dict) -> None:
+    """Check the per-task dispatch pins (``model`` #84, ``effort`` #96) with the SAME
+    resolvers ``Engine.add_task`` uses, so a bad pin fails at ``batch-plan validate`` rather
+    than at apply/dispatch time.
+
+    The provider check only fires when the plan entry declares ``provider_tag`` — that is the
+    only case where the plan itself determines the task's provider. With ``provider_tag``
+    omitted the tag comes from the task source (``add_task`` reads ``spec.provider_tag``),
+    which this offline check cannot see; ``add_task``'s own check still catches a mismatch
+    there, one step later."""
+    for t in plan["tasks"]:
+        tid = t["task_id"]
+        model = t.get("model")
+        if model is not None:
+            try:
+                model_pin = resolve_model_alias(model)
+            except ValueError as exc:
+                raise BatchPlanError(f"task {tid!r}: {exc}") from exc
+            tag = t.get("provider_tag")
+            if tag is not None:
+                pin_provider = provider_for_model(model_pin)
+                task_provider = Provider.CODEX if tag == "codex" else Provider.CLAUDE
+                if pin_provider is not task_provider:
+                    raise BatchPlanError(
+                        f"task {tid!r}: model pin {model_pin!r} is a "
+                        f"{pin_provider.value} model but the task is "
+                        f"{task_provider.value}-provider (provider_tag={tag!r}) — pin a "
+                        f"{task_provider.value} model instead"
+                    )
+        effort = t.get("effort")
+        if effort is not None:
+            try:
+                resolve_effort(effort)
+            except ValueError as exc:
+                raise BatchPlanError(f"task {tid!r}: {exc}") from exc
+
+
 def validate_plan(plan: dict, known_ids: Iterable[str] | None = None) -> None:
     """Validate the plan's DAG. Raises ``BatchPlanError`` on a duplicate ``task_id``, a
-    self-edge, a cycle, or an edge that resolves to neither a task in the plan nor a
-    ``known_ids`` member.
+    self-edge, a cycle, an edge that resolves to neither a task in the plan nor a
+    ``known_ids`` member, or an unusable per-task ``model``/``effort`` pin (#287 — see
+    ``_validate_pins``).
 
     ``known_ids`` is the set of real, existing task ids an edge may reference outside the
     plan (typically the open-issue ids the ``candidates`` fetch returned, which include
@@ -92,8 +131,9 @@ def validate_plan(plan: dict, known_ids: Iterable[str] | None = None) -> None:
     it permits (unverified) external edges while still enforcing every internal check.
 
     The dup/self/cycle checks are ``spec_intake``'s, run over an internal-edges-only view
-    of the plan (see ``_internal_spec``); only the external-ref rule is new here."""
+    of the plan (see ``_internal_spec``); only the external-ref and pin rules are new here."""
     validate_schema(plan)
+    _validate_pins(plan)
     tasks = plan["tasks"]
     plan_ids = {t["task_id"] for t in tasks}
 
@@ -158,8 +198,10 @@ def apply_plan(
     Validates first (``validate_plan``). For each task, in dependency order: pass its
     plan-internal ``depends_on`` edges (external already-terminal ids are dropped — they
     impose no scheduling constraint and the engine's ``Dag`` rejects edges to non-tasks),
-    its lane preset (from the ``pipeline`` hint), its ``provider_tag`` and
-    ``deterministic_stages``. Emits ONE ``batch_planned`` event summarizing what was added.
+    its lane preset (from the ``pipeline`` hint), its ``provider_tag``,
+    ``deterministic_stages``, and its ``model``/``effort`` pins (#287 — omitted pins pass
+    ``None``, which is exactly today's role-default behavior). Emits ONE ``batch_planned``
+    event summarizing what was added.
 
     ``dry_run`` adds nothing and emits no event — it returns exactly what WOULD be added so
     the caller (and the human) can inspect the plan before committing to it. Returns
@@ -185,6 +227,8 @@ def apply_plan(
             "pipeline": t.get("pipeline"),
             "provider_tag": t.get("provider_tag"),
             "deterministic_stages": [s.value for s in (det or ())],
+            "model": t.get("model"),
+            "effort": t.get("effort"),
             "rationale": t.get("rationale", ""),
         }
         if not dry_run:
@@ -195,6 +239,8 @@ def apply_plan(
                 depends_on=internal_deps,
                 provider_tag=t.get("provider_tag"),
                 deterministic_stages=det,
+                model=t.get("model"),
+                effort=t.get("effort"),
             )
         added.append(entry)
 

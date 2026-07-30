@@ -23,7 +23,8 @@ from orchestrator.batch_plan import (
 from orchestrator.cli import main
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import ExecutionLane, Stage
+from orchestrator.model_table import resolve_model_alias
+from orchestrator.schemas.enums import Effort, ExecutionLane, Stage
 from orchestrator.status_store import StatusStore
 
 
@@ -173,6 +174,73 @@ def test_apply_adds_tasks_in_topo_order_with_all_fields(tmp_path, project) -> No
     # provider_tag + deterministic_stages threaded through.
     assert t2.provider_tag == "codex"
     assert t3.deterministic_stages == (Stage.TEST, Stage.DELIVER)
+
+
+# --- per-task model / effort pins (#287) -------------------------------------------
+
+def test_plan_can_pin_model_and_effort(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    plan = {"tasks": [{"task_id": "#1", "model": "fable", "effort": "high",
+                       "rationale": "protocol design — Mythos tier"}]}
+    result = apply_plan(eng, "r1", plan, known_ids=["#1"])
+
+    task = eng.store.load_task("r1", "#1")
+    assert task.model_pin == resolve_model_alias("fable")
+    assert task.effort_pin is Effort.HIGH
+    assert result["added"][0]["model"] == "fable"
+    assert result["added"][0]["effort"] == "high"
+
+
+def test_plan_can_pin_a_codex_model_on_a_codex_task(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    plan = {"tasks": [{"task_id": "#1", "provider_tag": "codex", "model": "gpt-5.5"}]}
+    apply_plan(eng, "r1", plan, known_ids=["#1"])
+    assert eng.store.load_task("r1", "#1").model_pin == resolve_model_alias("gpt-5.5")
+
+
+def test_omitting_the_pins_keeps_role_defaults(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    apply_plan(eng, "r1", _plan(), known_ids=["#1", "#2", "#3"])
+    for tid in ("#1", "#2", "#3"):
+        task = eng.store.load_task("r1", tid)
+        assert task.model_pin is None
+        assert task.effort_pin is None
+
+
+def test_unknown_model_alias_fails_validation() -> None:
+    plan = {"tasks": [{"task_id": "#1", "model": "mythos"}]}
+    with pytest.raises(BatchPlanError, match="unknown model"):
+        validate_plan(plan, known_ids=["#1"])
+
+
+def test_claude_pin_on_a_codex_task_fails_validation() -> None:
+    plan = {"tasks": [{"task_id": "#1", "provider_tag": "codex", "model": "fable"}]}
+    with pytest.raises(BatchPlanError, match="codex-provider"):
+        validate_plan(plan, known_ids=["#1"])
+
+
+def test_codex_pin_on_a_claude_task_fails_validation() -> None:
+    plan = {"tasks": [{"task_id": "#1", "model": "gpt-5.5", "provider_tag": "claude"}]}
+    with pytest.raises(BatchPlanError, match="claude-provider"):
+        validate_plan(plan, known_ids=["#1"])
+
+
+def test_bad_effort_fails_schema_validation() -> None:
+    plan = {"tasks": [{"task_id": "#1", "effort": "extreme"}]}
+    with pytest.raises(BatchPlanError, match="extreme"):
+        validate_plan(plan, known_ids=["#1"])
+
+
+def test_bad_pin_fails_before_anything_is_added(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    plan = {"tasks": [{"task_id": "#1"}, {"task_id": "#2", "model": "nope"}]}
+    with pytest.raises(BatchPlanError, match="unknown model"):
+        apply_plan(eng, "r1", plan, known_ids=["#1", "#2"])
+    assert eng.store.load_run("r1").task_refs == []
 
 
 def test_apply_drops_external_deps_from_the_scheduling_graph(tmp_path, project) -> None:
