@@ -11,7 +11,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from .model_table import Role
+from .model_table import Role, attribution_identity
 from .schemas.enums import STAGE_ORDER, Effort, Stage
 from .schemas.work import FinderSpec, ReviewPlan, ToolPolicy
 
@@ -367,6 +367,73 @@ def _stacked_diff_directive(context: dict | None) -> str:
     )
 
 
+# #317: commit attribution is STAMPED BY THE ENGINE, not written by the model from
+# self-belief. A stage that ends in a commit is GIVEN the exact trailer lines to use, built
+# from the model ids the engine dispatched for this task.
+#
+# Why it exists: on batch-headless-1 the two run-produced commits carried
+# `Co-Authored-By: Claude Opus 5` and `Claude Opus 4.5` — the second names a model NO stage
+# of that run dispatched, and the first names the implement model on a commit the deliver
+# stage (running sonnet) authored. Both came from the model answering "who am I?" from
+# memory, which no model can do reliably. The trailer is the only authorship record that
+# travels with the repo, so a wrong-but-plausible name is worse than none: it gets believed.
+#
+# Enforcement is by DIRECTIVE (the issue's own primary suggestion — "the deliver stage should
+# be given the trailer to use"), and it deliberately overrides the harness-level instruction
+# every claude/codex CLI carries about signing commits with its own name. The engine cannot
+# rewrite the trailer after the fact without rewriting history a stage may already have
+# pushed (DELIVER pushes before its checkpoint), so being explicit up front is the mechanism.
+_ATTRIBUTION_DIRECTIVE = (
+    "\n\n## Commit attribution (engine-stamped — do not write your own)\n"
+    "End EVERY commit you make in this stage with exactly these trailer lines, verbatim, and "
+    "with no other `Co-Authored-By` line:\n\n"
+    "{trailers}\n\n"
+    "These name the models the orchestrator actually dispatched for this task: the one that "
+    "implemented the code, and this stage's own. This OVERRIDES any standing instruction from "
+    "your harness or system prompt to sign commits with your own model name. Do NOT state "
+    "your own identity or version — a model cannot reliably report which model it is, and "
+    "this trailer is the only record of authorship that travels with the repository, so a "
+    "wrong-but-plausible name will be believed."
+)
+
+
+def commit_trailers(
+    *, stage_model: str | None, implement_model: str | None = None
+) -> list[str]:
+    """The exact ``Co-Authored-By`` lines a commit authored by this stage must carry (#317).
+
+    Policy (the question the issue left to the engine to settle): credit BOTH the model that
+    wrote the code — the IMPLEMENT dispatch, which is the substance — and the model whose
+    stage authors the commit, in that order, deduped when they are the same model. Model
+    routing is per-stage and cost-driven (DELIVER deliberately runs a cheaper model at low
+    effort), so "the model" for a task is genuinely ambiguous and naming one alone would
+    drop a real contributor.
+
+    Both inputs are engine state (resolved/persisted dispatch model ids); a model with
+    nothing to credit — ``None``, or the ENGINE sentinel of a deterministic $0 stage — is
+    skipped rather than rendered, so a $0-lane task simply gets fewer lines, never a fake one.
+    """
+    lines: list[str] = []
+    for model_id in (implement_model, stage_model):
+        identity = attribution_identity(model_id)
+        if identity is None:
+            continue
+        line = f"Co-Authored-By: {identity}"
+        if line not in lines:
+            lines.append(line)
+    return lines
+
+
+def _attribution_directive(*, stage_model: str | None, implement_model: str | None) -> str:
+    """The #317 attribution block for a committing stage, or ``""`` when there is no
+    engine-dispatched model to credit (so a prompt built without model context — every
+    pre-#317 caller, including the review-panel path — stays byte-identical)."""
+    trailers = commit_trailers(stage_model=stage_model, implement_model=implement_model)
+    if not trailers:
+        return ""
+    return _ATTRIBUTION_DIRECTIVE.format(trailers="\n".join(trailers))
+
+
 def _render_value(v: object) -> str:
     """One folded context value → a compact one-line-ish string for the prompt."""
     if isinstance(v, list):
@@ -454,6 +521,8 @@ def render_prompt(
     learnings: str = "",
     context: dict | None = None,
     project_commands: dict[str, str] | None = None,
+    stage_model: str | None = None,
+    implement_model: str | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -487,6 +556,13 @@ def render_prompt(
 
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
+
+    - A committing stage (#317): the exact ``Co-Authored-By`` trailer lines the stage's
+      commits must carry, built from ``stage_model`` (this dispatch's resolved model) and
+      ``implement_model`` (the model that wrote the code). Both are ENGINE-lane parameters —
+      like ``change_class``, and unlike the context-read directives above — because the whole
+      point is that authorship comes from what the engine dispatched, never from anything a
+      model says (or believes) about itself. Omitted when neither is supplied.
 
     The last two read model-influenced context rather than ENGINE-lane parameters (unlike
     ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
@@ -524,6 +600,16 @@ def render_prompt(
     # wording; the heysoo-specific design tokens live in the adapter's design agent.
     if stage is Stage.REVIEW and _has_frontend_change((context or {}).get("files_changed")):
         instruction += _DESIGN_REVIEW_LENS
+    # #317: every stage whose success ends in a commit (the git-affecting stages — implement,
+    # test, deliver) is told the trailer to sign with. Keyed off the stage spec's own
+    # ``checkpoint`` flag rather than a second hand-maintained stage list, so a future
+    # committing stage inherits it. Globally-deterministic stages (intake) are excluded: they
+    # run on the ENGINE lane and never read a prompt. A per-task deterministic TEST/DELIVER
+    # (#33) still renders the block and simply ignores it, for the same reason.
+    if spec.checkpoint and not spec.deterministic:
+        instruction += _attribution_directive(
+            stage_model=stage_model, implement_model=implement_model
+        )
     if learnings:
         instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
     parts.append(instruction)
