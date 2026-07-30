@@ -27,7 +27,13 @@ from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
-from .errors import CapacityExhausted, ContractError, NoRunnerError, RunExistsError
+from .errors import (
+    CapacityExhausted,
+    ContractError,
+    NoRunnerError,
+    RunExistsError,
+    StatusNotFoundError,
+)
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
 )
@@ -522,13 +528,43 @@ class Engine:
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
         # Done BEFORE writing the task doc so a duplicate never clobbers an existing
         # task's persisted progress.
+        #
+        # Registration is recoverable AS A UNIT (#278): a crash between the ref write and
+        # the doc write below leaves a ref pointing at a missing document, which no retry
+        # could ever repair while an existing ref was a bare duplicate reject. So an
+        # existing ref is probed against its document: present-and-matching is the real
+        # duplicate (rejected, no clobber), while a missing/mismatched document on a
+        # still-PENDING ref is a partial registration this add completes in place.
+        repair_reason: str | None = None
+
         def _register(r: Run) -> None:
-            if any(ref.task_id == task_id for ref in r.task_refs):
+            nonlocal repair_reason
+            existing = next((ref for ref in r.task_refs if ref.task_id == task_id), None)
+            if existing is None:
+                r.task_refs.append(
+                    TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json")
+                )
+                r.dependency_graph[task_id] = list(deps)
+                return
+            # Lock-free probe (we hold the RUN lock; taking the task lock here would be a
+            # different lock order than every other writer). A corrupt/unreadable doc
+            # propagates as StatusStoreError — never treated as absent (#112).
+            reason = self._partial_registration_reason(run_id, task_id)
+            if reason is None:
                 raise ContractError(f"task {task_id} already added to run {run_id}")
-            r.task_refs.append(
-                TaskRef(task_id=task_id, status_file=f"status-{run_id}-{task_id}.json")
-            )
+            if existing.state is not TaskState.PENDING:
+                # The ref records progress the missing doc can no longer back; re-creating a
+                # fresh PENDING doc would invent state. Surface it instead of guessing.
+                raise ContractError(
+                    f"task {task_id} of run {run_id} has a {existing.state.value} ref whose "
+                    f"status document is unusable ({reason}) — refusing to re-register it "
+                    "over recorded progress"
+                )
+            # Complete the partial registration in place: no second ref, refreshed edge and
+            # canonical status_file, and the doc write below finishes the unit.
+            existing.status_file = f"status-{run_id}-{task_id}.json"
             r.dependency_graph[task_id] = list(deps)
+            repair_reason = reason
 
         self.store.update_run(run_id, _register)
         task = Task(
@@ -551,6 +587,15 @@ class Engine:
             max_filed_followups=max_filed_followups,
         )
         self.store.save_task(task)
+        if repair_reason is not None:
+            # Recovery is never silent (#278): the mutator only reports what it repaired,
+            # the engine call site events it — once the doc write above has actually closed
+            # the registration.
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "task_registration_repaired", "run_id": run_id,
+                 "task_id": task_id, "reason": repair_reason},
+            )
         if route_reason is not None:
             # Routing is never silent (#34): record WHY this un-pinned task got its preset
             # (remaining budget fraction, estimate) so a downgraded run explains itself.
@@ -560,6 +605,41 @@ class Engine:
                  "task_id": task_id, **route_reason},
             )
         return task
+
+    def _partial_registration_reason(self, run_id: str, task_id: str) -> str | None:
+        """``None`` when ``task_id``'s status document exists AND agrees with the ref's
+        identity (a genuinely registered task); otherwise a short reason describing why the
+        registration is only half-written and is therefore repairable (#278).
+
+        A corrupt or unreadable document raises ``StatusStoreError`` — an I/O or parse
+        failure is never reported as "absent" (#112), because re-registering over it would
+        destroy a document that may well hold real progress."""
+        try:
+            task = self.store.load_task(run_id, task_id)
+        except StatusNotFoundError:
+            return "status_document_missing"
+        if task.run_id != run_id or task.task_id != task_id:
+            return (
+                f"status_document_identity_mismatch (doc claims run {task.run_id!r} "
+                f"task {task.task_id!r})"
+            )
+        return None
+
+    def registered_task_ids(self, run_id: str) -> set[str]:
+        """The task ids of ``run_id`` that are FULLY registered: a task ref in the run doc
+        AND a matching status document (#278).
+
+        The set an idempotent re-ingest must skip. The raw ``task_refs`` ids are not that
+        set: a crash between ``add_task``'s ref write and its doc write leaves a ref whose
+        document never got written, and skipping on the ref alone would make that partial
+        registration permanent. A corrupt/unreadable document is not "absent" — it
+        propagates as ``StatusStoreError`` (#112) rather than inviting a re-add over it."""
+        run = self.store.load_run(run_id)
+        return {
+            ref.task_id
+            for ref in run.task_refs
+            if self._partial_registration_reason(run_id, ref.task_id) is None
+        }
 
     # --- dispatchable (DAG + lease) ------------------------------------------
     def dispatchable(self, run_id: str) -> list[str]:
