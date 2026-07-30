@@ -148,6 +148,7 @@ class CostLedger:
                     duration_s=sub.duration_s,
                     schema_retries=sub.schema_retries,
                     phase=sub.phase,
+                    usage_recovered=sub.usage_recovered,
                 )
                 for sub in result.sub_calls
             ]
@@ -160,6 +161,7 @@ class CostLedger:
                     duration_s=duration_s,
                     schema_retries=result.schema_retries,
                     phase=None,
+                    usage_recovered=result.usage_recovered,
                 )
             ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +255,7 @@ class CostLedger:
         duration_s: float | None,
         schema_retries: int,
         phase: str | None,
+        usage_recovered: bool = True,
     ) -> dict:
         """Build one ledger row for a single model call within ``result``.
 
@@ -274,6 +277,15 @@ class CostLedger:
         metered = not (
             result.lane_used.execution_mode.value == "interactive" and tokens_seen == 0
         )
+        # #319: the SAME honesty rule for a call whose usage could not be read at all — a
+        # stage killed before its provider printed a usage report. Its zeros are an unknown,
+        # not a measurement, so the row must not claim to be a priced, metered $0.00: that
+        # reads as "this attempt was free" when it may have burned minutes of Opus. Marking
+        # it unmetered also keeps it OUT of `metered_spend`, so the budget gate reports what
+        # it can actually account for rather than silently absorbing a guess of zero.
+        if not usage_recovered:
+            priced = False
+            metered = False
         row = {
             "ts": result.completed_at,
             "run_id": result.run_id,
@@ -326,6 +338,7 @@ class CostLedger:
             duration_s=duration_s,
             schema_retries=result.schema_retries,
             phase=None,
+            usage_recovered=result.usage_recovered,
         )
         view.update(
             {

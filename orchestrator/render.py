@@ -51,15 +51,20 @@ def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) 
     total_cost = summary.get("total_cost_usd") or 0.0
     unmetered = summary.get("unmetered_calls") or 0
     invocations = summary.get("total_invocations") or 0
-    # HONESTY: unmetered interactive calls have UNKNOWN cost — a bare $0.0000 total
-    # would read as "this run was free". Say what is metered and what isn't.
+    # HONESTY: unmetered calls have UNKNOWN cost — a bare $0.0000 total would read as
+    # "this run was free". Say what is metered and what isn't. Two ways a call lands here:
+    # the interactive lane cannot meter per-call usage at all (#54), and any lane can lose a
+    # call's usage report when it dies before printing one (#319) — a failed attempt that may
+    # have spent real money. Neither is $0, so the wording names neither lane specifically.
     if unmetered and unmetered == invocations:
-        cost_line = (f"- Total cost: **n/a — all {unmetered} call(s) ran on the "
-                     f"interactive lane, which cannot meter per-call usage** (billed "
-                     f"to the session's subscription, not $0)")
+        cost_line = (f"- Total cost: **n/a — all {unmetered} call(s) are unmetered** "
+                     f"(no per-call usage was recorded for them: an interactive-lane run "
+                     f"billed to the session's subscription, or calls that died before "
+                     f"reporting usage — not $0)")
     elif unmetered:
-        cost_line = (f"- Total cost: **${total_cost:.4f}** (metered lanes only — "
-                     f"⚠️ {unmetered} interactive call(s) are unmetered and NOT included)")
+        cost_line = (f"- Total cost: **${total_cost:.4f}** (metered calls only — "
+                     f"⚠️ {unmetered} unmetered call(s) have UNKNOWN cost and are NOT "
+                     f"included; the true total is higher)")
     else:
         cost_line = f"- Total cost: **${total_cost:.4f}**"
     lines = [
