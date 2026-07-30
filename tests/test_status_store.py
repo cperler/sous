@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import glob
 import json
+import os
 from datetime import UTC, datetime
+from unittest import mock
 
 import pytest
 
@@ -56,6 +58,35 @@ def test_atomic_write_leaves_no_tmp(tmp_path):
     store.save_task(_make_task())
     leftovers = glob.glob(str(tmp_path / "*.tmp.*"))
     assert leftovers == []
+
+
+def test_atomic_write_temp_name_is_unique_per_writer(tmp_path):
+    """#312: the temp name must not collide for two same-process writers to one path.
+
+    The pid alone is not unique within a process. Callers do serialize same-path writes
+    under that path's lock, so this is unreachable through the public API today — but the
+    guarantee has to belong to ``_atomic_write`` itself, not to every call site's locking
+    discipline, or any future unlocked writer silently loses a document.
+    """
+    store = StatusStore(tmp_path)
+    target = tmp_path / "collide.json"
+    seen: list[str] = []
+
+    real_replace = os.replace
+
+    def _capture(src, dst):  # noqa: ANN001 - test shim
+        seen.append(str(src))
+        real_replace(src, dst)
+
+    with mock.patch.object(os, "replace", _capture):
+        store._atomic_write(target, '{"n": 1}')
+        store._atomic_write(target, '{"n": 2}')
+
+    assert len(seen) == 2
+    assert seen[0] != seen[1], f"two writers reused one temp name: {seen[0]}"
+    # The last write wins and the file is intact (not a torn interleave of both).
+    assert json.loads(target.read_text()) == {"n": 2}
+    assert glob.glob(str(tmp_path / "*.tmp.*")) == []
 
 
 def test_update_task_mutates_bumps_and_persists(tmp_path):

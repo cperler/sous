@@ -5,8 +5,10 @@ Persistence layout under a run's ``root`` directory:
   - Task doc:  ``status-<run_id>-<task_id>.json``
   - Audit log: ``events.jsonl`` (append-only sidecar)
 
-Writes are atomic: a temp file ``<name>.tmp.<pid>`` is fully written and fsync'd,
+Writes are atomic: a temp file ``<name>.tmp.<pid>.<seq>`` is fully written and fsync'd,
 then ``os.replace()`` swaps it into place — a reader never sees a partial file.
+The temp suffix is per-writer, not just per-pid (#312), so two same-process writers to
+one path can never collide on the temp name.
 
 Locking ports the as-built flock-with-mkdir-fallback contract: prefer
 ``fcntl.flock(LOCK_EX)`` on a ``<path>.lock`` file; where fcntl is unavailable
@@ -16,6 +18,7 @@ Locking ports the as-built flock-with-mkdir-fallback contract: prefer
 from __future__ import annotations
 
 import contextlib
+import itertools
 import json
 import os
 import time
@@ -35,6 +38,10 @@ try:  # fcntl is POSIX-only; mkdir fallback covers the rest.
 except ImportError:  # pragma: no cover - platform dependent
     fcntl = None  # type: ignore[assignment]
     _HAVE_FCNTL = False
+
+# Per-writer suffix for `_atomic_write` temp files (#312): the pid alone is not unique
+# within a process, so two same-process writers to one path would collide.
+_TMP_SEQ = itertools.count()
 
 
 def _utc_now_iso() -> str:
@@ -109,7 +116,18 @@ class StatusStore:
     # ---- atomic write ---------------------------------------------------
 
     def _atomic_write(self, path: Path, text: str) -> None:
-        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}")
+        """Write ``text`` to ``path`` atomically (write-temp + rename).
+
+        The temp name is unique per WRITER, not per process (#312): two writers in the
+        same process targeting one path would otherwise compute the same
+        ``<name>.tmp.<pid>`` and race on the rename, losing one document with no error.
+        Callers do serialize same-path writes under that path's lock, so the collision is
+        unreachable today — but that safety is a property of every call site's locking
+        discipline rather than of this function, and #278's pre-fix run reached it for
+        real once doc writes were briefly unserialized. The counter makes the write safe
+        on its own terms; ``itertools.count`` is atomic in CPython, so no extra lock.
+        """
+        tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{next(_TMP_SEQ)}")
         try:
             with open(tmp, "w", encoding="utf-8") as fh:
                 fh.write(text)
