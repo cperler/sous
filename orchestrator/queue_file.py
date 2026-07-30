@@ -326,9 +326,14 @@ def _ingest_batch(
     DAG — a queue entry is a flat task list with no encoded edges). Reuse goes through
     the EXPLICIT ``create_or_reuse_run`` (#280) so a stable run id can never be
     re-created over live state, and a corrupt run doc surfaces as an error rather than
-    being silently replaced."""
-    run, created = engine.create_or_reuse_run(run_id, lane)
-    already = {ref.task_id for ref in run.task_refs}
+    being silently replaced.
+
+    "Already added" is ``engine.registered_task_ids`` — a task ref is only skipped once
+    its status document is verified to exist and to agree with the ref's identity (#278).
+    Skipping on the bare ref would make a crash between ``add_task``'s ref write and its
+    doc write permanent: the half-registered task could never be rebuilt."""
+    _run, created = engine.create_or_reuse_run(run_id, lane)
+    already = engine.registered_task_ids(run_id)
     added: list[str] = []
     for task_id in entry["tasks"]:
         if task_id in already:
