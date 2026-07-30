@@ -1094,8 +1094,21 @@ def main(argv: list[str] | None = None) -> int:
             work = eng.next_work(args.run, args.task, util_pct=util_pct)
         _emit(None if work is None else json.loads(work.model_dump_json()))
     elif args.cmd == "record":
+        from .errors import ContractError
+
         stage_result = StageResult.model_validate_json(Path(args.result).read_text())
-        _emit(eng.record(args.run, stage_result))
+        try:
+            _emit(eng.record(args.run, stage_result))
+        except ContractError as exc:
+            # #311: a result that does not answer the outstanding dispatch (garbled/copied
+            # content_hash, wrong work item, replay) is refused. Report it as the CLI's
+            # machine-readable error shape rather than a traceback: the supervisor reads
+            # this command's JSON, and a traceback on stdout-less stderr is how a refusal
+            # gets mistaken for a transport hiccup. The engine already evented it.
+            _emit({"ok": False, "recorded": False, "error": str(exc),
+                   "task_id": stage_result.task_id, "stage": stage_result.stage.value,
+                   "work_item_id": stage_result.work_item_id})
+            return 1
     elif args.cmd == "dispatchable":
         from .scheduler import Scheduler
 

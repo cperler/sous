@@ -253,3 +253,10 @@ def test_concurrent_duplicate_records_charge_once(tmp_path, project, monkeypatch
 
     assert sorted(outcomes) == ["recorded", "rejected"]
     _assert_converged(eng, work)  # one row, one stage_recorded, lease cleared once
+    # #311: the loser's refusal is audited too — this is the UNDER-LOCK rejection path
+    # (both calls passed the lock-free pre-check), and it must be as loud as the pre-lock
+    # one. Emitted outside the task lock, after the transaction aborts.
+    rejected = [e for e in eng.store.read_events("r1") if e["type"] == "result_rejected"]
+    assert len(rejected) == 1
+    assert rejected[0]["reason"] == "no_dispatch_outstanding"
+    assert rejected[0]["work_item_id"] == work.id

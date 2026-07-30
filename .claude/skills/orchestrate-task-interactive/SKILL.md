@@ -43,6 +43,12 @@ You never call a model directly and you never run `claude -p`.
    The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds the WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it — the engine classifies TIMEOUT and retries from the checkpoint. Never leave a hung dispatch un-recorded.
    The shim calls `agent()` in-session and **returns** an array of `StageResult`
    objects (it cannot write to disk). It does the actual work in the task's worktree.
+   - **Pass the WorkItem through VERBATIM** (#311): copy the whole JSON object `next`
+     printed — never retype or abbreviate a field. `content_hash` is a 64-char digest
+     whose only job is tying the returned result back to *this* dispatch, so a truncated
+     log preview (the live `batch-next5b` failure) or a hash copied from another in-flight
+     item breaks that tie. `record` refuses such a result and the shim aborts the batch
+     before spending anything when the shape is wrong.
    - **Honor the WorkItem's `effort`** (#96/#140): each WorkItem carries a per-stage
      reasoning `effort` (`low`/`medium`/`high`, or absent). The shim forwards it as
      `agent({ effort: wi.effort })` so the dispatched sub-agent runs at that reasoning
@@ -57,6 +63,11 @@ You never call a model directly and you never run `claude -p`.
    - `task_failed_*` → stop (failure); surface the reason.
    - `stage_completed` / `stage_failed_will_retry` → loop again (the engine re-emits
      the same stage with appended learnings on a retry).
+   - non-zero exit with `{"ok": false, "recorded": false, …}` → the result did not answer
+     the outstanding dispatch (garbled/cross-pasted `content_hash`, wrong work item, or a
+     replay); the engine logged a `result_rejected` event and stored nothing. Do NOT edit
+     the result's `content_hash` to make it pass — that defeats the check. Re-dispatch the
+     stage with `… next --resume` and record what actually comes back.
 
    Preserve the agent's narrative: pass its full prose back as the `StageResult`'s
    `raw_output` (the shim does this from `agentResult.raw`), not just the structured

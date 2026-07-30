@@ -91,7 +91,7 @@ from .schemas.enums import (
     effort_below,
     resolve_effort,
 )
-from .schemas.status import Run, StageRecord, Task, TaskRef
+from .schemas.status import Run, Task, TaskRef
 from .schemas.work import LanePolicy, LaneUsed, ReviewPlan, StageResult, TokenUsage, WorkItem
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
@@ -110,6 +110,17 @@ from .stream_probe import probe_current_stream
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _hash_preview(value: str | None) -> str | None:
+    """Short, comparable rendering of a content_hash for an audit event / error text (#311).
+
+    Keeps the leading bytes AND the length: the failure this exists for is a TRUNCATED
+    digest (a 16-char preview pasted where the 64-char hash belongs), which a prefix alone
+    would render identical to the real one. ``None`` (no lease) stays ``None``."""
+    if value is None:
+        return None
+    return f"{value[:12]}...(len {len(value)})"
 
 
 def _in_future(iso: str | None) -> bool:
@@ -1293,53 +1304,90 @@ class Engine:
         )
 
     @staticmethod
-    def _validate_result_lease(task: Task, run_id: str, result: StageResult) -> StageRecord:
-        """Validate ``result`` against the task's outstanding dispatch lease; returns the
-        dispatched stage record, raising ``ContractError`` on any mismatch.
+    def _lease_mismatch(
+        task: Task, run_id: str, result: StageResult
+    ) -> tuple[str, str] | None:
+        """PURE lease check: ``(reason_code, message)`` when ``result`` does not answer the
+        task's outstanding dispatch, else ``None``. No I/O, no events (#311).
+
+        The check RETURNS its rejection instead of raising it so the refusal can be BOTH
+        raised and audited: the pure function reports what it rejected and the engine call
+        site emits the ``result_rejected`` event (the CLAUDE.md "pure fold returns, only
+        the engine caller emits" convention). ``reason_code`` is the stable machine-readable
+        field on that event; the message is the human/CLI text of the ``ContractError``.
+
+        Called TWICE per ``record`` (#277): once lock-free as the cheap early reject
+        (BEFORE the first side effect, the ledger row), and again on the freshly-loaded
+        doc inside the locked commit — the authoritative check that makes two concurrent
+        duplicate records mutually exclusive (the loser sees the cleared lease under the
+        lock and raises). Both call sites emit ``result_rejected``, so a refused result is
+        loud in the run's durable log and not just an exception on the caller's stderr.
 
         A result is only valid against the WorkItem currently outstanding for this
         task. No outstanding dispatch (pending is None) => a replay/duplicate; reject
         so a stale result can never be re-folded into an already-advanced stage.
-        content_hash is an echoed string; the result still carries its OWN
-        stage/model/attempt/run_id, and those drive pricing (result.model) and which
-        stage record we fold into (result.stage). Bind them to what was actually
-        dispatched so a buggy runner or hand-edited result can't complete the wrong
-        stage or price the wrong model. task.current_stage is the dispatched stage
+        content_hash is an echoed string — on the interactive lane the supervisor
+        hand-assembles the WorkItem JSON, so a truncated/wrong-item paste is entirely
+        possible (#311, live in ``batch-next5b``) and must never be folded silently. The
+        result also carries its OWN stage/model/attempt/run_id, and those drive pricing
+        (result.model) and which stage record we fold into (result.stage). Bind them all to
+        what was actually dispatched so a buggy runner or hand-edited result can't complete
+        the wrong stage or price the wrong model. task.current_stage is the dispatched stage
         (begin_stage set it; a dispatch is outstanding).
-
-        Called TWICE per ``record`` (#277): once lock-free as the cheap early reject
-        (BEFORE the first side effect, the ledger row), and again on the freshly-loaded
-        doc inside the locked commit — the authoritative check that makes two
-        concurrent duplicate records mutually exclusive (the loser sees the cleared
-        lease under the lock and raises)."""
+        """
         if task.pending_work_item_id is None:
-            raise ContractError(
+            return ("no_dispatch_outstanding", (
                 f"no dispatch outstanding for task {result.task_id} — refusing replayed result "
                 f"{result.work_item_id}"
-            )
+            ))
         if result.work_item_id != task.pending_work_item_id:
-            raise ContractError(
+            return ("work_item_id_mismatch", (
                 f"result work_item_id {result.work_item_id} != pending {task.pending_work_item_id}"
-            )
+            ))
         if result.content_hash != task.pending_content_hash:
-            raise ContractError("result content_hash does not match the dispatched WorkItem")
+            return ("content_hash_mismatch", (
+                "result content_hash does not match the dispatched WorkItem "
+                f"(dispatched {_hash_preview(task.pending_content_hash)}, "
+                f"received {_hash_preview(result.content_hash)}) — echo the WorkItem's "
+                "content_hash verbatim; never retype or abbreviate it"
+            ))
         if result.run_id != run_id:
-            raise ContractError(f"result run_id {result.run_id} != dispatched {run_id}")
+            return ("run_id_mismatch", f"result run_id {result.run_id} != dispatched {run_id}")
         dispatched_stage = task.current_stage
         if result.stage is not dispatched_stage:
-            raise ContractError(
-                f"result stage {result.stage} != dispatched {dispatched_stage}"
-            )
+            return ("stage_mismatch", f"result stage {result.stage} != dispatched "
+                                      f"{dispatched_stage}")
         dispatched = task.stages[dispatched_stage]
         if result.model != dispatched.model:
-            raise ContractError(
-                f"result model {result.model!r} != dispatched {dispatched.model!r}"
-            )
+            return ("model_mismatch",
+                    f"result model {result.model!r} != dispatched {dispatched.model!r}")
         if result.attempt != dispatched.attempt:
-            raise ContractError(
-                f"result attempt {result.attempt} != dispatched {dispatched.attempt}"
-            )
-        return dispatched
+            return ("attempt_mismatch",
+                    f"result attempt {result.attempt} != dispatched {dispatched.attempt}")
+        return None
+
+    def _emit_result_rejected(
+        self, run_id: str, task: Task, result: StageResult, mismatch: tuple[str, str]
+    ) -> None:
+        """Audit a refused StageResult (#311) — warning-grade, engine-emitted.
+
+        The refusal itself is a ``ContractError`` the caller sees; this makes it survive in
+        ``events.jsonl`` too, so a supervisor that garbles a hash (or pastes one from
+        another in-flight WorkItem) leaves a trace in the run's durable log instead of a
+        run that "looks clean". Hashes are previewed, not dumped, so the truncation that
+        motivated this is visible without two 64-char digests per line."""
+        reason, message = mismatch
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "result_rejected", "level": "warning", "run_id": run_id,
+             "task_id": result.task_id, "stage": result.stage.value,
+             "attempt": result.attempt, "reason": reason,
+             "work_item_id": result.work_item_id,
+             "dispatched_work_item_id": task.pending_work_item_id,
+             "content_hash": _hash_preview(result.content_hash),
+             "dispatched_content_hash": _hash_preview(task.pending_content_hash),
+             "detail": message},
+        )
 
     def record(self, run_id: str, result: StageResult) -> dict:
         """Fold a runner's ``StageResult`` into the task and charge the cost ledger.
@@ -1362,15 +1410,24 @@ class Engine:
 
         Returns a summary dict (outcome, task_state, stage, cost_usd,
         lane_attributed, next_stage). Raises ``ContractError`` when ``result`` does
-        not match the outstanding dispatch lease (stale/duplicate/wrong stage-model-
-        attempt-run) — of two concurrent duplicate records exactly one commits.
+        not match the outstanding dispatch lease (stale/duplicate/wrong content-hash-
+        stage-model-attempt-run) — of two concurrent duplicate records exactly one
+        commits. Every such refusal also emits a warning-grade ``result_rejected``
+        event (#311) so it is never silent in the run's durable log.
         """
         task = self.store.load_task(run_id, result.task_id)
         # Optimistic pre-validation OUTSIDE the lock (#277): reject an ordinary stale/
         # replayed result cheaply BEFORE the first side effect (the ledger row). The
         # authoritative re-validation runs on the freshly-loaded doc inside the locked
-        # commit below.
-        dispatched = self._validate_result_lease(task, run_id, result)
+        # commit below. #311: the pure check RETURNS the mismatch so the engine can audit
+        # it here before raising — the refusal has to be visible to a human reading the
+        # run, not only to whoever caught the exception.
+        if (mismatch := self._lease_mismatch(task, run_id, result)) is not None:
+            self._emit_result_rejected(run_id, task, result, mismatch)
+            raise ContractError(mismatch[1])
+        # No mismatch => result.stage IS task.current_stage (the check above binds them),
+        # so this is the dispatched stage record.
+        dispatched = task.stages[result.stage]
         # #288: read the dispatched-plan marker BEFORE the locked commit clears it with the
         # lease. Safe off the pre-lock doc precisely because the lease matched: the fresh-doc
         # re-validation under the lock rejects anything that is not this same dispatch.
@@ -1534,16 +1591,23 @@ class Engine:
         test_validation: dict[str, object] | None = None
         cooldown_until: str | None = None
         provider_out_reason: str | None = None
+        # #311: what the under-lock re-validation rejected (fresh doc + mismatch), captured
+        # for the caller to audit AFTER the transaction aborts — the event is emitted
+        # outside the task lock, keeping "only the engine caller emits" true of the locked
+        # mutator too. Nothing is mutated before the check, so the doc is pristine.
+        lease_rejection: tuple[Task, tuple[str, str]] | None = None
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
-            nonlocal test_validation, cooldown_until, provider_out_reason
+            nonlocal test_validation, cooldown_until, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
             # validate→transition sequence is one read-modify-write on the fresh doc,
             # so of two concurrent duplicate records exactly one clears the lease —
             # the loser sees it already cleared here and gets the ContractError replay
             # rejection (after the idempotent ledger call, before any task mutation).
-            self._validate_result_lease(t, run_id, result)
+            if (m := self._lease_mismatch(t, run_id, result)) is not None:
+                lease_rejection = (t, m)
+                raise ContractError(m[1])
             if effective.status is ResultStatus.PROVIDER_UNAVAILABLE:
                 provider_out_reason = effective.error or "provider reported unavailable"
             elif effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
@@ -1844,7 +1908,15 @@ class Engine:
         # #174/#199). The idempotent ledger row and the idempotent per-stage artifacts
         # land before that point; everything after it (index/ref-state/progress and the
         # run-level effects below) is re-derivable best-effort.
-        task = self.store.commit_task_events(run_id, result.task_id, _commit, _stage_events)
+        try:
+            task = self.store.commit_task_events(run_id, result.task_id, _commit, _stage_events)
+        except ContractError:
+            # #311: the loser of a concurrent-record race (or a mismatch that only the fresh
+            # doc could see) is audited too — outside the lock, where events belong. Nothing
+            # was mutated, so the raise below is the whole effect the caller sees.
+            if lease_rejection is not None:
+                self._emit_result_rejected(run_id, lease_rejection[0], result, lease_rejection[1])
+            raise
         self.store.write_task_index(result.task_id, render_task_index(task))
         # cost-summary.md is written at run finalization and on status() — NOT on
         # every record (that re-read the whole ledger each time: O(N^2) on long runs).

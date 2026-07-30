@@ -90,7 +90,10 @@ reference system's ~12–15:
   `content_hash` (over stage+prompt+schema+model+lane+attempt) is its idempotency key; the
   task holds a **dispatch lease** (`pending_work_item_id`) so an in-flight or crashed-mid-stage
   task is never re-picked. `Engine.record()` ingests the `StageResult` under a locked
-  read-modify-write, re-checking the lease. Cost is computed from the engine's own
+  read-modify-write, re-checking the lease: a result whose `content_hash`/work-item/stage/
+  model/attempt does not answer the outstanding dispatch is refused (`ContractError`) and
+  audited as a warning-grade `result_rejected` event — never folded silently (#311). Cost
+  is computed from the engine's own
   `model_table`, never the runner's self-report (`orchestrator/cost_ledger.py`).
 - **Context plane.** Stages hand data forward through an engine-owned whitelist, not free
   text: `CONTEXT_KEYS` in `state_machine.py` names exactly which structured keys each stage
