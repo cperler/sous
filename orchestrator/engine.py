@@ -14,9 +14,11 @@ import hashlib
 import math
 import os
 import re
+import socket
 import subprocess
 import time
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -92,7 +94,7 @@ from .schemas.enums import (
     effort_below,
     resolve_effort,
 )
-from .schemas.status import Run, Task, TaskRef
+from .schemas.status import Run, RunDriver, Task, TaskRef
 from .schemas.work import LanePolicy, LaneUsed, ReviewPlan, StageResult, TokenUsage, WorkItem
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
@@ -165,6 +167,24 @@ def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
     if len(lines) <= n_lines:
         return "\n".join(lines), False
     return "\n".join(lines[-n_lines:]), True
+
+
+def _pid_alive(pid: int) -> bool:
+    """Is ``pid`` a live process on THIS host? (#313 — the driver-liveness sensor.)
+
+    Deliberately fails SAFE (True) on anything it cannot answer: an EPERM signal-0 means
+    the pid exists under another uid, and an unexpected OSError says nothing about
+    death. A wrong "dead" would let a second driver steal a live driver's dispatch lease
+    and double-dispatch the same stage; a wrong "alive" only leaves an orphan for the
+    operator to resolve loudly. Mirrors ``port_registry._pid_alive``'s convention.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
 
 
 # Default liveness window for `abandon` (#82): a mid-dispatch abandon is refused when the
@@ -3324,6 +3344,153 @@ class Engine:
         self._finalize_task_terminal(run_id, task, disposition=disposition, reason=reason)
         return task
 
+    # --- driver claim / orphaned-lease reclaim (#313) --------------------------
+    def driver_claim(
+        self, run_id: str, *, alive: Callable[[int], bool] | None = None, run: Run | None = None
+    ) -> dict:
+        """Classify the run's recorded driver claim (#313). Read-only.
+
+        Returns ``{"state", "host", "pid", "claimed_at", "reclaimable"}`` where ``state``
+        is one of:
+
+        - ``unclaimed`` — no driver ever stamped this run (e.g. it is being driven
+          task-by-task through the CLI supervisor, whose background invocations hold real
+          leases). NOT reclaimable: a lease with no known owner may still be live.
+        - ``mine`` — the claim is this very process. Reclaimable: ``Scheduler.run``
+          dispatches SYNCHRONOUSLY, so a lease this process left behind belongs to a tick
+          that already returned/raised — nothing is still running against it.
+        - ``dead`` — same host, and the pid is gone. Reclaimable: this is the killed-driver
+          case the whole mechanism exists for.
+        - ``live`` — same host, pid still running. NOT reclaimable — stealing a live
+          driver's lease would double-dispatch the same stage.
+        - ``foreign_host`` — claimed from another machine, where a local pid check means
+          nothing. NOT reclaimable (fails safe).
+
+        ``alive`` injects the pid-liveness sensor (tests pass a stub); it defaults to a
+        signal-0 probe that fails safe by reporting "alive" for anything it cannot answer.
+        ``run`` lets a caller that already holds the run doc (``status``) skip re-loading it.
+        """
+        probe = alive or _pid_alive
+        driver = (run if run is not None else self.store.load_run(run_id)).driver
+        if driver is None:
+            return {"state": "unclaimed", "host": None, "pid": None, "claimed_at": None,
+                    "reclaimable": False}
+        out = {"host": driver.host, "pid": driver.pid, "claimed_at": driver.claimed_at}
+        if driver.host != socket.gethostname():
+            return {**out, "state": "foreign_host", "reclaimable": False}
+        if driver.pid == os.getpid():
+            return {**out, "state": "mine", "reclaimable": True}
+        if probe(driver.pid):
+            return {**out, "state": "live", "reclaimable": False}
+        return {**out, "state": "dead", "reclaimable": True}
+
+    def claim_run_driver(
+        self, run_id: str, *, alive: Callable[[int], bool] | None = None
+    ) -> dict:
+        """Stamp THIS process as the run's driver (#313), unless a live foreign driver
+        already holds it — in which case the existing claim is left untouched and returned.
+
+        Persisted on the Run doc (not engine memory) because its whole purpose is to
+        survive the process that wrote it: the NEXT driver reads it back to tell its own
+        crashed leases from a live driver's (#206's persistence rule, for the same reason).
+        The claim is never cleared on exit — a stale claim is the evidence, not litter.
+        Returns the resulting claim classification.
+        """
+        current = self.driver_claim(run_id, alive=alive)
+        if current["state"] == "live":
+            return current  # someone else is driving; do not overwrite their ownership
+        claimed_at = _now()
+        pid, host = os.getpid(), socket.gethostname()
+
+        def _claim(run: Run) -> None:
+            run.driver = RunDriver(host=host, pid=pid, claimed_at=claimed_at)
+
+        self.store.update_run(run_id, _claim)
+        self.store.append_event(
+            run_id,
+            {"ts": claimed_at, "type": "driver_claimed", "run_id": run_id, "host": host,
+             "pid": pid, "previous": current["state"], "previous_pid": current["pid"]},
+        )
+        return {"state": "mine", "host": host, "pid": pid, "claimed_at": claimed_at,
+                "reclaimable": True}
+
+    def reclaim_orphaned_dispatches(
+        self, run_id: str, *, alive: Callable[[int], bool] | None = None
+    ) -> dict:
+        """Free the dispatch leases a KILLED driver left behind, so the run can continue
+        at the SAME attempt (#313) — called at ``Scheduler.run`` startup.
+
+        A driver killed mid-dispatch (Ctrl-C on the foreground ``run-headless``, a reboot)
+        leaves each in-flight task RUNNING with ``pending_work_item_id`` set. Every normal
+        path correctly refuses to step over that lease, so ``dispatchable()`` excluded the
+        task and the next ``Scheduler.run`` had nothing to do and exited looking like a
+        clean no-op. This is the third sanctioned lease-clearing path, alongside ``record``
+        (the result arrived) and ``abandon`` (give up, terminally) — the one that RESUMES.
+
+        Clearing the lease while leaving the stage record ``RUNNING`` is what makes the
+        re-dispatch free: ``next_work`` derives the attempt from the persisted stage status
+        (RUNNING -> re-dispatch the SAME attempt, and reset the worktree to the last
+        successful checkpoint), so recovery costs no retry budget — unlike the
+        hand-crafted ``timeout`` StageResult that was the only prior recovery.
+
+        SAFETY — same-owner only. Nothing is reclaimed unless ``driver_claim`` says the
+        recorded claim is ours or provably dead on this host; an unclaimed run, a live
+        driver, or a foreign-host claim reclaims NOTHING (the caller reports that loudly
+        instead). Stealing a live dispatch's lease would double-dispatch the stage.
+
+        Never silent: each reclaim appends a ``dispatch_reclaimed`` event naming the
+        retired ``work_item_id`` — the audit counterpart of ``lease_superseded``, so the
+        #175 dispatch/record balance still closes out every ``stage_dispatched``. The
+        task-doc mutation and its event commit together under the per-task lock (#199).
+
+        Returns ``{"driver", "reclaimed", "skipped"}``: the claim classification, the
+        per-task reclaim records, and any leased task that could not be reclaimed (a lease
+        with no current stage is a corrupt doc — left for ``abandon``).
+        """
+        claim = self.driver_claim(run_id, alive=alive)
+        reclaimed: list[dict] = []
+        skipped: list[dict] = []
+        if not claim["reclaimable"]:
+            return {"driver": claim, "reclaimed": reclaimed, "skipped": skipped}
+        run = self.store.load_run(run_id)
+        for ref in run.task_refs:
+            if ref.state in TERMINAL_TASK_STATES:
+                continue
+            task = self.store.load_task(run_id, ref.task_id)
+            if task.pending_work_item_id is None:
+                continue
+            stage = task.current_stage
+            if stage is None or stage not in task.stages:
+                skipped.append({"task_id": ref.task_id, "reason": "no_current_stage",
+                                "work_item_id": task.pending_work_item_id})
+                continue
+            work_item_id = task.pending_work_item_id
+            attempt = task.stages[stage].attempt
+
+            def _release(t: Task) -> None:
+                t.pending_work_item_id = None
+                t.pending_content_hash = None
+                # #288: the panel-plan marker describes the dispatch that just died, so it
+                # must not outlive its lease. `pending_fallback_model` is deliberately NOT
+                # touched: it is consumed INTO a dispatch, so it is already None here, and
+                # clearing it blindly could discard a fallback queued for the next one.
+                t.pending_plan = False
+                # The stage record stays RUNNING on purpose — that is what makes
+                # next_work re-dispatch the SAME attempt from the last checkpoint.
+
+            self.store.commit_task_events(
+                run_id, ref.task_id, _release,
+                [{"ts": _now(), "type": "dispatch_reclaimed", "severity": "warning",
+                  "run_id": run_id, "task_id": ref.task_id, "stage": stage.value,
+                  "attempt": attempt, "work_item_id": work_item_id,
+                  "driver_state": claim["state"], "driver_pid": claim["pid"],
+                  "reason": "driver died mid-dispatch; lease released for re-dispatch at "
+                            "the same attempt"}],
+            )
+            reclaimed.append({"task_id": ref.task_id, "stage": stage.value,
+                              "attempt": attempt, "work_item_id": work_item_id})
+        return {"driver": claim, "reclaimed": reclaimed, "skipped": skipped}
+
     # --- resume / status ------------------------------------------------------
     def resume(self, run_id: str) -> dict:
         run = self.store.load_run(run_id)
@@ -3441,6 +3608,10 @@ class Engine:
             "tasks": tasks,
             "cost": summary,
             "budget": budget,  # #34: metered spend vs. budget (None when no budget set)
+            # #313: who is driving this run's scheduler loop, and whether that process is
+            # still alive — so "the model went quiet" and "nobody is driving this run any
+            # more" are distinguishable from a poll (watch renders the difference).
+            "driver": self.driver_claim(run_id, run=run),
             "lane_audit": self.lane_audit(run_id, rows=rows),
             # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
             # automatically at every poll / batch completion instead of by hand-count.
@@ -3539,7 +3710,8 @@ class Engine:
         ``stage_recorded`` (29 vs 23) — was caught only because a human hand-counted the
         timeline. This makes that check automatic and self-describing: each
         ``stage_dispatched`` opens a ``work_item_id`` that must be closed by exactly one of
-        ``stage_recorded`` / ``lease_superseded`` / ``dispatch_abandoned``, OR still be a
+        ``stage_recorded`` / ``lease_superseded`` / ``dispatch_abandoned`` /
+        ``dispatch_reclaimed`` (#313 — a killed driver's lease released for re-dispatch), OR still be a
         live outstanding lease (a dispatch currently in flight on a non-terminal task). A
         dispatched lease with no closing event that is not outstanding is an ORPHAN and gets
         flagged — the regression this audit exists to surface at batch completion / CI
@@ -3559,8 +3731,8 @@ class Engine:
         dispatched: dict[str, dict] = {}  # work_item_id -> opening dispatch info
         closed: dict[str, str] = {}  # work_item_id -> closing event type
         recorded_no_wid = 0  # pre-#175 stage_recorded rows without a joinable lease id
-        counts = {"stage_dispatched": 0, "stage_recorded": 0,
-                  "lease_superseded": 0, "dispatch_abandoned": 0}
+        counts = {"stage_dispatched": 0, "stage_recorded": 0, "lease_superseded": 0,
+                  "dispatch_abandoned": 0, "dispatch_reclaimed": 0}
         # #314: session continuity, measured off the dispatch events. `session_ref` is only
         # stamped since #314, and an ABSENT key is not the same fact as an explicit null —
         # reading absence as "no session" is exactly the bug this reports (a pre-#314 run
@@ -3585,7 +3757,8 @@ class Engine:
                     dispatched[wid] = {"task_id": ev.get("task_id"),
                                        "stage": ev.get("stage"),
                                        "attempt": ev.get("attempt")}
-            elif etype in ("stage_recorded", "lease_superseded", "dispatch_abandoned"):
+            elif etype in ("stage_recorded", "lease_superseded", "dispatch_abandoned",
+                           "dispatch_reclaimed"):
                 if wid:
                     # First close wins: a later duplicate can't unflag an already-closed lease.
                     closed.setdefault(wid, etype)
@@ -3623,6 +3796,11 @@ class Engine:
             "recorded": counts["stage_recorded"],
             "superseded": counts["lease_superseded"],
             "abandoned": counts["dispatch_abandoned"],
+            # #313: leases released by the startup reclaim. Counted separately from
+            # `superseded` so a resumed-after-kill run is legible as such, and so the
+            # dispatched == recorded + superseded + abandoned + reclaimed + outstanding
+            # balance still closes.
+            "reclaimed": counts["dispatch_reclaimed"],
             "outstanding": len(outstanding),
             "orphans": orphans,
             "clean": not orphans,

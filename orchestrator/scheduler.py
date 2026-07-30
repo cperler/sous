@@ -11,7 +11,9 @@ Dispatch is abstracted behind a ``Runner`` (a batch of WorkItems -> StageResults
 the interactive lane passes a Workflow-shim-backed runner; tests pass a simulated
 one. Because all state is persisted by the engine, the scheduler is resumable —
 constructing a fresh Scheduler on the same run directory continues where a killed
-batch left off.
+batch left off, INCLUDING a kill that caught dispatches mid-flight: ``run()`` claims
+the run's driver record and reclaims the leases its own dead driver left behind
+before the first tick (#313). See ``Scheduler.run`` for the limits of that guarantee.
 """
 
 from __future__ import annotations
@@ -19,13 +21,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from datetime import UTC, datetime
 
-from .alerting import stale_notifications
+from .alerting import NOTIFY_RUN_BLOCKED, stale_notifications
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
 from .schemas.enums import TERMINAL_TASK_STATES
 from .schemas.work import StageResult, WorkItem
 
 Runner = Callable[[list[WorkItem]], list[StageResult]]
+
+# Why ``Scheduler.run`` stopped looping (#313). Reported under the returned status'
+# ``scheduler`` block so the end-of-run dump is never ambiguous — the silent failure this
+# vocabulary exists for was "nothing dispatchable because every task holds an orphaned
+# lease", whose output was byte-indistinguishable from an ordinary finished run.
+EXIT_DONE = "nothing_dispatchable"  # nothing left to do (finished, or blocked on a human)
+EXIT_BLOCKED_ORPHANED = "blocked_on_orphaned_dispatches"  # leases held, none reclaimable
+EXIT_PAUSED = "run_paused"  # the run doc says paused (human gate / budget)
+EXIT_BREAKER = "circuit_breaker"  # this loop tripped the batch breaker and paused the run
+EXIT_CAPACITY = "capacity_stalled"  # dispatch limit 0 and no sleeper to wait it out
+EXIT_MAX_TICKS = "max_ticks"  # the loop bound was hit — a real run should never see this
 
 
 class Scheduler:
@@ -94,17 +107,36 @@ class Scheduler:
     ) -> dict:
         """Loop until no task is dispatchable (all terminal or capacity-stalled).
 
+        FOREGROUND: this call owns the run for its whole duration — it dispatches
+        synchronously and, on the headless lane, the provider processes are its children.
+        Killing it (Ctrl-C) kills them. Monitor from a SEPARATE terminal (``orchestrator
+        watch``).
+
         With a ``sleeper`` (e.g. ``time.sleep``), capacity stalls and rate-limit
         cooldowns are WAITED OUT instead of ending the run — the old capacity_wait_loop
         behavior: sleep, re-probe (``util_provider`` re-reads utilization each tick),
         continue. Without one (the default), the caller owns retrying later — the
-        pre-existing behavior. Returns the final engine status. Resumable: call again
-        on the same run to continue after a kill.
+        pre-existing behavior.
+
+        Resumable after a kill (#313), with a stated limit. At startup this claims the
+        run's driver record and reclaims the dispatch leases left by a driver that is now
+        gone, re-dispatching each at the SAME attempt (no retry budget spent). It reclaims
+        ONLY leases whose owner is provably this process or a dead process on this host —
+        an unclaimed run (one driven task-by-task through the CLI supervisor, whose
+        background invocations hold live leases), a live driver, or a foreign-host claim
+        reclaims nothing, because stealing a live lease would double-dispatch the stage.
+        In that case the loop does not pretend to be finished: it returns
+        ``scheduler.exit_reason == "blocked_on_orphaned_dispatches"`` (``run-headless``
+        exits non-zero), naming the tasks and pointing at ``orchestrator abandon``.
 
         Batch-wide circuit breaker (#58): ``batch_failure_threshold`` consecutive task
         failures (no completion in between) PAUSE the run and stop dispatching — a
         systemic cause fails fast instead of burning every task's retry budget. A
         paused run refuses to schedule until ``orchestrator unpause``.
+
+        Returns the final engine status with an added ``scheduler`` block: why the loop
+        stopped (``exit_reason``, one of the ``EXIT_*`` constants), what was reclaimed at
+        startup, and any leases still outstanding.
         """
         consecutive_failures = 0
         stale_sent: set[str] = set()
@@ -112,8 +144,16 @@ class Scheduler:
         # dispatching, so this batch doesn't starve on ports a dead run never released.
         # Best-effort + opt-in (a no-op for projects without port needs).
         self.engine.reclaim_stale_ports(run_id)
+        # #313: free the dispatch leases OUR dead driver left behind, THEN stamp this
+        # process as the driver. Order matters: the reclaim classifies the claim that is
+        # on disk (the killed driver's), so claiming first would erase the very evidence
+        # that proves those leases are orphans.
+        reclaim = self.engine.reclaim_orphaned_dispatches(run_id)
+        self.engine.claim_run_driver(run_id)
+        exit_reason = EXIT_MAX_TICKS
         for _ in range(max_ticks):
             if self.engine.store.load_run(run_id).state.value == "paused":
+                exit_reason = EXIT_PAUSED
                 break  # human-gated: unpause first
             # Stall alerting (#55): poll the liveness sensor each pass and notify ONCE
             # per task per stall episode. The shared alerting core owns the dedupe (the
@@ -126,6 +166,13 @@ class Scheduler:
                 if wait is not None and sleeper is not None:
                     sleeper(wait)
                     continue
+                # #313: "nothing dispatchable" has TWO very different causes. If tasks are
+                # still holding dispatch leases we could not reclaim, this loop is giving
+                # up on a run that is not finished — say so instead of dumping a status
+                # that looks like success.
+                exit_reason = (
+                    EXIT_BLOCKED_ORPHANED if self.engine.in_flight(run_id) else EXIT_DONE
+                )
                 break
             util = util_provider() if util_provider is not None else util_pct
             res = self.tick(run_id, runner, util_pct=util)
@@ -157,14 +204,59 @@ class Scheduler:
                      "summary": f"run {run_id} PAUSED by the batch circuit breaker "
                                 f"({consecutive_failures} consecutive failures)"},
                 )
+                exit_reason = EXIT_BREAKER
                 break
             if res["dispatched"] == 0:
                 # Capacity-throttled tick (limit 0). Wait out the window if we can.
                 if sleeper is not None:
                     sleeper(drain_wait_s)
                     continue
+                exit_reason = EXIT_CAPACITY
                 break  # caller retries later
-        return self.engine.status(run_id)
+        return self._final_status(run_id, exit_reason, reclaim)
+
+    def _final_status(self, run_id: str, exit_reason: str, reclaim: dict) -> dict:
+        """The end-of-run status dump, annotated with WHY the loop stopped (#313).
+
+        The blocked case is also emitted (a warning-grade ``scheduler_exit_blocked`` event
+        plus a notification), because the operator who needs to know is the one who is no
+        longer watching this terminal.
+        """
+        in_flight = self.engine.in_flight(run_id)
+        block = {
+            "exit_reason": exit_reason,
+            "reclaimed": reclaim.get("reclaimed", []),
+            "reclaim_skipped": reclaim.get("skipped", []),
+            # The claim as FOUND at startup — i.e. whose leases the reclaim was judging.
+            # (The current owner is the status' own top-level ``driver``: normally us.)
+            "driver_at_start": reclaim.get("driver"),
+            "in_flight": in_flight,
+        }
+        if exit_reason == EXIT_BLOCKED_ORPHANED:
+            driver = reclaim.get("driver") or {}
+            block["message"] = (
+                f"stopped with nothing dispatchable while task(s) {', '.join(in_flight)} "
+                f"still hold a dispatch lease this driver may not reclaim (driver claim: "
+                f"{driver.get('state')}). A live driver elsewhere may be finishing them; "
+                f"otherwise release each with `orchestrator abandon --run {run_id} --task "
+                f"<id> --reason ...` (terminal) once you know the process is dead."
+            )
+            self.engine.store.append_event(
+                run_id,
+                {"ts": datetime.now(UTC).isoformat(), "type": "scheduler_exit_blocked",
+                 "severity": "warning",
+                 "run_id": run_id, "exit_reason": exit_reason, "in_flight": in_flight,
+                 "driver": driver, "message": block["message"]},
+            )
+            self.engine.emit_notification(
+                run_id, NOTIFY_RUN_BLOCKED,
+                {"run_id": run_id, "kind": NOTIFY_RUN_BLOCKED,
+                 "summary": f"run {run_id} scheduler stopped: {block['message']}",
+                 "in_flight": in_flight, "driver": driver},
+            )
+        status = self.engine.status(run_id)
+        status["scheduler"] = block
+        return status
 
     def _alert_stale(self, run_id: str, sent: set[str], stale_after_s: int) -> set[str]:
         """Poll the liveness sensor and fire any newly-due stall notifications, returning

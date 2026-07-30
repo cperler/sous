@@ -458,6 +458,10 @@ def drive_queue(
             "branch": head.get("branch"),
             "added": added,
             "final_state": status.get("run_state"),
+            # #313: WHY the scheduler stopped, not just where the run ended up — a batch
+            # that stopped on orphaned dispatch leases reports `run_state: running` and is
+            # otherwise indistinguishable here from one that simply finished.
+            "exit_reason": status.get("scheduler", {}).get("exit_reason"),
         })
 
     return {

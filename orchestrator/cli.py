@@ -348,7 +348,15 @@ def main(argv: list[str] | None = None) -> int:
     )
     d.add_argument("--util", default="0", help=util_help)
     d.add_argument("--max-concurrent", type=int, default=3)
-    rh = sub.add_parser("run-headless", help="drive the whole run in-process (headless mode)")
+    rh = sub.add_parser(
+        "run-headless",
+        help="drive the whole run in-process (headless mode). FOREGROUND: this process "
+             "owns the run for its entire duration and the provider processes are its "
+             "children — Ctrl-C kills them too. Monitor from a SEPARATE terminal "
+             "(`orchestrator watch`). Re-invoking after a kill resumes: leases left by "
+             "the dead driver are reclaimed at the same attempt (#313). Exits non-zero if "
+             "it stops with leases it may not reclaim (another live driver).",
+    )
     rh.add_argument("--util", default="0", help=util_help)
     rh.add_argument("--max-concurrent", type=int, default=3)
     rh.add_argument("--wait", action="store_true",
@@ -1132,14 +1140,21 @@ def main(argv: list[str] | None = None) -> int:
 
         from adapters.execution.runners import registry_runner
 
-        from .scheduler import Scheduler
+        from .scheduler import EXIT_BLOCKED_ORPHANED, Scheduler
 
         sched = Scheduler(eng, max_concurrent=args.max_concurrent)
         util_provider = _auto_util_provider() if args.util == "auto" else None
-        _emit(sched.run(
+        result = sched.run(
             args.run, registry_runner(eng.registry), util_pct=util_pct,
             util_provider=util_provider, sleeper=time.sleep if args.wait else None,
-        ))
+        )
+        _emit(result)
+        # #313: stopping with orphaned dispatch leases we may not reclaim is NOT a
+        # successful run — a status dump that looks like completion is exactly the silent
+        # failure this exits non-zero for, so a wrapper/CI can branch on it.
+        if result.get("scheduler", {}).get("exit_reason") == EXIT_BLOCKED_ORPHANED:
+            print(result["scheduler"]["message"], file=sys.stderr)
+            return 1
     elif args.cmd == "hold":
         task = eng.hold_for_approval(args.run, args.task, args.reason)
         _emit({"held": task.task_id, "state": task.state.value, "reason": args.reason})

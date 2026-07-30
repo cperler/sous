@@ -30,6 +30,10 @@ NOTIFY_TASK_FAILED = "task_failed"
 NOTIFY_TASK_BLOCKED = "task_blocked"
 NOTIFY_RUN_PAUSED = "run_paused"
 NOTIFY_RUN_FINALIZED = "run_finalized"
+# #313: the scheduler loop stopped with work left that it may not touch — every
+# non-terminal task holds a dispatch lease it could not reclaim. Distinct from
+# run_paused (a deliberate gate) and task_stale (the task may still be progressing).
+NOTIFY_RUN_BLOCKED = "run_blocked"
 
 # Run states that end a watch (mirror RunState terminal values without importing the
 # enum — this module works off the JSON status snapshot, not engine objects).
@@ -94,8 +98,16 @@ def activity_lines(status: dict, *, stall_after_s: int = 300) -> list[str]:
     doing + how long since the stream last grew. A stream that hasn't grown for
     ``stall_after_s`` while the stage is RUNNING gets a DISTINCT ``STREAM STALLED`` note — an
     earlier signal than task-level staleness (which only fires on the whole task not moving).
-    Pure and sleep-free, so it is unit-testable off a synthetic snapshot."""
+
+    #313: a frozen stream has two causes that call for opposite responses — the model went
+    quiet (wait, or look at the stage), or the DRIVER process died and nothing is running at
+    all (re-invoke the driver). When the snapshot's ``driver`` block says the claiming
+    process is gone, the line says NO LIVE DRIVER instead, so the operator is pointed at the
+    real cause rather than at the model. Pure and sleep-free, so it is unit-testable off a
+    synthetic snapshot."""
     tasks: dict[str, dict] = status.get("tasks", {}) or {}
+    driver: dict = status.get("driver") or {}
+    driver_dead = driver.get("state") == "dead"
     lines: list[str] = []
     for tid in sorted(tasks):
         ts = tasks[tid]
@@ -106,7 +118,13 @@ def activity_lines(status: dict, *, stall_after_s: int = 300) -> list[str]:
         since = act.get("seconds_since_event")
         desc = _fmt_activity(act.get("current_activity"))
         seen = act.get("events_seen")
-        if isinstance(since, (int, float)) and since >= stall_after_s:
+        if isinstance(since, (int, float)) and since >= stall_after_s and driver_dead:
+            lines.append(
+                f"[{tid}] NO LIVE DRIVER — the driver process (pid {driver.get('pid')}) "
+                f"is gone, so nothing is running this stage; no stream output for {since}s "
+                f"(stage {stage}, {desc}). Re-invoke the driver to resume."
+            )
+        elif isinstance(since, (int, float)) and since >= stall_after_s:
             lines.append(
                 f"[{tid}] STREAM STALLED — no stream output for {since}s "
                 f"(stage {stage}, {desc})"
