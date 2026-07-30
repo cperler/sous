@@ -51,6 +51,10 @@ class CodexRunner:
                 # primitive, so this cell can't fan a REVIEW plan out below the seam. The
                 # engine therefore never attaches one here and codex keeps dispatching the
                 # single-reviewer prompt — lane and content_hash stay consistent.
+                # #272: the transport DOES translate a ToolPolicy — into codex's sandbox mode
+                # (`--sandbox read-only` fresh, `sandbox_mode="read-only"` on resume), so the
+                # posture survives session continuity.
+                enforces_tool_policy=True,
                 status=SUPPORTED,
             ),
             # codex never runs in-session — declare the empty cell honestly.

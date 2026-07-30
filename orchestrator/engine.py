@@ -879,6 +879,15 @@ class Engine:
             if deterministic
             else self._review_plan_for(task, stage=stage, run=run, lane=lane, util_pct=util_pct)
         )
+        # Tool posture (#272): declared by the stage spec, attached on model lanes only (the
+        # deterministic ENGINE lane runs no model, so there is no toolset to narrow). Purely
+        # derived — nothing run-level to persist (#206), so re-reading the spec at every
+        # dispatch boundary is the whole mechanism.
+        tool_policy = None if deterministic else spec.tool_policy
+        # Honesty gate (#272): a lane that cannot translate the posture into a real provider
+        # restriction (the interactive shim — its `agent()` call takes no tool argument) still
+        # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
+        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -932,6 +941,8 @@ class Engine:
             # None on every non-workflow dispatch — which is what keeps the plan-less
             # WorkItem/prompt/hash byte-identical to the pre-#73 shape.
             plan=plan,
+            # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
+            tool_policy=tool_policy,
         )
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -1009,11 +1020,41 @@ class Engine:
                 event["resume"] = True
                 event["supersedes"] = superseded_lease
             evs.append(event)
+            # #272: ONE warning-grade notice per dispatch when the resolved lane does not
+            # declare enforcement, so a read-only posture that is only a prompt convention on
+            # that lane is visible in the event stream instead of quietly assumed.
+            if unenforced_policy:
+                evs.append(
+                    {
+                        "ts": _now(),
+                        "type": "tool_policy_unenforced",
+                        "severity": "warning",
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "stage": stage.value,
+                        "attempt": attempt,
+                        "work_item_id": work.id,
+                        "lane": f"{lane.execution_mode.value}:{lane.provider.value}",
+                        "policy": tool_policy.model_dump() if tool_policy else None,
+                    }
+                )
             return evs
 
         self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
         return work
+
+    def _lane_enforces_tool_policy(self, lane: LanePolicy) -> bool:
+        """Does the resolved lane translate a ``ToolPolicy`` into a real restriction (#272)?
+
+        Read off the lane's ``CapabilityDescriptor`` (``enforces_tool_policy``), never
+        hardcoded here — the transport that does the translation is the only honest source.
+        An unregistered lane counts as NOT enforcing: the conservative reading, because it
+        makes the gap visible rather than assuming protection the lane may not have."""
+        try:
+            return self.registry.describe(lane).enforces_tool_policy
+        except NoRunnerError:
+            return False
 
     # --- multi-agent REVIEW plan (#73) -----------------------------------------
     def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:

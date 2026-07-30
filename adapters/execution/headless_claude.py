@@ -44,6 +44,10 @@ class HeadlessClaudeRunner:
                 # #73: the reference lane for a multi-agent REVIEW — the transport can fan a
                 # plan's finders/verifiers out as sub-calls within one dispatch (design §2/§5).
                 supports_plan=True,
+                # #272: the transport translates a ToolPolicy into `--disallowedTools`, which
+                # is enforced even under `--dangerously-skip-permissions` (probed: the tool is
+                # absent from the toolset, not merely prompted for).
+                enforces_tool_policy=True,
                 status=SUPPORTED,
             )
         ]

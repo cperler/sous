@@ -747,6 +747,61 @@ def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
                           text=True, timeout=60)
 
 
+# --- tool-policy translation (#272) ------------------------------------------------------
+# The engine states a provider-neutral posture (`ToolPolicy`); each transport below turns it
+# into its own provider's primitive. These are the claude tool names for each posture bit —
+# the ONLY place in the codebase that knows them.
+_CLAUDE_WRITE_TOOLS: tuple[str, ...] = ("Write", "Edit", "NotebookEdit")
+_CLAUDE_EXEC_TOOLS: tuple[str, ...] = ("Bash", "BashOutput", "KillShell")
+
+
+def _claude_tool_policy_flags(work: WorkItem) -> list[str]:
+    """Translate ``work.tool_policy`` into ``claude`` CLI flags (#272).
+
+    EVIDENCE (probed 2026-07-29 against the installed CLI, haiku, in a scratch dir) that
+    ``--disallowedTools`` is a real enforcement primitive and not silently ignored under
+    ``--dangerously-skip-permissions``: with ``--disallowedTools "Write,Edit,NotebookEdit"``
+    the model's ``Write`` call came back
+    ``<tool_use_error>Error: No such tool available: Write. Write exists but is not enabled in
+    this context.</tool_use_error>`` and no file was created. The tool is removed from the
+    toolset, not merely gated behind a prompt — so the deny rule survives bypassPermissions
+    and this policy is enforced rather than decorative. (Same probe: ``MultiEdit`` is NOT a
+    known tool name — the CLI warns ``matches no known tool`` — which is why it is absent from
+    ``_CLAUDE_WRITE_TOOLS``.)
+
+    HONEST LIMIT: with command execution retained (REVIEW's deliberate trade-off), the model
+    can still write through the shell. This narrows the toolset against inadvertent mutation;
+    it is not a sandbox. Isolating a verifier's test run from the live worktree is tracked
+    separately.
+
+    No policy => an EMPTY list, so the argv stays byte-identical to the pre-#272 one."""
+    policy = work.tool_policy
+    if policy is None:
+        return []
+    denied: list[str] = []
+    if not policy.allow_file_writes:
+        denied += list(_CLAUDE_WRITE_TOOLS)
+    if not policy.allow_command_execution:
+        denied += list(_CLAUDE_EXEC_TOOLS)
+    if not denied:
+        return []
+    # Comma-joined single argument: `--disallowedTools` is variadic (comma OR space
+    # separated), and a space-separated list would swallow the following flags.
+    return ["--disallowedTools", ",".join(denied)]
+
+
+def _codex_tool_policy_readonly(work: WorkItem) -> bool:
+    """Does ``work.tool_policy`` demand codex's read-only sandbox (#272)?
+
+    codex has no per-tool primitive — its enforcement knob is the process sandbox
+    (``--sandbox read-only``), which is COARSER than claude's tool deny-list: a command that
+    writes anywhere (a pytest cache, a build dir) fails under it. That is the price of real
+    enforcement on this lane, and it is why the posture maps to the sandbox rather than being
+    dropped as untranslatable."""
+    policy = work.tool_policy
+    return policy is not None and not policy.allow_file_writes
+
+
 def subprocess_env(work: WorkItem) -> dict[str, str] | None:
     """The environment a stage's subprocess runs with: the inherited process env with the
     WorkItem's per-task ``env`` merged OVER it (#5 port injection), or ``None`` to inherit
@@ -960,6 +1015,11 @@ def claude_cli_transport(
             else ["--output-format", "json"]
         argv = ["claude", "-p", work.prompt, "--model", work.model,
                 "--dangerously-skip-permissions", *fmt]
+        # #272: narrow the TOOLSET for a posture-bearing dispatch (REVIEW). Note what is NOT
+        # done: `--dangerously-skip-permissions` stays. Headless dispatch is non-interactive by
+        # construction — there is no human to answer a permission prompt and a prompt would
+        # hang the run — so the fix is removing tools, not restoring interactive gating.
+        argv += _claude_tool_policy_flags(work)
         if work.effort:
             # #96: per-stage reasoning effort — the claude CLI's session effort level
             # (low/medium/high). Unset emits exactly the pre-#96 argv (byte-identical).
@@ -1253,15 +1313,35 @@ def codex_cli_transport(
             )
             tail = ["-m", work.model, *effort_cfg, "--skip-git-repo-check", *schema_flags,
                     "--json", "--output-last-message", str(last), work.prompt]
+            # #272: a write-denying posture swaps the write sandbox for codex's read-only one on
+            # BOTH call shapes, so the posture survives session continuity instead of silently
+            # reverting to workspace-write on the second call of the stage. The writable-root
+            # grant is dropped with it — granting write roots under a read-only sandbox would
+            # contradict the posture. Unset policy keeps the pre-#272 argv byte-identical.
+            read_only = _codex_tool_policy_readonly(work)
             if session_ref:
                 # Resume carries the warm session. It takes no sandbox/approval/--add-dir flags,
                 # so replicate `--full-auto`'s write posture via `-c` config overrides.
-                write_cfg = ["-c", 'sandbox_mode="workspace-write"',
-                             "-c", 'approval_policy="never"']
-                if grant:
-                    write_cfg += ["-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(grant)}]"]
+                if read_only:
+                    write_cfg = ["-c", 'sandbox_mode="read-only"',
+                                 "-c", 'approval_policy="never"']
+                else:
+                    write_cfg = ["-c", 'sandbox_mode="workspace-write"',
+                                 "-c", 'approval_policy="never"']
+                    if grant:
+                        write_cfg += [
+                            "-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(grant)}]"
+                        ]
                 argv = ["codex", "exec", "resume", session_ref, *write_cfg, *tail]
                 invocation = f"codex exec resume {session_ref} --json (model {work.model})"
+            elif read_only:
+                # `--sandbox read-only` replaces `--full-auto` (which is workspace-write +
+                # non-blocking approvals); `approval_policy="never"` is kept explicitly so a
+                # sandbox denial fails the command instead of stalling on an approval request
+                # nobody can answer.
+                argv = ["codex", "exec", "--sandbox", "read-only",
+                        "-c", 'approval_policy="never"', *tail]
+                invocation = f"codex exec --sandbox read-only --json (model {work.model})"
             else:
                 add_dir = ["--add-dir", grant] if grant else []
                 argv = ["codex", "exec", "--full-auto", *add_dir, *tail]

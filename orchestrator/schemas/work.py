@@ -45,6 +45,31 @@ class LaneUsed(BaseModel):
     invocation: str  # literal call string, e.g. "agent(model=...)" / "claude -p ..."
 
 
+class ToolPolicy(BaseModel):
+    """The tool POSTURE a dispatch runs under (#272) — provider-neutral, like ``Effort``.
+
+    The engine states the posture in its own vocabulary ("may this stage write files?")
+    and each execution adapter TRANSLATES it into its provider's primitive (claude
+    ``--disallowedTools``, codex ``--sandbox``). No claude tool name ever appears in the
+    engine, so a new provider only has to teach its own transport the translation.
+
+    Defaults are the historical posture (everything allowed), so a dispatch without a
+    policy is byte-identical to the pre-#272 argv on every lane."""
+
+    model_config = ConfigDict(frozen=True)
+
+    # May the dispatch mutate files through its file-writing tools? False for REVIEW: a
+    # reviewer's job is to read and report, and nothing but a prompt convention used to
+    # stop it editing the very tree it was judging (#272).
+    allow_file_writes: bool = True
+    # May the dispatch run shell commands? Deliberately left True for REVIEW — the issue's
+    # explicit trade-off: an adversarial verifier refutes a finding by RUNNING the suite,
+    # and taking Bash away would materially weaken the review. Retaining it does mean a
+    # write-denied dispatch can still write via the shell, so this posture is a guard
+    # against inadvertent mutation, NOT a sandbox (see the transport translation notes).
+    allow_command_execution: bool = True
+
+
 class TokenUsage(BaseModel):
     model_config = ConfigDict(frozen=True)
 
@@ -232,6 +257,19 @@ class WorkItem(BaseModel):
     # lands, never what the work IS) — and NEVER set by the engine: the engine emits one
     # WorkItem per dispatch and only the runner fans it out below the seam.
     phase: str | None = None
+    # Tool posture for this dispatch (#272): provider-neutral, translated per execution
+    # adapter (claude `--disallowedTools`, codex `--sandbox`). Set from
+    # ``STAGE_SPECS[stage].tool_policy`` on model lanes only; None (the default) on the
+    # deterministic ENGINE lane and every stage that declares no posture.
+    #
+    # DISPATCH METADATA — excluded from ``compute_content_hash`` alongside
+    # ``cwd``/``timeout_s``/``session_ref``. Why that is safe rather than convenient: the
+    # policy is derived deterministically from the stage (already in the hash) and the
+    # resolved lane (also in the hash, via ``lane_policy``), so no two dispatches of the
+    # same work can legitimately disagree about it — there is nothing for the hash to
+    # discriminate. Excluding it also keeps every content_hash byte-identical to pre-#272,
+    # so an in-flight REVIEW lease still verifies on ``record``.
+    tool_policy: ToolPolicy | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -259,6 +297,7 @@ class WorkItem(BaseModel):
         context: dict | None = None,
         env: dict[str, str] | None = None,
         plan: ReviewPlan | None = None,
+        tool_policy: ToolPolicy | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -293,6 +332,7 @@ class WorkItem(BaseModel):
             context=context,
             env=env,
             plan=plan,
+            tool_policy=tool_policy,
             created_at=created_at,
         )
 
