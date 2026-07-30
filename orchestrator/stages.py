@@ -156,13 +156,12 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         timeout_s=600,  # read the PR + judge
         effort=Effort.MEDIUM,  # careful judgment over a bounded diff (#96)
         # #272: the first stage with a declared tool posture (SCOPE joined it in #303). A
-        # reviewer must not be able to
-        # mutate the tree it is judging — otherwise the verdict is about a tree the reviewer
-        # changed, and that write is invisible in the diff the implement-stage commit
-        # produced. Command execution is RETAINED deliberately (the issue's explicit
-        # trade-off): an adversarial verifier refutes a finding by running the suite.
-        # Inherited by every finder and verifier sub-call of a review panel — up to 12
-        # agents per review since #73 — via ``review_panel._sub_item``.
+        # reviewer must not be able to mutate the tree it is judging — otherwise the verdict
+        # is about a tree the reviewer changed, and that write is invisible in the diff the
+        # implement-stage commit produced. Command execution is RETAINED deliberately (the
+        # issue's explicit trade-off): an adversarial verifier refutes a finding by running
+        # the suite. Inherited by every finder and verifier sub-call of a review panel — up
+        # to 12 agents per review since #73 — via ``review_panel._sub_item``.
         tool_policy=ToolPolicy(allow_file_writes=False),
         template=(
             "Review the PR (see pr_url in the context above) against the task goal and "
