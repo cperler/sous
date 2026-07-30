@@ -293,6 +293,80 @@ _TESTS_MEANINGFUL_DIRECTIVE = (
 )
 
 
+# #310: the stacked-branch scoping directive for a task whose worktree was composed on
+# unmerged batch dependencies (#216 ``composed_deps``).
+#
+# Why it exists: the dependency's commits sit BELOW this task's own in the branch, so a diff
+# against trunk — which is what ``gh pr diff`` gives you — mixes them together. A reviewer
+# that trusts that diff either approves the dependency's code as if this review covered it,
+# or rejects this task for something its dependency did (a pointless fix cycle). Both
+# misreads leave a normal-looking review record. The engine already knows the fork point:
+# ``base_sha`` is captured AFTER the dep merges (deterministic_setup), so ``base_sha..HEAD``
+# is exactly this task's own commits.
+#
+# Trust boundary (cf. ``render_review_plan``'s docstring): this keys off ``composed_deps``
+# and ``base_sha``, which live in the model-writable context plane rather than arriving as
+# ENGINE-lane parameters. That is sound here because the directive ADDS attribution — it
+# tells the reviewer which commits are the task's, not which criteria to skip — the same
+# safe direction as the ``_has_frontend_change`` design lens. The wording below is
+# deliberate about that: it narrows the COMMIT RANGE, never the judgment applied to it, so
+# even a fabricated ``composed_deps`` cannot buy a thinner review of the task's own work.
+_STACKED_DIFF_SCOPE = (
+    "\n\n## Stacked branch: review only THIS task's own commits\n"
+    "This task's worktree was composed at intake on batch dependencies whose own PRs have "
+    "not merged yet (composed_deps above: {deps}). Their commits ride along in this branch "
+    "and in this PR, so diffing against the trunk — `gh pr diff <n>` included — shows their "
+    "changes mixed in with this task's.\n"
+    "{scope}"
+    "Judge this task's own commits ONLY: do not reject this task for a change its dependency "
+    "made, and do not treat the dependency's code as reviewed here (it is under review on "
+    "its own PR). This narrows WHICH COMMITS are yours — it does not narrow what you must "
+    "judge within them: every criterion above still applies in full to that range."
+)
+
+# The scope sentence when the fork point is known — the normal case.
+_STACKED_DIFF_RANGE = (
+    "Scope your reading to `{base_sha}..HEAD` in the task's worktree (`git diff "
+    "{base_sha}..HEAD`, or `git log {base_sha}..HEAD` and `git show` per commit). "
+    "Everything at or below `{base_sha}` belongs to the dependencies.\n"
+)
+
+# The degraded sentence when intake recorded no usable base SHA: still tell the reviewer the
+# PR diff is not the task's change, and how to work out the boundary without one.
+_STACKED_DIFF_NO_BASE = (
+    "Intake recorded no usable base SHA for this task, so work the boundary out yourself "
+    "before reviewing: `git log --oneline` in the task's worktree and exclude the commits "
+    "belonging to the dependency branches named above (`git log <dependency-branch>` shows "
+    "them). Do not take the raw PR diff for this task's change.\n"
+)
+
+
+def _stacked_diff_directive(context: dict | None) -> str:
+    """The #310 stacked-branch scoping block, or ``""`` for an unstacked task.
+
+    Pure and deterministic: a function of the folded ``composed_deps``/``base_sha`` only, so
+    an unstacked task's prompt is byte-identical to what it was before #310. Tolerates the
+    shapes the context plane can actually hold — a bare string dep, a non-sequence, blank
+    entries — because ``composed_deps`` is folded from a stage output rather than typed.
+    """
+    raw = (context or {}).get("composed_deps") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return ""
+    deps = [str(d).strip() for d in raw if str(d).strip()]
+    if not deps:
+        return ""
+    base_sha = str((context or {}).get("base_sha") or "").strip()
+    scope = (
+        _STACKED_DIFF_RANGE.format(base_sha=base_sha) if base_sha else _STACKED_DIFF_NO_BASE
+    )
+    return _STACKED_DIFF_SCOPE.format(
+        deps=", ".join(f"`{d}`" for d in deps),
+        scope=scope,
+    )
+
+
 def _render_value(v: object) -> str:
     """One folded context value → a compact one-line-ish string for the prompt."""
     if isinstance(v, list):
@@ -406,8 +480,17 @@ def render_prompt(
       spuriously triggers the #13 independent-test-validate reject, the #144 misfire).
       An omission is stated to be recorded as "not judged" and evented, not a pass.
 
+    - REVIEW + stacked branch (#310): when the task was composed on unmerged batch
+      dependencies (``composed_deps`` non-empty), names them and scopes the review to
+      ``base_sha..HEAD`` — this task's own commits — because the PR's trunk-relative diff
+      carries the dependencies' commits too.
+
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
+
+    The last two read model-influenced context rather than ENGINE-lane parameters (unlike
+    ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
+    ``render_review_plan`` for the same boundary stated over the finder set.
     """
     spec = STAGE_SPECS[stage]
     parts = _shared_sections(
@@ -431,6 +514,11 @@ def render_prompt(
     # `false` on a no-test-surface change is what spuriously kicked #144 into a fix cycle.
     if stage is Stage.REVIEW:
         instruction += _TESTS_MEANINGFUL_DIRECTIVE
+        # #310: a task stacked on unmerged batch dependencies (#216) is told which commits
+        # are its own, so the reviewer doesn't judge the PR's trunk-relative diff — which
+        # carries the dependencies' commits too — as if it were this task's change. Empty
+        # for an unstacked task, so its prompt is byte-identical to the pre-#310 one.
+        instruction += _stacked_diff_directive(context)
     # #62: a frontend change (deterministic signal on files_changed folded from IMPLEMENT)
     # gets the design-review criteria block appended to the REVIEW prompt. Project-agnostic
     # wording; the heysoo-specific design tokens live in the adapter's design agent.
@@ -671,6 +759,13 @@ def render_review_plan(
     4. Independently, a frontend change appends ``find:design`` — so a large frontend diff
        resolves to the 4-lens full panel.
 
+    Independently of the ladder, a task stacked on unmerged batch dependencies (#310,
+    ``composed_deps`` non-empty in context) gets the stacked-scope block on EVERY surviving
+    finder — the same block the single-reviewer path appends. It reads model-writable
+    context for the same reason ``find:design`` may: it tells a finder which commits are the
+    task's own, and explicitly does not narrow the criteria applied to them, so it cannot be
+    used to talk the panel into judging less.
+
     ``agent_for`` is the project's roster resolver; a lens whose sub-role the roster does not
     define resolves to None, which the runner reads as "the base reviewer persona".
     """
@@ -697,6 +792,10 @@ def render_review_plan(
         # surviving lens so a finder doesn't demand unreachable test coverage.
         if docs_only:
             instruction += _DOCS_ONLY_DIRECTIVE
+        # #310: every finder reads the same working tree, so every finder needs the same
+        # stacked-branch scoping the single reviewer gets — otherwise a panel finder files
+        # findings against the dependency's commits.
+        instruction += _stacked_diff_directive(context)
         if learnings:
             instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
         finders.append(
