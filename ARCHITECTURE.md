@@ -191,7 +191,9 @@ cross-run `learnings-kb.jsonl` share one parent:
     cost-summary.md, cost-report.md                rendered rollups
     stages/<task>/NN-<stage>.{json,md}             per-stage record + prose
     stages/<task>/<stage>-attempt<N>.stream.jsonl  full raw provider stream (retained
-    stages/<task>/index.md                          evidence — teed live, never pruned)
+    stages/<task>/<stage>-attempt<N>.prompt.txt    the prompt that dispatch was sent —
+    stages/<task>/index.md                          same stem as its stream (#314);
+                                                    evidence — teed live, never pruned)
 ```
 
 - **CLIs** (`orchestrator/cli.py`): `status` (progress + cost + lane-attribution audit),

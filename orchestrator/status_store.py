@@ -43,6 +43,14 @@ except ImportError:  # pragma: no cover - platform dependent
 # within a process, so two same-process writers to one path would collide.
 _TMP_SEQ = itertools.count()
 
+# Ceiling on a persisted dispatch prompt (#314). Deliberately far above any real prompt
+# (a fat SCOPE prompt is tens of KB), so it is a backstop against a pathological
+# context-plane blowup filling the run dir — not a routine trim. When it does bite, the
+# write is NOT silent: `write_stage_prompt` RETURNS the dropped char count and the engine
+# call site emits the warning event (the "never silent" split — the writer reports what it
+# dropped, only the caller emits).
+STAGE_PROMPT_MAX_CHARS = 1_000_000
+
 
 def _utc_now_iso() -> str:
     return datetime.now(UTC).isoformat()
@@ -388,6 +396,35 @@ class StatusStore:
         path = d / f"{seq:02d}-{stage}.json"
         self._atomic_write(path, json.dumps(payload, indent=2, default=str))
         return path
+
+    def write_stage_prompt(
+        self, task_id: str, filename: str, text: str
+    ) -> tuple[Path, int | None]:
+        """Persist one dispatch's rendered prompt into the task's stage dir (#314).
+
+        ``filename`` comes from ``stream_probe.prompt_filename`` — that module owns the
+        stage-file naming and imports THIS one for ``safe_task_dirname``, so the dependency
+        runs one way and the engine composes the two rather than the store importing back.
+
+        Returns ``(path, dropped_chars)``. ``dropped_chars`` is ``None`` for the normal
+        whole-prompt write and the number of characters cut when
+        :data:`STAGE_PROMPT_MAX_CHARS` bites; the caller emits the notice (this writer never
+        logs a truncation itself). A truncated file also says so in-band, so a human reading
+        the ``.txt`` alone is never misled into treating it as the complete prompt.
+        """
+        d = self._stages_dir(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / filename
+        dropped: int | None = None
+        if len(text) > STAGE_PROMPT_MAX_CHARS:
+            dropped = len(text) - STAGE_PROMPT_MAX_CHARS
+            text = (
+                text[:STAGE_PROMPT_MAX_CHARS]
+                + f"\n\n[truncated by orchestrator: {dropped} of {dropped + STAGE_PROMPT_MAX_CHARS}"
+                " chars dropped; see the stage_prompt_truncated event]\n"
+            )
+        self._atomic_write(path, text)
+        return path, dropped
 
     def write_stage_markdown(self, task_id: str, seq: int, stage: str, text: str) -> Path:
         """Human-readable per-stage Markdown alongside the JSON record."""

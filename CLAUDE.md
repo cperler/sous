@@ -86,8 +86,12 @@ real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
 Reach for `orchestrate-batch-interactive` only when a human needs to watch each stage live.
 That lane runs every stage through the session context AND records `$0.00`/zero tokens —
 the Workflow shim cannot report usage, so all 15 pre-2026-07-30 interactive runs are
-financially invisible. Cost-shaping inputs are also only partly captured in the timeline
-(#314: dispatched prompts unpersisted, `session_ref` absent from `stage_dispatched`).
+financially invisible. Cost-shaping inputs themselves ARE now captured on every lane (#314):
+each dispatch persists its rendered prompt to `stages/<task>/<stage>-attempt<N>.prompt.txt`
+and stamps `session_ref` + `prompt_sha256`/`prompt_chars`/`prompt_file` onto
+`stage_dispatched`, so prompt bloat, cross-stage prefix drift, and session-continuity rate
+are all answerable from a finished `runs/<run>/` (`events_audit` reports the continuity
+block; a dispatch predating #314 counts as `unknown`, never a false 0%).
 
 The driver owns the run for its whole duration: Ctrl-C kills the `claude -p` children via the
 process group, and the scheduler does not currently recover from the orphaned leases that
