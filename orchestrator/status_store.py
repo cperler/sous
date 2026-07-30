@@ -129,6 +129,29 @@ class StatusStore:
         with file_lock(path):
             yield
 
+    @contextmanager
+    def with_task_lock(self, run_id: str, task_id: str) -> Iterator[None]:
+        """Hold a task doc's write lock across a MULTI-STEP caller transaction (#278).
+
+        The store's own writers each take this lock for the duration of one
+        read-modify-write; a caller that must keep two writes (a run-doc mutation and the
+        task doc it pairs with) exclusive against a concurrent caller needs the lock to
+        span both, and takes it here. The locks are not re-entrant (a second ``flock`` on
+        the same path from the same process blocks forever), so inside this block write the
+        task doc with :meth:`write_task_locked` — never ``save_task``/``update_task``.
+
+        Lock order: this task lock is the OUTER lock; the run lock may be taken inside it
+        (``update_run``). No path ever takes them the other way round, so there is no cycle
+        to deadlock on."""
+        with self.with_lock(self._task_path(run_id, task_id)):
+            yield
+
+    def write_task_locked(self, task: Task) -> None:
+        """Atomically write ``task``'s document while the CALLER holds its lock (i.e. from
+        inside :meth:`with_task_lock`). ``save_task`` is the locking equivalent for callers
+        that hold nothing."""
+        self._write_task(task)
+
     def sweep_locks(self) -> int:
         """Delete the ``.lock``/``.lockdir`` sentinels under the run dir; return the count.
 

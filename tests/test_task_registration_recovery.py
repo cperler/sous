@@ -10,12 +10,19 @@ These tests pin the recovery: failure injection after EITHER write converges on 
 partial registration is repaired in place (one ref, one loadable document, intact edges, an
 evented repair), a genuine duplicate is still rejected without clobbering progress, and
 ``_ingest_batch`` verifies document existence + identity before skipping an existing ref.
+
+They also pin the other half of the invariant: because the repair path keys on the on-disk
+shape "ref present, doc absent", that shape must be reachable ONLY by a crash. Both writes
+therefore happen under one held task lock, and the race tests at the bottom widen the window
+between them to prove a concurrent add is serialized (told "already added") rather than
+repairing its way into a silent clobber of the first caller's lane/pins/deps.
 """
 
 from __future__ import annotations
 
 import json
 import threading
+import time
 
 import pytest
 
@@ -36,10 +43,10 @@ def _crash_after_ref_write(eng: Engine, monkeypatch) -> None:
     """Make the task-document write fail, simulating a process death between ``add_task``'s
     ref write and its doc write."""
 
-    def _boom(task):  # noqa: ANN001 - matches StatusStore.save_task
+    def _boom(task):  # noqa: ANN001 - matches StatusStore.write_task_locked
         raise RuntimeError("killed before the task doc was written")
 
-    monkeypatch.setattr(eng.store, "save_task", _boom)
+    monkeypatch.setattr(eng.store, "write_task_locked", _boom)
 
 
 def _repair_events(eng: Engine, run_id: str) -> list[dict]:
@@ -191,28 +198,105 @@ def test_ingest_batch_skips_fully_registered_tasks(tmp_path) -> None:
 
 # --- concurrent duplicate adds still converge on one ref, no clobber ----------------
 
-def test_concurrent_duplicate_adds_leave_one_ref_and_no_lost_progress(tmp_path) -> None:
-    eng = _eng(tmp_path)
-    eng.create_run("r1")
-    barrier = threading.Barrier(4)
-    errors: list[Exception] = []
+def _slow_doc_write(eng: Engine, monkeypatch, delay: float = 0.25) -> None:
+    """Widen the window between ``add_task``'s ref write and its doc write.
 
-    def _add() -> None:
+    Without this the race below almost always resolves on the fast path (the second caller
+    arrives after the first has finished both writes), so a test that did not widen it would
+    pass on timing rather than on the guarantee. The delay is spent INSIDE the doc write,
+    i.e. exactly in the interval where the on-disk shape is "ref present, doc absent"."""
+    real = eng.store.write_task_locked
+
+    def _slow(task):  # noqa: ANN001 - matches StatusStore.write_task_locked
+        time.sleep(delay)
+        real(task)
+
+    monkeypatch.setattr(eng.store, "write_task_locked", _slow)
+
+
+def _race_add_task(eng: Engine, calls: list[dict]) -> tuple[list, list[ContractError]]:
+    """Fire one ``add_task(**kwargs)`` per entry in ``calls`` simultaneously; return
+    ``(tasks_returned, duplicate_rejections)`` and re-raise anything else."""
+    barrier = threading.Barrier(len(calls))
+    won: list = []
+    rejected: list[ContractError] = []
+    other: list[BaseException] = []
+    guard = threading.Lock()
+
+    def _add(kwargs: dict) -> None:
         barrier.wait()
         try:
-            eng.add_task("r1", "t1")
-        except ContractError:
-            pass  # the duplicate reject is a legitimate outcome
-        except Exception as exc:  # noqa: BLE001 - any other failure is a real defect
-            errors.append(exc)
+            task = eng.add_task("r1", "t1", **kwargs)
+        except ContractError as exc:
+            with guard:
+                rejected.append(exc)
+        except BaseException as exc:  # noqa: BLE001 - any other failure is a real defect
+            with guard:
+                other.append(exc)
+        else:
+            with guard:
+                won.append(task)
 
-    threads = [threading.Thread(target=_add) for _ in range(4)]
+    threads = [threading.Thread(target=_add, args=(kw,)) for kw in calls]
     for t in threads:
         t.start()
     for t in threads:
         t.join()
+    if other:
+        raise other[0]
+    return won, rejected
 
-    assert errors == []
+
+def test_concurrent_duplicate_adds_leave_one_ref_and_no_lost_progress(
+    tmp_path, monkeypatch
+) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    _slow_doc_write(eng, monkeypatch)
+
+    won, rejected = _race_add_task(eng, [{} for _ in range(4)])
+
+    # Exactly ONE caller may register the task; every other caller is told so.
+    assert len(won) == 1
+    assert len(rejected) == 3
+    assert all("already added" in str(exc) for exc in rejected)
     assert [ref.task_id for ref in eng.store.load_run("r1").task_refs] == ["t1"]
     assert eng.store.load_task("r1", "t1").state is TaskState.PENDING
     assert eng.registered_task_ids("r1") == {"t1"}
+    # A live race is NOT a crash: nothing may be reported as a recovered registration.
+    assert _repair_events(eng, "r1") == []
+
+
+def test_concurrent_adds_with_differing_args_never_silently_clobber(
+    tmp_path, monkeypatch
+) -> None:
+    # The clobber this pins is invisible when every caller passes identical arguments, so
+    # each racer asks for a DIFFERENT lane/deps. "Ref present + doc absent + PENDING" is the
+    # crash signature add_task repairs in place; if that shape were reachable by a live
+    # second caller, both callers would be told they succeeded while only the last doc write
+    # survived — one caller's lane/deps silently replaced by the other's.
+    eng = _eng(tmp_path)
+    eng.create_run("r1")
+    eng.add_task("r1", "dep")
+    _slow_doc_write(eng, monkeypatch)
+
+    won, rejected = _race_add_task(
+        eng,
+        [
+            {"lane": ExecutionLane.MICRO},
+            {"lane": ExecutionLane.FULL, "depends_on": ["dep"]},
+        ],
+    )
+
+    assert len(won) == 1 and len(rejected) == 1
+    winner = won[0]
+    # What the winning caller was told it registered is exactly what is on disk…
+    doc = eng.store.load_task("r1", "t1")
+    assert doc.execution_lane is winner.execution_lane
+    assert doc.pipeline == winner.pipeline
+    assert doc.depends_on == winner.depends_on
+    # …including the run-side dependency edge, which the loser must not have rewritten.
+    run = eng.store.load_run("r1")
+    assert run.dependency_graph["t1"] == winner.depends_on
+    assert [ref.task_id for ref in run.task_refs] == ["dep", "t1"]
+    assert _repair_events(eng, "r1") == []

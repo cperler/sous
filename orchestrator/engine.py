@@ -535,6 +535,15 @@ class Engine:
         # existing ref is probed against its document: present-and-matching is the real
         # duplicate (rejected, no clobber), while a missing/mismatched document on a
         # still-PENDING ref is a partial registration this add completes in place.
+        #
+        # That repair branch is safe ONLY because both writes happen under ONE held task
+        # lock (``with_task_lock`` below): the run lock alone is released between them, so
+        # two concurrent adds of the same task_id would otherwise BOTH see "ref present,
+        # doc absent, ref PENDING" — the crash shape — each take the repair path, and the
+        # later doc write would silently clobber the earlier caller's task (differing lane /
+        # pins / deps) with no error to either side. Serializing on the task lock makes the
+        # loser observe the completed registration and get the duplicate ContractError, so
+        # "ref present + doc absent" is a crash signature and never a live race.
         repair_reason: str | None = None
 
         def _register(r: Run) -> None:
@@ -546,9 +555,10 @@ class Engine:
                 )
                 r.dependency_graph[task_id] = list(deps)
                 return
-            # Lock-free probe (we hold the RUN lock; taking the task lock here would be a
-            # different lock order than every other writer). A corrupt/unreadable doc
-            # propagates as StatusStoreError — never treated as absent (#112).
+            # Probe the document. The caller already holds this task's lock (outer) so the
+            # read can't land mid-write and no concurrent add can change the answer under
+            # us; no lock is taken here (that would block on the one we hold). A
+            # corrupt/unreadable doc propagates as StatusStoreError — never absent (#112).
             reason = self._partial_registration_reason(run_id, task_id)
             if reason is None:
                 raise ContractError(f"task {task_id} already added to run {run_id}")
@@ -566,27 +576,32 @@ class Engine:
             r.dependency_graph[task_id] = list(deps)
             repair_reason = reason
 
-        self.store.update_run(run_id, _register)
-        task = Task(
-            task_id=task_id,
-            run_id=run_id,
-            created_at=_now(),
-            updated_at=_now(),
-            state=TaskState.PENDING,
-            title=spec.title,
-            body=spec.body,
-            provider_tag=tag,
-            model_pin=model_pin,
-            effort_pin=effort_pin,
-            issue_number=spec.issue_number,
-            depends_on=deps,
-            execution_lane=effective_lane,
-            pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
-            deterministic_stages=tuple(deterministic_stages or ()),
-            max_attempts=self.max_attempts,
-            max_filed_followups=max_filed_followups,
-        )
-        self.store.save_task(task)
+        # ONE transaction boundary for the registration: the task lock spans the ref write
+        # and the doc write, so a concurrent add of the same task_id is serialized behind it
+        # (see the note above). ``write_task_locked`` writes under the lock we already hold —
+        # ``save_task`` would re-take it and deadlock.
+        with self.store.with_task_lock(run_id, task_id):
+            self.store.update_run(run_id, _register)
+            task = Task(
+                task_id=task_id,
+                run_id=run_id,
+                created_at=_now(),
+                updated_at=_now(),
+                state=TaskState.PENDING,
+                title=spec.title,
+                body=spec.body,
+                provider_tag=tag,
+                model_pin=model_pin,
+                effort_pin=effort_pin,
+                issue_number=spec.issue_number,
+                depends_on=deps,
+                execution_lane=effective_lane,
+                pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
+                deterministic_stages=tuple(deterministic_stages or ()),
+                max_attempts=self.max_attempts,
+                max_filed_followups=max_filed_followups,
+            )
+            self.store.write_task_locked(task)
         if repair_reason is not None:
             # Recovery is never silent (#278): the mutator only reports what it repaired,
             # the engine call site events it — once the doc write above has actually closed
