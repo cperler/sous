@@ -10,8 +10,11 @@ code (paths are real — grep them). For the *why* and the historical record see
 some execution lane, and the engine ingests the returned `StageResult`. That contract seam
 (`orchestrator/schemas/work.py`) is what makes execution lanes interchangeable, runs
 resumable after a kill, and every model call structurally attributable (no ledger row can
-be skipped). The engine imports no adapter; adapters import the engine's schemas, never the
-reverse.
+be skipped). The engine imports the two adapter *contracts* only — `adapters/execution/base.py`
+(`Registry`/`default_registry`) and `adapters/project/base.py` (`ProjectConfig`) — never a
+concrete lane or project adapter; the concrete registry is wired at the CLI boundary
+(`orchestrator/cli.py` → `adapters/execution/runners.build_registry`). Adapters import the
+engine's schemas, never the reverse.
 
 ```
                  orchestrator/  (the engine — deterministic, project-agnostic, no model call)
@@ -216,8 +219,9 @@ cross-run `learnings-kb.jsonl` share one parent:
    flow hangs off these two methods.
 3. `orchestrator/state_machine.py` — stage transitions, the context-plane fold, fix-cycle reset.
 4. `orchestrator/scheduler.py` — how a batch fans the engine over a DAG.
-5. `tests/` (838 cases) — the behavioural spec; a `test_<subsystem>.py` exists per module, and
-   reading one is the fastest way to see a subsystem's contract exercised.
+5. `tests/` — the behavioural spec; a `test_<subsystem>.py` exists per module, and
+   reading one is the fastest way to see a subsystem's contract exercised. Run the gate the
+   way CI does: `uv run pytest`, `uv run ruff check .`, `uv run mypy`.
 
 Then, for depth and history: `docs/orchestration-spec/target.md` (the implementation-agnostic
 target the rebuild was built from), `docs/orchestration-spec/as-built.md` (the read-only
