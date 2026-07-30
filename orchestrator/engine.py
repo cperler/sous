@@ -1721,7 +1721,14 @@ class Engine:
         explicit ``false`` is a veto. An abstention here is not free, though: if REVIEW
         abstains too, ``record`` emits a warning-grade ``test_validation_skipped`` event so
         the run never *claims* a verification nobody performed. (A stronger, schema- or
-        independent-reviewer-enforced version is tracked as issue #13.)"""
+        independent-reviewer-enforced version is tracked as issue #13.)
+
+        The veto downgrades the result to a FAILURE, so ``apply_result`` never absorbs its
+        outputs — which is why ``_failure_learning`` carries the vetoed attempt's
+        ``validation_notes`` forward into the retry's prompt explicitly (#298), the way a
+        REVIEW rejection carries its blocking ``issues``. The veto string below is
+        load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
+        failure streak → ``task.last_error``): enrich the learning, not this reason."""
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
@@ -2274,7 +2281,19 @@ class Engine:
         """One failed attempt's learning entry. Richer than a bare error string (the old
         system carried the stage trail + a log tail): the failing-test ids (kind-tagged
         when classified) and a bounded tail of the runner's output, so the retry starts
-        from the failure's substance instead of re-discovering it."""
+        from the failure's substance instead of re-discovering it.
+
+        #298 — the vacuity-rejection asymmetry, closed here: a REVIEW rejection already
+        carries its blocking ``issues`` forward as learnings (``_apply_review_rejection``),
+        which is what makes the fix cycle converge. A TEST vacuity veto
+        (``_stage_gate``, ``tests_meaningful=false``) used to carry NOTHING: the gate
+        downgrades a SUCCESS to a FAILURE, so ``apply_result`` never absorbs the result's
+        outputs and ``validation_notes`` — the only channel naming *why* the attempt
+        rejected — was dropped. The retry then re-derived the diagnosis from scratch, or
+        (worse) passed on a second look and converted a caught vacuity into a shipped one.
+        So a TEST failure whose result explicitly self-reports ``tests_meaningful=false``
+        appends the prior ``validation_notes`` verbatim (bounded) plus the convergence
+        directive: close the named gap, treat already-confirmed coverage as settled."""
         lines = [f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"]
         kind_by_test = {f.test: f.kind.value for f in classified}
         if isinstance(failures, list) and failures:
@@ -2308,12 +2327,45 @@ class Engine:
                 "not a code failure — consider resetting the test environment before "
                 "re-diagnosing the change itself."
             )
+        # #298: a TEST vacuity veto carries its reasoning forward, the way a REVIEW
+        # rejection carries its blocking issues. Bounded to the explicit self-report
+        # (never a missing/null tests_meaningful — #261 made the field tri-state) and to
+        # a non-empty string note, so no empty header is ever emitted.
+        notes = Engine._vacuity_notes(result)
+        if notes is not None:
+            clipped = notes[:1000]
+            suffix = "…" if len(notes) > 1000 else ""
+            lines.append(
+                f"  why the previous attempt rejected — prior validation_notes: "
+                f"{clipped}{suffix}"
+            )
+            lines.append(
+                "  CLOSE the specific gap those notes name — do not merely re-derive it. "
+                "Coverage the notes already confirm ADEQUATE is settled: do not redundantly "
+                "re-verify or re-mutation-test it."
+            )
         tail = (result.raw_output or "").strip()
         if tail:
             clipped = tail[-500:]
             prefix = "…" if len(tail) > 500 else ""
             lines.append(f"  output tail: {prefix}{clipped}")
         return "\n".join(lines)
+
+    @staticmethod
+    def _vacuity_notes(result: StageResult) -> str | None:
+        """The prior attempt's ``validation_notes`` when — and only when — this failed
+        result is a TEST stage that explicitly self-reported ``tests_meaningful=false``
+        (#298). None for every other stage, for an absent/null tri-state field (#261), and
+        for absent/blank/non-string notes, so the caller emits no empty header."""
+        if result.stage is not Stage.TEST:
+            return None
+        out = result.structured_output or {}
+        if out.get("tests_meaningful") is not False:  # explicit self-report only
+            return None
+        notes = out.get("validation_notes")
+        if not isinstance(notes, str) or not notes.strip():
+            return None
+        return notes.strip()
 
     # --- human approval gate (design pass §4) ----------------------------------
     def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
