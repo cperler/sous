@@ -399,6 +399,107 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     return FoldNotices(pr_fields=dropped, truncations=truncations, evictions=evictions)
 
 
+def no_model_test_surface(task: Task) -> bool:
+    """#41/#168: does this task have NO model-written/graded test surface for the #13
+    independent test-validate criterion to bite on?
+
+    True on any of three signals, ALL fixed at ``add_task`` time or set only by the
+    deterministic ENGINE lane — so a model can never self-exempt:
+
+    (a) #41 the change was deterministically classified ``docs-only`` (the git-diff tag; a
+        model claim is dropped at the fold, see ``DETERMINISTIC_ONLY_KEYS``);
+    (b) #168 the pipeline has no TEST stage at all (micro);
+    (c) #168 TEST ran on the deterministic $0 ENGINE runner (#33/#68), so no model wrote or
+        graded the tests the reviewer would be judging.
+
+    Pure (a function of the task doc only). Lives here, next to the fold, because BOTH the
+    engine's ``_review_verdict`` exemption and ``unjudged_tests_notice`` below must read
+    the SAME predicate — two spellings would drift.
+    """
+    return (
+        task.context.get("change_class") == "docs-only"
+        or Stage.TEST not in task.pipeline
+        or Stage.TEST in task.deterministic_stages
+    )
+
+
+def unjudged_tests_notice(task: Task, result: StageResult) -> dict[str, object] | None:
+    """Did anything actually judge whether this change's tests are meaningful (#261)?
+
+    Returns a notice dict describing what went unjudged (or was judged and then
+    discarded), else None. PURE — no wall-clock/random/I/O, per the project's
+    "pure functions return what they dropped; the engine emits the event" convention:
+    ``Engine.record`` turns a notice into a warning-grade ``test_validation_skipped``
+    event. This NEVER blocks completion — fail-OPEN is deliberate and load-bearing; the
+    fix is to stop *claiming* a verification that did not happen, not to start blocking.
+
+    Two shapes, both observed on the lite lane (#255):
+
+    ``kind="not_judged"`` — neither side produced a boolean: the TEST stage abstained
+    (the deterministic ENGINE runner reports ``tests_meaningful: null`` because a script
+    cannot judge it) AND the REVIEW output omitted/nulled the field. Each side deferred to
+    the other and neither did it. Scoped to a plausible test surface: a pipeline that HAS a
+    TEST stage and a change not deterministically classified ``docs-only``. A pipeline with
+    no TEST stage (micro) is out of scope — that lane declares no test verification at all
+    at ``add_task`` time, which is a recorded lane choice rather than a silent skip.
+
+    ``kind="verdict_suppressed"`` — the reviewer DID judge (an explicit ``false``) and the
+    #41/#168 no-model-test-surface exemption discarded it. That is the other half of the
+    same mutual deference: on the lite lane a model (IMPLEMENT) wrote those tests even
+    though TEST ran on the ENGINE lane, so the reviewer's verdict was about something real.
+    Behavior is unchanged (the exemption still suppresses); it is no longer silent.
+    """
+    if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+        return None
+    reviewed = (result.structured_output or {}).get("tests_meaningful")
+    tested = task.context.get("tests_meaningful")
+    exempt = no_model_test_surface(task)
+    if reviewed is False and exempt:
+        return {
+            "kind": "verdict_suppressed",
+            "test_stage": _test_stage_fact(task),
+            "review_reported": False,
+            "reason": (
+                "the reviewer judged the tests NOT meaningful, but the no-model-test-surface "
+                "exemption (#41/#168) discarded that verdict, so it did not reject the task"
+            ),
+        }
+    if isinstance(reviewed, bool) or isinstance(tested, bool):
+        return None  # somebody judged it — nothing to report
+    if task.context.get("change_class") == "docs-only" or Stage.TEST not in task.pipeline:
+        return None  # no plausible test surface to judge (docs-only / no TEST stage)
+    return {
+        "kind": "not_judged",
+        "test_stage": _test_stage_fact(task),
+        # Null/absent on both sides in the normal case; a non-boolean (a model can return
+        # anything there) is bounded, never carried into the event verbatim.
+        "test_reported": _bound_report(tested),
+        "review_reported": _bound_report(reviewed),
+        "reason": (
+            "nothing judged whether the tests meaningfully exercise this change: the TEST "
+            "stage reported no verdict and REVIEW omitted tests_meaningful — the #13 "
+            "independent test-validate guarantee did not happen (fail-OPEN, not blocking)"
+        ),
+    }
+
+
+def _bound_report(value: object) -> object:
+    """One side's ``tests_meaningful`` as it goes into the audit event: ``None`` stays null
+    (the honest abstention this event is about), and anything else — a model may return an
+    arbitrary string there, which every gate ignores as non-boolean — becomes a BOUNDED repr,
+    reusing #201's drop-notice bound so an oversized value can't bloat the event."""
+    return None if value is None else _bound_dropped_value(value)
+
+
+def _test_stage_fact(task: Task) -> str:
+    """How the task's TEST stage ran, for a ``test_validation_skipped`` notice: the
+    deterministic ENGINE runner (which cannot judge meaningfulness), a model lane, or
+    absent from the pipeline entirely."""
+    if Stage.TEST not in task.pipeline:
+        return "absent"
+    return "engine" if Stage.TEST in task.deterministic_stages else "model"
+
+
 def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
     """Re-open the tail of the pipeline for a review-rejection fix cycle: every
     pipeline stage at/after ``from_stage`` gets a fresh PENDING record, so

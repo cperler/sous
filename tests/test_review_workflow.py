@@ -93,7 +93,7 @@ def test_confirmed_critical_finding_rejects() -> None:
     assert review["approved"] is False
     assert review["issues"] == [CRITICAL]  # object identity of shape, not a re-render
     assert review["non_blocking"] == []
-    assert review["tests_meaningful"] is True
+    assert review["tests_meaningful"] is None  # #261: find:tests never ran → no verdict
     assert notices == ()
 
 
@@ -182,16 +182,30 @@ def test_explicit_tests_meaningful_false_is_vacuous_with_zero_issues() -> None:
     assert notices == ()
 
 
-def test_omitted_tests_lens_folds_to_true_fail_open() -> None:
-    """Docs-only omits the lens entirely; fail-OPEN is preserved — only an explicit
-    false is vacuous."""
+def test_omitted_tests_lens_folds_to_null_not_judged_and_fails_open() -> None:
+    """#261: an omitted judgment folds to NULL — "not judged" — never a synthesized true
+    (the fold must not record a verification no lens performed). Fail-OPEN is preserved:
+    only an explicit false is vacuous, so the review still approves."""
     review, _, _ = synthesize(_panel({"find:code": {"findings": []}}))
-    assert review["tests_meaningful"] is True
-    assert review["approved"] is True
+    assert review["tests_meaningful"] is None  # no claim, not an affirmation
+    assert review["approved"] is True  # ... and it still fails OPEN
 
     # ... and so does an omitted field on a present find:tests lens.
     review2, _, _ = synthesize(_panel({"find:tests": {"findings": []}}))
-    assert review2["tests_meaningful"] is True
+    assert review2["tests_meaningful"] is None
+    assert review2["approved"] is True
+
+    # An explicit TRUE from the judging lens is still recorded verbatim — the fix removes
+    # the FABRICATED true, not the real one.
+    review3, _, _ = synthesize(_panel({"find:tests": {"findings": [], "tests_meaningful": True}}))
+    assert review3["tests_meaningful"] is True
+
+    # A non-boolean report is ignored (fails OPEN) and must not become a true either.
+    review4, notices, _ = synthesize(
+        _panel({"find:tests": {"findings": [], "tests_meaningful": "yes"}})
+    )
+    assert review4["tests_meaningful"] is None and review4["approved"] is True
+    assert _kinds(notices) == ["tests_meaningful_ignored"]
 
 
 def test_tests_meaningful_from_a_non_tests_lens_is_ignored_with_a_notice() -> None:
@@ -332,7 +346,7 @@ def test_malformed_sub_results_root_folds_to_an_empty_panel() -> None:
     for bad in ("nope", [1, 2], 7):
         review, notices, _ = synthesize(bad)
         assert review == {"approved": True, "issues": [], "non_blocking": [],
-                          "tests_meaningful": True}
+                          "tests_meaningful": None}  # #261: no lens judged → no claim
         assert _kinds(notices) == ["sub_results_malformed"]
     empty, notices, _ = synthesize({})
     assert empty["approved"] is True and notices == ()

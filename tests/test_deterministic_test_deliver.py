@@ -80,8 +80,40 @@ def test_test_green_run_succeeds_schema_valid(tmp_path) -> None:
     assert (res.lane_used.execution_mode, res.lane_used.provider) == (ExecutionMode.ENGINE, Provider.NONE)
     out = res.structured_output
     assert out["passed"] is True and out["failures"] == []
-    assert out["tests_meaningful"] is True  # never false from a script — REVIEW judges it
+    # #261: a script cannot judge meaningfulness, so it makes NO claim (null) — never the
+    # affirmative `true` it used to write next to a "not judged by this runner" note.
+    assert out["tests_meaningful"] is None
     _assert_schema_valid("test", out)
+
+
+def test_engine_lane_never_claims_tests_meaningful_on_any_exit_path(tmp_path) -> None:
+    """#261 regression: the ENGINE-lane TEST runner must not emit an affirmative
+    `tests_meaningful: true` on ANY of its three exit paths — it cannot judge meaningfulness
+    (a `true` there is a false audit record; the lite lane's REVIEW then omitted the field
+    and nobody judged it at all). The key stays PRESENT as null: an honest abstention that
+    still satisfies the schema's `required` list. It must never be `false` either — that is
+    the engine's veto over a judgment this runner did not make.
+    """
+    # (a) real suite run (green) and (b) real suite run (red)
+    for cmd, red in ((["sh", "-c", "exit 0"], False),
+                     (["sh", "-c", "echo 'FAILED a::t1'; exit 1"], True)):
+        res = DeterministicTestRunner(_TestProj(unit=cmd)).dispatch(
+            _wi(Stage.TEST, schema_ref="test", cwd=str(tmp_path), context={})
+        )
+        out = res.structured_output
+        assert (res.status is ResultStatus.FAILURE) is red
+        assert out["tests_meaningful"] is None, cmd
+        assert "not judged by this runner" in out["validation_notes"]
+        _assert_schema_valid("test", out)
+
+    # (c) no test commands defined (the ['true'] no-op sentinel → nothing to run)
+    res = DeterministicTestRunner(_TestProj(unit=["true"])).dispatch(
+        _wi(Stage.TEST, schema_ref="test", cwd=str(tmp_path), context={})
+    )
+    assert res.status is ResultStatus.SUCCESS
+    assert res.structured_output["tests_meaningful"] is None
+    assert "no test commands defined" in res.structured_output["validation_notes"]
+    _assert_schema_valid("test", res.structured_output)
 
 
 def test_test_caused_failure_fails_with_classified_kind(tmp_path) -> None:

@@ -125,6 +125,7 @@ def test_runner_short_circuits_docs_only_without_running_suite(tmp_path) -> None
     assert out["change_class"] == "docs-only"
     assert out["skipped"] == "docs-only"  # honest skip marker, not a faked green
     assert out["passed"] is True and out["failures"] == []
+    assert out["tests_meaningful"] is None  # #261: the skip path claims no judgment either
     assert "no behavioral surface" in out["validation_notes"]
     Draft202012Validator(load_stage_schema("test")).validate(out)  # schema-clean
 

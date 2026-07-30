@@ -206,7 +206,8 @@ def test_docs_only_tag_exempts_vacuous_tests_rejection(tmp_path, project) -> Non
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     w = _advance_to_review_with_test(eng, test_output={
-        "passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only",
+        # ENGINE-lane shape (#261): the deterministic runner makes no meaningfulness claim.
+        "passed": True, "failures": [], "tests_meaningful": None, "change_class": "docs-only",
     })
     out = eng.record("r1", make_result(w, structured_output={
         "approved": True, "issues": [], "tests_meaningful": False,
@@ -221,7 +222,8 @@ def test_docs_only_tag_does_not_exempt_an_explicit_rejection(tmp_path, project) 
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     w = _advance_to_review_with_test(eng, test_output={
-        "passed": True, "failures": [], "tests_meaningful": True, "change_class": "docs-only",
+        # ENGINE-lane shape (#261): the deterministic runner makes no meaningfulness claim.
+        "passed": True, "failures": [], "tests_meaningful": None, "change_class": "docs-only",
     })
     out = eng.record("r1", make_result(w, structured_output={
         "approved": False, "issues": [{"severity": "critical", "description": "wrong doc claim"}],
