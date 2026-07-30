@@ -52,15 +52,16 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   after the aborted transaction — never from inside the locked mutator) emit
   `result_rejected` before raising, so a rejected StageResult is loud in `events.jsonl`
   instead of only on the caller's stderr.
-- **Commits** end with a `Co-Authored-By` trailer naming the authoring model (e.g.
-  `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. On a
-  RUN-produced commit the engine settles this, not the model: `render_prompt` gives every
-  committing stage the exact trailer lines built from the dispatched model ids
-  (`stages.commit_trailers` + `model_table.attribution_identity`), crediting the implement
-  model and the committing stage's own — because a model cannot reliably report its own
-  version and #317 caught two commits signed with one no stage of the run dispatched. Work on
-  `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`
-  after committing).
+- **Commits carry NO model attribution trailer** (#317) — no `Co-Authored-By`, no model or
+  agent name, in hand-authored and run-produced commits alike. Model self-report is
+  unreliable (batch-headless-1 signed a commit `Claude Opus 4.5`, a model no stage of that
+  run dispatched), and engine-stamped attribution was considered and rejected: routing is
+  per-stage, so "the model" for a commit is ambiguous and any stamping policy is an arbitrary
+  pick. Per-stage provenance already lives in `runs/<run>/events.jsonl` and
+  `stage-costs.jsonl`. Because every claude/codex CLI carries a standing instruction to sign
+  its commits, silence is not enough: `render_prompt` appends an explicit
+  `_NO_ATTRIBUTION_DIRECTIVE` to every committing stage's prompt. Work on `main`. Remote:
+  `github.com/cperler/orchestration-template` (private; push `main` after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the
   worktree, the task branch, and checkpoint tags — but NEVER the run's log dir under
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).

@@ -1015,17 +1015,6 @@ class Engine:
             learnings=learnings,
             context=task.context,
             project_commands=self._project_commands(),
-            # #317: commit attribution is stamped from what the engine DISPATCHED, so a
-            # committing stage never signs the commit from its own (unreliable) self-belief.
-            # ``model`` is this dispatch's resolved id; the implement model is read off the
-            # PERSISTED IMPLEMENT stage record (durable task state, #206 — every subcommand
-            # rebuilds the Engine, so engine memory would be gone by the deliver stage). On
-            # the implement dispatch itself the record still holds the PREVIOUS attempt's
-            # model (``begin_stage`` writes it at commit, below), so use this dispatch's.
-            stage_model=model,
-            implement_model=(
-                model if stage is Stage.IMPLEMENT else task.stages[Stage.IMPLEMENT].model
-            ),
         )
         agent = self.project.agent_for(stage, spec.agent_role)
         # Multi-agent REVIEW (#73): one gate, consulted only for a model-lane REVIEW. It

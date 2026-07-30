@@ -27,11 +27,6 @@ class ModelInfo(BaseModel):
     output_per_mtok: float
     cache_read_mult: float = 0.10  # cache reads bill at 10% of input
     cache_write_mult: float = 1.25  # cache writes bill at 125% of input
-    # Human-facing name for commit attribution (#317) — what a ``Co-Authored-By`` trailer on
-    # a run-produced commit says. Lives on the model row so a model bump updates the id, the
-    # price and the attribution name in ONE place. Empty means "not attributable" (the
-    # ENGINE sentinel): a $0 shell stage has no model to credit.
-    display_name: str = ""
 
 
 # The sentinel model id for a deterministic (non-model) ENGINE-lane stage.
@@ -56,39 +51,29 @@ _MODELS: dict[str, ModelInfo] = {
     # role default. Price is the published Anthropic API rate ($10/$50 per Mtok, 2x Opus 5),
     # source: platform.claude.com/docs/en/about-claude/models/overview (Claude Fable 5 row,
     # re-confirmed 2026-07-25 with the Opus 5 / Sonnet 5 bump).
-    "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0,
-                                display_name="Claude Fable 5"),
-    "claude-opus-5": ModelInfo(id="claude-opus-5", input_per_mtok=5.0, output_per_mtok=25.0,
-                               display_name="Claude Opus 5"),
+    "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-opus-5": ModelInfo(id="claude-opus-5", input_per_mtok=5.0, output_per_mtok=25.0),
     # Sonnet 5 carries an INTRODUCTORY rate of $2/$10 per Mtok through 2026-08-31, after
     # which it reverts to the $3/$15 pinned here. We deliberately price at the standard
     # rate rather than the discount: the ledger feeds the `--budget-usd` hard-PAUSE gate,
     # so over-estimating spend fails safe (an early pause), while pricing the discount
     # would silently under-report every row once the intro window closes. Revisit after
     # 2026-08-31 only to confirm — no edit should be needed.
-    "claude-sonnet-5": ModelInfo(id="claude-sonnet-5", input_per_mtok=3.0, output_per_mtok=15.0,
-                                 display_name="Claude Sonnet 5"),
-    "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0,
-                                  display_name="Claude Haiku 4.5"),
+    "claude-sonnet-5": ModelInfo(id="claude-sonnet-5", input_per_mtok=3.0, output_per_mtok=15.0),
+    "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
     # Superseded claude tiers — retained for PRICING historical ledger rows (runs dispatched
     # before the Opus 5 / Sonnet 5 bump), not for dispatch. Removing them would make every
     # prior row unpriced (`priced=False`) and corrupt historical cost reports.
-    "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0,
-                                 display_name="Claude Opus 4.8"),
-    "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0,
-                                   output_per_mtok=15.0, display_name="Claude Sonnet 4.6"),
+    "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
+    "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
     # codex (OpenAI) — the ids passed to `codex exec -m`. On a ChatGPT-plan account only
     # gpt-5.5 is accepted (probed live 2026-07-04: gpt-5-codex/gpt-5/gpt-5.5-mini all 400
     # "not supported when using Codex with a ChatGPT account"). Older ids are kept below
     # for pricing historical ledger rows, not for dispatch.
-    "gpt-5.5": ModelInfo(id="gpt-5.5", input_per_mtok=1.25, output_per_mtok=10.0,
-                         display_name="GPT-5.5"),
-    "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0,
-                             display_name="GPT-5 Codex"),
-    "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0,
-                       display_name="GPT-5"),
-    "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0,
-                            display_name="GPT-5 mini"),
+    "gpt-5.5": ModelInfo(id="gpt-5.5", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0),
     # sentinel for the deterministic ENGINE lane: no model call, always $0. Present so
     # its ledger row prices cleanly (priced=True, cost 0) rather than warning as unpriced.
     ENGINE_MODEL: ModelInfo(id="engine", input_per_mtok=0.0, output_per_mtok=0.0),
@@ -202,43 +187,6 @@ def provider_for_model(model_id: str) -> Provider:
     if model_id == ENGINE_MODEL:
         return Provider.NONE
     raise ValueError(f"cannot classify provider for model id {model_id!r}")
-
-
-# Commit-attribution identities (#317). The ``Co-Authored-By`` trailer on a run-produced
-# commit is the ONLY record of authorship that travels with the repo (events.jsonl and
-# stage-costs.jsonl hold the truth but are local + gitignored), so it must name the model the
-# engine DISPATCHED — never a model's self-report, which is a well-known hallucination
-# surface (batch-headless-1 credited "Claude Opus 4.5", a model no stage of the run ran).
-# The address is per-PROVIDER, not per-model: it is the vendor's no-reply identity that makes
-# the trailer a well-formed git ident, and the display name carries which model it was.
-_ATTRIBUTION_EMAIL: dict[Provider, str] = {
-    Provider.CLAUDE: "noreply@anthropic.com",
-    Provider.CODEX: "noreply@openai.com",
-}
-# Reserved-by-RFC-2606 placeholder for a model id we cannot classify: an honest "unknown
-# vendor" rather than guessing one (a wrong vendor address is the same defect as a wrong
-# model name, just quieter).
-_UNKNOWN_ATTRIBUTION_EMAIL = "noreply@invalid"
-
-
-def attribution_identity(model_id: str | None) -> str | None:
-    """``Name <email>`` for a commit ``Co-Authored-By`` trailer, or None when there is nobody
-    to credit — no model at all, or the ENGINE sentinel of a deterministic $0 shell stage.
-
-    Tolerant like ``try_cost_usd``: a model id that is not in the table (a retired pin, a
-    freshly-bumped id) attributes under its RAW id rather than raising or inventing a name.
-    The id is still something the engine really dispatched, which is the property that
-    matters — the trailer never names a model absent from the run.
-    """
-    if not model_id or model_id == ENGINE_MODEL:
-        return None
-    info = _MODELS.get(model_id)
-    name = (info.display_name if info else "") or model_id
-    try:
-        email = _ATTRIBUTION_EMAIL.get(provider_for_model(model_id), _UNKNOWN_ATTRIBUTION_EMAIL)
-    except ValueError:  # unclassifiable id — honest placeholder, never a guessed vendor
-        email = _UNKNOWN_ATTRIBUTION_EMAIL
-    return f"{name} <{email}>"
 
 
 def resolve_model_alias(name: str) -> str:
