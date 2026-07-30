@@ -101,7 +101,9 @@ def build_registry(
                 provider=Provider.CLAUDE,
                 in_process=False,
                 schema_enforced=True,
-                supports_plan=True,  # the Workflow shim has agent()/parallel() (#73 design §5)
+                # #288: the shim has agent()/parallel() but no plan-execution branch yet, and
+                # a flag that over-promises degrades silently. Flip to True with #262.
+                supports_plan=False,
                 status=SUPPORTED,
             )
         )

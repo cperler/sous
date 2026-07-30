@@ -380,6 +380,19 @@ def render_stage(payload: dict) -> str:
         lines += ["", "## Result", "", *_render_struct(payload["structured_output"])]
     if isinstance(payload.get("panel_summary"), dict):
         lines += ["", *_render_panel_summary(payload["panel_summary"])]
+    # #288: the honest counterpart to a missing `## Review panel` — this dispatch DID carry a
+    # multi-agent plan and the runner returned no panel, so the review below is a single
+    # reviewer's despite the run opting into the panel. Defensive on the key like everything
+    # else here (a stage log is a durable artifact an older/newer engine may have written).
+    if payload.get("review_plan_not_executed"):
+        lines += [
+            "",
+            "## Review panel",
+            "",
+            "- **Panel requested but NOT executed** — this dispatch carried a multi-agent "
+            "review plan and the runner returned no panel output, so the verdict above is a "
+            "single reviewer's (see the `review_plan_not_executed` event).",
+        ]
     if payload.get("raw_output"):
         lines += ["", "## Commentary", "", *_commentary(str(payload["raw_output"]), payload)]
     lines.append("")

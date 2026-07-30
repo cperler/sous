@@ -11,6 +11,11 @@
 //    parallel()/agent() cap here is only a ceiling — never exceed args.dispatchLimit.
 //  - Every result is lane-attributed interactive:claude so the cost ledger can never
 //    see an unattributed call (closes as-built D6).
+//  - NO PLAN EXECUTION (#262): this shim ignores `wi.plan` and dispatches the single
+//    prompt, so the interactive x claude descriptor declares `supports_plan: false`
+//    (adapters/execution/base.py) and the engine never attaches a plan to a dispatch
+//    that lands here. When a plan-bearing branch is added below, flip that flag to true
+//    in the SAME PR — a descriptor that over-promises degrades SILENTLY (#288).
 //  - TIMEOUTS: the sandbox has no clock or timers (Date.now/setTimeout unavailable),
 //    so wi.timeout_s CANNOT be enforced here. The SUPERVISOR owns it: if a dispatch
 //    visibly exceeds the WorkItem's timeout_s, stop waiting and record a StageResult

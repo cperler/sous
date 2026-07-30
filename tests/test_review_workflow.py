@@ -563,10 +563,12 @@ def test_ledger_still_writes_one_row_for_a_sub_results_bearing_result(tmp_path, 
 # ---------------------------------- (#285/#268) panel telemetry + the runner-notice contract
 #
 # Fixture-driven by necessity, not preference: the panel has never executed inside the
-# engine and cannot on the interactive lane (the shim declares supports_plan but ignores
-# ``wi.plan``, so a plan-bearing dispatch returns no sub_results — #288/#262). Everything
-# below is therefore constructed ``sub_results``, which is also what the fold's purity
-# contract makes sufficient: the summary is a function of that input and nothing else.
+# engine and cannot on the interactive lane (the shim ignores ``wi.plan``, so that lane's
+# descriptor declares ``supports_plan=False`` until #262 lands and the engine vetoes the plan
+# outright — #288). Everything below is therefore constructed ``sub_results``, which is also
+# what the fold's purity contract makes sufficient: the summary is a function of that input
+# and nothing else. (These results carry no dispatched plan, so they never trip the #288
+# ``review_plan_not_executed`` marker — that path is pinned in tests/test_review_plan.py.)
 
 ONLY_CODE = {"severity": "critical", "file": "d.py", "description": "code alone"}
 ONLY_DESIGN = {"severity": "critical", "file": "e.py", "description": "design gap alone"}
@@ -897,7 +899,13 @@ def test_status_surfaces_panel_notices_per_task(tmp_path, project) -> None:
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     clean = eng.status("r1")["review_panel"]
-    assert clean == {"notices": 0, "by_notice": {}, "by_task": {}, "clean": True}
+    assert clean == {
+        "notices": 0, "by_notice": {}, "by_task": {},
+        # #288: the two other ways a requested panel fails to materialize, both zero here.
+        "plan_not_executed": 0, "plan_not_executed_by_task": {},
+        "workflow_skipped": 0, "workflow_skipped_by_reason": {},
+        "clean": True,
+    }
 
     panel = _panel_with_notices(
         {"find:code": {"findings": [CRITICAL]}}, None,
