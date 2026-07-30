@@ -3549,6 +3549,11 @@ class Engine:
         ``work_item_id`` and cannot be joined by id, so those are counted and the orphan
         list is conservatively discounted by that many — old, known-good history never
         false-flags.
+
+        Also returns a ``continuity`` block (#314): how many ``stage_dispatched`` events
+        resumed a provider session (``session_ref`` set) vs. started fresh, over just the
+        dispatches that carry the field at all (pre-#314 events are ``unknown`` and excluded
+        from ``rate``, so old logs read as "no data" rather than a false 0%).
         """
         events = self.store.read_events(run_id) if events is None else events
         dispatched: dict[str, dict] = {}  # work_item_id -> opening dispatch info
