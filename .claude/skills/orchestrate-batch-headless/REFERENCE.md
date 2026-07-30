@@ -3,85 +3,41 @@
 Loaded on demand from `SKILL.md`. Everything here is for when something has already gone
 wrong, or when you need to reason about the lane's mechanics.
 
-## Symptom: `run-headless` returns immediately and does nothing
+## The driver was killed mid-dispatch
 
-The output looks like a normal end-of-run status dump — `run_state: running`, tasks showing
-`stage: <something>`, `stale: false`, `lane_audit.clean: true`. It reads as a successful
-no-op. It is not.
+A kill (Ctrl-C, reboot) while dispatches are outstanding leaves each in-flight task `RUNNING`
+with `pending_work_item_id` set. `dispatchable()` correctly excludes leased tasks, so before
+#313 the next `run-headless` found nothing to do and printed an end-of-run status dump that
+read as a successful no-op.
 
-**Check `events_audit`.** If `outstanding > 0` (i.e. `dispatched > recorded`), the run holds
-orphaned dispatch leases: a previous driver was killed mid-stage, leaving tasks `RUNNING`
-with `pending_work_item_id` set. `dispatchable()` correctly excludes in-flight tasks, so the
-dispatchable set is empty and `Scheduler.run` exits on its first tick.
+**Since #313, just re-invoke the driver command.** At startup `Scheduler.run` reclaims the
+leases left by the driver claim on the Run doc when that process is this one or is provably
+dead on this host: the lease is cleared, the stage stays `RUNNING`, and `next_work`
+re-dispatches the **same attempt** from the last checkpoint. No `record` by hand, and no
+retry budget spent. Each release is evented as `dispatch_reclaimed` (which `events_audit`
+counts as closing its `stage_dispatched`), and the run's `scheduler.reclaimed` block lists
+what was recovered.
 
-`Scheduler.run`'s docstring claims "Resumable: call again on the same run to continue after a
-kill." **That claim does not hold in this state** — tracked as #313. Until it lands, recover
-by hand.
+### Symptom: it stops with `blocked_on_orphaned_dispatches`
 
-Confirm nothing is actually alive first:
-```
-ps -eo pid,etime,command | grep "[r]un-headless"
-ps -eo pid,etime,command | grep "[c]laude -p"
-```
-If a driver *is* alive, do nothing — you are looking at a healthy run.
+`run-headless` exits **non-zero** with `scheduler.exit_reason = blocked_on_orphaned_dispatches`
+when tasks hold leases it may not reclaim — `scheduler.driver_at_start.state` says which:
 
-### Recovery: record a timeout per orphaned dispatch
+- `live` — another driver on this host is still running those dispatches. **Do nothing**;
+  you are looking at a healthy run. Confirm with
+  `ps -eo pid,etime,command | grep "[r]un-headless"`.
+- `unclaimed` — no scheduler ever claimed the run (it was driven task-by-task through
+  `next`/`record`, whose background invocations hold live leases the same way). The engine
+  cannot prove those are orphans, so it refuses to steal them.
+- `foreign_host` — the claim came from another machine, where a local pid check means nothing.
 
-`resume` is read-only (it only reports resume points) and `abandon` is terminal (it sets
-`state = FAILED`). Neither recovers. The working path is to record a `timeout` StageResult
-for each held lease: `TIMEOUT` is in `SALVAGEABLE_FAILURE_STATUSES` (`engine.py:191`), so the
-stage re-dispatches at the next attempt from its checkpoint instead of failing the task.
+Once you have confirmed by hand that nothing is alive, the escape hatch is still terminal:
+`orchestrator abandon --run RUN --task <id> --reason "driver killed"` releases the lease and
+FAILS the task (`--min-idle-s` / `--force` govern its own liveness guard). There is no
+"steal anyway" flag by design: a wrongly reclaimed live lease double-dispatches the stage.
 
-Build one result file per orphaned dispatch, reading the lease and the original dispatch
-event straight off disk so the `work_item_id` and the **full 64-char** `content_hash` are
-exact (a truncated hash is accepted silently — #311):
-
-```python
-import json, datetime, pathlib
-run = "<RUN>"
-ev = [json.loads(l) for l in open(f"runs/{run}/events.jsonl")]
-now = datetime.datetime.now(datetime.timezone.utc).isoformat()
-for t in ("<TASK>", ...):
-    task = json.load(open(f"runs/{run}/status-{run}-#{t}.json"))
-    wid, chash = task["pending_work_item_id"], task["pending_content_hash"]
-    disp = [e for e in ev if e["type"] == "stage_dispatched"
-            and e["task_id"] == f"#{t}" and e.get("work_item_id") == wid][0]
-    pathlib.Path(f"scratchpad/timeout-{t}.json").write_text(json.dumps({
-        "schema_version": "1", "work_item_id": wid, "content_hash": chash,
-        "run_id": run, "task_id": f"#{t}", "stage": disp["stage"],
-        "attempt": disp["attempt"], "model": disp["model"], "effort": disp.get("effort"),
-        "status": "timeout", "structured_output": None, "raw_output": None,
-        "error": "driver process exited mid-dispatch; stream ended without a result event",
-        "lane_used": {"execution_mode": "headless", "provider": "claude",
-                      "invocation": f"claude -p --model {disp['model']}"},
-        "token_usage": {"input": 0, "output": 0, "cache_read": 0, "cache_write": 0},
-        "cost_usd": None, "completed_at": now}, indent=1))
-```
-
-Then hand the human one `record` per file, followed by the driver command again:
-```
-uv run orchestrator --root runs --shared-root --run RUN --project PROJECT record --result scratchpad/timeout-<TASK>.json
-```
-
-Each `record` reports `outcome: stage_failed` and the task moving to `retrying` — that is
-correct, not a problem.
-
-**Tell the human the cost:** this burns one attempt per task. They each have one fewer retry
-than a clean run. If a task later fails at the attempt ceiling, discount it — that is partly
-the recovery, not the model. It also costs real money: on `batch-headless-1` the killed
-attempt burned 2 of 4 scope calls totalling $2.11.
-
-Verify recovery worked before walking away — you want `timeout` at attempt N and a fresh
-dispatch at attempt N+1:
-```
-python3 -c "
-import json
-for l in open('runs/RUN/events.jsonl'):
-    e=json.loads(l)
-    if e['type'] in ('stage_dispatched','stage_recorded'):
-        print(e['type'], e['task_id'], e.get('stage'), 'att=', e.get('attempt'), e.get('status',''))
-"
-```
+`watch --activity` distinguishes the two shapes of a frozen stream: `STREAM STALLED` (the
+model went quiet) vs `NO LIVE DRIVER` (the claiming process is gone — re-invoke the driver).
 
 ## Genuine crash resume (no orphaned leases)
 

@@ -99,8 +99,18 @@ are all answerable from a finished `runs/<run>/` (`events_audit` reports the con
 block; a dispatch predating #314 counts as `unknown`, never a false 0%).
 
 The driver owns the run for its whole duration: Ctrl-C kills the `claude -p` children via the
-process group, and the scheduler does not currently recover from the orphaned leases that
-leaves (#313). Monitor from a second terminal.
+process group. Monitor from a second terminal. **Re-invoking `run-headless` after a kill now
+resumes it (#313):** `Scheduler.run` stamps a driver claim (host/pid) on the Run doc and, at
+the next startup, reclaims the leases that claim's now-dead process left — clearing
+`pending_work_item_id` while leaving the stage `RUNNING`, so `next_work` re-dispatches the
+SAME attempt from the last checkpoint and no retry budget is spent (each release is evented
+as `dispatch_reclaimed`, which `events_audit` counts as closing its `stage_dispatched`).
+Same-owner ONLY: an unclaimed run (the per-task CLI supervisor holds live leases exactly that
+way), a live driver, or a foreign-host claim reclaims nothing, because stealing a live lease
+would double-dispatch the stage. In that case the loop no longer exits looking finished — it
+returns `scheduler.exit_reason = blocked_on_orphaned_dispatches` (warning event +
+notification, and `run-headless` exits non-zero), and the escape hatch is still the terminal
+`orchestrator abandon`. `watch --activity` distinguishes a stalled stream from a dead driver.
 
 ## Live runs against the product repo (HARD CHECKPOINT)
 A live run writes to the real product repo (heysoo) and opens a PR. **The human picks the

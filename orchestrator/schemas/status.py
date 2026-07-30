@@ -290,6 +290,22 @@ class Progress(_StatusModel):
     closed_infeasible: int = 0
 
 
+class RunDriver(_StatusModel):
+    """Which process is currently DRIVING the run's scheduler loop (#313).
+
+    Stamped by ``Scheduler.run`` at startup and left behind when the driver dies. Its
+    only job is to make "is the process that took these dispatch leases still alive?"
+    answerable from the run doc: a lease held by a process that no longer exists is an
+    orphan the next driver may reclaim, while a lease held by a LIVE driver must never
+    be touched. ``host`` scopes the pid — a pid from another machine says nothing about
+    a local process, so a foreign-host claim is never treated as dead.
+    """
+
+    host: str
+    pid: int
+    claimed_at: str
+
+
 class Run(_StatusModel):
     """Run/batch document (status-<run>.json)."""
 
@@ -368,6 +384,14 @@ class Run(_StatusModel):
     # Cost/capacity policy may still veto it per dispatch. Additive field: pre-#73 run docs
     # load with the default, no SCHEMA_VERSION bump.
     review_workflow: bool = False
+    # The process currently driving this run's scheduler loop (#313), or None when no
+    # driver has ever claimed it (a run driven task-by-task through the CLI supervisor
+    # never claims). Written by ``Engine.claim_run_driver`` at ``Scheduler.run`` startup;
+    # deliberately NOT cleared on exit — a STALE claim is the evidence that lets the next
+    # driver tell its own crashed leases (reclaimable) from a live driver's (never). NOT a
+    # create_run setting: it is per-invocation ownership, not run configuration. Additive
+    # field: pre-#313 run docs load with the default, no SCHEMA_VERSION bump.
+    driver: RunDriver | None = None
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""
