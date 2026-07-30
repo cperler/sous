@@ -71,6 +71,19 @@ def stderr_filename(
     return stream_basename(stage_value, attempt, retry, phase=phase) + ".stderr.log"
 
 
+def prompt_filename(stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None) -> str:
+    """The dispatched prompt's file for one (stage, attempt) — ``<stem>.prompt.txt`` (#314).
+
+    Shares ``stream_basename`` with the ``.stream.jsonl``/``.stderr.log`` tees deliberately:
+    a dispatch's prompt then sits next to that same call's raw provider stream under one
+    stem, so "what did this call cost, and what was it sent?" is one directory listing
+    rather than a join. Named by (stage, attempt) rather than by the per-stage record's
+    ``NN-`` sequence because that counter is only claimed under the record-time lock — a
+    resume that supersedes a lease (#142) dispatches twice with no record in between, and
+    both dispatches would predict the same ``NN``."""
+    return stream_basename(stage_value, attempt, retry, phase=phase) + ".prompt.txt"
+
+
 def stages_dir(run_root: str | Path, task_id: str) -> Path:
     """``<run_root>/stages/<safe-task>/`` — the per-task log dir the StatusStore and the
     teeing adapter both write into (one sanitization, one location)."""
@@ -93,6 +106,17 @@ def stderr_relpath(
     return str(
         Path("stages") / safe_task_dirname(task_id)
         / stderr_filename(stage_value, attempt, retry, phase=phase)
+    )
+
+
+def prompt_relpath(
+    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+) -> str:
+    """Prompt path RELATIVE to the run root (portable if the run dir moves) — the spelling
+    that rides ``stage_dispatched`` so a reader never has to reconstruct the convention."""
+    return str(
+        Path("stages") / safe_task_dirname(task_id)
+        / prompt_filename(stage_value, attempt, retry, phase=phase)
     )
 
 

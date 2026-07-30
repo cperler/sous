@@ -10,6 +10,7 @@ row keyed by its actual lane — an unattributed call is structurally impossible
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import os
 import re
@@ -105,7 +106,7 @@ from .state_machine import (
     unjudged_tests_notice,
 )
 from .status_store import StatusStore
-from .stream_probe import probe_current_stream
+from .stream_probe import probe_current_stream, prompt_filename, prompt_relpath
 
 
 def _now() -> str:
@@ -1070,6 +1071,18 @@ class Engine:
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
         )
+        # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
+        # the commit below — evidence-first, matching commit_task_events' events-before-doc
+        # ordering, so a `stage_dispatched` never names a prompt file that isn't on disk.
+        # (The reverse order could; a crash here instead leaves an orphan prompt file for a
+        # dispatch that never committed, which is inert.) The hash is over the FULL prompt,
+        # not the possibly-capped file, so cross-stage prefix-drift comparison — the whole
+        # point of recording it — is unaffected by any truncation.
+        prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        _, prompt_dropped = self.store.write_stage_prompt(
+            task_id, prompt_filename(stage.value, attempt), prompt
+        )
+        prompt_file = prompt_relpath(task_id, stage.value, attempt)
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
         # can't both claim the task — the loser sees the moved lease/stage and raises.
@@ -1141,6 +1154,17 @@ class Engine:
                 "effort": effort,
                 "agent": agent,
                 "work_item_id": work.id,
+                # #314: the cost-shaping inputs of THIS call. `session_ref` is read off the
+                # WorkItem, i.e. exactly what the transport is handed — so a #9
+                # provider-mismatch suppression shows as null here rather than the ref the
+                # task still holds, and the event describes what was SENT, not what was
+                # computed. Unconditional (null when absent), unlike the #142/#288 markers:
+                # a field that is only present sometimes cannot be aggregated, and its
+                # absence is precisely what made continuity read as 0% across a whole run.
+                "session_ref": work.session_ref,
+                "prompt_sha256": prompt_sha256,
+                "prompt_chars": len(prompt),
+                "prompt_file": prompt_file,
             }
             # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
             # supersedes so a reader can tell a genuine crash-recovery re-lease from a
@@ -1156,6 +1180,26 @@ class Engine:
                 event["plan"] = True
                 event["plan_lenses"] = [f.lens for f in work.plan.finders]
             evs.append(event)
+            # #314: the persisted prompt was capped, so the `.prompt.txt` is not the whole
+            # input. Warning-grade and explicit about how much was cut — the "never silent"
+            # convention: the writer returned what it dropped, this call site emits it.
+            if prompt_dropped is not None:
+                evs.append(
+                    {
+                        "ts": _now(),
+                        "type": "stage_prompt_truncated",
+                        "severity": "warning",
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "stage": stage.value,
+                        "attempt": attempt,
+                        "work_item_id": work.id,
+                        "prompt_file": prompt_file,
+                        "prompt_chars": len(prompt),
+                        "written_chars": len(prompt) - prompt_dropped,
+                        "dropped_chars": prompt_dropped,
+                    }
+                )
             # #272: ONE warning-grade notice per dispatch when the resolved lane does not
             # declare enforcement, so a read-only posture that is only a prompt convention on
             # that lane is visible in the event stream instead of quietly assumed.
@@ -3505,6 +3549,11 @@ class Engine:
         ``work_item_id`` and cannot be joined by id, so those are counted and the orphan
         list is conservatively discounted by that many — old, known-good history never
         false-flags.
+
+        Also returns a ``continuity`` block (#314): how many ``stage_dispatched`` events
+        resumed a provider session (``session_ref`` set) vs. started fresh, over just the
+        dispatches that carry the field at all (pre-#314 events are ``unknown`` and excluded
+        from ``rate``, so old logs read as "no data" rather than a false 0%).
         """
         events = self.store.read_events(run_id) if events is None else events
         dispatched: dict[str, dict] = {}  # work_item_id -> opening dispatch info
@@ -3512,12 +3561,26 @@ class Engine:
         recorded_no_wid = 0  # pre-#175 stage_recorded rows without a joinable lease id
         counts = {"stage_dispatched": 0, "stage_recorded": 0,
                   "lease_superseded": 0, "dispatch_abandoned": 0}
+        # #314: session continuity, measured off the dispatch events. `session_ref` is only
+        # stamped since #314, and an ABSENT key is not the same fact as an explicit null —
+        # reading absence as "no session" is exactly the bug this reports (a pre-#314 run
+        # would score a confident 0% when continuity was working the whole time). So a
+        # dispatch that predates the field counts as UNKNOWN and is excluded from the rate.
+        resumed = 0
+        continuity_known = 0
+        continuity_unknown = 0
         for ev in events:
             etype = ev.get("type")
             if etype in counts:
                 counts[etype] += 1
             wid = ev.get("work_item_id")
             if etype == "stage_dispatched":
+                if "session_ref" in ev:
+                    continuity_known += 1
+                    if ev.get("session_ref"):
+                        resumed += 1
+                else:
+                    continuity_unknown += 1
                 if wid:
                     dispatched[wid] = {"task_id": ev.get("task_id"),
                                        "stage": ev.get("stage"),
@@ -3563,6 +3626,16 @@ class Engine:
             "outstanding": len(outstanding),
             "orphans": orphans,
             "clean": not orphans,
+            # #314: how many dispatches resumed a provider session, over the dispatches that
+            # can answer the question at all. `rate` is None (not 0.0) when nothing is
+            # measurable, so "no data" never renders as "continuity never engaged".
+            "continuity": {
+                "resumed": resumed,
+                "fresh": continuity_known - resumed,
+                "known": continuity_known,
+                "unknown": continuity_unknown,
+                "rate": (resumed / continuity_known) if continuity_known else None,
+            },
         }
 
     # --- helpers --------------------------------------------------------------
