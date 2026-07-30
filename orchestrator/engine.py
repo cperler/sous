@@ -469,7 +469,18 @@ class Engine:
         lane preset from the run's remaining budget fraction (refined by ``estimate`` /
         the task's ``size:``/``estimate:`` labels) and prefers $0 deterministic
         TEST/DELIVER — every such decision is emitted as a ``lane_routed`` event (never
-        silent). An explicit ``pipeline`` is always honored."""
+        silent). An explicit ``pipeline`` is always honored.
+
+        Registration is atomic and idempotent-on-crash (#278): the run-doc ref write and
+        the task-doc write happen under one held task lock (see
+        :meth:`StatusStore.with_task_lock`), so a concurrent ``add_task`` for the same
+        ``task_id`` blocks rather than racing, and a process crash between the two writes
+        leaves a repairable half-registration rather than a duplicate-reject deadend — the
+        next call for the same ``task_id`` completes it in place (emitting a
+        ``task_registration_repaired`` event) instead of raising. A ref whose document
+        exists and matches raises ``ContractError`` ("already added"), as before. See
+        :meth:`registered_task_ids` for the corresponding "is this task fully registered"
+        check used by re-ingest."""
         spec = self.project.task_source.resolve(task_id)
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
