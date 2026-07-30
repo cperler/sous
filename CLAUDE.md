@@ -46,7 +46,12 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   `_cap_value`/`_cap_item`) and `context_key_evicted` (from `_enforce_context_ceiling`).
   #289 also fixed the cap that motivated it: per-item caps are chosen by FIELD MEANING
   (`_ITEM_CAP_BY_KEY`), so a SCOPE `plan`'s prose subtasks are no longer cut at the
-  500-char incidental-list-item cap.
+  500-char incidental-list-item cap. #311 applied the same shape to a REFUSAL rather than a
+  drop: `_lease_mismatch` is pure and returns `(reason_code, message)`, and both `record()`
+  call sites (lock-free pre-check and the under-lock re-validation, whose event is emitted
+  after the aborted transaction — never from inside the locked mutator) emit
+  `result_rejected` before raising, so a rejected StageResult is loud in `events.jsonl`
+  instead of only on the caller's stderr.
 - **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
   `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
   `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`

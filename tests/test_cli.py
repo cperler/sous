@@ -99,6 +99,33 @@ def test_cli_next_resume_reemits_leased_item_and_record_succeeds(tmp_path, capsy
     assert outcome["stage"] == "scope" and outcome["lane_attributed"] is True
 
 
+def test_cli_record_refuses_a_mismatched_content_hash_as_json(tmp_path, capsys) -> None:
+    # #311: the supervisor reads this command's JSON. A result whose content_hash does not
+    # answer the outstanding dispatch must come back as a non-zero, machine-readable
+    # refusal — not a traceback with nothing on stdout (which reads as a transport hiccup
+    # rather than "your result was rejected").
+    base = ["--root", str(tmp_path), "--run", "run1", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    _run(capsys, *base, "add-task", "--task", "#42")
+    work = _run(capsys, *base, "next", "--task", "#42")
+
+    wi = WorkItem.model_validate(work)
+    garbled = make_result(wi).model_copy(update={"content_hash": wi.content_hash[:16]})
+    result_file = tmp_path / "result.json"
+    result_file.write_text(garbled.model_dump_json())
+
+    rc = main([*base, "record", "--result", str(result_file)])
+
+    assert rc == 1
+    payload = json.loads(capsys.readouterr().out.strip())
+    assert payload["ok"] is False and payload["recorded"] is False
+    assert "content_hash" in payload["error"]
+    assert payload["task_id"] == "#42" and payload["stage"] == "scope"
+    # …and the refusal is in the run's durable log, not just this process's stdout.
+    events = (tmp_path / "events.jsonl").read_text()
+    assert '"type":"result_rejected"' in events
+
+
 def test_cli_next_resume_with_nothing_leased_errors_clearly(tmp_path, capsys) -> None:
     # #50: --resume is ONLY for recovering a held lease. On a fresh task with nothing
     # outstanding there is nothing to resume — fail loudly rather than silently minting a

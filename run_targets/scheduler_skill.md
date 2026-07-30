@@ -34,11 +34,20 @@ directly and never run `claude -p`.
 3. **dispatch ONE Workflow batch**: invoke `run_targets/workflow_shim.js` with
    `{ workItems: [...all collected...], dispatchLimit: <engine limit>, now: <ISO>, schemas: {...} }`.
    The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds a WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it. Never leave a hung dispatch un-recorded.
+   **Pass each WorkItem through VERBATIM** — copy the whole JSON object from `next`,
+   never retype or abbreviate a field. `content_hash` is a 64-char digest that ties the
+   returned result to its dispatch; a truncated preview or one copied from a *sibling*
+   in-flight item (easy with several in the batch) is refused at `record`, and the shim
+   now aborts the whole batch before spending anything if the shape is wrong (#311).
    The shim runs the stages in-session (hub-and-spoke) and **returns** the
    StageResults (it cannot persist).
 4. **record** each returned StageResult: write to a temp file → `… record --result <file>`.
    The engine advances each task, retries failed stages with learnings, and
    cascade-blocks dependents of any task that fails — you don't manage that.
+   A non-zero exit with `{"ok": false, "recorded": false, …}` means the result did not
+   answer the outstanding dispatch (also logged as `result_rejected`). Do NOT patch the
+   result's `content_hash` to make it pass — re-dispatch that task's stage with
+   `… next --resume` and record what actually comes back.
 5. Loop. Stop when `… status` shows `run_state` = `completed` or `failed`.
 
 ## Resumability

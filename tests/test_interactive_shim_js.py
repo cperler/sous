@@ -49,3 +49,24 @@ def test_shim_parses_string_args_and_sanitizes_schema() -> None:
     # sides (undefined -> absent in the agent opts JSON, null on the result row).
     assert data["agentEffort"] == {"p1": "high"}  # p2 absent: no effort forwarded
     assert data["resultEffort"] == {"wi-1": "high", "wi-2": None}
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_shim_refuses_a_malformed_content_hash_before_dispatching() -> None:
+    """#311: a truncated content_hash aborts the batch with ZERO model spend.
+
+    The live failure was a 16-char log preview pasted over the 64-char digest, echoed back
+    onto both StageResults. record() refuses such a result — but only after the stage has
+    been paid for. The shim checks the shape first, so the transcription slip costs
+    nothing and the message tells the supervisor how to re-dispatch."""
+    proc = subprocess.run(  # noqa: S603
+        [shutil.which("node"), str(DRIVER), str(SHIM), "badhash"],
+        capture_output=True, text=True, check=True,
+    )
+    data = json.loads(proc.stdout)
+
+    assert "content_hash" in data["threw"] and "64-char" in data["threw"]
+    assert "wi-2" in data["threw"]  # names the offending item, not just "a work item"
+    # The whole batch is refused: the VALID sibling was not dispatched either, so a
+    # partial batch can never land results the supervisor thinks it re-ran in full.
+    assert data["agentCalls"] == 0

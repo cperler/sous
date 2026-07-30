@@ -16,6 +16,10 @@
 //    (adapters/execution/base.py) and the engine never attaches a plan to a dispatch
 //    that lands here. When a plan-bearing branch is added below, flip that flag to true
 //    in the SAME PR — a descriptor that over-promises degrades SILENTLY (#288).
+//  - WORKITEM FIDELITY (#311): every WorkItem must reach this shim byte-for-byte as the
+//    engine emitted it — `content_hash` is echoed onto the StageResult and is what ties
+//    the result to its dispatch. A malformed hash aborts the batch BEFORE any agent()
+//    call (see the HEX64 guard below), so a transcription slip costs zero model spend.
 //  - TIMEOUTS: the sandbox has no clock or timers (Date.now/setTimeout unavailable),
 //    so wi.timeout_s CANNOT be enforced here. The SUPERVISOR owns it: if a dispatch
 //    visibly exceeds the WorkItem's timeout_s, stop waiting and record a StageResult
@@ -41,6 +45,28 @@ const A = typeof args === 'string' ? JSON.parse(args) : (args || {})
 
 const items = A.workItems || []
 const ceiling = Math.max(1, Math.min(A.dispatchLimit || 1, items.length || 1))
+
+// #311: the supervisor hand-assembles this args payload, so a WorkItem field can be
+// mistyped — and `content_hash` (a sha256 hexdigest, always 64 lowercase hex chars) is the
+// one field whose whole job is tying the result back to the dispatch. A truncated paste (a
+// 16-char log preview) was echoed back on two stages of a live run. Check the SHAPE before
+// any agent() call: the engine's record() would refuse the echoed result anyway, but by
+// then the stage has already been paid for. Fail the whole batch loudly instead — nothing
+// here is recoverable in-sandbox (the shim has no filesystem and cannot re-read the real
+// WorkItem), so the supervisor must re-dispatch with the WorkItem passed through verbatim.
+const HEX64 = /^[0-9a-f]{64}$/
+const malformed = items.filter((wi) => !HEX64.test(String((wi && wi.content_hash) || '')))
+if (malformed.length) {
+  const detail = malformed
+    .map((wi) => `${wi.id}: ${JSON.stringify(wi.content_hash)}`)
+    .join(', ')
+  throw new Error(
+    `workflow_shim: ${malformed.length} work item(s) carry a malformed content_hash ` +
+    `(expected a 64-char sha256 hexdigest) — ${detail}. Nothing was dispatched. Re-run ` +
+    'with each WorkItem copied VERBATIM from `orchestrator next` (never retyped, never a ' +
+    'truncated preview, never mixed between in-flight items).',
+  )
+}
 
 // agent()'s schema validator rejects a top-level `$schema`/`$id` — it tries to resolve
 // the meta-schema URI as a $ref and fails ("no schema with key or ref ..."). The engine's

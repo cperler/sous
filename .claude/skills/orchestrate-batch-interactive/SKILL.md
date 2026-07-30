@@ -68,12 +68,22 @@ its `timeout_s` + start time). Each pass:
    - **Launch ONE Workflow invocation for that task with `run_in_background`**:
      invoke `run_targets/workflow_shim.js` with
      `{ workItems: [WORK], dispatchLimit: <engine limit>, now: <ISO>, schemas: {...} }`.
+     **Pass `WORK` through VERBATIM** (#311): copy the whole JSON object `next` printed —
+     never retype or abbreviate a field. `content_hash` is a 64-char digest whose only job
+     is tying the returned result back to *this* dispatch; with several tasks in flight, a
+     truncated log preview or a hash copied from a sibling item is exactly the live
+     `batch-next5b` failure. `record` refuses such a result, and the shim aborts before
+     spending anything when the shape is wrong.
      The shim runs the stage in-session and **returns** its StageResult (it cannot
      persist). Record `T`, the background handle, `WORK.timeout_s`, and the start time.
 2. **Reap returns.** As each background invocation returns, immediately:
    - **record** its StageResult: write to a temp file → `… --shared-root … record --result <file>`.
      The engine advances that task, retries a failed stage with learnings, and
      cascade-blocks dependents of any task that fails — you don't manage that.
+     A non-zero exit with `{"ok": false, "recorded": false, …}` means the result did not
+     answer that task's outstanding dispatch (also logged as `result_rejected`). Do NOT
+     patch the result's `content_hash` to make it pass — re-dispatch that stage with
+     `… next --resume` and record what actually comes back.
    - **re-check `dispatchable`** and, if that task is now dispatchable and there's
      headroom, immediately launch its next stage (step 1). Do not wait for siblings.
 3. **Own per-item timeouts individually.** The shim CANNOT enforce `timeout_s` (no
