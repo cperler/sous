@@ -52,8 +52,13 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   after the aborted transaction — never from inside the locked mutator) emit
   `result_rejected` before raising, so a rejected StageResult is loud in `events.jsonl`
   instead of only on the caller's stderr.
-- **Commits** end with the authoring model's own `Co-Authored-By` trailer (e.g.
-  `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. Work on
+- **Commits** end with a `Co-Authored-By` trailer naming the authoring model (e.g.
+  `Claude Opus 4.8 (1M context)`, `Claude Fable 5`) — attribution is accurate, not fixed. On a
+  RUN-produced commit the engine settles this, not the model: `render_prompt` gives every
+  committing stage the exact trailer lines built from the dispatched model ids
+  (`stages.commit_trailers` + `model_table.attribution_identity`), crediting the implement
+  model and the committing stage's own — because a model cannot reliably report its own
+  version and #317 caught two commits signed with one no stage of the run dispatched. Work on
   `main`. Remote: `github.com/cperler/orchestration-template` (private; push `main`
   after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the

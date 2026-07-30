@@ -2,7 +2,8 @@
 
 A reusable, project-agnostic orchestration harness for driving multi-stage,
 dependency-aware coding tasks through Claude (and Codex) — runnable as an in-session
-Workflow on the subscription, and headless via the Agent SDK / `claude -p` / `codex exec`.
+Workflow on the subscription, and headless by shelling out to `claude -p` / `codex exec`
+(both behind an injectable transport seam, so another headless client can be dropped in).
 
 It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
 `.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
@@ -13,9 +14,9 @@ split, the six-stage pipeline, the front doors, the control loops, and where to 
 **Status: built and live-proven.** Phases 1–5 complete plus engine-hardening passes, the
 2026-07-01 review→execute cycle (context plane, per-task pipelines, session continuity,
 checkpoints, approval gate), and the 2026-07-04 burn-down (deterministic test/deliver,
-front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). 725 pytest
-cases green, ruff clean. Driven real GitHub issues to merged/draft PRs on the reference
-project (heysoo PRs #556–#560) with clean lane-attribution audits. Remaining/known-thinned
+front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). The full
+CI gate (pytest + ruff + mypy) is green. Driven real GitHub issues to merged/draft PRs on
+the reference project (heysoo PRs #556–#560) with clean lane-attribution audits. Remaining/known-thinned
 scope is tracked as GitHub issues (label `deferred-scope`); see `DEFERRED.md` for the
 discipline.
 
@@ -43,7 +44,9 @@ The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test
 - **Two adapter families:** the **execution adapter** (`adapters/execution/` — how/where a
   call runs: the interactive Workflow shim, headless `claude -p`, `codex exec`) and the
   **project-config adapter** (`adapters/project/` — what a repo plugs in: commands, test
-  taxonomy, agent roster, task source). The engine imports neither.
+  taxonomy, agent roster, task source). The engine imports only the two *contracts*
+  (`adapters/execution/base.py`, `adapters/project/base.py`) — never a concrete lane or
+  project adapter; those are resolved at the CLI/registry boundary.
 
 ## Layout
 
@@ -69,7 +72,7 @@ adapters/
   project/{base,heysoo,selfhost}/   the contract + reference adapters (a NEW project's
                          adapter lives in the project's OWN repo — see below)
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
-tests/                   pytest suite (725)
+tests/                   pytest suite (one test_<subsystem>.py per module)
 docs/                    design doc, plan, and the as-built/target spec (see below)
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
@@ -163,9 +166,10 @@ $ORCH status
 For a fully hands-off launch, feed batches through a **queue file** instead of adding tasks
 by hand. The file is a `ralph-queue.json`-style JSON array of batch entries
 (`{tasks, branch, enqueued_at}` — the as-built scheduler §1.8 format); `enqueue` appends one
-entry (lock-free atomic append — no engine needed, so a cron job can top it up), and
-`run-queue` is the unattended entrypoint that drains it batch-by-batch, driving each derived
-run in-process to terminal.
+entry (an atomic whole-array rewrite held under a cross-process advisory lock, so two
+parallel producers can't lose an entry — and no engine is needed, so a cron job can top it
+up), and `run-queue` is the unattended entrypoint that drains it batch-by-batch, driving
+each derived run in-process to terminal.
 
 ```bash
 # a producer (cron, CI, or a human) appends batches — no engine/store touched:
@@ -180,10 +184,12 @@ Each batch's run id is derived deterministically from its `enqueued_at`, so a dr
 crashes and is relaunched **reuses** the same run (create-or-reuse, idempotent adds) rather
 than forking a duplicate. `--wait` idle-waits on an empty queue (polling every
 `--poll-interval` seconds up to `--idle-timeout`, then exits) and sleeps through capacity /
-rate-limit stalls; without it `run-queue` makes a single drain pass and returns. On an ingest
-failure the popped batch is re-prepended to the head (never silently dropped) and the failure
-is surfaced. Everything below the ingest step is the same already-resumable `Scheduler.run`
-loop mode 1 uses.
+rate-limit stalls; without it `run-queue` makes a single drain pass and returns. The consumer
+claims the head entry **in place** (stamping `{run_id, owner, claimed_at}`) and pops it only
+once its derived run reached terminal, so no kill window can lose a batch; on an ingest
+failure the claim is stripped instead and the same head is retried (never silently dropped),
+with the failure surfaced. Everything below the ingest step is the same already-resumable
+`Scheduler.run` loop mode 1 uses.
 
 ### 2. From within a Claude session — interactive (subscription)
 
@@ -214,7 +220,9 @@ standalone — `$ORCH next --task "#42" --util 0`, then `$ORCH record --result r
 
 Mode 1's transport is literally `claude -p <prompt> --model <model> --output-format json`
 (see `adapters/execution/transport.py`), with a `codex exec` sibling for the codex
-provider. You don't invoke these by hand — `run-headless` builds and runs one per stage —
+provider. These two subprocess transports are what ships; the runners take a `Transport`
+callable, so a different headless client is an injection, not an engine change (tests use
+that seam). You don't invoke these by hand — `run-headless` builds and runs one per stage —
 but that's the actual model call, and it's why mode 1 needs no interactive session. Pick
 the provider on the same command:
 
@@ -285,9 +293,14 @@ reference implementations, kept in lockstep by this repo's test suite.
 ## Developing
 
 ```bash
-uv run pytest        # 725 cases
-uv run ruff check .
+uv run pytest        # the suite
+uv run ruff check .  # lint
+uv run mypy          # type-check
 ```
+
+All three are the required-green gate CI enforces (`.github/workflows/ci.yml`); a change
+keeps every one of them green. `tests/test_docs_consistency.py` pins that this list stays
+in sync with CI (and that these docs don't re-acquire a hardcoded test total).
 
 The engine stays project-agnostic: new projects plug in via a project-owned
 `.orchestration/` adapter (or `adapters/project/` for in-repo reference adapters), never

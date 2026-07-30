@@ -18,6 +18,8 @@
           "pipeline": {"type": ["string", "null"], "enum": ["full", "lite", "micro", null], "description": "lane preset for this task (docs-only -> micro, small mechanical -> lite, risky/cross-cutting -> full); null uses the run's default lane"},
           "provider_tag": {"type": ["string", "null"], "description": "per-task provider routing tag (e.g. codex)"},
           "deterministic_stages": {"type": ["array", "null"], "items": {"type": "string", "enum": ["intake", "scope", "implement", "test", "deliver", "review"]}, "description": "stages to run on the $0 ENGINE lane instead of a model (e.g. test/deliver for a docs-only task); null keeps the preset's model stages"},
+          "model": {"type": ["string", "null"], "description": "per-task model pin (#84): a friendly alias (fable/opus/sonnet/haiku) or an exact model id, e.g. 'fable' for an architecture-heavy task. Must belong to the task's provider (a codex-tagged task pins a codex id); null keeps the role default"},
+          "effort": {"type": ["string", "null"], "enum": ["low", "medium", "high", null], "description": "per-task reasoning-effort pin (#96), overriding the stage-spec defaults; null keeps the stage defaults"},
           "rationale": {"type": "string", "description": "why these edges/lane were chosen — the model's analysis, human-visible"}
         },
         "additionalProperties": false

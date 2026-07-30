@@ -36,15 +36,20 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      `deterministic_stages` — a docs change needs no model test/PR-writing); small mechanical /
      localized → `lite`; risky, cross-cutting, or ambiguous → `full`.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
-   - **Model tier**: for an architecture-heavy / brainstorming-shaped task, suggest pinning the
-     Mythos tier at apply time — `add-task --model fable` (claude-fable-5) — so the design work
-     runs above Opus (#84); leave routine tasks on the role default.
+   - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
+     brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`
+     (claude-fable-5) — so the design work runs above Opus (#84); `"effort": "high"` raises
+     reasoning effort (#96). Both are plan fields (#287) — never hand-write `add-task --model`,
+     which would cost you `apply`'s topological ordering. Omit both to keep the role default.
+     A pin must match the task's provider (a `codex`-tagged task pins a codex id like
+     `gpt-5.5`); `validate` catches a bad alias or a mismatch before anything is added.
 3. **Write the plan JSON** to a file (schema: `orchestrator/schemas/batch_plan.json`):
    ```json
    {
      "tasks": [
        { "task_id": "#41", "depends_on": [], "pipeline": "full",
-         "rationale": "adds the auth middleware everything else layers on" },
+         "model": "fable", "effort": "high",
+         "rationale": "adds the auth middleware everything else layers on — protocol design, Mythos tier" },
        { "task_id": "#42", "depends_on": ["#41"], "pipeline": "lite",
          "rationale": "calls the middleware from #41; localized" },
        { "task_id": "#43", "depends_on": ["#41"], "pipeline": "micro",
@@ -58,14 +63,15 @@ topological order. **Applying mutates a real run: the human confirms the plan be
    the plan). An edge may point at an already-terminal issue *outside* the batch (a completed
    dependency) — that's allowed and imposes no scheduling constraint.
 4. **Validate.** `uv run orchestrator --project "$PROJECT" batch-plan validate <file>` —
-   schema + DAG (cycles, dup ids, self-edges) and, with `--project`, verifies every external
-   edge points at a real issue. Fix any reported error before continuing.
+   schema + DAG (cycles, dup ids, self-edges) + the `model`/`effort` pins (unknown alias,
+   provider mismatch) and, with `--project`, verifies every external edge points at a real
+   issue. Fix any reported error before continuing.
 5. **Show the human the plan and STOP.** `apply` adds tasks to a real run. Present the ordered
    plan with your rationales and **wait for confirmation.** Do not apply unprompted.
 6. **Apply.** `uv run orchestrator --root <dir> --run <R> --project "$PROJECT" batch-plan apply
    <file>` (add `--dry-run` first to preview exactly what would be added). It adds each task in
-   topological order with its edges, lane, `provider_tag`, and `deterministic_stages`, and
-   emits a `batch_planned` event. The run must already exist (`init-run`).
+   topological order with its edges, lane, `provider_tag`, `deterministic_stages`, and any
+   `model`/`effort` pin, and emits a `batch_planned` event. The run must already exist (`init-run`).
 7. **Drive the batch.** The run now carries the DAG. Point at `orchestrate-batch-interactive`
    to fan the tasks out; the engine walks the graph you built.
 8. **Acceptance pass (spec-originated batches only).** If this batch is a `spec:<slug>` group

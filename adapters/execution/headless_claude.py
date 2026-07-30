@@ -1,6 +1,7 @@
 """Headless × claude in-process runner (target.md §4 — the always-works lane).
 
-Drives the model via ``claude -p`` (or the Agent SDK) as a subprocess and returns a
+Drives the model via ``claude -p`` as a subprocess (through the injectable ``Transport``
+seam in ``transport.py``, so another headless client can be substituted) and returns a
 StageResult. Unlike the interactive shim, this runs in-process, so the engine/scheduler
 can dispatch it directly (the headless run target). Under the anticipated billing
 change this lane bills credit/at API rates — a cost property of the (headless, claude)
