@@ -24,7 +24,12 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as _JSONSchemaError
 
-from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
+from orchestrator.schemas.enums import (
+    ExecutionMode,
+    PermissionPosture,
+    Provider,
+    ResultStatus,
+)
 from orchestrator.schemas.work import LaneUsed, StageResult, SubCall, TokenUsage, WorkItem
 from orchestrator.status_store import safe_task_dirname
 from orchestrator.stream_probe import (
@@ -790,14 +795,85 @@ def _claude_tool_policy_flags(work: WorkItem) -> list[str]:
     return ["--disallowedTools", ",".join(denied)]
 
 
-def _codex_tool_policy_readonly(work: WorkItem) -> bool:
-    """Does ``work.tool_policy`` demand codex's read-only sandbox (#272)?
+def resolve_permission_posture(work: WorkItem) -> PermissionPosture:
+    """The permission gate this dispatch runs under (#304) — the ONE source both provider
+    translations below read, so claude and codex can never disagree about it.
+
+    Resolution is MONOTONE in tightness, which is the whole safety property:
+
+    1. a write-denying ``tool_policy`` forces RESTRICTED, whatever the stamp says — a stage
+       posture can always tighten, so a mis-stamped WorkItem cannot hand a read-only stage
+       blanket permission;
+    2. otherwise the engine's stamp (the lane's declared default) wins;
+    3. an UNSTAMPED item — built by a direct-transport caller, or loaded from a pre-#304
+       doc on resume — falls back to BYPASS, exactly what the transport did when the flag
+       was an unconditional constant.
+    """
+    policy = work.tool_policy
+    if policy is not None and not policy.allow_file_writes:
+        return PermissionPosture.RESTRICTED
+    return work.permission_posture or PermissionPosture.BYPASS
+
+
+def _claude_permission_flags(work: WorkItem) -> list[str]:
+    """Translate the resolved posture into ``claude``'s permission flags (#304).
+
+    BYPASS emits ``--dangerously-skip-permissions``, as every headless dispatch did
+    unconditionally before this change. RESTRICTED emits NO bypass flag: the session keeps
+    its normal permission gate and gets an explicit ``--allowedTools`` pre-grant for exactly
+    the tools the posture still allows.
+
+    EVIDENCE (probed 2026-07-30 against the installed CLI, haiku, ``-p`` in a scratch dir)
+    that dropping the bypass flag does not break — or hang — a non-interactive dispatch.
+    With ``--allowedTools Bash,BashOutput,KillShell --disallowedTools Write,Edit,NotebookEdit``
+    and no permission flag at all:
+
+    * ``Bash`` RAN (``echo probe-bash-ok`` returned its output) — the pre-grant is honored,
+      so REVIEW's deliberate keep-command-execution trade-off survives without bypass;
+    * ``Read`` RAN unlisted — the provider's default-allowed read tools do not need the
+      pre-grant, which is why the grant list carries only the exec tools;
+    * ``Write`` came back ``Error: No such tool available: Write. Write exists but is not
+      enabled in this context.`` and no file was created;
+    * the run exited 0 with ``permission_denials: []`` and no stall — a tool outside the
+      grant is REFUSED in-band, never queued behind a prompt nobody can answer;
+    * the grant PROPAGATES to subagents (a spawned agent ran ``echo`` fine), which matters
+      because SCOPE and REVIEW both delegate searching — a grant that stopped at the
+      top-level agent would have broken exactly the stages this posture is for.
+
+    The honest limit is unchanged from #272: a stage that keeps command execution can still
+    write through the shell. RESTRICTED narrows *authority granted by default*, it is not a
+    sandbox — codex's sandbox below is the lane with real containment."""
+    if resolve_permission_posture(work) is PermissionPosture.BYPASS:
+        return ["--dangerously-skip-permissions"]
+    policy = work.tool_policy
+    granted: list[str] = []
+    if policy is None or policy.allow_command_execution:
+        granted += list(_CLAUDE_EXEC_TOOLS)
+    if not granted:
+        # Nothing beyond the default-allowed read tools — say nothing rather than pass an
+        # empty flag value the CLI would read as a stray argument.
+        return []
+    # Comma-joined for the same reason as `--disallowedTools`: the flag is variadic, and a
+    # space-separated list would swallow the flags that follow it.
+    return ["--allowedTools", ",".join(granted)]
+
+
+def _codex_permission_read_only(work: WorkItem) -> bool:
+    """Does this dispatch get codex's read-only sandbox (#272, routed through #304's posture)?
 
     codex has no per-tool primitive — its enforcement knob is the process sandbox
     (``--sandbox read-only``), which is COARSER than claude's tool deny-list: a command that
     writes anywhere (a pytest cache, a build dir) fails under it. That is the price of real
     enforcement on this lane, and it is why the posture maps to the sandbox rather than being
-    dropped as untranslatable."""
+    dropped as untranslatable.
+
+    A RESTRICTED posture from the LANE alone (no write-denying stage policy) does NOT go
+    read-only: it would break every writing stage on that lane, and there is nothing else to
+    translate — ``codex exec`` is sandboxed on every path this transport emits and the true
+    bypass (``--dangerously-bypass-approvals-and-sandbox``) is never used, so codex has no
+    blanket-permission grant to withhold in the first place."""
+    if resolve_permission_posture(work) is not PermissionPosture.RESTRICTED:
+        return False
     policy = work.tool_policy
     return policy is not None and not policy.allow_file_writes
 
@@ -1013,12 +1089,16 @@ def claude_cli_transport(
         streaming = root is not None
         fmt = ["--output-format", "stream-json", "--verbose"] if streaming \
             else ["--output-format", "json"]
+        # #304: the permission gate is now DERIVED (lane default, tightened by a write-denying
+        # stage posture) rather than the unconditional `--dangerously-skip-permissions` this
+        # line used to hardcode. BYPASS emits that flag in the same argv position as before,
+        # so an unpoliced dispatch is byte-identical; a read-only stage instead runs under the
+        # normal gate with an explicit pre-grant for the tools its posture still allows.
         argv = ["claude", "-p", work.prompt, "--model", work.model,
-                "--dangerously-skip-permissions", *fmt]
-        # #272: narrow the TOOLSET for a posture-bearing dispatch (REVIEW). Note what is NOT
-        # done: `--dangerously-skip-permissions` stays. Headless dispatch is non-interactive by
-        # construction — there is no human to answer a permission prompt and a prompt would
-        # hang the run — so the fix is removing tools, not restoring interactive gating.
+                *_claude_permission_flags(work), *fmt]
+        # #272: narrow the TOOLSET for a posture-bearing dispatch (SCOPE/REVIEW). This is the
+        # enforcement half and stands on its own: `--disallowedTools` removes the tool from the
+        # toolset under EITHER permission posture, so the deny rule never depended on the gate.
         argv += _claude_tool_policy_flags(work)
         if work.effort:
             # #96: per-stage reasoning effort — the claude CLI's session effort level
@@ -1318,7 +1398,7 @@ def codex_cli_transport(
             # reverting to workspace-write on the second call of the stage. The writable-root
             # grant is dropped with it — granting write roots under a read-only sandbox would
             # contradict the posture. Unset policy keeps the pre-#272 argv byte-identical.
-            read_only = _codex_tool_policy_readonly(work)
+            read_only = _codex_permission_read_only(work)
             if session_ref:
                 # Resume carries the warm session. It takes no sandbox/approval/--add-dir flags,
                 # so replicate `--full-auto`'s write posture via `-c` config overrides.

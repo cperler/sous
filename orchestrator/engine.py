@@ -85,6 +85,7 @@ from .schemas.enums import (
     ExecutionMode,
     FailureKind,
     ModelId,
+    PermissionPosture,
     Provider,
     ResultStatus,
     RunState,
@@ -95,7 +96,15 @@ from .schemas.enums import (
     resolve_effort,
 )
 from .schemas.status import Run, RunDriver, Task, TaskRef
-from .schemas.work import LanePolicy, LaneUsed, ReviewPlan, StageResult, TokenUsage, WorkItem
+from .schemas.work import (
+    LanePolicy,
+    LaneUsed,
+    ReviewPlan,
+    StageResult,
+    TokenUsage,
+    ToolPolicy,
+    WorkItem,
+)
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
     apply_result,
@@ -1007,6 +1016,22 @@ class Engine:
             if prior_learnings:
                 task.context["prior_learnings"] = prior_learnings
         learnings = "\n".join(task.learnings)
+        # Tool posture (#272): declared by the stage spec, attached on model lanes only (the
+        # deterministic ENGINE lane runs no model, so there is no toolset to narrow). Purely
+        # derived — nothing run-level to persist (#206), so re-reading the spec at every
+        # dispatch boundary is the whole mechanism.
+        tool_policy = None if deterministic else spec.tool_policy
+        # Honesty gate (#272): a lane that cannot translate the posture into a real provider
+        # restriction (the interactive shim — its `agent()` call takes no tool argument) still
+        # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
+        # Resolved BEFORE the prompt render because #302 made it prompt-affecting: on such a
+        # lane the posture is stated in-band, which is the only enforcement available there.
+        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
+        # Permission posture (#304): the lane's declared default, tightened to RESTRICTED by a
+        # write-denying stage posture — so `--dangerously-skip-permissions` is a decision made
+        # here from (lane, stage), not a constant in the transport. None on the deterministic
+        # lane, which runs no model and therefore has no permission gate to set.
+        permission_posture = None if deterministic else self._permission_posture(lane, tool_policy)
         prompt = render_prompt(
             stage,
             task_id=task_id,
@@ -1015,6 +1040,7 @@ class Engine:
             learnings=learnings,
             context=task.context,
             project_commands=self._project_commands(),
+            tool_posture_unenforced=unenforced_policy,
         )
         agent = self.project.agent_for(stage, spec.agent_role)
         # Multi-agent REVIEW (#73): one gate, consulted only for a model-lane REVIEW. It
@@ -1026,15 +1052,6 @@ class Engine:
             if deterministic
             else self._review_plan_for(task, stage=stage, run=run, lane=lane, util_pct=util_pct)
         )
-        # Tool posture (#272): declared by the stage spec, attached on model lanes only (the
-        # deterministic ENGINE lane runs no model, so there is no toolset to narrow). Purely
-        # derived — nothing run-level to persist (#206), so re-reading the spec at every
-        # dispatch boundary is the whole mechanism.
-        tool_policy = None if deterministic else spec.tool_policy
-        # Honesty gate (#272): a lane that cannot translate the posture into a real provider
-        # restriction (the interactive shim — its `agent()` call takes no tool argument) still
-        # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
-        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -1090,6 +1107,7 @@ class Engine:
             plan=plan,
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
+            permission_posture=permission_posture,  # #304, hash-excluded for the same reason
         )
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
@@ -1255,6 +1273,25 @@ class Engine:
             return self.registry.describe(lane).enforces_tool_policy
         except NoRunnerError:
             return False
+
+    def _permission_posture(
+        self, lane: LanePolicy, tool_policy: ToolPolicy | None
+    ) -> PermissionPosture:
+        """The permission gate this dispatch runs under (#304): the LANE's declared default,
+        tightened to RESTRICTED by a write-denying STAGE posture.
+
+        Only ever tightened, never loosened — a lane that declares RESTRICTED keeps it for
+        every stage, while a lane that declares BYPASS still loses blanket permission on a
+        read-only stage. An unregistered lane falls back to BYPASS: it is today's behavior for
+        a lane whose descriptor states nothing, and it cannot mask a gap, because such a lane
+        has no runner and fails at dispatch anyway (unlike ``_lane_enforces_tool_policy``,
+        where the conservative reading is what makes the gap visible)."""
+        if tool_policy is not None and not tool_policy.allow_file_writes:
+            return PermissionPosture.RESTRICTED
+        try:
+            return self.registry.describe(lane).permission_posture
+        except NoRunnerError:
+            return PermissionPosture.BYPASS
 
     # --- multi-agent REVIEW plan (#73) -----------------------------------------
     def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:

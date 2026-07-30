@@ -52,22 +52,46 @@ engine's schemas, never the reverse.
   a shared task source. A new external project's adapter lives in **its own repo** under
   `<repo>/.orchestration/` (loaded by path, contract-version-checked) or ships as a package
   registering an `orchestrator.project_adapters` entry point.
-- **Per-stage tool posture, translated per lane** (#272). `StageSpec.tool_policy` declares what
-  a stage's dispatch may *do* in the engine's own provider-neutral words (`allow_file_writes`,
-  `allow_command_execution`) — never a claude tool name — and each transport translates it:
-  claude `--disallowedTools Write,Edit,NotebookEdit`, codex `--sandbox read-only` (on the
-  resume call too, so continuity can't revert the posture). Only **REVIEW** declares one:
-  writes denied, **command execution deliberately retained**, because an adversarial verifier
-  refutes a finding by running the suite. Panel finders/verifiers inherit it. `--disallowedTools`
-  is genuinely enforced under `--dangerously-skip-permissions` (the tool is absent from the
-  toolset, not merely prompted) — and that flag deliberately **stays**: headless dispatch is
-  non-interactive by construction, there is no human to answer a prompt and a prompt would hang
-  the run, so the fix narrows the toolset rather than restoring interactive gating. A lane that
-  cannot translate the posture (the interactive shim) declares
-  `CapabilityDescriptor.enforces_tool_policy = False` and the engine emits one warning-grade
-  `tool_policy_unenforced` event per dispatch, so declared-but-unenforced is never silent.
-  Because the posture is derived from the stage and lane (both already hashed), it is dispatch
-  metadata excluded from `content_hash` like `cwd`/`session_ref`.
+- **Per-stage tool posture, translated per lane** (#272, widened/decided by #327).
+  `StageSpec.tool_policy` declares what a stage's dispatch may *do* in the engine's own
+  provider-neutral words (`allow_file_writes`, `allow_command_execution`) — never a claude tool
+  name — and each transport translates it: claude `--disallowedTools Write,Edit,NotebookEdit`,
+  codex `--sandbox read-only` (on the resume call too, so continuity can't revert the posture).
+  **SCOPE and REVIEW** declare one (#303): both read the repo and return a document, so both get
+  writes denied with **command execution deliberately retained** — a scoper reads and greps, an
+  adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
+  it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
+  prompted), independent of the permission gate below.
+- **Permission gate: a lane decision, not a constant** (#304, superseding #272's "the flag
+  stays"). `--dangerously-skip-permissions` used to be appended to *every* headless dispatch
+  from `transport.py`. It is now derived: `CapabilityDescriptor.permission_posture` declares a
+  lane's default (`PermissionPosture.BYPASS` on every shipped lane, so unpoliced argv is
+  byte-identical to pre-#304), and a **write-denying stage posture tightens it to RESTRICTED** —
+  resolution is monotone, a stage can only tighten. #272's reasoning still holds for BYPASS
+  (headless dispatch is non-interactive; nobody can answer a prompt and a prompt would hang the
+  run) — what changed is that a read-only stage no longer needs blanket permission to avoid one.
+  RESTRICTED emits no bypass flag and instead **pre-grants exactly the tools the posture allows**
+  (`--allowedTools Bash,BashOutput,KillShell`); probed against the CLI, `Bash` runs (in
+  subagents too), default read tools run unlisted, `Write` is refused, and an ungranted tool is
+  refused in-band rather than stalling. codex has no blanket grant to withhold (`codex exec` is
+  sandboxed on every path we emit and the true bypass is never used), so there a lane-level
+  RESTRICTED changes nothing and only a write-denying stage reaches `--sandbox read-only`. A lane
+  that must never hold blanket permission (shared/production checkout) now declares that on its
+  descriptor instead of editing the transport.
+- **Where a lane can't enforce, the degradation is explicit** (#302 — decided, not deferred
+  again). interactive×claude keeps `CapabilityDescriptor.enforces_tool_policy = False`, because
+  `run_targets/workflow_shim.js` calls `agent()` with model/effort/agentType/schema and no tool
+  restriction — declaring `True` would be the same silent over-promise ruled out for
+  `supports_plan` (#288). But the warning event is no longer the whole answer: it reports the gap
+  to the human *afterwards* while the dispatch runs as if no posture existed. So on a
+  non-enforcing lane `render_prompt` states the posture **in-band**, rendered from the policy
+  itself (the `_NO_ATTRIBUTION_DIRECTIVE` shape: when the engine can't remove the capability, it
+  overrides the standing instruction to use it), and the per-dispatch `tool_policy_unenforced`
+  event stays alongside it. Prompt convention is a weaker guarantee than a removed tool, which is
+  why it is scoped to the one lane with nothing better; it retires when `agent()` gains a tool
+  option (the same change that flips the flag to `True`).
+  Because posture and permission gate are both derived from the stage and lane (both already
+  hashed), they are dispatch metadata excluded from `content_hash` like `cwd`/`session_ref`.
 
 ## The pipeline
 

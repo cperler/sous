@@ -113,6 +113,12 @@ function toStageResult(wi, agentResult) {
 // Run the batch concurrently up to the engine-supplied ceiling (a true cap).
 const thunks = items.map((wi) => async () => {
   try {
+    // #302 (decided): `wi.tool_policy` / `wi.permission_posture` are NOT passed below —
+    // agent() exposes no tool-restriction or permission option, so this cell declares
+    // `enforces_tool_policy=false` rather than pretend. The engine compensates by stating the
+    // posture in-band inside `wi.prompt` for this lane, plus a `tool_policy_unenforced` event
+    // per dispatch. If agent() ever gains a tool option, wire it HERE and flip the flag on the
+    // interactive×claude descriptor in the same change (which also retires the directive).
     const res = await agent(wi.prompt, {
       model: wi.model,
       effort: wi.effort || undefined, // #96: per-stage reasoning effort (low/medium/high)

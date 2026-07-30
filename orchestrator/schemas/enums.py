@@ -100,6 +100,33 @@ def resolve_effort(name: str) -> Effort:
         raise ValueError(f"unknown effort {name!r}; valid values: {valid}") from None
 
 
+class PermissionPosture(StrEnum):
+    """How a dispatch's PERMISSION gate is set (#304) — the sibling of ``ToolPolicy``.
+
+    ``ToolPolicy`` says which tools may exist; this says what happens to a tool call that
+    would normally require a human's approval. Non-interactive dispatch has no human, so
+    the only two honest answers are "pre-grant everything" and "pre-grant exactly what the
+    posture allows, refuse the rest" — a prompt is never an option (it would hang the run
+    until the stage timeout).
+
+    Provider-neutral like ``Effort``: the engine only NAMES the posture and each execution
+    adapter translates it (claude ``--dangerously-skip-permissions`` vs. an ``--allowedTools``
+    pre-grant, codex ``--full-auto`` vs. ``--sandbox read-only``). No provider flag name ever
+    appears in ``orchestrator/``.
+
+    BYPASS is the historical constant and stays the lane default, so every dispatch that
+    declares no tool posture emits a byte-identical pre-#304 argv."""
+
+    # Grant every tool without asking (claude `--dangerously-skip-permissions`). What every
+    # headless dispatch did unconditionally before #304.
+    BYPASS = "bypass"
+    # Pre-grant ONLY the tools the dispatch's ``ToolPolicy`` allows; anything else falls back
+    # to the provider's normal gate, which in a non-interactive run refuses rather than
+    # prompts. Chosen for a write-denying stage: a reviewer that may not edit the tree has no
+    # business holding blanket permission over everything else either.
+    RESTRICTED = "restricted"
+
+
 class Provider(StrEnum):
     CLAUDE = "claude"
     CODEX = "codex"

@@ -19,6 +19,7 @@ from .enums import (
     Effort,
     ExecutionMode,
     ModelId,
+    PermissionPosture,
     Provider,
     ResultStatus,
     Stage,
@@ -270,6 +271,15 @@ class WorkItem(BaseModel):
     # discriminate. Excluding it also keeps every content_hash byte-identical to pre-#272,
     # so an in-flight REVIEW lease still verifies on ``record``.
     tool_policy: ToolPolicy | None = None
+    # Permission posture for this dispatch (#304): the LANE's declared default
+    # (``CapabilityDescriptor.permission_posture``), downgraded to RESTRICTED by a
+    # write-denying ``tool_policy``. None (the default) means "unstamped" — a WorkItem built
+    # outside the engine (a direct-transport caller, a pre-#304 doc on resume) — and every
+    # transport resolves it from ``tool_policy`` alone, which is exactly what it did before
+    # the field existed. Dispatch metadata, excluded from ``compute_content_hash`` for the
+    # same reason as ``tool_policy``: it is derived from the stage and the lane, both already
+    # hashed, so no two dispatches of the same work can legitimately disagree about it.
+    permission_posture: PermissionPosture | None = None
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -298,6 +308,7 @@ class WorkItem(BaseModel):
         env: dict[str, str] | None = None,
         plan: ReviewPlan | None = None,
         tool_policy: ToolPolicy | None = None,
+        permission_posture: PermissionPosture | None = None,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -333,6 +344,7 @@ class WorkItem(BaseModel):
             env=env,
             plan=plan,
             tool_policy=tool_policy,
+            permission_posture=permission_posture,
             created_at=created_at,
         )
 

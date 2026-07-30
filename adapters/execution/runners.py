@@ -104,6 +104,18 @@ def build_registry(
                 # #288: the shim has agent()/parallel() but no plan-execution branch yet, and
                 # a flag that over-promises degrades silently. Flip to True with #262.
                 supports_plan=False,
+                # #302 (decided, not deferred again): stays False — `run_targets/
+                # workflow_shim.js` calls `agent(prompt, {model, effort, agentType, schema})`,
+                # which exposes NO tool restriction, so True would be the same silent
+                # over-promise `supports_plan` already rules out. The degradation is no longer
+                # just the warning event: `render_prompt` now states the posture IN-BAND for
+                # this lane (`_unenforced_tool_posture_directive`), so the dispatch itself
+                # differs. Flip to True in the SAME change that lands a tool option on
+                # `agent()`, which also retires that directive.
+                enforces_tool_policy=False,
+                # No claude CLI argv exists on this lane at all (the call is in-session), so
+                # the permission posture is untranslatable here for the same reason. It keeps
+                # the BYPASS default only because nothing reads it for an external cell.
                 status=SUPPORTED,
             )
         )
