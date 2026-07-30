@@ -76,6 +76,23 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   automatic wiring into scheduler finalize (which is pre-merge). Someone/something external
   invokes it after the batch's PRs land.
 
+## Running a batch: headless is the default lane
+Use the **`orchestrate-batch-headless`** skill for ordinary batches. The human runs one
+foreground `run-headless` driver; the engine's `Scheduler` supervises and spawns `claude -p`
+per stage, so no stage prompt or output passes through the session. Measured on
+`batch-headless-1`: 92–96% cache hits on long stages (provider sessions chain via `--resume`),
+real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
+
+Reach for `orchestrate-batch-interactive` only when a human needs to watch each stage live.
+That lane runs every stage through the session context AND records `$0.00`/zero tokens —
+the Workflow shim cannot report usage, so all 15 pre-2026-07-30 interactive runs are
+financially invisible. Cost-shaping inputs are also only partly captured in the timeline
+(#314: dispatched prompts unpersisted, `session_ref` absent from `stage_dispatched`).
+
+The driver owns the run for its whole duration: Ctrl-C kills the `claude -p` children via the
+process group, and the scheduler does not currently recover from the orphaned leases that
+leaves (#313). Monitor from a second terminal.
+
 ## Live runs against the product repo (HARD CHECKPOINT)
 A live run writes to the real product repo (heysoo) and opens a PR. **The human picks the
 specific (small, low-risk) issue and approves the run before any write or PR.** Do not
