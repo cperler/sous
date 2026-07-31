@@ -56,7 +56,7 @@ from typing import Any
 
 from .engine import Engine
 from .errors import OrchestratorError
-from .scheduler import Runner, Scheduler
+from .scheduler import AnyRunner, Scheduler
 from .schemas.enums import ExecutionLane
 
 try:  # fcntl is POSIX-only; the mkdir-spin fallback covers the rest (e.g. Windows).
@@ -344,9 +344,10 @@ def _ingest_batch(
 
 
 #: Per-run construction seam (#281): given a derived run id, return a FRESH ``Engine``
-#: (and its registry-backed ``Runner``) rooted at that run's OWN store — never a shared
-#: one. ``drive_queue`` calls it once per claimed entry.
-EngineFactory = Callable[[str], tuple[Engine, Runner]]
+#: (and its registry-backed runner — either runner form the scheduler accepts, #318)
+#: rooted at that run's OWN store — never a shared one. ``drive_queue`` calls it once per
+#: claimed entry.
+EngineFactory = Callable[[str], tuple[Engine, AnyRunner]]
 
 
 def drive_queue(
