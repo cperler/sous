@@ -338,7 +338,20 @@ def _aggregate_review_costs(per_review: list[dict[str, Any]]) -> dict[str, dict[
 
 
 def build_panel_report(root: str | Path, *, limit: int = 20) -> dict[str, Any]:
-    """Aggregate the newest ``limit`` run stores beneath a shared runs root."""
+    """Aggregate review-panel telemetry from the newest stores under ``root``.
+
+    ``root`` is the shared runs directory, whose child stores are ordered by their run
+    document's mtime.  ``limit`` must be positive and bounds that newest-first sample.
+    The returned JSON-ready mapping separates stage-record yield from ledger cost: stage
+    ``sub_results`` marks a panel review, while ledger ``phase`` marks panel sub-calls.
+    Marker disagreements, unreadable artifacts, missing cost rows, and unmetered or
+    unpriced calls are retained in ``coverage`` rather than discarded; affected cost
+    totals are explicitly floors.  The report is observational and intentionally has no
+    single-reviewer counterfactual.
+
+    Raises:
+        ValueError: If ``limit`` is less than one.
+    """
     if limit < 1:
         raise ValueError("limit must be at least 1")
     all_runs = _discover_runs(Path(root))
@@ -452,7 +465,13 @@ def _pct(value: float) -> str:
 
 
 def render_panel_report(report: dict[str, Any]) -> str:
-    """Render a compact Markdown report suitable for terminal output."""
+    """Render a ``build_panel_report`` result as terminal-friendly Markdown.
+
+    The renderer preserves the aggregation's honesty contract: it includes the selected
+    sample size and observational limitation, calls out low panel sample sizes, and marks
+    incomplete cost totals with ``+`` rather than presenting unknown spend as free.  It
+    returns text only and does not read or modify run artifacts.
+    """
     runs = report["runs"]
     reviews = report["reviews"]
     yield_data = report["yield"]
