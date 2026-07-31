@@ -128,6 +128,36 @@ class _PanelTransport:
         return RawResult(outputs[work.phase], usage_recovered=False)
 
 
+class _UnicodePanelTransport:
+    """Headless script for the casefold and code-point truncation conformance vectors."""
+
+    def __call__(self, work: WorkItem) -> RawResult:
+        long_fingerprint = f":{'a' * 158}😀"
+        outputs = {
+            "find:code": {"findings": [
+                {"severity": "critical", "file": "Straße.py", "line": 1,
+                 "description": "BROKEN"},
+                {"severity": "important", "file": "", "line": 2,
+                 "description": f"{'a' * 158}😀discarded"},
+            ]},
+            "find:spec": {"findings": [
+                {"severity": "critical", "file": "STRASSE.PY", "line": 99,
+                 "description": "broken"},
+            ]},
+            "verify:1": {
+                "fingerprint": "strasse.py:broken",
+                "verdict": "confirmed",
+                "reasoning": "confirmed across lanes",
+            },
+            "verify:2": {
+                "fingerprint": long_fingerprint,
+                "verdict": "confirmed",
+                "reasoning": "confirmed across lanes",
+            },
+        }
+        return RawResult(outputs[work.phase], usage_recovered=False)
+
+
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_plan_bearing_shim_conforms_to_the_headless_panel(monkeypatch) -> None:
     """Design §5(f): the real JS branch and Python reference return one equivalent panel.
@@ -170,6 +200,36 @@ def test_plan_bearing_shim_conforms_to_the_headless_panel(monkeypatch) -> None:
     assert all(c["prompt"] != "ordinary single-reviewer prompt" for c in calls)
     assert "- line: 7" in calls[-1]["prompt"]  # fold-order representative, not duplicate
     assert calls[-1]["prompt"].endswith("AT a.py:7")  # mechanical diff-hint slot
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_plan_bearing_shim_matches_headless_unicode_fingerprints(monkeypatch) -> None:
+    """Casefold expansions and astral truncation obey fingerprint-v1 on both lanes."""
+    actual = StageResult.model_validate(_run_shim("panel-unicode")["panelResult"])
+    work = WorkItem.create(
+        id="wi-headless", run_id="r", task_id="#1", stage=Stage.REVIEW,
+        prompt="ordinary single-reviewer prompt", schema_ref="review",
+        model="claude-opus-5", effort="high",
+        lane_policy=LanePolicy(execution_mode=ExecutionMode.HEADLESS,
+                               provider=Provider.CLAUDE),
+        created_at="T", plan=_panel_plan(),
+    )
+    monkeypatch.setattr("adapters.execution.review_panel.time.monotonic", lambda: 1.0)
+    expected = run_review_panel(work, _UnicodePanelTransport())
+
+    assert actual.sub_results == expected.sub_results
+    assert [c.model_dump(mode="json") for c in actual.sub_calls or ()] == [
+        c.model_dump(mode="json") for c in expected.sub_calls or ()
+    ]
+    # The sharp-s variants consume one verifier slot, while the astral-boundary finding
+    # consumes the other. UTF-16 slicing or lowercase-only folding would produce three calls.
+    assert [c.phase for c in actual.sub_calls or ()] == [
+        "find:code", "find:spec", "verify:1", "verify:2",
+    ]
+    assert [v["fingerprint"] for v in actual.sub_results["verdicts"]] == [
+        "strasse.py:broken",
+        f":{'a' * 158}😀",
+    ]
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")

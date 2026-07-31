@@ -31,6 +31,13 @@ const agent = async (prompt, opts) => {
   capturedCalls.push({ prompt, agentType: opts.agentType || null, label: opts.label })
   if (mode.startsWith('panel')) {
     if (prompt === 'finder-code') {
+      if (mode === 'panel-unicode') {
+        return { findings: [
+          { severity: 'critical', file: 'Straße.py', line: 1, description: 'BROKEN' },
+          { severity: 'important', file: '', line: 2,
+            description: `${'a'.repeat(158)}😀discarded` },
+        ] }
+      }
       if (mode === 'panel-cap') {
         return { findings: Array.from({ length: 12 }, (_, i) => ({
           severity: 'critical', file: 'cap.py', line: i + 1,
@@ -43,6 +50,11 @@ const agent = async (prompt, opts) => {
     if (prompt === 'finder-spec') {
       if (mode === 'panel-finder-error') throw new Error('finder exploded')
       if (mode === 'panel-cap') return { findings: [] }
+      if (mode === 'panel-unicode') {
+        return { findings: [
+          { severity: 'critical', file: 'STRASSE.PY', line: 99, description: 'broken' },
+        ] }
+      }
       return { findings: [
         { severity: 'critical', file: 'a.py', line: 99,
           description: 'null   DEREF in the guard' },
@@ -51,6 +63,12 @@ const agent = async (prompt, opts) => {
     }
     if (prompt.startsWith('VERIFY ')) {
       if (mode === 'panel-verifier-error') throw new Error('verifier exploded')
+      if (mode === 'panel-unicode') {
+        const fingerprint = prompt.includes('strasse.py:broken')
+          ? 'strasse.py:broken'
+          : `:${'a'.repeat(158)}😀`
+        return { fingerprint, verdict: 'confirmed', reasoning: 'confirmed across lanes' }
+      }
       return {
         fingerprint: 'a.py:null deref in the guard',
         verdict: 'refuted',

@@ -153,13 +153,39 @@ function subCall(phaseName, wi, call) {
   }
 }
 
+// `fingerprint-v1` is pinned to Python's Unicode 15 casefold table (the table used by
+// Python 3.12; Python 3.11's Unicode 14 table has the same case mappings). JavaScript has
+// no casefold primitive. Upper-then-lower per CODE POINT produces the full folds (including
+// expansions such as ß -> ss); these exceptions cover the mappings where Unicode casefold
+// intentionally differs from that operation. The final two ranges and singleton set keep a
+// newer Workflow runtime from applying case mappings added after the v1 table was named.
+const CASEFOLD_V1_IDENTITY = new Set([
+  0x0131, 0x1c89, 0xa7cb, 0xa7cc, 0xa7ce, 0xa7d2, 0xa7d4, 0xa7da, 0xa7dc,
+])
+
+function casefoldV1(text) {
+  return Array.from(text, (character) => {
+    const point = character.codePointAt(0)
+    if (CASEFOLD_V1_IDENTITY.has(point) ||
+        (point >= 0x10d50 && point <= 0x10d65) ||
+        (point >= 0x16ea0 && point <= 0x16eb8)) return character
+    if (point === 0x1e9e) return 'ss'
+    // Cherokee casefolds to UPPERCASE. Most scripts fold to lowercase, which is why the
+    // generic upper/lower operation below needs these three compact range corrections.
+    if (point >= 0x13a0 && point <= 0x13f5) return character
+    if (point >= 0x13f8 && point <= 0x13fd) return String.fromCodePoint(point - 8)
+    if (point >= 0xab70 && point <= 0xabbf) return String.fromCodePoint(point - 0x97d0)
+    return character.toUpperCase().toLowerCase()
+  }).join('')
+}
+
 function issueFingerprint(issue) {
   const base = isRecord(issue)
     ? `${String(issue.file || '').trim()}:${String(issue.description || '').trim()}`
     : String(issue)
-  // JavaScript has no casefold primitive; lower-casing is its direct analogue for the
-  // model-authored file/description text used by fingerprint-v1.
-  return base.replace(/\s+/gu, ' ').toLowerCase().slice(0, 160)
+  // Array.from slices Unicode code points, matching Python string slicing. String.slice
+  // slices UTF-16 code units and can otherwise leave a dangling surrogate at the boundary.
+  return Array.from(casefoldV1(base.replace(/\s+/gu, ' '))).slice(0, 160).join('')
 }
 
 function findingsOf(payload) {
