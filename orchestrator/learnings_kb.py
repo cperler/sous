@@ -13,9 +13,9 @@ is NOT committed because ``runs/`` is gitignored).
 
 Entry shape::
 
-    {id, ts, run_id, task_id, kind (failure|review|infra|salvage|manual),
+    {id, ts, run_id, task_id, kind (failure|review|infra|salvage|manual|process),
      text (bounded ~500 chars), files (list), failure_kind (classifier kind|null),
-     stage (stage value|null)}
+     stage (stage value|null), target ({kind, ref}|null)}
 
 Pure functions over the file (the engine wires the path in), so they are trivially
 testable and never depend on the engine's working directory.
@@ -36,7 +36,11 @@ from .schemas.enums import FailureKind, Stage
 # folded into a prompt is already the right size.
 MAX_TEXT = 500
 
-VALID_KINDS = frozenset({"failure", "review", "infra", "salvage", "manual"})
+VALID_KINDS = frozenset({"failure", "review", "infra", "salvage", "manual", "process"})
+
+VALID_PROCESS_TARGET_KINDS = frozenset(
+    {"stage-template", "agent", "skill", "stage-schema", "kit"}
+)
 
 _STAGE_VALUES = frozenset(s.value for s in Stage)
 _FAILURE_KIND_VALUES = frozenset(k.value for k in FailureKind)
@@ -165,17 +169,31 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     on (default), an entry whose normalized-text fingerprint already exists (in the file OR
     earlier in this batch) is skipped — re-learning the same lesson never grows the KB."""
     path = Path(path)
-    seen = {_fingerprint(e["text"]) for e in read_entries(path)} if dedupe else set()
+
+    def dedupe_key(entry: dict) -> tuple[str, str | None] | tuple[str]:
+        """Process observations must recur across runs to be useful detector fuel.
+
+        Ordinary task learnings retain their historical global text dedupe. Process
+        observations dedupe only within a run, making task-finalize replay idempotent
+        without erasing the same complaint when a later run independently repeats it.
+        """
+        fp = _fingerprint(entry.get("text", ""))
+        if entry.get("kind") == "process":
+            return (fp, entry.get("run_id"))
+        return (fp,)
+
+    seen = {dedupe_key(e) for e in read_entries(path)} if dedupe else set()
     written: list[dict] = []
     lines: list[str] = []
     for raw in entries:
         text = bound_text(raw.get("text", ""))
         if not text:
             continue
-        fp = _fingerprint(text)
-        if dedupe and fp in seen:
+        raw_with_text = {**raw, "text": text}
+        key = dedupe_key(raw_with_text)
+        if dedupe and key in seen:
             continue
-        seen.add(fp)
+        seen.add(key)
         kind = raw.get("kind") or "manual"
         entry = {
             "id": raw.get("id") or _new_id(),
@@ -188,6 +206,8 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
             "failure_kind": raw.get("failure_kind"),
             "stage": raw.get("stage"),
         }
+        if raw.get("target") is not None:
+            entry["target"] = raw["target"]
         lines.append(json.dumps(entry, separators=(",", ":"), ensure_ascii=False))
         written.append(entry)
     if lines:
@@ -221,6 +241,51 @@ def harvest_from_task(path: str | Path, task: object, run_id: str, *, now: str |
         for text in learnings
     ]
     return append_learnings(path, entries)
+
+
+def harvest_process_retrospective(
+    path: str | Path, task: object, run_id: str, *, now: str | None = None
+) -> list[dict]:
+    """Persist one REVIEW process retrospective as detector-only KB evidence.
+
+    Interactive lanes may bypass JSON-schema validation, so malformed values are treated
+    as absent. A malformed optional target is dropped while the useful lesson is retained.
+    """
+    stages = getattr(task, "stages", None) or {}
+    review = stages.get(Stage.REVIEW)
+    output = getattr(review, "output", None) if review is not None else None
+    retrospective = output.get("retrospective") if isinstance(output, dict) else None
+    if not isinstance(retrospective, dict):
+        return []
+    title = retrospective.get("title")
+    if not isinstance(title, str) or not title.strip():
+        return []
+    detail = retrospective.get("detail")
+    text = title.strip()
+    if isinstance(detail, str) and detail.strip():
+        text = f"{text}: {detail.strip()}"
+
+    target = retrospective.get("target")
+    clean_target: dict[str, str] | None = None
+    if isinstance(target, dict):
+        kind, ref = target.get("kind"), target.get("ref")
+        if kind in VALID_PROCESS_TARGET_KINDS and isinstance(ref, str) and ref.strip():
+            clean_target = {"kind": kind, "ref": ref.strip()}
+
+    return append_learnings(
+        path,
+        [{
+            "run_id": run_id,
+            "task_id": getattr(task, "task_id", None),
+            "kind": "process",
+            "text": text,
+            "files": [],
+            "failure_kind": None,
+            "stage": Stage.REVIEW.value,
+            "target": clean_target,
+            "ts": now,
+        }],
+    )
 
 
 # --- deterministic recall -----------------------------------------------------------
@@ -270,6 +335,8 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
     bounded at write time."""
     scored: list[tuple[tuple[int, int, int, int], str, dict]] = []
     for entry in read_entries(path):
+        if entry.get("kind") == "process":
+            continue  # detector fuel, never advice for an unrelated product task
         s = _score(entry, query)
         if sum(s) == 0:
             continue  # no signal at all — not relevant

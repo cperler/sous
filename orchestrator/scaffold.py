@@ -393,7 +393,8 @@ class LocalTaskSource:
             raise OrchestratorError(f"unknown task {{task_id!r}}")
         t = data[task_id]
         return TaskSpec(task_id=task_id, title=t.get("title", ""), body=t.get("body", ""),
-                        depends_on=list(t.get("depends_on", [])))
+                        depends_on=list(t.get("depends_on", [])),
+                        labels=list(t.get("labels", [])))
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         with open(self.tasks_path.with_name("completed.log"), "a", encoding="utf-8") as fh:
