@@ -240,9 +240,14 @@ function severityRank(finding) {
 }
 
 function notice(kind, detail, extras = {}) {
-  const bounded = detail.length <= MAX_NOTICE_DETAIL
+  // Measure and cut by CODE POINT, matching the engine's Python-side slicing. `String.length`
+  // and `String.slice` count UTF-16 units, so an astral character straddling the boundary is
+  // cut in half and emitted as a lone surrogate — different evidence on the two lanes, which
+  // is exactly what the interactive≡headless conformance vectors exist to prevent.
+  const points = Array.from(detail)
+  const bounded = points.length <= MAX_NOTICE_DETAIL
     ? detail
-    : `${detail.slice(0, MAX_NOTICE_DETAIL)} … [truncated]`
+    : `${points.slice(0, MAX_NOTICE_DETAIL).join('')} … [truncated]`
   return { notice: kind, detail: bounded, ...extras }
 }
 

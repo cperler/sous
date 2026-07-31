@@ -227,6 +227,13 @@ def test_diff_hint_falls_back_to_reported_files_and_changes_plan_identity() -> N
                 model="claude-opus-5", attempt=0,
                 lane_policy=_lane(ExecutionMode.HEADLESS, Provider.CLAUDE))
     assert compute_content_hash(**base, plan=first) != compute_content_hash(**base, plan=second)
+    # `files_changed` also rewrites the finder prompts, so the inequality above proves only
+    # that SOMETHING in the plan is hashed. Isolate the field: two plans identical except
+    # for `diff_hint` must still hash apart, and a plan re-hashed unchanged must not.
+    only_hint = first.model_copy(update={"diff_hint": first.diff_hint + " (rephrased)"})
+    assert only_hint.finders == first.finders
+    assert compute_content_hash(**base, plan=only_hint) != compute_content_hash(**base, plan=first)
+    assert compute_content_hash(**base, plan=first) == compute_content_hash(**base, plan=first)
 
 
 # --- agent resolution -------------------------------------------------------------------

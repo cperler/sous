@@ -193,6 +193,43 @@ def test_marker_disagreement_and_ledger_only_review_are_visible(tmp_path: Path) 
     assert per_review[1]["kind"] == "panel"
 
 
+def test_render_carries_the_aggregated_values_not_just_the_headings(tmp_path: Path) -> None:
+    """The aggregation is asserted elsewhere; this pins the FORMATTING path.
+
+    Heading-and-caveat assertions pass just as happily when a metric is dropped from the
+    template or wired to the wrong bucket, so assert a representative value from each
+    section — lens yield, verifier verdicts, cap pressure, and per-path cost — actually
+    reaches the rendered text.
+    """
+    panel = _run(tmp_path, "panel-run", 200)
+    single = _run(tmp_path, "single-run", 100)
+    _review(panel, task="t-panel", work_item_id="wi-panel", sub_results=True, panel_summary={
+        "lenses": {"code": {"total": 2, "unique": 1, "shared": 1}},
+        "findings": 2, "agreed": 1,
+        "verdicts": {"confirmed": 1, "refuted": 3}, "inconclusive": 1,
+        "cap_hit": True, "cap_dropped": 7,
+    })
+    _review(single, task="t-single", work_item_id="wi-single", sub_results=False)
+    _ledger(panel, [
+        _row("panel-run", "wi-panel", 1.25, phase="find:code", schema_retries=1),
+        _row("panel-run", "wi-panel", 3.75, phase="verify:0"),
+    ])
+    _ledger(single, [_row("single-run", "wi-single", 0.5)])
+
+    rendered = render_panel_report(build_panel_report(tmp_path))
+
+    assert "reviews: 2 (1 panel, 1 single)" in rendered
+    assert "| code | 1 | 2 | 1 | 1 |" in rendered           # lens yield row
+    assert "Verifier verdicts: 3 refuted / 4 conclusive (75.0%); 1 inconclusive." in rendered
+    assert "7 finding(s) left unverified" in rendered       # cap pressure
+    # The panel-vs-single spend comparison is the number the whole report exists to make
+    # concrete, and the finder/verifier split is the one that explains it.
+    assert "| panel | 1 | 1 | 2 | $5.0000 | $5.0000 |" in rendered
+    assert "| single | 1 | 1 | 1 | $0.5000 | $0.5000 |" in rendered
+    assert "| finder | 1 | $1.2500 | 1 | 100.0% | 1 |" in rendered
+    assert "| verifier | 1 | $3.7500 | 0 | 0.0% | 0 |" in rendered
+
+
 def test_render_always_states_observational_limit_and_low_sample(tmp_path: Path) -> None:
     rendered = render_panel_report(build_panel_report(tmp_path))
 

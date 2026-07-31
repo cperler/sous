@@ -268,6 +268,55 @@ def test_plan_bearing_shim_fails_on_a_missing_finder_and_not_an_inconclusive_ver
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_plan_bearing_shim_truncates_notice_detail_by_code_point() -> None:
+    """The shim's notice cap must cut where Python's does.
+
+    `String.length`/`String.slice` count UTF-16 units, so astral characters ahead of the
+    200-character boundary make the JS cut land at a different place than the engine's
+    code-point slicing — and can bisect an emoji into a lone surrogate. Both lanes render
+    the same panel here, so the truncated evidence must match byte for byte.
+    """
+    class _UndedupedTransport(_PanelTransport):
+        """An unknown rule dedupes nothing, so every finding reaches a verifier — the Node
+        harness answers each with the same verdict, and so must this."""
+
+        def __call__(self, work: WorkItem) -> RawResult:
+            if work.phase.startswith("verify:"):
+                return RawResult({"fingerprint": "a.py:null deref in the guard",
+                                  "verdict": "refuted",
+                                  "reasoning": "guarded by the caller"},
+                                 usage_recovered=False)
+            return super().__call__(work)
+
+    rule = f"x{'😀' * 100}{'y' * 100}"
+    actual = StageResult.model_validate(_run_shim("panel-notice-astral")["panelResult"])
+    work = WorkItem.create(
+        id="wi-panel", run_id="r", task_id="#1", stage=Stage.REVIEW,
+        prompt="ordinary single-reviewer prompt", schema_ref="review",
+        model="claude-opus-5", effort="high",
+        lane_policy=LanePolicy(execution_mode=ExecutionMode.HEADLESS,
+                               provider=Provider.CLAUDE),
+        created_at="T", plan=_panel_plan().model_copy(update={"dedupe_rule": rule}),
+    )
+    expected = run_review_panel(work, _UndedupedTransport())
+
+    def _detail(result: StageResult) -> str:
+        return next(n for n in result.sub_results["notices"]
+                    if n["notice"] == "unknown_dedupe_rule")["detail"]
+
+    detail, engine_detail = _detail(actual), _detail(expected)
+    # The cut is 200 code points wide regardless of how many UTF-16 units they occupy...
+    assert len(detail) == len(engine_detail) == 200 + len(" … [truncated]")
+    # ...and no emoji was bisected: a lone surrogate cannot round-trip through UTF-8.
+    assert detail.encode("utf-8") and detail.count("😀") == 100
+    # The lanes truncate the same text. They still quote the echoed rule differently
+    # (JS `JSON.stringify` -> ", Python `!r` -> '), which is a separate divergence in the
+    # notice's framing rather than in what the cap keeps — compare past the quote.
+    marker = "plan dedupe_rule "
+    assert detail[len(marker) + 1:] == engine_detail[len(marker) + 1:]
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_plan_bearing_shim_caps_verifiers_without_dropping_findings() -> None:
     result = StageResult.model_validate(_run_shim("panel-cap")["panelResult"])
     assert len([c for c in result.sub_calls or () if c.phase.startswith("verify:")]) == 8

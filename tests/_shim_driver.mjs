@@ -140,6 +140,15 @@ if (mode.startsWith('panel')) {
   }]
 }
 
+// An unknown dedupe rule is echoed verbatim into the `unknown_dedupe_rule` notice, which is
+// the one notice detail a plan can push past the 200-code-point cap. Astral characters ahead
+// of that boundary shift the UTF-16 offsets away from the code-point offsets, so a UTF-16
+// `slice` truncates different text than the engine's Python slicing — and can cut an emoji in
+// half, emitting a lone surrogate.
+if (mode === 'panel-notice-astral') {
+  argsObj.workItems[0].plan.dedupe_rule = `x${'😀'.repeat(100)}${'y'.repeat(100)}`
+}
+
 // #311: the exact live failure — a 16-char log preview pasted over the full digest.
 if (mode === 'badhash') {
   argsObj.workItems[1].content_hash = argsObj.workItems[1].content_hash.slice(0, 16)
