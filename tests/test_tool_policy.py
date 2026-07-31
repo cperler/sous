@@ -453,7 +453,9 @@ def test_a_stage_posture_tightens_a_bypass_stamp_but_a_stamp_never_loosens_one()
     ) is PermissionPosture.RESTRICTED
 
 
-def test_a_lane_can_declare_a_non_bypass_default_for_every_stage(tmp_path, project) -> None:
+def test_a_lane_can_declare_a_non_bypass_default_for_every_stage(
+    tmp_path, project, monkeypatch
+) -> None:
     """#304's actual ask: a lane that must NOT hold blanket permission (a shared/production
     checkout) declares it once on its descriptor, and every stage on that lane — including the
     writing ones — dispatches without the bypass flag."""
@@ -469,6 +471,19 @@ def test_a_lane_can_declare_a_non_bypass_default_for_every_stage(tmp_path, proje
     w = _drive_to(eng, Stage.IMPLEMENT)
     assert w.tool_policy is None  # implement still gets its write tools...
     assert w.permission_posture is PermissionPosture.RESTRICTED  # ...but not blanket permission
+    # ...and that is what the ARGV must actually say. Withholding the blanket grant must not
+    # silently withhold the stage's own authority: with no TTY to answer a permission prompt,
+    # a tool that is neither pre-granted nor denied is the one shape this posture must never
+    # emit, so a writing stage on a RESTRICTED lane pre-grants its write tools explicitly.
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_run(calls))
+    claude_cli_transport()(w)
+    argv = calls[0]
+    assert "--dangerously-skip-permissions" not in argv
+    granted = argv[argv.index("--allowedTools") + 1].split(",")
+    assert set(granted) == {"Write", "Edit", "NotebookEdit", "Bash", "BashOutput", "KillShell"}
+    # Nothing is denied (the stage declares no posture), so grant+deny cover the vocabulary.
+    assert "--disallowedTools" not in argv
 
 
 def test_a_lane_level_restriction_does_not_read_only_codex(monkeypatch) -> None:

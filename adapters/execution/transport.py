@@ -823,6 +823,13 @@ def _claude_permission_flags(work: WorkItem) -> list[str]:
     its normal permission gate and gets an explicit ``--allowedTools`` pre-grant for exactly
     the tools the posture still allows.
 
+    The grant is derived from the SAME ``ToolPolicy`` bits the deny-list above reads, both of
+    them: a RESTRICTED lane whose stage still allows writes pre-grants the write tools too,
+    so a writing stage on a no-blanket-permission lane can still write. Withholding blanket
+    permission must not silently withhold the stage's own declared authority — with no TTY to
+    answer a prompt, an ungranted-but-undenied tool is the one shape this posture must never
+    produce (grant it or deny it, never leave it to the gate).
+
     EVIDENCE (probed 2026-07-30 against the installed CLI, haiku, ``-p`` in a scratch dir)
     that dropping the bypass flag does not break — or hang — a non-interactive dispatch.
     With ``--allowedTools Bash,BashOutput,KillShell --disallowedTools Write,Edit,NotebookEdit``
@@ -847,6 +854,8 @@ def _claude_permission_flags(work: WorkItem) -> list[str]:
         return ["--dangerously-skip-permissions"]
     policy = work.tool_policy
     granted: list[str] = []
+    if policy is None or policy.allow_file_writes:
+        granted += list(_CLAUDE_WRITE_TOOLS)
     if policy is None or policy.allow_command_execution:
         granted += list(_CLAUDE_EXEC_TOOLS)
     if not granted:

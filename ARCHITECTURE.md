@@ -70,10 +70,13 @@ engine's schemas, never the reverse.
   resolution is monotone, a stage can only tighten. #272's reasoning still holds for BYPASS
   (headless dispatch is non-interactive; nobody can answer a prompt and a prompt would hang the
   run) — what changed is that a read-only stage no longer needs blanket permission to avoid one.
-  RESTRICTED emits no bypass flag and instead **pre-grants exactly the tools the posture allows**
-  (`--allowedTools Bash,BashOutput,KillShell`); probed against the CLI, `Bash` runs (in
-  subagents too), default read tools run unlisted, `Write` is refused, and an ungranted tool is
-  refused in-band rather than stalling. codex has no blanket grant to withhold (`codex exec` is
+  RESTRICTED emits no bypass flag and instead **pre-grants exactly the tools the posture allows**,
+  read from the same `ToolPolicy` bits the deny-list reads — `--allowedTools Bash,BashOutput,
+  KillShell` for a write-denied stage, the write tools too for a writing stage on a RESTRICTED
+  lane, so withholding blanket permission never silently withholds a stage's own declared
+  authority (with no TTY, granted-or-denied are the only safe states). Probed against the CLI,
+  `Bash` runs (in subagents too), default read tools run unlisted, `Write` is refused by the
+  deny-list, and an ungranted tool is refused in-band rather than stalling. codex has no blanket grant to withhold (`codex exec` is
   sandboxed on every path we emit and the true bypass is never used), so there a lane-level
   RESTRICTED changes nothing and only a write-denying stage reaches `--sandbox read-only`. A lane
   that must never hold blanket permission (shared/production checkout) now declares that on its
