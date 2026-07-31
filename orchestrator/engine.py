@@ -80,6 +80,7 @@ from .routing import DEFAULT_ROUTER, Router
 from .schemas.enums import (
     LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
+    SUPPORTED_WORK_VERSIONS,
     TERMINAL_RUN_STATES,
     TERMINAL_TASK_STATES,
     Effort,
@@ -1432,6 +1433,17 @@ class Engine:
         lock and raises). Both call sites emit ``result_rejected``, so a refused result is
         loud in the run's durable log and not just an exception on the caller's stderr.
 
+        The schema_version check comes FIRST (#275): if the runner and the engine do not
+        agree on what a StageResult *is*, every field-level comparison below is reading a
+        contract it cannot trust, and the actionable error is the version mismatch rather
+        than whichever field happened to move. There is no migration ladder for the work
+        plane — a WorkItem/StageResult is in-flight wire traffic, not an archive, so exactly
+        one version is supported and an off-version result is refused rather than guessed
+        at. Refusing here (not in a Pydantic validator) is deliberate: this is the boundary
+        that already emits ``result_rejected``, so an off-version runner shows up in the
+        run's durable log with a reason code instead of as a parse error on someone's
+        stderr, and the raw result JSON still deserializes for a human to inspect.
+
         A result is only valid against the WorkItem currently outstanding for this
         task. No outstanding dispatch (pending is None) => a replay/duplicate; reject
         so a stale result can never be re-folded into an already-advanced stage.
@@ -1444,6 +1456,13 @@ class Engine:
         the wrong stage or price the wrong model. task.current_stage is the dispatched stage
         (begin_stage set it; a dispatch is outstanding).
         """
+        if result.schema_version not in SUPPORTED_WORK_VERSIONS:
+            return ("schema_version_unsupported", (
+                f"result schema_version {result.schema_version!r} is not one this engine "
+                f"speaks ({', '.join(sorted(SUPPORTED_WORK_VERSIONS))}) — the runner that "
+                "produced it is built against a different StageResult contract. Update the "
+                "runner (or the engine) so both sides agree; the result was NOT recorded."
+            ))
         if task.pending_work_item_id is None:
             return ("no_dispatch_outstanding", (
                 f"no dispatch outstanding for task {result.task_id} — refusing replayed result "

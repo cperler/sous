@@ -6,6 +6,18 @@ which is what makes the modes interchangeable and a run resumable across a sessi
 death. Every dispatch (interactive subagent, headless ``claude -p``, codex, or the
 former one-shot path) produces exactly one StageResult, so an unattributed model
 call is structurally impossible (closes as-built D6).
+
+Every model here is ``frozen=True, extra="forbid"``. Frozen because these two artifacts are
+immutable once emitted; extra-forbidding (#275) because this is a CROSS-LANGUAGE seam — the
+JS interactive shim and the headless/codex transports all hand-assemble result JSON, so a
+misspelled or invented key is a real and recurring failure mode (``run_targets/workflow_shim.js``
+shipped ``schema_version: '1'`` against an engine speaking "3"). Pydantic's default would
+ignore such a key, and the engine would then act on a result whose author believed it had
+said something the engine never read. Forbidding makes the mismatch fail loudly at the seam
+instead. The version half of the same policy is enforced in ``Engine._lease_mismatch``:
+unlike the persisted status docs there is no migration ladder here, because a WorkItem is
+in-flight wire traffic rather than an archive — exactly one wire version is supported
+(``SUPPORTED_WORK_VERSIONS``), and a result on any other is refused.
 """
 
 from __future__ import annotations
@@ -29,7 +41,7 @@ from .enums import (
 class LanePolicy(BaseModel):
     """The (mode, provider) cell the engine wants this WorkItem run on."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     execution_mode: ExecutionMode
     provider: Provider
@@ -39,7 +51,7 @@ class LanePolicy(BaseModel):
 class LaneUsed(BaseModel):
     """The lane a runner actually used — ground truth for cost attribution."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     execution_mode: ExecutionMode
     provider: Provider
@@ -57,7 +69,7 @@ class ToolPolicy(BaseModel):
     Defaults are the historical posture (everything allowed), so a dispatch without a
     policy is byte-identical to the pre-#272 argv on every lane."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     # May the dispatch mutate files through its file-writing tools? False for REVIEW: a
     # reviewer's job is to read and report, and nothing but a prompt convention used to
@@ -72,7 +84,7 @@ class ToolPolicy(BaseModel):
 
 
 class TokenUsage(BaseModel):
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     input: int = 0
     output: int = 0
@@ -88,7 +100,7 @@ class FinderSpec(BaseModel):
     validates every sub-call against ``schema_ref`` (``review_findings``). ``agent`` is the
     persona the runner injects (None => the base reviewer persona)."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     lens: str
     prompt: str  # fully rendered by the engine, like WorkItem.prompt
@@ -104,7 +116,7 @@ class ReviewPlan(BaseModel):
     with different finder sets are different work. It is explicitly NOT routing metadata like
     ``session_ref``/``cwd`` and must NOT join any content-hash exclusion set."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     finders: tuple[FinderSpec, ...]
     verify_template: str  # prompt template with mechanical slots the runner fills per finding
@@ -117,7 +129,7 @@ class SubCall(BaseModel):
     verifier — so no model call is unattributed even below the WorkItem seam. The ledger
     writes one row per SubCall (priced from the engine model_table, never this self-report)."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     phase: str  # discriminator, e.g. "find:code" / "verify:3"
     model: ModelId
@@ -179,7 +191,7 @@ def compute_content_hash(
 class WorkItem(BaseModel):
     """Engine -> runner. Immutable once emitted."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: str = SCHEMA_VERSION
     id: str
@@ -357,7 +369,7 @@ class WorkItem(BaseModel):
 class StageResult(BaseModel):
     """Runner -> engine. The engine advances a task only after recording one."""
 
-    model_config = ConfigDict(frozen=True)
+    model_config = ConfigDict(frozen=True, extra="forbid")
 
     schema_version: str = SCHEMA_VERSION
     work_item_id: str

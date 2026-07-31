@@ -44,7 +44,10 @@ const argsObj = {
     // pass the former to agent() and keep the latter's opts/result effort-free.
     // The hashes are real-shaped sha256 hexdigests: #311 made the shim refuse anything
     // that is not one, so a placeholder like 'h1' would (correctly) abort the batch.
-    { id: 'wi-1', content_hash: 'a'.repeat(64), run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
+    // wi-1 also carries a deliberately non-current `schema_version` (#275): the shim must
+    // ECHO the dispatching WorkItem's version rather than restate a literal of its own, so
+    // an arbitrary value proves the echo where '3' would also match the fallback.
+    { id: 'wi-1', schema_version: '77', content_hash: 'a'.repeat(64), run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
     { id: 'wi-2', content_hash: 'b'.repeat(64), run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p2' },
   ],
 }
@@ -80,4 +83,6 @@ console.log(JSON.stringify({
   schemaKeys: capturedSchemas.map((s) => (s ? Object.keys(s) : null)),
   agentEffort: capturedEffort, // prompt -> effort opt (undefined serializes as absent)
   resultEffort: Object.fromEntries(results.map((r) => [r.work_item_id, r.effort])),
+  // #275: wi-1 carries schema_version '77' (echoed), wi-2 carries none (fallback literal).
+  resultSchemaVersion: Object.fromEntries(results.map((r) => [r.work_item_id, r.schema_version])),
 }))

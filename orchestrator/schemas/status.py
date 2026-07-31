@@ -57,9 +57,28 @@ class _StatusModel(BaseModel):
     4. Pin it with a regression test: string assignment coerces, an invalid string
        raises at assignment, and the JSON round-trip is unchanged (see
        tests/test_status_assignment.py).
+
+    ``extra="forbid"`` (#275) makes unknown-field behavior DELIBERATE. Pydantic's default
+    is to ignore them, which on a persisted document means silent data loss: an unknown key
+    is dropped at load and gone at the next write, with nothing in the run's log to say so.
+    Neither alternative fits a status doc — ``ignore`` is the silent drop itself, and
+    ``allow`` would let arbitrary keys ride along as untyped attributes that no reader
+    consults, so the doc grows fields the engine cannot act on. Forbidding turns the
+    mismatch into a loud read-time error instead.
+
+    This is safe against OLD documents precisely because the ladder has only ever been
+    additive: no field has been removed, so no archived doc carries a key the models no
+    longer declare (a future REMOVAL must strip the key in ``StatusStore._migrate``, which
+    is where the ladder lives). It is safe against NEW documents because the store refuses a
+    future version before validation ever runs — so the error a human sees for a doc from a
+    newer engine is the explicit ``SchemaVersionError``, not a confusing extra-key report.
+    Free-form payloads that legitimately hold arbitrary keys (``Task.context``,
+    ``StageRecord.output``) are typed as ``dict`` and are unaffected.
     """
 
-    model_config = ConfigDict(use_enum_values=False, validate_assignment=True)
+    model_config = ConfigDict(
+        use_enum_values=False, validate_assignment=True, extra="forbid"
+    )
 
 
 class StageRecord(_StatusModel):
