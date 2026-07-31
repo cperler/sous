@@ -96,6 +96,53 @@ def test_statusline_cli_captures_context_for_sensor_command(
     assert sensed["remaining_tokens"] == 128_000
 
 
+def test_guarded_next_cli_parks_then_fresh_session_resumes(tmp_path, monkeypatch, capsys) -> None:
+    """The CLI must carry the sensor into ``next_work``, not merely expose it."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("ORCHESTRATOR_SUPERVISOR_CONTEXT_DIR", str(tmp_path / "cache"))
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    engine.add_task("r1", "t1")
+    _through_intake(engine, "r1", "t1")
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+
+    capture_statusline_context(
+        {
+            "session_id": "old-session",
+            "cwd": str(tmp_path),
+            "context_window": {"context_window_size": 200_000, "remaining_percentage": 1},
+        }
+    )
+    assert main([
+        *base,
+        "next",
+        "--task",
+        "t1",
+        "--guard-supervisor-context",
+        "--supervisor-resume-command",
+        "fresh-session /orchestrate-task-interactive r1 t1",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out) is None
+    assert engine.store.load_run("r1").state is RunState.PARKED
+    assert engine.store.load_task("r1", "t1").pending_work_item_id is None
+
+    capture_statusline_context(
+        {
+            "session_id": "new-session",
+            "cwd": str(tmp_path),
+            "context_window": {"context_window_size": 200_000, "remaining_percentage": 90},
+        }
+    )
+    assert main([*base, "resume-supervisor"]) == 0
+    assert json.loads(capsys.readouterr().out) == {"resumed": "r1", "state": "running"}
+    assert engine.store.load_run("r1").state is RunState.RUNNING
+
+    assert main([*base, "next", "--task", "t1", "--guard-supervisor-context"]) == 0
+    work = json.loads(capsys.readouterr().out)
+    assert work["stage"] == "scope"
+    assert engine.store.load_task("r1", "t1").pending_work_item_id == work["id"]
+
+
 def test_low_context_parks_before_prompt_artifact_or_lease(tmp_path) -> None:
     engine = _engine(tmp_path)
     engine.create_run("r1")
