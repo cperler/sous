@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from .schemas.enums import TERMINAL_RUN_STATES
+from .schemas.enums import TERMINAL_RUN_STATES, RunState
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an engine<-alerting import cycle
     from .engine import Engine
@@ -46,6 +46,7 @@ NOTIFY_RUN_BLOCKED = "run_blocked"
 # an omitted one means `watch` polls a finished run forever. Includes
 # completed_with_rejections (#67) and superseded (#257) by construction.
 _TERMINAL_RUN_STATES = frozenset(s.value for s in TERMINAL_RUN_STATES)
+_WATCH_STOP_STATES = _TERMINAL_RUN_STATES | {RunState.PARKED.value}
 
 
 def stale_notifications(
@@ -217,6 +218,13 @@ def watch(
         if activity:
             for line in activity_lines(status, stall_after_s=stall_after_s):
                 emit(line)
-        if str(status.get("run_state")) in _TERMINAL_RUN_STATES:
+        if str(status.get("run_state")) == RunState.PARKED.value:
+            parked = status.get("supervisor_parked") or {}
+            emit(
+                "run PARKED — needs a fresh supervisor; resume: "
+                f"{parked.get('resume_command') or 'resume-supervisor'}"
+            )
+            return status
+        if str(status.get("run_state")) in _WATCH_STOP_STATES:
             return status
         sleeper(interval)

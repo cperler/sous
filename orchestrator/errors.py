@@ -50,6 +50,18 @@ class CapacityExhausted(OrchestratorError):
     """No capacity-safe dispatch slot is available right now."""
 
 
+class SupervisorParkDeferred(OrchestratorError):
+    """Supervisor context is low, but live dispatches must drain before parking."""
+
+    def __init__(self, in_flight: list[str], projection: dict) -> None:
+        self.in_flight = in_flight
+        self.projection = projection
+        super().__init__(
+            "supervisor context is below the dispatch threshold; stop refilling and "
+            f"record the in-flight task(s) before parking: {in_flight}"
+        )
+
+
 class NoRunnerError(OrchestratorError):
     """No execution runner is registered for a required (mode, provider) cell."""
 

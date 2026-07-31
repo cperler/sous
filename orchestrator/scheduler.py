@@ -51,7 +51,7 @@ from .driver_log import (
 )
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
-from .schemas.enums import TERMINAL_TASK_STATES
+from .schemas.enums import TERMINAL_TASK_STATES, RunState
 from .schemas.work import StageResult, WorkItem
 
 Runner = Callable[[list[WorkItem]], list[StageResult]]
@@ -135,6 +135,7 @@ def as_streaming(runner: AnyRunner) -> StreamingRunner:
 EXIT_DONE = "nothing_dispatchable"  # nothing left to do (finished, or blocked on a human)
 EXIT_BLOCKED_ORPHANED = "blocked_on_orphaned_dispatches"  # leases held, none reclaimable
 EXIT_PAUSED = "run_paused"  # the run doc says paused (human gate / budget)
+EXIT_PARKED = "supervisor_parked"  # interactive context handoff; fresh supervisor required
 EXIT_BREAKER = "circuit_breaker"  # this loop tripped the batch breaker and paused the run
 EXIT_CAPACITY = "capacity_stalled"  # dispatch limit 0 and no sleeper to wait it out
 EXIT_MAX_TICKS = "max_ticks"  # the loop bound was hit — a real run should never see this
@@ -377,9 +378,13 @@ class Scheduler:
         traps.enter_context(log.trap_signals())
         try:
             for tick in range(1, max_ticks + 1):
-                if self.engine.store.load_run(run_id).state.value == "paused":
+                run_state = self.engine.store.load_run(run_id).state.value
+                if run_state == RunState.PAUSED.value:
                     exit_reason = EXIT_PAUSED
                     break  # human-gated: unpause first
+                if run_state == RunState.PARKED.value:
+                    exit_reason = EXIT_PARKED
+                    break
                 # Stall alerting (#55): poll the liveness sensor each pass and notify ONCE
                 # per task per stall episode. The shared alerting core owns the dedupe (the
                 # `watch` CLI feeds it the same way), so a re-ping is impossible until the

@@ -428,6 +428,14 @@ class Run(_StatusModel):
     # Cost/capacity policy may still veto it per dispatch. Additive field: pre-#73 run docs
     # load with the default, no SCHEMA_VERSION bump.
     review_workflow: bool = False
+    # Interactive supervisor context park (#259). These fields make the current park
+    # self-describing from the run doc without replaying events.jsonl. They are cleared
+    # when a fresh supervisor resumes; archived events retain the full history. Additive
+    # defaults keep pre-#259 run documents loadable without a schema-version bump.
+    supervisor_parked_at: str | None = None
+    supervisor_park_reason: str | None = None
+    supervisor_resume_command: str | None = None
+    supervisor_context: dict | None = None
     # The process currently driving this run's scheduler loop (#313), or None when no
     # driver has ever claimed it (a run driven task-by-task through the CLI supervisor
     # never claims). Written by ``Engine.claim_run_driver`` at ``Scheduler.run`` startup;

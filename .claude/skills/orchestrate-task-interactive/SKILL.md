@@ -27,8 +27,19 @@ You never call a model directly and you never run `claude -p`.
 2. `… add-task --task "$TASK"` (resolves the issue via the GitHub task source).
 
 ## The loop (repeat until the task is terminal)
-1. **next**: `WORK=$(… next --task "$TASK" --util auto)`.
+Before every model dispatch, require the Claude Code status-line sensor. Configure
+`orchestrator statusline` as this session's `statusLine` command; it retains the existing
+5h/7d display and caches Claude Code's `context_window` payload for the guard. Confirm it
+with `orchestrator supervisor-context` (unavailable/stale fails closed).
+
+1. **next**: `WORK=$(… next --task "$TASK" --util auto --guard-supervisor-context
+   --supervisor-resume-command "start a fresh Claude Code session and invoke
+   /orchestrate-task-interactive for $RUN $TASK")`.
    - If `WORK` is `null`, the task is done — stop.
+   - First check `… status`: if `run_state` is `parked`, report
+     `supervisor_parked.reason` and its `resume_command`, then stop. The engine evaluated
+     the exact rendered prompt before emitting it or taking a lease, so there is nothing
+     to replay. A fresh session runs `… resume-supervisor` once, then restarts this loop.
    - **Deterministic stages are already done for you.** `next` runs any leading
      deterministic stage (e.g. `intake` — worktree/branch/baseline) in-process on the
      `engine:none` lane and returns the first *model* WorkItem. You never create a
