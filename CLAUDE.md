@@ -60,7 +60,14 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   pick. Per-stage provenance already lives in `runs/<run>/events.jsonl` and
   `stage-costs.jsonl`. Because every claude/codex CLI carries a standing instruction to sign
   its commits, silence is not enough: `render_prompt` appends an explicit
-  `_NO_ATTRIBUTION_DIRECTIVE` to every committing stage's prompt. Work on `main`. Remote:
+  `_NO_ATTRIBUTION_DIRECTIVE` to every committing stage's prompt. A directive is not a
+  guarantee, so #322 adds the post-hoc half: after every SUCCESSFUL checkpoint stage,
+  `Engine._audit_commit_attribution` scans that stage's own commits (`<prev checkpoint or
+  base_sha>..<checkpoint sha>`, pure detection in `orchestrator/commit_attribution.py`) and
+  emits warning-grade `commit_attribution_trailer_found` per offending commit plus a
+  `commit_attribution_scanned` receipt (clean and never-looked must not read alike).
+  Report-only — it NEVER amends, because DELIVER pushes before its checkpoint lands and an
+  engine-side amend would rewrite already-remote history. Work on `main`. Remote:
   `github.com/cperler/orchestration-template` (private; push `main` after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the
   worktree, the task branch, and checkpoint tags — but NEVER the run's log dir under

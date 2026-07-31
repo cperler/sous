@@ -27,6 +27,7 @@ from adapters.execution.base import Registry, default_registry
 from adapters.project.base import ProjectConfig
 
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
+from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
@@ -159,6 +160,12 @@ def _validated_budget(value: float | None, *, field: str, run_id: str) -> float 
 # thousands of lines, but the event/issue only needs the last few for the operator to see
 # what broke. Truncation is never silent — the caller marks a trimmed tail as such.
 _TRUNK_GATE_TAIL_LINES = 40
+
+# Bound the post-commit attribution scan (#322). A stage produces a handful of commits; a
+# three-figure range means the anchor was wrong (a stale checkpoint, a rebased branch), and
+# walking it would turn a cheap audit into an unbounded git read. Truncation is never silent
+# — the scan event carries ``capped``.
+_ATTRIBUTION_SCAN_COMMIT_CAP = 50
 
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
@@ -1454,6 +1461,100 @@ class Engine:
              "detail": message},
         )
 
+    def _audit_commit_attribution(
+        self, run_id: str, task: Task, result: StageResult, *, since_sha: str | None
+    ) -> None:
+        """Post-hoc check that the commits a checkpoint stage produced carry NO model/agent
+        attribution trailer (#322) — the verification half of #317's prompt directive.
+
+        WHY it exists: the directive is the only thing standing between a harness's standing
+        "sign your commits" instruction and a trailer in permanent history, and a directive
+        is not a guarantee. It has already failed twice here — ``batch-headless-1`` and
+        ``batch-headless-2`` each merged a commit signed ``Claude Opus 4.5``, a model NEITHER
+        run dispatched — and both times the only detector was a human reading ``git log``.
+
+        WHICH commits: ``<previous checkpoint or base_sha>..<this stage's checkpoint sha>``
+        in the task's own worktree — exactly the commits this stage added, so each new commit
+        is scanned once rather than the whole branch being re-scanned every stage.
+
+        REPORT-ONLY, never amend — that is how the "rewrite already-pushed history" hazard is
+        avoided rather than merely survived. DELIVER pushes its branch BEFORE its checkpoint
+        lands, so by the time any engine-side check can see the commit it is already remote;
+        amending would fork the PR's history under the reviewer. The honest scope is a
+        warning-grade ``commit_attribution_trailer_found`` event (one per offending commit,
+        with the offending line as evidence) that a human or CI can act on.
+
+        Never-silent about ITSELF: every call emits one ``commit_attribution_scanned``
+        carrying the range, how many commits it read, how many it flagged, whether the cap
+        truncated it, and — when it could not run at all — a ``skipped`` reason. "Clean" and
+        "never looked" must not read alike in the log, which is the same defect class the
+        check exists to close.
+
+        Best-effort (ENGINE lane, no model): any git or filesystem failure degrades to a
+        recorded skip. This is an audit; it must never fail a stage that otherwise succeeded.
+        """
+        stage_ctx = {
+            "run_id": run_id, "task_id": result.task_id, "stage": result.stage.value,
+            "attempt": result.attempt,
+        }
+
+        def _scanned(**fields: object) -> None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "commit_attribution_scanned", **stage_ctx,
+                 "commits": 0, "flagged": 0, "capped": False, "range": None,
+                 "skipped": None, **fields},
+            )
+
+        worktree = task.context.get("worktree")
+        if not worktree or not Path(str(worktree)).is_dir():
+            _scanned(skipped="no_worktree")
+            return
+        head = (result.checkpoint or {}).get("sha") or "HEAD"
+        # The lower bound: this stage's own starting point. base_sha is the fallback for the
+        # FIRST checkpoint stage, which has no previous checkpoint to diff against.
+        since = since_sha or task.context.get("base_sha")
+        if not since:
+            # No anchor means no bounded range, and an unbounded ``git log <head>`` would
+            # scan the project's entire history and flag every pre-existing human commit.
+            # Refusing is the correct answer; recording the refusal is what keeps it honest.
+            _scanned(skipped="no_base")
+            return
+        rev = f"{since}..{head}"
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["git", "log", f"-n{_ATTRIBUTION_SCAN_COMMIT_CAP + 1}",  # noqa: S607
+                 "--format=%H%x1f%B%x1e", rev],
+                cwd=str(worktree), capture_output=True, text=True, timeout=30,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            _scanned(range=rev, skipped=f"git_error: {type(exc).__name__}")
+            return
+        if proc.returncode != 0:
+            # An unresolvable anchor (a checkpoint tag pruned, a rebased branch) is the
+            # common cause: report it, don't guess a wider range.
+            _scanned(range=rev, skipped="git_error: rev_unreadable")
+            return
+
+        commits: list[tuple[str, str]] = []
+        for record_text in proc.stdout.split("\x1e"):
+            entry = record_text.strip("\n")
+            if not entry.strip():
+                continue
+            sha, _, message = entry.partition("\x1f")
+            commits.append((sha.strip(), message))
+        capped = len(commits) > _ATTRIBUTION_SCAN_COMMIT_CAP
+        commits = commits[:_ATTRIBUTION_SCAN_COMMIT_CAP]
+
+        flagged = scan_commits(commits)
+        for offender in flagged:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "commit_attribution_trailer_found", "level": "warning",
+                 **stage_ctx, **offender},
+            )
+        _scanned(range=rev, commits=len(commits), flagged=len(flagged), capped=capped)
+
     def record(self, run_id: str, result: StageResult) -> dict:
         """Fold a runner's ``StageResult`` into the task and charge the cost ledger.
 
@@ -1497,6 +1598,11 @@ class Engine:
         # lease. Safe off the pre-lock doc precisely because the lease matched: the fresh-doc
         # re-validation under the lock rejects anything that is not this same dispatch.
         plan_dispatched = task.pending_plan
+        # #322: likewise read the PREVIOUS checkpoint before the commit absorbs this stage's
+        # own — it is the lower bound of "the commits THIS stage produced", so the
+        # attribution scan below flags each new commit once instead of re-flagging the whole
+        # branch at every later stage. None on the first checkpoint (falls back to base_sha).
+        prior_checkpoint_sha = (task.last_checkpoint or {}).get("sha")
 
         # Cost ledger: EVERY call recorded, single authoritative pricing (the ledger
         # and the engine share one model table; compute once, in the ledger). Wall time
@@ -1994,6 +2100,15 @@ class Engine:
         # cost-summary.md is written at run finalization and on status() — NOT on
         # every record (that re-read the whole ledger each time: O(N^2) on long runs).
         self._set_ref_state(run_id, result.task_id, task.state)
+        # #322: verify, after the fact, that the commits this stage actually produced carry
+        # no model/agent attribution trailer. #317's directive is an instruction, not a
+        # guarantee; this is the deterministic check that says so in ``events.jsonl`` when it
+        # was ignored. Runs outside the lock (it shells git) and best-effort — it never
+        # changes the transition the transaction just committed.
+        if effective.status is ResultStatus.SUCCESS and STAGE_SPECS[result.stage].checkpoint:
+            self._audit_commit_attribution(
+                run_id, task, result, since_sha=prior_checkpoint_sha
+            )
         # Mid-run progress commentary (#64): upsert the living progress comment/PR-body
         # section on the driving issue/PR at this stage boundary (opt-in, throttled,
         # best-effort). A rate-limit re-queue and a cross-provider fallthrough are NOT
