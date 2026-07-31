@@ -108,6 +108,8 @@ from .schemas.work import (
     ToolPolicy,
     WorkItem,
 )
+from .spec_refresh import diff_summary as spec_diff_summary
+from .spec_refresh import fingerprint as spec_fingerprint
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
     apply_result,
@@ -539,7 +541,16 @@ class Engine:
         ``task_registration_repaired`` event) instead of raising. A ref whose document
         exists and matches raises ``ContractError`` ("already added"), as before. See
         :meth:`registered_task_ids` for the corresponding "is this task fully registered"
-        check used by re-ingest."""
+        check used by re-ingest.
+
+        The resolved ``title``/``body`` are snapshotted onto the Task doc HERE and never
+        re-read automatically (#271) — every stage prompt for the rest of the run renders
+        from this copy, which is what makes a run reproducible and prompts byte-stable.
+        The snapshot's provenance is stamped alongside it (``spec_captured_at``,
+        ``spec_source_updated_at`` from ``spec.updated_at`` when the source reports one,
+        ``spec_fingerprint``), so a later ``refresh_spec``/``spec_staleness`` call has
+        something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
+        audited way to move the snapshot mid-run."""
         spec = self.project.task_source.resolve(task_id)
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
@@ -660,6 +671,15 @@ class Engine:
                 state=TaskState.PENDING,
                 title=spec.title,
                 body=spec.body,
+                # #271: stamp the snapshot's provenance WITH the snapshot — when it was
+                # captured, what the source called its own last-modified time, and the
+                # content fingerprint a later staleness check compares against. Written
+                # here (not lazily) so every task doc carries an origin for the copy its
+                # prompts render from. ``spec.updated_at`` is duck-typed off the TaskSpec
+                # so an external adapter pinned to an older contract still registers.
+                spec_captured_at=_now(),
+                spec_source_updated_at=getattr(spec, "updated_at", None),
+                spec_fingerprint=spec_fingerprint(spec.title, spec.body),
                 provider_tag=tag,
                 model_pin=model_pin,
                 effort_pin=effort_pin,
@@ -3535,6 +3555,177 @@ class Engine:
         self._finalize_task_terminal(run_id, task, disposition=disposition, reason=reason)
         return task
 
+    # --- task spec snapshot refresh (#271) -------------------------------------
+    def refresh_spec(
+        self, run_id: str, task_id: str, *, force: bool = False, check_only: bool = False
+    ) -> dict:
+        """Re-read ``task_id``'s spec from the task source onto its Task doc (#271).
+
+        A task's ``title``/``body`` are snapshotted ONCE, at ``add_task``, and every stage
+        prompt for the rest of the run renders from that copy. The snapshot is deliberate —
+        it is what makes a run reproducible and stage prompts byte-stable — but until now
+        there was no sanctioned way to MOVE it: editing the upstream issue mid-run was
+        silently a no-op, so the workarounds were rebuilding the run (discarding its
+        history) or hand-patching the status JSON behind the engine's back (no event, no
+        lock, no audit). This is that operation, guarded and evented.
+
+        Deliberately NOT automatic: the engine never re-resolves the spec per stage. A
+        refresh is an operator decision, recorded as one.
+
+        Returns a JSON-safe report: ``{"task_id", "changed", "applied", "check_only",
+        "leased_dispatch", "spec_captured_at", "spec_source_updated_at", "diff"}`` where
+        ``diff`` is ``spec_refresh.diff_summary``'s block.
+
+        ``check_only=True`` is a read-only dry run — resolve, diff, report, write nothing
+        (no doc mutation, no event), so an operator can see what a refresh WOULD change
+        before taking it.
+
+        Guards (all ``ContractError``, modeled on :meth:`abandon`):
+
+        - the task is terminal — no further stage will render a prompt, so a refresh would
+          only rewrite the audit trail of what actually ran;
+        - the task holds an outstanding dispatch lease (``pending_work_item_id``): that
+          stage's prompt was ALREADY rendered from the old copy, so a refresh cannot reach
+          it and would leave the in-flight stage's spec and the doc's spec disagreeing —
+          exactly the #256 failure (a SCOPE plan contradicting its own task's spec).
+          ``force=True`` overrides this one, for the operator who knows the leased stage's
+          output will be discarded anyway; the override is stamped ``leased_dispatch`` on
+          the event rather than being silent.
+
+        Whether or not anything changed, a SUCCESSFUL (non-dry-run) refresh emits
+        ``task_spec_refreshed`` — a no-op refresh is a receipt that the snapshot was
+        verified against the source, and "verified identical" must not read like "never
+        looked" (the #322 convention).
+        """
+        task = self.store.load_task(run_id, task_id)
+        if task.state in TERMINAL_TASK_STATES:
+            raise ContractError(
+                f"task {task_id} is terminal ({task.state.value}); refusing to refresh its "
+                "spec — no further stage will render a prompt from it"
+            )
+        leased = task.pending_work_item_id is not None
+        if leased and not force and not check_only:
+            raise ContractError(
+                f"task {task_id} holds an outstanding dispatch ({task.pending_work_item_id} "
+                f"on stage {task.current_stage.value if task.current_stage else '?'}) whose "
+                "prompt was already rendered from the current snapshot — a refresh cannot "
+                "reach it. Wait for the stage to land, or pass --force to refresh anyway "
+                "(the in-flight stage keeps the old spec)."
+            )
+        # Resolve OUTSIDE the task lock: this is the network/subprocess call, and the
+        # comparison below is pure. A source failure (unreachable, closed-issue refusal)
+        # propagates to the caller unchanged — a refresh that could not read the source
+        # must fail loudly, never quietly leave the snapshot in place.
+        spec = self.project.task_source.resolve(task_id)
+        diff = spec_diff_summary(task.title, task.body, spec.title, spec.body)
+        source_updated_at = getattr(spec, "updated_at", None)
+        report = {
+            "task_id": task_id,
+            "changed": diff["changed"],
+            "applied": False,
+            "check_only": check_only,
+            "leased_dispatch": leased,
+            "spec_captured_at": task.spec_captured_at,
+            "spec_source_updated_at": source_updated_at,
+            "diff": diff,
+        }
+        if check_only:
+            return report
+
+        refreshed_at = _now()
+        new_title, new_body = spec.title, spec.body
+        new_fingerprint = diff["new_fingerprint"]
+        # The diff/guards above ran on a PRE-LOCK read, and the source round-trip between
+        # them and the write is long enough for a scheduler tick to dispatch this very task.
+        # Both are therefore re-decided inside the mutator against the doc actually being
+        # overwritten, and ``applied_diff`` (not the pre-lock one) is what the event reports.
+        applied_diff = diff
+
+        def _refresh(t: Task) -> None:
+            nonlocal applied_diff
+            # Re-validate under the lock (#311's shape): raising here aborts the transaction
+            # before any event append or doc write, so a refused refresh leaves no trace but
+            # the caller's error — same outcome as the pre-check, just race-free.
+            if t.state in TERMINAL_TASK_STATES:
+                raise ContractError(
+                    f"task {task_id} became terminal ({t.state.value}) while its spec was "
+                    "being re-read; refusing to refresh"
+                )
+            if t.pending_work_item_id is not None and not force:
+                raise ContractError(
+                    f"task {task_id} was dispatched ({t.pending_work_item_id}) while its "
+                    "spec was being re-read — that prompt is already rendered from the "
+                    "current snapshot. Re-run once it lands, or pass --force."
+                )
+            applied_diff = spec_diff_summary(t.title, t.body, new_title, new_body)
+            t.title = new_title
+            t.body = new_body
+            t.spec_fingerprint = new_fingerprint
+            t.spec_source_updated_at = source_updated_at
+            # ``spec_captured_at`` moves too: it dates the copy the prompts render from,
+            # and after this write that copy is THIS read. ``spec_refreshed_at`` is what
+            # distinguishes a refreshed snapshot from an original add_task capture.
+            t.spec_captured_at = refreshed_at
+            t.spec_refreshed_at = refreshed_at
+
+        # #199 pattern: commit the doc mutation and its audit event as one unit under the
+        # per-task lock, so a refreshed snapshot can never exist without its event. The
+        # event is built from the MUTATED task (callable form) so its lease/stage fields
+        # describe the state the refresh actually landed on.
+        self.store.commit_task_events(
+            run_id, task_id, _refresh,
+            lambda t: [{
+                "ts": refreshed_at, "type": "task_spec_refreshed", "run_id": run_id,
+                "task_id": task_id, "changed": bool(applied_diff["changed"]),
+                "leased_dispatch": t.pending_work_item_id is not None,
+                "forced": bool(force and t.pending_work_item_id is not None),
+                "stage": t.current_stage.value if t.current_stage else None,
+                "source_updated_at": source_updated_at,
+                "diff": applied_diff,
+            }],
+        )
+        report["applied"] = True
+        report["changed"] = applied_diff["changed"]
+        report["diff"] = applied_diff
+        report["spec_captured_at"] = refreshed_at
+        return report
+
+    def spec_staleness(self, run_id: str, task_id: str, *, task: Task | None = None) -> dict:
+        """Has ``task_id``'s upstream spec diverged from the snapshot the run renders from?
+
+        The read-only sensor behind ``status --check-spec`` (#271). Resolves the task source
+        and compares CONTENT fingerprints — not the source's ``updated_at``, which moves for
+        edits that never touch title or body (a label, a comment) and which some sources
+        cannot report at all.
+
+        Never raises: a source that is unreachable, rate-limited, or refuses the issue (the
+        GitHub source refuses a CLOSED one) returns ``{"spec_check_error": ...}`` so one
+        unreachable task cannot take down a whole run's status dump. A task whose doc predates
+        #271 has no stored fingerprint; its verdict is computed from the stored title/body
+        directly, so it still gets a real answer rather than "unknown".
+        """
+        t = task if task is not None else self.store.load_task(run_id, task_id)
+        out: dict = {
+            "spec_captured_at": t.spec_captured_at,
+            "spec_refreshed_at": t.spec_refreshed_at,
+        }
+        try:
+            spec = self.project.task_source.resolve(task_id)
+        except Exception as exc:  # noqa: BLE001 — a probe must degrade, never break status
+            out["spec_stale"] = None
+            out["spec_check_error"] = f"{type(exc).__name__}: {exc}"
+            out["spec_source_updated_at"] = t.spec_source_updated_at
+            return out
+        # Prefer the stored fingerprint (it is what the snapshot was taken as), but fall back
+        # to hashing the stored title/body for a pre-#271 doc — same answer, one extra hash.
+        stored = t.spec_fingerprint or spec_fingerprint(t.title, t.body)
+        current = spec_fingerprint(spec.title, spec.body)
+        out["spec_stale"] = stored != current
+        out["spec_source_updated_at"] = getattr(spec, "updated_at", None)
+        if stored != current:
+            out["spec_diff"] = spec_diff_summary(t.title, t.body, spec.title, spec.body)
+        return out
+
     # --- driver claim / orphaned-lease reclaim (#313) --------------------------
     def driver_claim(
         self, run_id: str, *, alive: Callable[[int], bool] | None = None, run: Run | None = None
@@ -3734,8 +3925,18 @@ class Engine:
         return build_retrospective(run, tasks, events, stage_logs, rejections=rejections)
 
     def status(
-        self, run_id: str, *, stale_after_s: int = 1800, include_activity: bool = False
+        self,
+        run_id: str,
+        *,
+        stale_after_s: int = 1800,
+        include_activity: bool = False,
+        check_spec: bool = False,
     ) -> dict:
+        """Poll a run. ``check_spec`` (#271, opt-in like ``include_activity``) additionally
+        resolves each non-terminal task's spec from the task source and flags one whose
+        upstream has diverged from the snapshot its prompts render from. Default-off because
+        it costs one source round-trip per task — the cheap poll path stays offline and its
+        output byte-for-byte unchanged."""
         run = self.store.load_run(run_id)
         progress = run.progress()
         now = datetime.now(UTC)
@@ -3795,6 +3996,13 @@ class Engine:
                             else None
                         ),
                     }
+            # Spec staleness (#271, opt-in): does the upstream issue still say what this
+            # task's snapshotted prompt says? Divergence used to be entirely invisible —
+            # an amended issue reached nothing and nothing said so. Only for a task that
+            # still has stages to render (a terminal task's snapshot is history, not
+            # input), and never fatal: an unreachable source attaches spec_check_error.
+            if check_spec and task.state not in TERMINAL_TASK_STATES:
+                task_status["spec"] = self.spec_staleness(run_id, ref.task_id, task=task)
             tasks[ref.task_id] = task_status
         # One ledger read shared by the summary, the audit, and the cost-summary.md
         # refresh (status() used to read the ledger twice) — filtered to THIS run's rows
