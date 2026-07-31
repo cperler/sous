@@ -1172,42 +1172,6 @@ class Engine:
             tool_policy=tool_policy,
             permission_posture=permission_posture,  # #304, hash-excluded for the same reason
         )
-        # Interactive supervisor context gate (#259). The exact engine-rendered prompt is
-        # already in memory, but no prompt artifact/event/WorkItem has crossed the process
-        # boundary and no dispatch lease exists yet. That is the only safe point to park:
-        # later would leave pending_work_item_id behind if the session died. Deterministic
-        # and headless work never traverses the supervisor context, so the gate is scoped to
-        # interactive model dispatches only. Crash resume already owns a live lease and is
-        # deliberately excluded; it must be recovered by a fresh session, not converted
-        # into a pretend clean boundary.
-        if (
-            supervisor_context is not None
-            and not resume
-            and lane.execution_mode is ExecutionMode.INTERACTIVE
-        ):
-            projection = supervisor_context.projected(
-                prompt, min_remaining_pct=supervisor_min_remaining_pct
-            )
-            if projection["should_park"]:
-                in_flight = self.in_flight(run_id)
-                if in_flight:
-                    raise SupervisorParkDeferred(in_flight, projection)
-                reason = (
-                    "supervisor context sensor unavailable"
-                    if not projection["available"]
-                    else "remaining supervisor context cannot safely carry the next "
-                    "engine-rendered prompt"
-                )
-                self.park_supervisor(
-                    run_id,
-                    reason=reason,
-                    resume_command=(
-                        supervisor_resume_command
-                        or f"orchestrator --run {run_id} resume-supervisor"
-                    ),
-                    context=projection,
-                )
-                return None
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
         # ordering, so a `stage_dispatched` never names a prompt file that isn't on disk.
@@ -1216,9 +1180,7 @@ class Engine:
         # not the possibly-capped file, so cross-stage prefix-drift comparison — the whole
         # point of recording it — is unaffected by any truncation.
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        _, prompt_dropped = self.store.write_stage_prompt(
-            task_id, prompt_filename(stage.value, attempt), prompt
-        )
+        prompt_dropped: int | None = None
         prompt_file = prompt_relpath(task_id, stage.value, attempt)
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -1357,7 +1319,63 @@ class Engine:
                 )
             return evs
 
-        self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
+        def _locked_dispatch() -> bool:
+            """Guard and commit one dispatch while excluding run-level parking."""
+            nonlocal prompt_dropped
+
+            # A caller may have rendered this prompt before another caller parked the run.
+            # Re-check under the same run-level lock used by park_supervisor so no fresh
+            # lease can commit after PARKED becomes durable.
+            locked_run = self.store.load_run(run_id)
+            if not resume and locked_run.state in (RunState.PAUSED, RunState.PARKED):
+                return False
+
+            # Interactive supervisor context gate (#259). The exact engine-rendered prompt
+            # is already in memory, but no prompt artifact/event/WorkItem has crossed the
+            # process boundary and no dispatch lease exists yet. The guard and possible
+            # PARKED transition share this critical section with every fresh lease commit,
+            # making this stage-boundary decision atomic across concurrent next_work calls.
+            # Deterministic/headless dispatches do not traverse supervisor context, and a
+            # crash resume already owns a lease, so neither is context-gated.
+            if (
+                supervisor_context is not None
+                and not resume
+                and lane.execution_mode is ExecutionMode.INTERACTIVE
+            ):
+                projection = supervisor_context.projected(
+                    prompt, min_remaining_pct=supervisor_min_remaining_pct
+                )
+                if projection["should_park"]:
+                    in_flight = self.in_flight(run_id)
+                    if in_flight:
+                        raise SupervisorParkDeferred(in_flight, projection)
+                    reason = (
+                        "supervisor context sensor unavailable"
+                        if not projection["available"]
+                        else "remaining supervisor context cannot safely carry the next "
+                        "engine-rendered prompt"
+                    )
+                    self._park_supervisor_locked(
+                        run_id,
+                        reason=reason,
+                        resume_command=(
+                            supervisor_resume_command
+                            or f"orchestrator --run {run_id} resume-supervisor"
+                        ),
+                        context=projection,
+                    )
+                    return False
+
+            _, prompt_dropped = self.store.write_stage_prompt(
+                task_id, prompt_filename(stage.value, attempt), prompt
+            )
+            self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
+            return True
+
+        with self.store.with_dispatch_lock(run_id):
+            committed = _locked_dispatch()
+        if not committed:
+            return None
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
         return work
 
@@ -3150,6 +3168,23 @@ class Engine:
         has one event. Raises ``ContractError`` for missing handoff details, a paused or
         terminal run, or any outstanding dispatch lease.
         """
+        with self.store.with_dispatch_lock(run_id):
+            return self._park_supervisor_locked(
+                run_id,
+                reason=reason,
+                resume_command=resume_command,
+                context=context,
+            )
+
+    def _park_supervisor_locked(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        resume_command: str,
+        context: dict | None = None,
+    ) -> Run:
+        """Implement :meth:`park_supervisor` while the dispatch lock is held."""
         run = self.store.load_run(run_id)
         if run.state is RunState.PARKED:
             return run

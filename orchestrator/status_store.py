@@ -124,6 +124,9 @@ class StatusStore:
     def _task_path(self, run_id: str, task_id: str) -> Path:
         return self.root / f"status-{run_id}-{task_id}.json"
 
+    def _dispatch_path(self, run_id: str) -> Path:
+        return self.root / f"dispatch-{run_id}"
+
     @property
     def _events_path(self) -> Path:
         return self.root / "events.jsonl"
@@ -180,6 +183,19 @@ class StatusStore:
         (``update_run``). No path ever takes them the other way round, so there is no cycle
         to deadlock on."""
         with self.with_lock(self._task_path(run_id, task_id)):
+            yield
+
+    @contextmanager
+    def with_dispatch_lock(self, run_id: str) -> Iterator[None]:
+        """Serialize fresh lease commits with run-level dispatch-boundary parks.
+
+        This lock is outermost: dispatch commits may take a task lock and parking may
+        take the run lock while it is held, but no task/run transaction may acquire it.
+        Keeping the guard, lease scan, PARKED transition, and fresh lease commit in this
+        critical section prevents a run from becoming PARKED while a concurrent
+        ``next_work`` is between its preflight checks and task-doc commit.
+        """
+        with self.with_lock(self._dispatch_path(run_id)):
             yield
 
     def write_task_locked(self, task: Task) -> None:

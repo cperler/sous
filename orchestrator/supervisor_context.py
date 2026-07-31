@@ -112,6 +112,65 @@ def _finite_number(value: object) -> float | None:
     return number if math.isfinite(number) else None
 
 
+def _snapshot_from_cache(data: object) -> SupervisorContext | None:
+    """Validate one persisted sensor row before constructing its dataclass.
+
+    ``SupervisorContext`` is intentionally a plain dataclass, so its constructor does
+    not enforce runtime field types. Cache data crosses a process boundary and must be
+    checked explicitly: every value used by freshness or prompt projection is finite and
+    correctly typed before callers can perform arithmetic with it.
+    """
+    if not isinstance(data, dict) or data.get("available") is not True:
+        return None
+    allowed = {
+        "available",
+        "observed_at",
+        "session_id",
+        "cwd",
+        "context_window_size",
+        "used_percentage",
+        "remaining_percentage",
+        "reason",
+    }
+    if not set(data).issubset(allowed):
+        return None
+
+    observed_at = _finite_number(data.get("observed_at"))
+    size = data.get("context_window_size")
+    used = _finite_number(data.get("used_percentage"))
+    remaining = _finite_number(data.get("remaining_percentage"))
+    session_id = data.get("session_id")
+    cwd = data.get("cwd")
+    reason = data.get("reason")
+    if (
+        observed_at is None
+        or not isinstance(size, int)
+        or isinstance(size, bool)
+        or size <= 0
+        or used is None
+        or not 0 <= used <= 100
+        or remaining is None
+        or not 0 <= remaining <= 100
+        or session_id is not None
+        and not isinstance(session_id, str)
+        or not isinstance(cwd, str)
+        or not cwd
+        or reason is not None
+        and not isinstance(reason, str)
+    ):
+        return None
+    return SupervisorContext(
+        available=True,
+        observed_at=observed_at,
+        session_id=session_id,
+        cwd=cwd,
+        context_window_size=size,
+        used_percentage=used,
+        remaining_percentage=remaining,
+        reason=reason,
+    )
+
+
 def capture_statusline_context(
     payload: dict, *, cache_root: Path | None = None, now: float | None = None
 ) -> Path | None:
@@ -183,8 +242,10 @@ def read_supervisor_context(
     target = _cache_root(cache_root) / f"{_cwd_key(cwd)}.json"
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
-        snapshot = SupervisorContext(**data)
     except (OSError, ValueError, TypeError):
+        return SupervisorContext(available=False, reason="supervisor context sensor unavailable")
+    snapshot = _snapshot_from_cache(data)
+    if snapshot is None:
         return SupervisorContext(available=False, reason="supervisor context sensor unavailable")
     current = now if now is not None else time.time()
     if snapshot.observed_at is None or current - snapshot.observed_at > max_age_s:

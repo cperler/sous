@@ -5,6 +5,8 @@ from __future__ import annotations
 import io
 import json
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -69,6 +71,46 @@ def test_statusline_capture_round_trips_and_stale_fails_closed(tmp_path) -> None
     )
     assert stale.available is False
     assert stale.reason == "supervisor context sensor is stale"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("available", "yes"),
+        ("observed_at", "recent"),
+        ("context_window_size", True),
+        ("context_window_size", 0),
+        ("used_percentage", []),
+        ("remaining_percentage", float("nan")),
+        ("session_id", 123),
+        ("cwd", None),
+    ],
+)
+def test_malformed_valid_json_cache_fails_closed(tmp_path, field, value) -> None:
+    project = tmp_path / "project"
+    path = capture_statusline_context(
+        {
+            "session_id": "s1",
+            "cwd": str(project),
+            "context_window": {
+                "context_window_size": 200_000,
+                "remaining_percentage": 50,
+            },
+        },
+        cache_root=tmp_path / "cache",
+        now=100.0,
+    )
+    assert path is not None
+    row = json.loads(path.read_text())
+    row[field] = value
+    path.write_text(json.dumps(row))
+
+    snapshot = read_supervisor_context(
+        project, cache_root=tmp_path / "cache", now=110.0
+    )
+    assert snapshot.available is False
+    assert snapshot.reason == "supervisor context sensor unavailable"
+    assert snapshot.projected("next prompt", min_remaining_pct=20)["should_park"] is True
 
 
 def test_statusline_cli_captures_context_for_sensor_command(
@@ -226,3 +268,80 @@ def test_batch_low_context_defers_park_until_existing_lease_drains(tmp_path) -> 
     engine.record("r1", make_result(live))
     assert engine.next_work("r1", "t2", supervisor_context=_context(remaining=1)) is None
     assert engine.store.load_run("r1").state is RunState.PARKED
+
+
+def test_concurrent_fresh_dispatch_commits_before_low_context_can_park(
+    tmp_path, monkeypatch
+) -> None:
+    """The park decision and every fresh lease commit share one run-level lock."""
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    for task in ("t1", "t2"):
+        engine.add_task("r1", task)
+        _through_intake(engine, "r1", task)
+
+    commit_entered = threading.Event()
+    release_commit = threading.Event()
+    original_commit = engine.store.commit_task_events
+
+    def delayed_commit(*args, **kwargs):
+        commit_entered.set()
+        assert release_commit.wait(timeout=5)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(engine.store, "commit_task_events", delayed_commit)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        dispatch = pool.submit(
+            engine.next_work, "r1", "t1", supervisor_context=_context(remaining=90)
+        )
+        assert commit_entered.wait(timeout=5)
+        park = pool.submit(
+            engine.next_work, "r1", "t2", supervisor_context=_context(remaining=1)
+        )
+        release_commit.set()
+        live = dispatch.result(timeout=5)
+        assert live is not None
+        with pytest.raises(SupervisorParkDeferred) as caught:
+            park.result(timeout=5)
+
+    assert caught.value.in_flight == ["t1"]
+    assert engine.store.load_run("r1").state is RunState.RUNNING
+    assert engine.store.load_task("r1", "t1").pending_work_item_id == live.id
+    assert engine.store.load_task("r1", "t2").pending_work_item_id is None
+
+
+def test_concurrent_dispatch_refuses_commit_after_low_context_parks(
+    tmp_path, monkeypatch
+) -> None:
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    for task in ("t1", "t2"):
+        engine.add_task("r1", task)
+        _through_intake(engine, "r1", task)
+
+    park_entered = threading.Event()
+    release_park = threading.Event()
+    original_park = engine._park_supervisor_locked
+
+    def delayed_park(*args, **kwargs):
+        park_entered.set()
+        assert release_park.wait(timeout=5)
+        return original_park(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_park_supervisor_locked", delayed_park)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        park = pool.submit(
+            engine.next_work, "r1", "t1", supervisor_context=_context(remaining=1)
+        )
+        assert park_entered.wait(timeout=5)
+        dispatch = pool.submit(
+            engine.next_work, "r1", "t2", supervisor_context=_context(remaining=90)
+        )
+        release_park.set()
+        assert park.result(timeout=5) is None
+        assert dispatch.result(timeout=5) is None
+
+    assert engine.store.load_run("r1").state is RunState.PARKED
+    for task in ("t1", "t2"):
+        assert engine.store.load_task("r1", task).pending_work_item_id is None
+        assert not list((tmp_path / "stages" / task).glob("scope-*.prompt.txt"))
