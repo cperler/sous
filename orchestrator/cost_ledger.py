@@ -509,6 +509,11 @@ class CostLedger:
 
         * ``invocations`` — number of ledger rows in the group
         * ``cost_usd`` — summed (authoritative) spend
+        * ``unmetered`` — rows in the group whose usage was never recorded (#319/#331).
+          Those rows contribute ``cost_usd: 0.0``, so a group with ``unmetered > 0`` has a
+          ``cost_usd`` that is a FLOOR, not a measurement; ``unmetered == invocations``
+          means the group's spend is entirely unknown. Renderers must say so rather than
+          print a bare, confident dollar figure.
         * ``total_duration_s`` / ``avg_duration_s`` — wall time summed and averaged
         * ``retries`` / ``retry_rate`` — rows that are re-dispatches (``attempt > 0``)
         * ``failures`` / ``failure_rate`` — rows whose status is a real failure, using the
@@ -555,6 +560,7 @@ class CostLedger:
                     "model": model,
                     "invocations": 0,
                     "cost_usd": 0.0,
+                    "unmetered": 0,
                     "total_duration_s": 0.0,
                     "retries": 0,
                     "failures": 0,
@@ -562,6 +568,11 @@ class CostLedger:
             )
             g["invocations"] += 1
             g["cost_usd"] = round(g["cost_usd"] + (row.get("cost_usd") or 0.0), 6)
+            # ``is False`` (not falsy) so a row predating the flag counts as metered, matching
+            # summary()/analysis(). An unmetered row still adds its 0.0 above, which is exactly
+            # why the count has to travel with the group (#331).
+            if row.get("metered") is False:
+                g["unmetered"] += 1
             g["total_duration_s"] += row.get("duration_s") or 0.0
             if (row.get("attempt") or 0) > 0:
                 g["retries"] += 1

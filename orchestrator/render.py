@@ -40,6 +40,24 @@ def _cost_cell(rec: StageRecord) -> str:
     return f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
 
 
+def aggregate_cost_cell(cost: float | None, unmetered: int, invocations: int) -> str:
+    """Cost cell for an AGGREGATE of ledger rows (a by-effort group, a whole run) — the
+    table-cell sibling of ``render_cost_summary``'s prose caveat (#319/#331).
+
+    An unmetered row contributes ``cost_usd: 0.0`` to whatever bucket it lands in, so a bare
+    ``$0.0000`` from a bucket that is all-unmetered reads as "free" and a bare ``$1.23`` from
+    a partly-unmetered bucket reads as exact when it is only a floor. Three cases:
+    everything metered → the plain figure; some unmetered → ``≥$X`` (a floor); all unmetered
+    → ``n/a (unmetered)`` (unknown, NOT $0)."""
+    if not isinstance(cost, (int, float)):
+        return "—"
+    if unmetered and invocations and unmetered >= invocations:
+        return "n/a (unmetered)"
+    if unmetered:
+        return f"≥${cost:.4f}"
+    return f"${cost:.4f}"
+
+
 def _effort_cell(rec: StageRecord) -> str:
     """Effort column for a stage row (#159): the reasoning effort the stage ran at, the
     sibling of ``model``. Shows high vs medium after any capacity downshift; ``—`` on
@@ -192,7 +210,13 @@ def render_by_effort(run_id: str, agg: list[dict]) -> str:
 
     One row per (stage, effort, model) group with calls, cost, avg duration, retry-rate and
     failure-rate — the empirical evidence for validating or revising the per-stage effort
-    defaults from #96. Groups arrive pre-ordered (stage, then effort, then model)."""
+    defaults from #96. Groups arrive pre-ordered (stage, then effort, then model).
+
+    Cost cells carry the same honesty rule as every other cost artifact (#319/#331): a group
+    holding unmetered rows sums their ``0.0`` into its total, so it renders as ``≥$X`` (a
+    floor) or ``n/a (unmetered)`` when nothing in it was metered. Tuning effort defaults off
+    a silently-understated dollar figure would draw exactly the wrong conclusion — a stage
+    whose expensive attempts died before reporting usage would look cheap."""
     lines = [
         f"# Cost by effort — {run_id}",
         "",
@@ -202,13 +226,28 @@ def render_by_effort(run_id: str, agg: list[dict]) -> str:
         "| Stage | Effort | Model | Calls | Cost (USD) | Avg dur (s) | Retry rate | Failure rate |",
         "|---|---|---|---:|---:|---:|---:|---:|",
     ]
+    unmetered_total = 0
     for g in agg:
+        unmetered = int(g.get("unmetered") or 0)
+        unmetered_total += unmetered
+        cost_cell = aggregate_cost_cell(
+            g.get("cost_usd") or 0.0, unmetered, int(g.get("invocations") or 0)
+        )
         lines.append(
             f"| `{g.get('stage', 'unknown')}` | `{g.get('effort', '(default)')}` | "
             f"`{g.get('model', 'unknown')}` | {g.get('invocations', 0)} | "
-            f"${(g.get('cost_usd') or 0.0):.4f} | {(g.get('avg_duration_s') or 0.0):.1f} | "
+            f"{cost_cell} | {(g.get('avg_duration_s') or 0.0):.1f} | "
             f"{(g.get('retry_rate') or 0.0) * 100:.0f}% | {(g.get('failure_rate') or 0.0) * 100:.0f}% |"
         )
+    if unmetered_total:
+        lines += [
+            "",
+            f"_⚠️ {unmetered_total} call(s) in this table are unmetered — no per-call usage "
+            f"was recorded for them (an interactive-lane run billed to the session's "
+            f"subscription, or a call that died before reporting usage). They contribute "
+            f"$0 to their group, so a `≥$` cost is a FLOOR and `n/a (unmetered)` means "
+            f"unknown, not free._",
+        ]
     lines += ["", "_Priced from the single model table; raw rows in `stage-costs.jsonl`._", ""]
     return "\n".join(lines)
 
