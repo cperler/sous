@@ -38,8 +38,9 @@ evidence-out still files them for a human and the false-negative loop stays clos
 runner had to cap or give up on — used to be persisted and never read. ``synthesize`` now
 also returns ``panel_summary``: a small, deterministic dict computed inside the SAME lens
 walk (no second pass over ``sub_results`` — the module's anti-drift rule), carrying the
-cross-lens agreement the dedupe ``continue`` would otherwise discard. It is RETURNED, not
-written: the engine call site persists it next to ``sub_results`` and emits one
+cross-lens agreement the dedupe ``continue`` would otherwise discard and a ``found_by``
+sidecar mapping each finding fingerprint to its finder lenses. It is RETURNED, not written:
+the engine call site persists it next to ``sub_results`` and emits one
 ``review_panel_notice`` event per normalized runner notice, so a capped or inconclusive
 review is visible from ``status``/the event stream instead of only inside a stage log.
 
@@ -318,6 +319,8 @@ def _panel_summary(
       the issue asked for: a lens whose findings are all shared earned nothing on its own.
       Only lenses that raised a finding the fold KEPT appear (a silent or all-malformed
       lens has nothing to attribute) — ``finders`` below is where it is still counted.
+    * ``found_by`` — a sidecar keyed by fingerprint whose value is the sorted list of
+      lenses that independently raised it. Attribution stays out of canonical findings.
     * ``findings`` — distinct fingerprints across the panel; ``agreed`` — how many of those
       **>= 2 lenses independently raised** (what the dedupe ``continue`` used to discard).
     * ``finders`` — derived from the ``findings_by_lens`` KEYS, and ``verifiers`` from
@@ -335,15 +338,18 @@ def _panel_summary(
     * ``notices`` — the normalized runner notices verbatim; the engine emits one
       ``review_panel_notice`` per entry (#268).
     """
-    fingerprint_lenses: dict[str, int] = {}
-    for fingerprints in by_lens_fingerprints.values():
-        for fingerprint in fingerprints:
-            fingerprint_lenses[fingerprint] = fingerprint_lenses.get(fingerprint, 0) + 1
+    found_by: dict[str, list[str]] = {}
+    for lens in sorted(by_lens_fingerprints):
+        for fingerprint in sorted(by_lens_fingerprints[lens]):
+            found_by.setdefault(fingerprint, []).append(lens)
+    # Fingerprints originate in sets, so explicitly sort the map as well as its lens lists.
+    # This keeps serialized stage logs independent of input and hash iteration order.
+    found_by = {fingerprint: found_by[fingerprint] for fingerprint in sorted(found_by)}
 
     lenses: dict[str, dict[str, int]] = {}
     for lens in sorted(by_lens_fingerprints):
         fingerprints = by_lens_fingerprints[lens]
-        shared = sum(1 for fp in fingerprints if fingerprint_lenses[fp] > 1)
+        shared = sum(1 for fp in fingerprints if len(found_by[fp]) > 1)
         lenses[lens] = {
             "total": len(fingerprints),
             "unique": len(fingerprints) - shared,
@@ -366,9 +372,10 @@ def _panel_summary(
             cap_dropped += dropped
     return {
         "lenses": lenses,
+        "found_by": found_by,
         "finders": len(by_lens),
-        "findings": len(fingerprint_lenses),
-        "agreed": sum(1 for n in fingerprint_lenses.values() if n > 1),
+        "findings": len(found_by),
+        "agreed": sum(1 for lenses in found_by.values() if len(lenses) > 1),
         "verifiers": len(verdicts) + inconclusive,
         "verdicts": tally,
         "inconclusive": inconclusive,

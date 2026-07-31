@@ -278,6 +278,7 @@ inside the EXISTING lens walk:
 | key | meaning |
 |---|---|
 | `lenses` | per lens: `total` fingerprints raised, `unique` to it, `shared` with another lens — whether that lens earned its cost |
+| `found_by` | sidecar from each fingerprint to its sorted finder-lens list; canonical `review.json` findings remain unchanged |
 | `findings` / `agreed` | distinct fingerprints; how many **>= 2 lenses** independently raised |
 | `finders` / `verifiers` | derived: `len(findings_by_lens)` and `len(verdicts) + inconclusive` (`sub_calls` are not visible to the fold) |
 | `verdicts` | `{confirmed, refuted}` over the INDEXED verdicts, i.e. after first-wins dedupe and the fail-toward-scrutiny coercions |
