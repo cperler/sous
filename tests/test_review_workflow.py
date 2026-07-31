@@ -611,6 +611,12 @@ def test_panel_summary_counts_per_lens_unique_shared_and_agreement() -> None:
         "find:code": {"total": 3, "unique": 2, "shared": 1},
         "find:spec": {"total": 2, "unique": 1, "shared": 1},
     }
+    assert summary["found_by"] == {
+        issue_fingerprint(CRITICAL): ["find:code", "find:spec"],
+        issue_fingerprint(IMPORTANT): ["find:code"],
+        issue_fingerprint(ONLY_CODE): ["find:code"],
+        issue_fingerprint(SUGGESTION): ["find:spec"],
+    }
     assert summary["findings"] == 4  # distinct fingerprints
     assert summary["agreed"] == 1  # only CRITICAL was raised by two lenses
     assert summary["finders"] == 2
@@ -671,7 +677,7 @@ def test_panel_summary_is_byte_stable_and_independent_of_lens_dict_order() -> No
     lenses = {
         "find:tests": {"findings": [dict(CRITICAL)], "tests_meaningful": True},
         "find:code": {"findings": [CRITICAL, ONLY_CODE]},
-        "find:design": {"findings": [ONLY_DESIGN]},
+        "find:design": {"findings": [ONLY_DESIGN, dict(IMPORTANT)]},
         "find:spec": {"findings": [IMPORTANT]},
     }
     first = synthesize(_panel(lenses)).panel_summary
@@ -683,6 +689,9 @@ def test_panel_summary_is_byte_stable_and_independent_of_lens_dict_order() -> No
     # ever switched to preserving walk order instead, this would need to become
     # ["find:code", "find:spec", "find:design", "find:tests"] — and say so explicitly.
     assert list(first["lenses"]) == ["find:code", "find:design", "find:spec", "find:tests"]
+    assert list(first["found_by"]) == sorted(first["found_by"])
+    # Attribution lists are sorted by lens name too, rather than inheriting the fold order.
+    assert first["found_by"][issue_fingerprint(IMPORTANT)] == ["find:design", "find:spec"]
     assert sorted(LENS_ORDER) != list(LENS_ORDER)  # the divergence this test exists to catch
 
 
@@ -695,6 +704,11 @@ def test_panel_summary_never_leaks_into_review_json() -> None:
     ))
     assert set(folded.review) == {"approved", "issues", "non_blocking", "tests_meaningful"}
     assert folded.review["issues"] == [CRITICAL]
+    assert folded.review["issues"][0] is CRITICAL
+    assert "found_by" not in folded.review["issues"][0]
+    assert folded.panel_summary["found_by"] == {
+        issue_fingerprint(CRITICAL): ["find:code"]
+    }
     assert folded.panel_summary["cap_dropped"] == 2
 
 
