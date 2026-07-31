@@ -31,6 +31,14 @@ def test_every_stage_ref_has_a_valid_schema() -> None:
     assert load_stage_schema("does-not-exist") is None
 
 
+def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
+    """Prompt and schema agree: omitting disposition is note-only, never a file default."""
+    prompt = STAGE_SPECS[Stage.REVIEW].template
+    assert "omitting `disposition` means noted, not filed" in prompt
+    assert "Filing requires an explicit `file`" in prompt
+    assert "an explicit `file` files it as an enhancement issue" in prompt
+
+
 def test_local_override_wins(tmp_path) -> None:
     (tmp_path / "test.json").write_text(json.dumps({"type": "object", "required": ["custom"]}))
     overridden = resolve_stage_schema("test", local_dir=tmp_path)
