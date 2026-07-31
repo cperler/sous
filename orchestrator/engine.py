@@ -3193,42 +3193,73 @@ class Engine:
             return run
         if not reason.strip() or not resume_command.strip():
             raise ContractError("supervisor park requires a reason and resume command")
-        if run.state is RunState.PAUSED:
-            raise ContractError(
-                f"cannot supervisor-park paused run {run_id}; resolve its pause first"
-            )
-        if run.state in TERMINAL_RUN_STATES:
-            raise ContractError(
-                f"cannot park terminal run {run_id} (state {run.state.value})"
-            )
+
+        def _ensure_parkable(r: Run) -> None:
+            if r.state is RunState.PAUSED:
+                raise ContractError(
+                    f"cannot supervisor-park paused run {run_id}; resolve its pause first"
+                )
+            if r.state in TERMINAL_RUN_STATES:
+                raise ContractError(
+                    f"cannot park terminal run {run_id} (state {r.state.value})"
+                )
+
+        _ensure_parkable(run)
         in_flight = self.in_flight(run_id)
         if in_flight:
             raise ContractError(
                 "supervisor park requires a stage boundary with no dispatch leases; "
                 f"still in flight: {in_flight}"
             )
-        parked_at = _now()
+
+        park_event: dict | None = None
+        append_park_event = True
 
         def _park(r: Run) -> None:
+            nonlocal append_park_event, park_event
+            # A record/finalize, pause, or retire transition does not take the dispatch
+            # lock. Revalidate the freshly locked run document so none of those can be
+            # overwritten by the older snapshot validated above.
+            _ensure_parkable(r)
+            transition_key = f"supervisor_parked:{r.updated_at}"
+            prior = next(
+                (
+                    event
+                    for event in reversed(self.store.read_events(run_id))
+                    if event.get("type") == "supervisor_parked"
+                    and event.get("transition_key") == transition_key
+                ),
+                None,
+            )
+            if prior is None:
+                parked_at = _now()
+                park_event = {
+                    "ts": parked_at,
+                    "type": "supervisor_parked",
+                    "run_id": run_id,
+                    "reason": reason,
+                    "resume_command": resume_command,
+                    "context": context,
+                    "transition_key": transition_key,
+                }
+            else:
+                # The event-first transaction was interrupted before its run-doc commit.
+                # Reuse that episode's evidence and finish the document without appending
+                # a duplicate event.
+                append_park_event = False
+                park_event = prior
+            assert park_event is not None
             r.state = RunState.PARKED
-            r.supervisor_parked_at = parked_at
-            r.supervisor_park_reason = reason
-            r.supervisor_resume_command = resume_command
-            r.supervisor_context = context
+            r.supervisor_parked_at = park_event["ts"]
+            r.supervisor_park_reason = park_event["reason"]
+            r.supervisor_resume_command = park_event["resume_command"]
+            r.supervisor_context = park_event.get("context")
 
-        self.store.update_run(run_id, _park)
-        self.store.append_event(
+        return self.store.commit_run_events(
             run_id,
-            {
-                "ts": parked_at,
-                "type": "supervisor_parked",
-                "run_id": run_id,
-                "reason": reason,
-                "resume_command": resume_command,
-                "context": context,
-            },
+            _park,
+            lambda _run: [park_event] if append_park_event and park_event is not None else [],
         )
-        return self.store.load_run(run_id)
 
     def resume_supervisor(
         self, run_id: str, *, supervisor_session_id: str | None = None
@@ -3241,43 +3272,64 @@ class Engine:
         immediately refilling the run. Raises ``ContractError`` unless the run is parked
         and that freshness check succeeds.
         """
-        run = self.store.load_run(run_id)
-        if run.state is not RunState.PARKED:
-            raise ContractError(f"run {run_id} is not parked (state {run.state.value})")
-        previous_session = (
-            run.supervisor_context.get("session_id")
-            if isinstance(run.supervisor_context, dict)
-            else None
-        )
-        if previous_session and not supervisor_session_id:
-            raise ContractError(
-                "resuming this parked run requires a fresh supervisor context snapshot"
-            )
-        if previous_session and supervisor_session_id == previous_session:
-            raise ContractError(
-                f"run {run_id} was parked by supervisor session {previous_session}; "
-                "resume it from a fresh Claude Code session"
-            )
+        resume_event: dict | None = None
+        append_resume_event = True
 
         def _resume(r: Run) -> None:
+            nonlocal append_resume_event, resume_event
+            if r.state is not RunState.PARKED:
+                raise ContractError(f"run {run_id} is not parked (state {r.state.value})")
+            previous_session = (
+                r.supervisor_context.get("session_id")
+                if isinstance(r.supervisor_context, dict)
+                else None
+            )
+            if previous_session and not supervisor_session_id:
+                raise ContractError(
+                    "resuming this parked run requires a fresh supervisor context snapshot"
+                )
+            if previous_session and supervisor_session_id == previous_session:
+                raise ContractError(
+                    f"run {run_id} was parked by supervisor session {previous_session}; "
+                    "resume it from a fresh Claude Code session"
+                )
+            transition_key = f"supervisor_resumed:{r.updated_at}"
+            prior = next(
+                (
+                    event
+                    for event in reversed(self.store.read_events(run_id))
+                    if event.get("type") == "supervisor_resumed"
+                    and event.get("transition_key") == transition_key
+                ),
+                None,
+            )
+            if prior is None:
+                resume_event = {
+                    "ts": _now(),
+                    "type": "supervisor_resumed",
+                    "run_id": run_id,
+                    "previous_session_id": previous_session,
+                    "session_id": supervisor_session_id,
+                    "transition_key": transition_key,
+                }
+            else:
+                append_resume_event = False
+                resume_event = prior
             r.state = RunState.RUNNING
             r.supervisor_parked_at = None
             r.supervisor_park_reason = None
             r.supervisor_resume_command = None
             r.supervisor_context = None
 
-        self.store.update_run(run_id, _resume)
-        self.store.append_event(
+        return self.store.commit_run_events(
             run_id,
-            {
-                "ts": _now(),
-                "type": "supervisor_resumed",
-                "run_id": run_id,
-                "previous_session_id": previous_session,
-                "session_id": supervisor_session_id,
-            },
+            _resume,
+            lambda _run: (
+                [resume_event]
+                if append_resume_event and resume_event is not None
+                else []
+            ),
         )
-        return self.store.load_run(run_id)
 
     # --- per-run ledger attribution (#281) -------------------------------------
     def run_rows(self, run_id: str) -> list[dict]:

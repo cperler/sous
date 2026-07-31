@@ -330,6 +330,36 @@ class StatusStore:
             self._write_run(run)  # already under the lock
             return run
 
+    def commit_run_events(
+        self,
+        run_id: str,
+        mutator: Callable[[Run], None],
+        events: list[dict] | Callable[[Run], list[dict]] | None = None,
+    ) -> Run:
+        """Transactionally mutate a run and append its bookkeeping events.
+
+        This is the run-document counterpart to :meth:`commit_task_events`: the
+        events are appended first and the run document is written last as the durable
+        commit point. Consequently, a persisted run transition always has its audit
+        evidence already on disk. ``events`` may be computed from the freshly mutated
+        run when transition details are only known inside the locked mutation.
+
+        A crash after an event append but before the run write can leave the safe
+        inverse (event present, document unchanged). Callers whose transition must be
+        idempotent should give the event a stable transition key and suppress a matching
+        append when retrying against that unchanged document.
+        """
+        path = self._run_path(run_id)
+        with self.with_lock(path):
+            run = self.load_run(run_id)
+            mutator(run)
+            run.updated_at = _utc_now_iso()
+            evs = events(run) if callable(events) else (events or [])
+            for ev in evs:
+                self.append_event(run_id, ev)
+            self._write_run(run)  # durable commit point — LAST, already under lock
+            return run
+
     # ---- task API -------------------------------------------------------
 
     def _write_task(self, task: Task) -> None:

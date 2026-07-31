@@ -345,3 +345,133 @@ def test_concurrent_dispatch_refuses_commit_after_low_context_parks(
     for task in ("t1", "t2"):
         assert engine.store.load_task("r1", task).pending_work_item_id is None
         assert not list((tmp_path / "stages" / task).glob("scope-*.prompt.txt"))
+
+
+def test_concurrent_record_finalization_wins_over_stale_park_snapshot(
+    tmp_path, monkeypatch
+) -> None:
+    """A final record may finish between the lease scan and park run-doc commit."""
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    engine.add_task("r1", "t1", pipeline=[Stage.SCOPE])
+    work = engine.next_work(
+        "r1", "t1", supervisor_context=_context(remaining=90)
+    )
+    assert work is not None
+
+    record_at_finalize = threading.Event()
+    release_record = threading.Event()
+    original_finalize = engine._maybe_finalize_run
+
+    def delayed_finalize(run_id):
+        record_at_finalize.set()
+        assert release_record.wait(timeout=5)
+        return original_finalize(run_id)
+
+    park_at_commit = threading.Event()
+    release_park = threading.Event()
+    original_commit = engine.store.commit_run_events
+
+    def delayed_park_commit(*args, **kwargs):
+        park_at_commit.set()
+        assert release_park.wait(timeout=5)
+        return original_commit(*args, **kwargs)
+
+    monkeypatch.setattr(engine, "_maybe_finalize_run", delayed_finalize)
+    monkeypatch.setattr(engine.store, "commit_run_events", delayed_park_commit)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        record = pool.submit(engine.record, "r1", make_result(work))
+        assert record_at_finalize.wait(timeout=5)
+        assert engine.store.load_task("r1", "t1").pending_work_item_id is None
+
+        park = pool.submit(
+            engine.park_supervisor,
+            "r1",
+            reason="context exhausted",
+            resume_command="resume r1",
+        )
+        assert park_at_commit.wait(timeout=5)
+        release_record.set()
+        record.result(timeout=5)
+        assert engine.store.load_run("r1").state is RunState.COMPLETED
+
+        release_park.set()
+        with pytest.raises(ContractError, match="cannot park terminal run"):
+            park.result(timeout=5)
+
+    assert engine.store.load_run("r1").state is RunState.COMPLETED
+    assert not [
+        event
+        for event in engine.store.read_events("r1")
+        if event["type"] == "supervisor_parked"
+    ]
+
+
+def test_park_and_resume_recover_event_first_crash_without_duplicate(
+    tmp_path, monkeypatch
+) -> None:
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    engine.add_task("r1", "t1")
+
+    original_write = engine.store._write_run
+    crash_state: RunState | None = RunState.PARKED
+
+    def crash_once(run):
+        nonlocal crash_state
+        if run.state is crash_state:
+            crash_state = None
+            raise RuntimeError("simulated crash before run commit")
+        return original_write(run)
+
+    monkeypatch.setattr(engine.store, "_write_run", crash_once)
+    context = {"session_id": "old-session", "remaining_percentage": 1}
+
+    with pytest.raises(RuntimeError, match="before run commit"):
+        engine.park_supervisor(
+            "r1",
+            reason="context exhausted",
+            resume_command="resume r1",
+            context=context,
+        )
+    assert engine.store.load_run("r1").state is RunState.RUNNING
+    parked_events = [
+        event
+        for event in engine.store.read_events("r1")
+        if event["type"] == "supervisor_parked"
+    ]
+    assert len(parked_events) == 1
+
+    parked = engine.park_supervisor(
+        "r1",
+        reason="context exhausted",
+        resume_command="resume r1",
+        context=context,
+    )
+    assert parked.state is RunState.PARKED
+    assert parked.supervisor_parked_at == parked_events[0]["ts"]
+    assert len([
+        event
+        for event in engine.store.read_events("r1")
+        if event["type"] == "supervisor_parked"
+    ]) == 1
+
+    crash_state = RunState.RUNNING
+    with pytest.raises(RuntimeError, match="before run commit"):
+        engine.resume_supervisor("r1", supervisor_session_id="new-session")
+    assert engine.store.load_run("r1").state is RunState.PARKED
+    resumed_events = [
+        event
+        for event in engine.store.read_events("r1")
+        if event["type"] == "supervisor_resumed"
+    ]
+    assert len(resumed_events) == 1
+
+    resumed = engine.resume_supervisor("r1", supervisor_session_id="new-session")
+    assert resumed.state is RunState.RUNNING
+    assert len([
+        event
+        for event in engine.store.read_events("r1")
+        if event["type"] == "supervisor_resumed"
+    ]) == 1
