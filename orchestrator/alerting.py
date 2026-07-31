@@ -92,6 +92,21 @@ def _fmt_activity(act: dict | None) -> str:
     return f"{tool}: {detail}" if detail else str(tool)
 
 
+def _driver_down_reason(driver: dict) -> str:
+    """Why a still-running driver counts as down (#334) — the operator-facing half of
+    ``driver.alive``. Prefers the recorded exit (the driver said so itself) over an inferred
+    stale heartbeat, and degrades to a generic phrase if the block carries neither."""
+    if driver.get("exited"):
+        reason = driver.get("exit_reason")
+        return f"it recorded an exit ({reason})" if reason else "it recorded an exit"
+    age = driver.get("heartbeat_age_s")
+    if driver.get("heartbeat_stale") and isinstance(age, (int, float)):
+        return f"its last heartbeat was {age}s ago"
+    if driver.get("heartbeat_stale"):
+        return "its heartbeat has gone stale"
+    return "it is no longer reporting alive"
+
+
 def activity_lines(status: dict, *, stall_after_s: int = 300) -> list[str]:
     """Human activity lines for a status snapshot taken with ``include_activity=True`` (#66):
     one line per RUNNING task that has a live provider stream, describing what the model is
@@ -104,10 +119,21 @@ def activity_lines(status: dict, *, stall_after_s: int = 300) -> list[str]:
     all (re-invoke the driver). When the snapshot's ``driver`` block says the claiming
     process is gone, the line says NO LIVE DRIVER instead, so the operator is pointed at the
     real cause rather than at the model. Pure and sleep-free, so it is unit-testable off a
-    synthetic snapshot."""
+    synthetic snapshot.
+
+    #334: keyed off #323's merged ``driver.alive`` (pid claim + heartbeat freshness + a
+    recorded exit) rather than the narrow #313 ``state == "dead"`` pid probe, so a driver
+    whose process is technically still running but has STOPPED LOOPING is caught too — the
+    state a pid probe cannot see. The two down-cases get distinct wording because the fix
+    differs: a gone process is re-invoked directly, a wedged one must be killed first.
+    ``alive`` is tri-state and fails safe (``None`` = cannot answer, e.g. a foreign-host
+    claim), so only an explicit ``False`` raises the alarm."""
     tasks: dict[str, dict] = status.get("tasks", {}) or {}
     driver: dict = status.get("driver") or {}
-    driver_dead = driver.get("state") == "dead"
+    driver_process_gone = driver.get("state") == "dead"
+    # Strict superset of the #313 condition: an explicit alive=False OR the old pid verdict,
+    # so a pre-#323 snapshot (no ``alive`` key at all) keeps its NO LIVE DRIVER alert.
+    driver_down = driver.get("alive") is False or driver_process_gone
     lines: list[str] = []
     for tid in sorted(tasks):
         ts = tasks[tid]
@@ -118,12 +144,21 @@ def activity_lines(status: dict, *, stall_after_s: int = 300) -> list[str]:
         since = act.get("seconds_since_event")
         desc = _fmt_activity(act.get("current_activity"))
         seen = act.get("events_seen")
-        if isinstance(since, (int, float)) and since >= stall_after_s and driver_dead:
-            lines.append(
-                f"[{tid}] NO LIVE DRIVER — the driver process (pid {driver.get('pid')}) "
-                f"is gone, so nothing is running this stage; no stream output for {since}s "
-                f"(stage {stage}, {desc}). Re-invoke the driver to resume."
-            )
+        if isinstance(since, (int, float)) and since >= stall_after_s and driver_down:
+            if driver_process_gone:
+                lines.append(
+                    f"[{tid}] NO LIVE DRIVER — the driver process (pid {driver.get('pid')}) "
+                    f"is gone, so nothing is running this stage; no stream output for {since}s "
+                    f"(stage {stage}, {desc}). Re-invoke the driver to resume."
+                )
+            else:
+                why = _driver_down_reason(driver)
+                lines.append(
+                    f"[{tid}] DRIVER NOT LOOPING — the driver process (pid "
+                    f"{driver.get('pid')}) is still running but {why}, so nothing is "
+                    f"advancing this stage; no stream output for {since}s (stage {stage}, "
+                    f"{desc}). Kill its process group, then re-invoke the driver to resume."
+                )
         elif isinstance(since, (int, float)) and since >= stall_after_s:
             lines.append(
                 f"[{tid}] STREAM STALLED — no stream output for {since}s "

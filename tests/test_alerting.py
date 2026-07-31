@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from orchestrator.alerting import (
     NOTIFY_TASK_STALE,
+    activity_lines,
     stale_notifications,
     watch,
 )
@@ -258,3 +259,61 @@ def test_watch_polls_dedupes_and_exits_on_terminal() -> None:
     assert len(stale_notes) == 1  # once, despite two stale polls
     assert len(lines) == 1  # the human line printed once too
     assert slept == [5, 5]  # slept between the three polls, not after the terminal one
+
+
+def _stalled_snapshot(driver: dict) -> dict:
+    return {
+        "driver": driver,
+        "tasks": {
+            "t1": {"current_stage": "implement",
+                   "activity": {"current_activity": {"tool": "Bash", "detail": "pytest"},
+                                "events_seen": 12, "seconds_since_event": 900}},
+        },
+    }
+
+
+def test_activity_lines_catch_a_wedged_driver_the_pid_probe_calls_live() -> None:
+    # #334: the failure a pid probe CANNOT see — the process is still there (state "mine",
+    # so the #313 condition is False) but #323's merged signal says alive=False because the
+    # heartbeat went stale. The old wording ("re-invoke") is wrong here: the wedged process
+    # must be killed first, so the line must be distinct AND name the reason.
+    (line,) = activity_lines(_stalled_snapshot(
+        {"state": "mine", "pid": 777, "alive": False,
+         "heartbeat_stale": True, "heartbeat_age_s": 1800.0}), stall_after_s=300)
+
+    assert "DRIVER NOT LOOPING" in line
+    assert "777" in line and "1800.0s ago" in line
+    assert "Kill its process group" in line
+    assert "NO LIVE DRIVER" not in line and "STREAM STALLED" not in line
+
+
+def test_activity_lines_prefer_a_recorded_exit_over_a_stale_heartbeat() -> None:
+    # A driver that recorded WHY it stopped beats an inferred stale beat — the operator gets
+    # the driver's own reason rather than "its heartbeat went stale".
+    (line,) = activity_lines(_stalled_snapshot(
+        {"state": "mine", "pid": 778, "alive": False, "exited": True,
+         "exit_reason": "blocked_on_orphaned_dispatches",
+         "heartbeat_stale": True, "heartbeat_age_s": 60.0}), stall_after_s=300)
+
+    assert "recorded an exit (blocked_on_orphaned_dispatches)" in line
+    assert "heartbeat" not in line
+
+
+def test_activity_lines_do_not_alarm_when_liveness_is_unknowable() -> None:
+    # alive is tri-state and fails safe: None means "cannot answer" (a foreign-host claim).
+    # An unknowable driver must NOT be reported as down — the stall stays model-facing.
+    (line,) = activity_lines(_stalled_snapshot(
+        {"state": "foreign_host", "pid": 779, "alive": None}), stall_after_s=300)
+
+    assert "STREAM STALLED" in line
+    assert "DRIVER NOT LOOPING" not in line and "NO LIVE DRIVER" not in line
+
+
+def test_activity_lines_keep_the_dead_process_alert_for_a_pre_323_snapshot() -> None:
+    # Back-compat: a snapshot predating #323 carries no "alive" key at all. The old pid
+    # verdict must still raise NO LIVE DRIVER rather than silently losing the alert.
+    (line,) = activity_lines(_stalled_snapshot(
+        {"state": "dead", "pid": 424242}), stall_after_s=300)
+
+    assert "NO LIVE DRIVER" in line and "424242" in line
+    assert "DRIVER NOT LOOPING" not in line
