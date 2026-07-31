@@ -262,6 +262,8 @@ def harvest_process_retrospective(
 
     Interactive lanes may bypass JSON-schema validation, so malformed values are treated
     as absent. A malformed optional target is dropped while the useful lesson is retained.
+    Returns the entries actually written, or an empty list for absent, invalid, or replayed
+    evidence. Process entries feed recurrence detection and are excluded from task recall.
     """
     stages = getattr(task, "stages", None) or {}
     review = stages.get(Stage.REVIEW)

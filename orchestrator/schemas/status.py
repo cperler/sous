@@ -209,7 +209,10 @@ class Task(_StatusModel):
     # Optional pre-stage human checkpoint (#71). The task is parked before this stage
     # until that exact gate identity is approved. Additive for backward compatibility.
     hold_before: Stage | None = None
+    # Identity of the currently pending checkpoint; approval consumes and clears it.
     pending_approval_what: str | None = None
+    # Checkpoint identities released for this task. Dispatch additionally requires the
+    # matching durable approval artifact, so an earlier approval cannot release a new gate.
     approved_holds: list[str] = Field(default_factory=list)
     pr_number: int | None = None
     pr_url: str | None = None

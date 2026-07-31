@@ -5268,7 +5268,8 @@ class Engine:
 
         Detection and filing are best-effort run-finalize effects. A successful tracker
         reference is ledgered; a missing/raising hook is non-fatal and leaves the cluster
-        eligible for a later run to retry.
+        eligible for a later run to retry. Each cluster's ledger recheck, external filing,
+        and ledger append share one guard so concurrent finalizers cannot file duplicates.
         """
         if not self._learnings_kb_enabled():
             return

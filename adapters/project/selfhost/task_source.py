@@ -26,6 +26,10 @@ class LocalFileTaskSource:
         return json.loads(self.tasks_path.read_text())
 
     def resolve(self, task_id: str) -> TaskSpec:
+        """Resolve a local task snapshot, including labels that drive engine policies.
+
+        Raises ``OrchestratorError`` when the task file or requested task is absent.
+        """
         data = self._load()
         if task_id not in data:
             raise OrchestratorError(f"unknown task {task_id!r} in {self.tasks_path}")

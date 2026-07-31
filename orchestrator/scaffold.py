@@ -386,6 +386,7 @@ class LocalTaskSource:
         self.tasks_path = Path(tasks_path)
 
     def resolve(self, task_id: str) -> TaskSpec:
+        """Resolve a local task snapshot, including labels used by engine policies."""
         if not self.tasks_path.exists():
             raise OrchestratorError(f"tasks file not found: {{self.tasks_path}}")
         data = json.loads(self.tasks_path.read_text())
