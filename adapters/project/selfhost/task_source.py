@@ -44,7 +44,12 @@ class LocalFileTaskSource:
         )
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
-        """List local tasks for batch planning and decomposition crash deduplication."""
+        """Return at most ``limit`` local tasks, optionally matching an exact label.
+
+        The source order is preserved.  A missing task file is treated as an empty
+        source so decomposition recovery can probe safely before the first local task
+        is created.
+        """
         data = self._load() if self.tasks_path.exists() else {}
         tasks: list[TaskSpec] = []
         for task_id, raw in data.items():
@@ -125,7 +130,9 @@ class LocalFileTaskSource:
     def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
         """Create a new task in the tasks file and return its id (the offline mirror of the
         GitHub source's spec-filing hook, #18). Assigns the next free ``t<N>`` id so the
-        spec front door's Depends-on translation works against the local lane too."""
+        spec front door's Depends-on translation works against the local lane too. The
+        first case-insensitive ``Depends-on:`` body line is stored as structured dependency
+        metadata so a decomposed child resolves with the same DAG edges after restart."""
         data = self._load() if self.tasks_path.exists() else {}
         n = len(data) + 1
         while f"t{n}" in data:

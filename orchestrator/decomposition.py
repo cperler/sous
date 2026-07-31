@@ -1,4 +1,9 @@
-"""Validated SCOPE-authored child-task DAGs (#60)."""
+"""Parse SCOPE-authored child plans for registration on the run-level task DAG.
+
+Decomposition deliberately reuses the durable task graph instead of introducing an
+intra-task execution loop.  This module validates the model-authored boundary before
+the engine performs any external child-task creation.
+"""
 
 from __future__ import annotations
 
@@ -14,6 +19,12 @@ class DecompositionError(OrchestratorError):
 
 
 class ChildTaskPlan(BaseModel):
+    """One child task and its execution controls, keyed by a plan-local id.
+
+    ``depends_on`` contains other local ids; the engine translates them to durable
+    task-source references only after the complete child graph has been validated.
+    """
+
     model_config = ConfigDict(extra="forbid")
 
     id: str = Field(min_length=1, max_length=80)
@@ -25,7 +36,12 @@ class ChildTaskPlan(BaseModel):
 
 
 def parse_subtasks(output: dict | None) -> list[ChildTaskPlan]:
-    """Parse and DAG-validate an optional ``subtasks`` payload."""
+    """Parse and DAG-validate an optional SCOPE ``subtasks`` payload.
+
+    Returns an empty list when decomposition was not requested.  A present payload
+    must be a non-empty, closed acyclic graph; malformed controls, duplicate/unknown
+    ids, and cycles raise :class:`DecompositionError` before any filing can begin.
+    """
     raw = (output or {}).get("subtasks")
     if raw is None:
         return []
@@ -46,6 +62,11 @@ def parse_subtasks(output: dict | None) -> list[ChildTaskPlan]:
 
 
 def topological_order(tasks: list[ChildTaskPlan]) -> list[str]:
+    """Return local child ids in dependency-first filing order.
+
+    Callers must pass plans previously accepted by :func:`parse_subtasks`.
+    """
+
     spec = {
         "tasks": [{"id": task.id, "depends_on": task.depends_on} for task in tasks]
     }
@@ -53,5 +74,11 @@ def topological_order(tasks: list[ChildTaskPlan]) -> list[str]:
 
 
 def leaf_ids(tasks: list[ChildTaskPlan]) -> list[str]:
+    """Return children that no sibling depends on, preserving plan order.
+
+    These leaves become the umbrella parent's dependencies: completing every leaf
+    implies that every transitive prerequisite in the validated DAG also completed.
+    """
+
     depended_on = {dep for task in tasks for dep in task.depends_on}
     return [task.id for task in tasks if task.id not in depended_on]

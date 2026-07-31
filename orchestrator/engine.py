@@ -565,8 +565,10 @@ class Engine:
         per-task model tier (#84); ``effort`` pins a per-task reasoning effort
         (low/medium/high, #96) that overrides the stage-spec defaults the same way.
         ``agent_role``/``quality_tier``/``implementation_budget`` carry SCOPE-authored
-        child controls (#60). The role is resolved through the project adapter; the budget
-        selects the IMPLEMENT timeout. ``max_filed_followups`` (#191) caps how many non-blocking review findings THIS task
+        child controls (#60). The role is resolved through the project adapter; the quality
+        tier selects the child's explicit quality pipeline and the budget selects a 30- or
+        15-minute IMPLEMENT timeout. ``max_filed_followups`` (#191) caps how many
+        non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
         engine default, a negative value is rejected. Validation (non-empty, duplicate-free)
@@ -2523,7 +2525,13 @@ class Engine:
 
     @staticmethod
     def _find_decomposition_child(source: object, marker: str) -> str | None:
-        """Best-effort crash-window dedupe through the source's existing list hook."""
+        """Find a previously filed child by its deterministic body marker.
+
+        Sources without a usable ``list_tasks`` hook return ``None``.  Lookup is
+        deliberately best-effort because creation remains the source's responsibility;
+        durable mappings are the authoritative deduplication mechanism after filing is
+        acknowledged locally.
+        """
         list_tasks = getattr(source, "list_tasks", None)
         if not callable(list_tasks):
             return None
@@ -2555,6 +2563,12 @@ class Engine:
                 self._apply_scope_decomposition(run_id, task, output)
 
     def _hold_decomposition(self, run_id: str, task_id: str, reason: str) -> Task:
+        """Park an incomplete decomposition for explicit operator recovery.
+
+        Any already persisted local-id mapping is retained, the run-level task ref is
+        synchronized, and a warning event records why automatic filing could not continue.
+        """
+
         def _hold(task: Task) -> None:
             task.state = TaskState.BLOCKED_ON_HUMAN
             task.last_error = f"scope decomposition: {reason}"
@@ -2570,7 +2584,12 @@ class Engine:
         return task
 
     def _complete_ready_umbrellas(self, run_id: str) -> None:
-        """Complete decomposed parents whose leaf children all completed successfully."""
+        """Complete umbrella parents whose leaf children all completed successfully.
+
+        Pending parent stages are marked skipped, completion is propagated to the task
+        source, and resources are released without dispatching implementation work for
+        the umbrella itself.  A failed leaf is handled by normal DAG failure cascading.
+        """
         run = self.store.load_run(run_id)
         states = {ref.task_id: ref.state for ref in run.task_refs}
         for ref in list(run.task_refs):

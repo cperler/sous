@@ -294,7 +294,11 @@ class ExecutionLane(StrEnum):
 
 
 class QualityTier(StrEnum):
-    """Per-child quality depth emitted by SCOPE decomposition."""
+    """Per-child quality pipeline emitted by SCOPE decomposition.
+
+    ``full`` adds SIMPLIFY and REVIEW, ``light`` retains REVIEW without SIMPLIFY,
+    and ``none`` runs neither quality pass.  All tiers still run TEST and DELIVER.
+    """
 
     FULL = "full"
     LIGHT = "light"
@@ -302,7 +306,11 @@ class QualityTier(StrEnum):
 
 
 class ImplementationBudget(StrEnum):
-    """Per-child implementation wall-clock budget from the historical planner."""
+    """Per-child IMPLEMENT wall-clock budget emitted by SCOPE decomposition.
+
+    The engine maps ``standard`` to 30 minutes and ``short`` to 15 minutes; the
+    selected value is persisted on the task and copied to its implementation work.
+    """
 
     STANDARD = "standard"
     SHORT = "short"
