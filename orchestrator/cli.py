@@ -709,6 +709,7 @@ def main(argv: list[str] | None = None) -> int:
         # Cross-session board (#6): reads every runs/<id>/ store under --root. Needs --project
         # to build the per-run read-only engine (like `status`), but NOT --run (it spans runs).
         from .dashboard import (
+            DashboardSnapshotKwargs,
             dashboard_snapshot,
             default_engine_factory,
             render_dashboard,
@@ -719,10 +720,13 @@ def main(argv: list[str] | None = None) -> int:
         if not args.root or not args.project:
             p.error("--root and --project are required for dashboard")
         factory = default_engine_factory(args.project, mode=args.mode, provider=args.provider)
-        snap_kw = dict(
-            stale_after_s=args.stale_after, limit=args.limit, show_all=args.all,
-            engine_factory=factory, usage_reader=read_usage,
-        )
+        snap_kw: DashboardSnapshotKwargs = {
+            "stale_after_s": args.stale_after,
+            "limit": args.limit,
+            "show_all": args.all,
+            "engine_factory": factory,
+            "usage_reader": read_usage,
+        }
         if args.serve:
             # Read-only web skin (#94): serve dashboard_snapshot()/stream_probe as JSON + a
             # self-contained polling page. Same runs-root + read-only engine as the text board.
