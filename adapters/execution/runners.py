@@ -1,8 +1,9 @@
 """Registry assembly + the registry-backed runner (target.md §4 Phase 4).
 
 ``build_registry`` wires the cells the engine sanctions for a run; ``registry_runner``
-turns a registry into a Scheduler ``Runner`` so the scheduler drives the engine fully
-in-process for the headless lane (the headless run target). The interactive×claude
+turns a registry into a Scheduler runner (a streaming ``RegistryPool``, #318) so the
+scheduler drives the engine fully in-process for the headless lane — recording each stage
+as it completes instead of at its batch's barrier. The interactive×claude
 cell stays external (served by the Workflow shim), so a registry-backed runner only
 dispatches in-process cells (headless/codex) — exactly the headless/codex modes.
 """
@@ -11,7 +12,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
 from adapters.project.base import ProjectConfig
@@ -150,25 +151,88 @@ def build_registry(
     return reg
 
 
-def registry_runner(
-    registry: Registry, *, max_workers: int | None = None
-) -> Callable[[list[WorkItem]], list[StageResult]]:
-    """A Scheduler Runner that dispatches each WorkItem via its cell's in-process runner.
+class RegistryPool:
+    """Registry-backed dispatch pool: submit WorkItems, harvest StageResults AS THEY COMPLETE.
 
-    Raises (via Registry.resolve) if a WorkItem targets an external cell (interactive),
-    which is the correct failure: headless drive can't run an interactive lane. The
-    batch is dispatched concurrently (runners are subprocess-bound; the batch size is
-    already capped upstream by the engine's capacity dispatch_limit), order preserved.
+    Implements the scheduler's ``StreamingRunner`` protocol over a persistent thread pool
+    (runners are subprocess-bound, so threads are the right shape). Completion-ordered
+    harvesting is the #318 fix: the previous ``[f.result() for f in futures]`` collected in
+    SUBMISSION order inside a single batch call, so a stage that finished first was not even
+    observed until the slowest one landed — and could not be, because the list-in/list-out
+    signature had nowhere to put a partial answer.
+
+    Also callable (``pool(workitems) -> list[StageResult]``, submission order preserved) so
+    the narrow ``Runner`` form keeps working for direct callers and tests.
+
+    Single-consumer: submit/harvest/close are called from the scheduler's own thread; only
+    the dispatches themselves run concurrently (and they touch no engine state).
     """
 
-    def run(workitems: list[WorkItem]) -> list[StageResult]:
-        if not workitems:
-            return []
-        # Resolve first so an external/missing cell raises before any work starts.
-        pairs = [(w, registry.resolve(w.lane_policy)) for w in workitems]
-        workers = max_workers or len(pairs)
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            futures = [ex.submit(runner.dispatch, w) for (w, runner) in pairs]
-            return [f.result() for f in futures]
+    # The real cap on concurrent dispatches is the engine's capacity ``dispatch_limit``
+    # (single digits); this is only the pool's ceiling, sized so it never becomes the
+    # binding constraint. An explicit ``max_workers`` overrides it.
+    DEFAULT_WORKERS = 32
 
-    return run
+    def __init__(self, registry: Registry, *, max_workers: int | None = None) -> None:
+        self._registry = registry
+        self._max_workers = max_workers or self.DEFAULT_WORKERS
+        self._ex: ThreadPoolExecutor | None = None
+        self._futures: list[Future[StageResult]] = []
+
+    def submit(self, work: list[WorkItem]) -> None:
+        if not work:
+            return
+        # Resolve first so an external/missing cell (interactive — headless drive can't run
+        # it) raises before any work starts.
+        pairs = [(w, self._registry.resolve(w.lane_policy)) for w in work]
+        if self._ex is None:
+            self._ex = ThreadPoolExecutor(
+                max_workers=self._max_workers, thread_name_prefix="dispatch"
+            )
+        self._futures.extend(self._ex.submit(runner.dispatch, w) for (w, runner) in pairs)
+
+    def pending(self) -> int:
+        return len(self._futures)
+
+    def harvest(self, *, block: bool = True) -> list[StageResult]:
+        """Every result available now — waiting for the first completion when asked to
+        block. A dispatch that raised re-raises here (same as the old ``f.result()``)."""
+        if not self._futures:
+            return []
+        done = {f for f in self._futures if f.done()}
+        if not done and block:
+            done = set(wait(self._futures, return_when=FIRST_COMPLETED).done)
+        if not done:
+            return []
+        harvested = [f for f in self._futures if f in done]  # submission order within a batch
+        self._futures = [f for f in self._futures if f not in done]
+        return [f.result() for f in harvested]
+
+    def close(self) -> None:
+        """Release the worker threads. Idempotent, and the pool is reusable afterwards (the
+        executor is rebuilt lazily on the next submit) — the scheduler closes the pool it was
+        handed on every exit path, including ones a caller may follow with another run.
+        Never waits: an abandoned dispatch must not hang the driver on its way out."""
+        ex, self._ex = self._ex, None
+        self._futures = []
+        if ex is not None:
+            ex.shutdown(wait=False, cancel_futures=True)
+
+    def __call__(self, workitems: list[WorkItem]) -> list[StageResult]:
+        """The legacy list-in/list-out ``Runner`` form: dispatch the batch, drain it, and
+        return the results in submission order."""
+        self.submit(workitems)
+        out: list[StageResult] = []
+        while self.pending():
+            out.extend(self.harvest(block=True))
+        order = {w.id: i for i, w in enumerate(workitems)}
+        return sorted(out, key=lambda r: order.get(r.work_item_id, len(order)))
+
+
+def registry_runner(registry: Registry, *, max_workers: int | None = None) -> RegistryPool:
+    """A Scheduler runner that dispatches each WorkItem via its cell's in-process runner.
+
+    Returns a :class:`RegistryPool` — usable both as the streaming pool the scheduler
+    prefers and as the old list-in/list-out callable.
+    """
+    return RegistryPool(registry, max_workers=max_workers)

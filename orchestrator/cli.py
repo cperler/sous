@@ -967,7 +967,7 @@ def main(argv: list[str] | None = None) -> int:
         from adapters.execution.runners import registry_runner
 
         from .queue_file import QueueError, QueueFile, drive_queue
-        from .scheduler import Runner
+        from .scheduler import AnyRunner
         from .status_store import StatusStore
 
         if not args.root or not args.project:
@@ -977,7 +977,7 @@ def main(argv: list[str] | None = None) -> int:
         util_pct, _ = resolve_util(args.util)
         util_provider = _auto_util_provider() if args.util == "auto" else None
 
-        def _queue_engine(run_id: str) -> tuple[Engine, Runner]:
+        def _queue_engine(run_id: str) -> tuple[Engine, AnyRunner]:
             """The ``EngineFactory`` for this drain (#281): a FRESH engine + runner
             rooted at ``<--root>/<run_id>/``, so the derived run's StatusStore,
             CostLedger, and stage logs never mix with another run's. Called by
