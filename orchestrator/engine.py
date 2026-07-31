@@ -540,7 +540,16 @@ class Engine:
         ``task_registration_repaired`` event) instead of raising. A ref whose document
         exists and matches raises ``ContractError`` ("already added"), as before. See
         :meth:`registered_task_ids` for the corresponding "is this task fully registered"
-        check used by re-ingest."""
+        check used by re-ingest.
+
+        The resolved ``title``/``body`` are snapshotted onto the Task doc HERE and never
+        re-read automatically (#271) — every stage prompt for the rest of the run renders
+        from this copy, which is what makes a run reproducible and prompts byte-stable.
+        The snapshot's provenance is stamped alongside it (``spec_captured_at``,
+        ``spec_source_updated_at`` from ``spec.updated_at`` when the source reports one,
+        ``spec_fingerprint``), so a later ``refresh_spec``/``spec_staleness`` call has
+        something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
+        audited way to move the snapshot mid-run."""
         spec = self.project.task_source.resolve(task_id)
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
