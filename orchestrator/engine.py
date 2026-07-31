@@ -23,9 +23,6 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
-from adapters.execution.base import Registry, default_registry
-from adapters.project.base import ProjectConfig
-
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
@@ -62,6 +59,8 @@ from .port_registry import (
     project_needs_ports,
     registry_for_project,
 )
+from .ports.execution import Registry, default_registry
+from .ports.project import ProjectConfig
 from .render import (
     format_review_issue,
     render_completion_note,

@@ -19,7 +19,7 @@ import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from adapters.project.base import ADAPTER_CONTRACT_VERSION
+from orchestrator.ports.project import ADAPTER_CONTRACT_VERSION
 
 
 def _kit_dir() -> Path:
@@ -375,7 +375,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from adapters.project.base import TaskSpec
+from orchestrator.ports.project import TaskSpec
 from orchestrator.errors import OrchestratorError
 
 

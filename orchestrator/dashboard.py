@@ -121,10 +121,9 @@ def default_engine_factory(
     Engine on it exactly like ``orchestrator status`` would. The dashboard only calls
     ``engine.status``, so no interactive/model wiring runs — but the registry is built so the
     lane audit inside ``status`` still resolves. Imported lazily to avoid an import cycle."""
-    from adapters.execution.runners import build_registry
-
     from .cost_ledger import CostLedger
     from .engine import Engine
+    from .lane_loader import build_registry
     from .project_loader import load_project
     from .routing import Router
     from .schemas.enums import ExecutionMode, Provider

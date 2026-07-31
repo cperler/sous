@@ -10,26 +10,44 @@ code (paths are real — grep them). For the *why* and the historical record see
 some execution lane, and the engine ingests the returned `StageResult`. That contract seam
 (`orchestrator/schemas/work.py`) is what makes execution lanes interchangeable, runs
 resumable after a kill, and every model call structurally attributable (no ledger row can
-be skipped). The engine imports the two adapter *contracts* only — `adapters/execution/base.py`
-(`Registry`/`default_registry`) and `adapters/project/base.py` (`ProjectConfig`) — never a
-concrete lane or project adapter; the concrete registry is wired at the CLI boundary
-(`orchestrator/cli.py` → `adapters/execution/runners.build_registry`). Adapters import the
-engine's schemas, never the reverse.
+be skipped).
+
+**The dependency arrow points inward** (#273): `adapters/` imports `orchestrator/`, and no
+module under `orchestrator/` imports `adapters` at all. The engine OWNS both adapter
+contracts as *ports* — `orchestrator/ports/execution.py` (`Runner`/`CapabilityDescriptor`/
+`Registry`/`default_registry`) and `orchestrator/ports/project.py` (`ProjectConfig`/
+`TaskSource`/`TaskSpec`/`ADAPTER_CONTRACT_VERSION`) — and an adapter implements them.
+Concrete adapters are reached by NAME, never by import, at the composition root:
+`orchestrator/lane_loader.py` resolves the execution-lane bundle through the
+`orchestrator.execution_lanes` entry point (this repo registers `adapters.execution.runners`
+there), and `orchestrator/project_loader.py` resolves a project adapter by path, dotted
+module, or `orchestrator.project_adapters` entry point. `adapters/execution/base.py` and
+`adapters/project/base.py` survive as re-export shims so adapters scaffolded before the move
+keep importing; they re-export the *same* objects, never redefinitions. The rule is enforced,
+not just documented: `tests/test_dependency_direction.py` walks the AST of every engine
+module (catching lazy imports and `importlib.import_module("adapters…")` too) with an empty
+allowlist, and ruff's `TID251` ban fails the lint gate at the line where such an import is
+written.
 
 ```
                  orchestrator/  (the engine — deterministic, project-agnostic, no model call)
                  emits WorkItem ──▶            ◀── ingests StageResult
-                        │                                  ▲
+                 orchestrator/ports/  ← the contracts; imports NOTHING outward
+                   execution.py  Runner / CapabilityDescriptor / Registry
+                   project.py    ProjectConfig / TaskSource / TaskSpec
+                        ▲                                  ▲
         ┌───────────────┴──────────────┐                   │
-        ▼                              ▼                    │  dispatch on a lane
+        │        implement the ports   │                   │  dispatch on a lane
   adapters/execution/            adapters/project/          │
   HOW/WHERE a call runs:         WHAT a repo plugs in:      │
-   interactive (Workflow shim)    base.py  (the contract)   │
-   headless_claude (claude -p)    heysoo/  selfhost/        │
-   codex (codex exec)             github_issues.py          │
-   deterministic_* (ENGINE lane,  external repos plug in    │
-     no model — setup/test/         via <repo>/.orchestration/
-     deliver)                       (path-load) or an entry point
+   interactive (Workflow shim)    heysoo/  selfhost/        │
+   headless_claude (claude -p)    github_issues.py          │
+   codex (codex exec)             external repos plug in    │
+   deterministic_* (ENGINE lane,    via <repo>/.orchestration/
+     no model — setup/test/         (path-load) or an entry point
+     deliver)                                               │
+   runners.py = the lane BUNDLE, resolved by name           │
+     (orchestrator.execution_lanes entry point)             │
         │                                                   │
         └──▶ model conversations live in .claude/skills/ ───┘
              (front-door + supervisor skills; run_targets/ holds their
@@ -42,14 +60,16 @@ engine's schemas, never the reverse.
   Billing is a derived property of the (mode, provider) cell, not a hardcoded branch. `codex`
   is always headless; `codex×interactive` is an intentional empty cell; the `engine×none`
   cell is the deterministic, no-model lane.
-- **Two adapter families.** `adapters/execution/` = how/where a call runs (the interactive
-  `interactive.py` shim, `headless_claude.py`, `codex.py`, and the deterministic
-  `deterministic_setup.py` / `deterministic_test.py` / `deterministic_deliver.py`; wired by
-  `base.py` + `runners.py`, dispatched through `transport.py`, with `review_panel.py` fanning
-  a plan-bearing REVIEW out into finder/verifier sub-calls below the seam). `adapters/project/` = what a
-  repo supplies (commands, test taxonomy, agent roster, task source): `base.py` is the
-  contract, `heysoo/` and `selfhost/` are the in-repo reference adapters, `github_issues.py`
-  a shared task source. A new external project's adapter lives in **its own repo** under
+- **Two adapter families, one contract home.** Both contracts live inward under
+  `orchestrator/ports/` (#273); `adapters/` holds only implementations.
+  `adapters/execution/` = how/where a call runs (the interactive `interactive.py` shim,
+  `headless_claude.py`, `codex.py`, and the deterministic `deterministic_setup.py` /
+  `deterministic_test.py` / `deterministic_deliver.py`; bundled by `runners.py`, dispatched
+  through `transport.py`, with `review_panel.py` fanning a plan-bearing REVIEW out into
+  finder/verifier sub-calls below the seam). `adapters/project/` = what a repo supplies
+  (commands, test taxonomy, agent roster, task source): `heysoo/` and `selfhost/` are the
+  in-repo reference adapters, `github_issues.py` a shared task source. A new external
+  project's adapter lives in **its own repo** under
   `<repo>/.orchestration/` (loaded by path, contract-version-checked) or ships as a package
   registering an `orchestrator.project_adapters` entry point.
 - **Per-stage tool posture, translated per lane** (#272, widened/decided by #327).
@@ -279,7 +299,7 @@ cross-run `learnings-kb.jsonl` share one parent:
   then re-raised unchanged. `status`'s `driver` block merges the #313 pid claim with the
   log's last heartbeat (`alive`, `heartbeat_age_s`, `last_state`), so a dead driver does
   not present identically to a working one.
-- **Seams** (`adapters/project/base.py`, all duck-typed/best-effort): `notify` /
+- **Seams** (`orchestrator/ports/project.py`, all duck-typed/best-effort): `notify` /
   `emit_notification` for stall + transition alerts (`alerting.py`), `publish_progress` /
   `publish_note` to post progress to the task source, `file_followup` to file follow-up
   issues. A raising or missing hook never breaks a run.

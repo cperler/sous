@@ -19,6 +19,15 @@ orchestrator-scaffold = "orchestrator.scaffold:main"
 heysoo = "adapters.project.heysoo"
 selfhost = "adapters.project.selfhost"
 
+# The execution-lane bundle (#273). The engine owns the lane CONTRACT
+# (`orchestrator/ports/execution.py`) but ships no lane, and no module under
+# `orchestrator/` may import a concrete adapter — so the composition root resolves the
+# bundle by name through this group (`orchestrator/lane_loader.py`), the same seam the
+# project adapters above use. Ours is the shipped default; a project with its own lanes
+# registers its module here instead.
+[project.entry-points."orchestrator.execution_lanes"]
+reference = "adapters.execution.runners"
+
 [dependency-groups]
 dev = [
     "hypothesis>=6.156.1",
@@ -56,8 +65,25 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM", "BLE"]
+# TC004 only (not the whole TC family): flags a symbol imported under `if TYPE_CHECKING:`
+# but USED at runtime — an import that typechecks and lints clean, then raises NameError on
+# the first real call. Moving the lane-bundle import inward (#273) introduced exactly that in
+# `dashboard.default_engine_factory`, where no test covered the production path.
+select = ["E", "F", "I", "B", "UP", "SIM", "BLE", "TID", "TC004"]
 ignore = ["E501"]  # line length handled pragmatically in tests/fixtures
+
+# Dependency direction, enforced at LINT time (#273). The engine may not import a
+# concrete adapter; it depends on `orchestrator/ports/` and resolves concrete adapters by
+# name (`orchestrator.lane_loader` / `orchestrator.project_loader`). `tests/` and
+# `adapters/` are exempt below — the adapters ARE the outward layer, and the tests must be
+# able to reach both sides. `tests/test_dependency_direction.py` is the deeper guard (it
+# also catches lazy imports and `importlib.import_module("adapters...")`).
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"adapters".msg = "the engine must not import adapters — depend on orchestrator.ports.* or resolve by name via orchestrator.lane_loader/project_loader (#273)"
+
+[tool.ruff.lint.per-file-ignores]
+"adapters/**" = ["TID251"]
+"tests/**" = ["TID251"]
 
 [tool.mypy]
 # Type-check the shipped code (engine + adapters). Tests stay out of the gate;
@@ -96,9 +122,14 @@ module = [
     "orchestrator.engine",
     "orchestrator.errors",
     "orchestrator.failure_classifier",
+    "orchestrator.gitcmd",
+    "orchestrator.lane_loader",
     "orchestrator.learnings_kb",
     "orchestrator.model_table",
     "orchestrator.port_registry",
+    "orchestrator.ports",
+    "orchestrator.ports.execution",
+    "orchestrator.ports.project",
     "orchestrator.project_loader",
     "orchestrator.queue_file",
     "orchestrator.render",

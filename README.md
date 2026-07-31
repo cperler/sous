@@ -44,9 +44,14 @@ The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test
 - **Two adapter families:** the **execution adapter** (`adapters/execution/` — how/where a
   call runs: the interactive Workflow shim, headless `claude -p`, `codex exec`) and the
   **project-config adapter** (`adapters/project/` — what a repo plugs in: commands, test
-  taxonomy, agent roster, task source). The engine imports only the two *contracts*
-  (`adapters/execution/base.py`, `adapters/project/base.py`) — never a concrete lane or
-  project adapter; those are resolved at the CLI/registry boundary.
+  taxonomy, agent roster, task source).
+- **The dependency arrow points inward.** The engine owns both contracts as *ports*
+  (`orchestrator/ports/execution.py`, `orchestrator/ports/project.py`) and adapters implement
+  them; no module under `orchestrator/` imports `adapters` at all. The composition root
+  reaches a concrete adapter by NAME — an `orchestrator.execution_lanes` entry point for the
+  lane bundle (`orchestrator/lane_loader.py`), and path / dotted module / entry point for the
+  project adapter (`orchestrator/project_loader.py`). Enforced by
+  `tests/test_dependency_direction.py` and a ruff `TID251` ban, not by convention.
 
 ## Layout
 
@@ -67,10 +72,15 @@ orchestrator/            the deterministic engine (never calls a model) + CLI
   scaffold.py            `orchestrator-scaffold` — generate a new project adapter
   stages.py / cli.py     stage prompts + the supervisor's CLI surface
   schemas/               versioned status + work-item/result schemas
-adapters/
-  execution/             interactive shim, headless_claude, codex, registry, transport
-  project/{base,heysoo,selfhost}/   the contract + reference adapters (a NEW project's
-                         adapter lives in the project's OWN repo — see below)
+  ports/                 the adapter CONTRACTS the engine owns: execution.py (Runner /
+                         Registry), project.py (ProjectConfig / TaskSource / TaskSpec)
+  lane_loader.py         resolves the execution-lane bundle BY NAME (entry point), so the
+  project_loader.py      engine imports no adapter; same for the project adapter
+adapters/                implementations of the ports above (nothing imports back inward)
+  execution/             interactive shim, headless_claude, codex, runners (the bundle),
+                         transport; base.py is a back-compat re-export of the port
+  project/{heysoo,selfhost}/   reference adapters (a NEW project's adapter lives in the
+                         project's OWN repo — see below); base.py likewise a shim
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
 tests/                   pytest suite (one test_<subsystem>.py per module)
 docs/                    design doc, plan, and the as-built/target spec (see below)
@@ -285,7 +295,7 @@ The adapter is **owned by the project's repo**, not this one (the two-folder lay
 it by path — `--project <repo>/.orchestration`. The adapter runs inside the engine's
 process, so the project repo needs no Python packaging. Because an external adapter isn't
 updated in lockstep with the engine, its generated `__init__.py` declares the
-`CONTRACT_VERSION` it targets (`adapters/project/base.py`); the loader refuses a mismatch
+`CONTRACT_VERSION` it targets (`orchestrator/ports/project.py`); the loader refuses a mismatch
 loudly, and `orchestrator --project <dir> validate` duck-checks the full ProjectConfig
 surface without needing a run. The in-repo `adapters/project/{heysoo,selfhost}` remain the
 reference implementations, kept in lockstep by this repo's test suite.

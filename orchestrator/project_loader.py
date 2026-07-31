@@ -6,9 +6,11 @@ Three ways a project plugs its adapter in:
   imported off ``sys.path`` and kept honest by this repo's test suite;
 - **directory path** (``../my-project/.orchestration``) — the adapter lives in the
   *project's* repo and the engine loads it by path. The adapter executes inside the
-  engine's process, so its ``orchestrator.*`` / ``adapters.project.base`` imports
-  resolve against the engine — the project repo needs no Python packaging. This is the
-  zero-packaging option and stays first-class;
+  engine's process, so its ``orchestrator.*`` imports (the contracts live inward in
+  ``orchestrator.ports.project``; a pre-#273 adapter importing ``adapters.project.base``
+  still resolves through that module's re-export shim) resolve against the engine — the
+  project repo needs no Python packaging. This is the zero-packaging option and stays
+  first-class;
 - **entry-point name** (``heysoo``) — when the engine is ``pip``/``uv tool`` installed as
   a library, a project (or third-party) package registers its adapter under the
   ``orchestrator.project_adapters`` group. ``--project <name>`` then resolves by that name
@@ -37,12 +39,12 @@ from importlib.metadata import EntryPoint, EntryPoints
 from pathlib import Path
 from types import ModuleType
 
-from adapters.project.base import ADAPTER_CONTRACT_VERSION, ProjectConfig
+from orchestrator.ports.project import ADAPTER_CONTRACT_VERSION, ProjectConfig
 
 # The entry-point group a packaged project (or third-party) registers its adapter under.
 ENTRY_POINT_GROUP = "orchestrator.project_adapters"
 
-# Mirrors the ProjectConfig Protocol (adapters/project/base.py). ``schema_for`` and
+# Mirrors the ProjectConfig Protocol (orchestrator/ports/project.py). ``schema_for`` and
 # ``types_cmd`` are deliberately absent: both are optional, duck-typed via ``getattr``
 # (the CLI for schema_for, the trunk gate for types_cmd) — so an older external adapter
 # that predates them still satisfies the contract.

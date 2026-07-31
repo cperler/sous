@@ -34,17 +34,17 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
-from adapters.project.base import ProjectConfig
 from orchestrator.port_registry import (
     port_env_for,
     project_needs_ports,
     registry_for_project,
 )
+from orchestrator.ports.execution import SUPPORTED, CapabilityDescriptor
+from orchestrator.ports.project import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from . import install_cache
-from .base import SUPPORTED, CapabilityDescriptor
 from .transport import RawResult, _git, _tag_head, to_stage_result
 
 

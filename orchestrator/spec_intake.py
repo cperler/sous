@@ -13,7 +13,7 @@ tasks so ``Depends-on:`` lines point at live issues.
 Pure and project-agnostic: it calls no model and knows nothing about a specific repo.
 Issue creation goes through the task source's optional, duck-typed ``create_task`` hook
 (the same pattern as the ``file_followup`` / ``publish_note`` evidence-out hooks in
-``adapters/project/base.py``).
+``orchestrator/ports/project.py``).
 """
 
 from __future__ import annotations

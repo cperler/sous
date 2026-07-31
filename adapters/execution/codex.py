@@ -13,10 +13,10 @@ from collections.abc import Callable
 
 from jsonschema import Draft202012Validator
 
+from orchestrator.ports.execution import EXPLICIT_EMPTY, SUPPORTED, CapabilityDescriptor
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from .base import EXPLICIT_EMPTY, SUPPORTED, CapabilityDescriptor
 from .transport import (
     RawResult,
     Transport,
