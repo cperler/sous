@@ -187,7 +187,8 @@ $ORCH enqueue --queue-file runs/queue.json --tasks "#42,#43" --branch batch-a
 
 # the daemon drains the queue, deriving one run per batch (run id from enqueued_at):
 $ORCH --root runs --project adapters.project.heysoo \
-      run-queue --queue-file runs/queue.json --wait --idle-timeout 300
+      run-queue --queue-file runs/queue.json --owner day-cron \
+      --wait --idle-timeout 300
 ```
 
 Each batch's run id is derived deterministically from its `enqueued_at`, so a driver that
@@ -195,11 +196,32 @@ crashes and is relaunched **reuses** the same run (create-or-reuse, idempotent a
 than forking a duplicate. `--wait` idle-waits on an empty queue (polling every
 `--poll-interval` seconds up to `--idle-timeout`, then exits) and sleeps through capacity /
 rate-limit stalls; without it `run-queue` makes a single drain pass and returns. The consumer
-claims the head entry **in place** (stamping `{run_id, owner, claimed_at}`) and pops it only
-once its derived run reached terminal, so no kill window can lose a batch; on an ingest
-failure the claim is stripped instead and the same head is retried (never silently dropped),
-with the failure surfaced. Everything below the ingest step is the same already-resumable
-`Scheduler.run` loop mode 1 uses.
+claims the head entry **in place** (stamping `{run_id, owner, claimed_at, host, pid}`) and
+pops it only once its derived run reached terminal, so no kill window can lose a batch; on
+an ingest failure the claim is stripped instead and the same head is retried (never silently
+dropped), with the failure surfaced. Everything below the ingest step is the same
+already-resumable `Scheduler.run` loop mode 1 uses.
+
+Give every concurrently configured consumer a distinct, stable `--owner`. `run-queue`
+holds a non-blocking, process-lifetime lock named `consumer-<owner>.lock` in the queue
+directory for the entire drain. That lock prevents overlapping invocations on the same
+host with the same owner from adopting and double-driving one claim, and the kernel drops
+it automatically after a crash so a relaunch can resume. `flock` does not provide reliable
+cross-host exclusion on every shared filesystem, so use distinct owners for consumers on
+different hosts too; the summary reports `consumer_guard: unavailable` on platforms where
+the guard cannot be enforced.
+
+If an owner is permanently retired or renamed while it holds the head, release the stale
+claim explicitly (the batch remains queued and can then be claimed by another consumer):
+
+```bash
+$ORCH run-queue --queue-file runs/queue.json --release-claim
+```
+
+Release refuses when the claim records this host and that owner's consumer lock is still
+held. Stop the live consumer first; `--force` is available for deliberate administrative
+override. Claims from another host cannot be proven live by this host-local check, so
+coordinate cross-host releases operationally.
 
 ### 2. From within a Claude session — interactive (subscription)
 
