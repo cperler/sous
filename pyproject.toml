@@ -65,7 +65,11 @@ line-length = 100
 target-version = "py311"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "B", "UP", "SIM", "BLE", "TID"]
+# TC004 only (not the whole TC family): flags a symbol imported under `if TYPE_CHECKING:`
+# but USED at runtime — an import that typechecks and lints clean, then raises NameError on
+# the first real call. Moving the lane-bundle import inward (#273) introduced exactly that in
+# `dashboard.default_engine_factory`, where no test covered the production path.
+select = ["E", "F", "I", "B", "UP", "SIM", "BLE", "TID", "TC004"]
 ignore = ["E501"]  # line length handled pragmatically in tests/fixtures
 
 # Dependency direction, enforced at LINT time (#273). The engine may not import a

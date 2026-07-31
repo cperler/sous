@@ -16,15 +16,18 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.dashboard import (
     dashboard_snapshot,
+    default_engine_factory,
     discover_runs,
     render_dashboard,
     render_watch,
 )
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.enums import ExecutionMode, Stage
 from orchestrator.status_store import StatusStore
 from orchestrator.stream_probe import stages_dir
 from tests.conftest import FakeProject, make_result
@@ -393,3 +396,29 @@ def test_usage_probe_failure_still_renders(tmp_path) -> None:
     assert snap["header"]["usage"] is None
     out = render_dashboard(snap)
     assert "usage: unavailable" in out
+
+
+# --- the production factory ------------------------------------------------------------
+#
+# Every test above injects a FakeProject `engine_factory`, so none of them execute the real
+# `default_engine_factory` the CLI actually passes (`cli.py`'s `dashboard` subcommand). That
+# blind spot let #273 ship a `build_registry` import that had been moved into the module's
+# `if TYPE_CHECKING:` block: green suite, `NameError` the moment a human ran the command.
+
+
+def test_default_engine_factory_builds_a_working_engine(tmp_path) -> None:
+    """The REAL factory the CLI uses: it must import and build, not just typecheck."""
+    factory = default_engine_factory("selfhost", mode="interactive", provider=None)
+    engine = factory(tmp_path / "runs" / "r1")
+
+    # Built far enough to serve the board: the lane registry (whose absence was the bug)
+    # is real, and the read-only board never gets interactive lanes built for it.
+    assert isinstance(engine, Engine)
+    sanctioned = engine.registry.sanctioned()
+    assert sanctioned, "the factory built an empty lane registry"
+    assert not any(mode is ExecutionMode.INTERACTIVE for mode, _ in sanctioned)
+
+
+def test_default_engine_factory_requires_a_project() -> None:
+    with pytest.raises(SystemExit, match="--project"):
+        default_engine_factory(None)
