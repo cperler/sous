@@ -119,7 +119,13 @@ _NOTICE_VERIFIER_INCONCLUSIVE = "verifier_inconclusive"
 
 
 def _casefold_v1(text: str) -> str:
-    """Return the runtime-independent Unicode-15 fold named by ``fingerprint-v1``."""
+    """Return the Unicode-15 fold promised by ``fingerprint-v1``.
+
+    ``str.casefold()`` tracks the running interpreter's Unicode database, whereas review
+    fingerprints are persisted and exchanged with the interactive JavaScript lane.  The
+    compact exceptions below therefore freeze the named rule's identity before applying the
+    established upper/lower folds shared with the shim.
+    """
     folded: list[str] = []
     for character in text:
         point = ord(character)
@@ -143,13 +149,14 @@ def _casefold_v1(text: str) -> str:
 
 
 def issue_fingerprint(issue: object) -> str:
-    """Stable convergence/dedupe key for one review finding — the named
-    ``fingerprint-v1`` rule (#15, ports the as-built ``file:description`` fingerprint,
-    OC:993-999): normalized so cosmetic rewording of the same finding still matches.
+    """Return the stable ``fingerprint-v1`` key for a finding or verifier echo.
 
-    Canonical here (rather than on ``Engine``) because BOTH lanes and the verifier
-    sub-calls must normalize identically: a runner computes it to address a verdict at
-    a finding, and the fold re-computes it to match that verdict back."""
+    Mapping inputs contribute their trimmed ``file:description`` fields; every other input
+    is treated as an already-rendered fingerprint.  Whitespace is collapsed, then the
+    Unicode-15 fold is applied and the result is capped at 160 Unicode code points.  This is
+    canonical because runners use it to address verdicts and the engine uses it to match
+    those verdicts back to findings across interactive and headless lanes.
+    """
     if isinstance(issue, dict):
         base = f"{str(issue.get('file') or '').strip()}:{str(issue.get('description') or '').strip()}"
     else:

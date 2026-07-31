@@ -138,6 +138,13 @@ async function dispatchSubCall(wi, phaseName, prompt, schemaRef, agentType) {
   }
 }
 
+/**
+ * Convert one provider attempt into the engine's attributed ``sub_calls`` evidence row.
+ *
+ * Workflow exposes neither a clock nor a reusable session identifier, so those unavailable
+ * fields remain explicit null/zero values; usage recovery records whether provider usage was
+ * actually supplied rather than making a missing report look free.
+ */
 function subCall(phaseName, wi, call) {
   return {
     phase: phaseName,
@@ -239,6 +246,13 @@ function notice(kind, detail, extras = {}) {
   return { notice: kind, detail: bounded, ...extras }
 }
 
+/**
+ * Select blocking findings for adversarial verification in the shared deterministic order.
+ *
+ * A recognized ``fingerprint-v1`` rule deduplicates during the fixed lens walk. An unknown
+ * rule deliberately keeps duplicate findings and emits a notice: synthesis still deduplicates
+ * later, while this evidence preserves the runner's inability to honor the requested rule.
+ */
 function verifyQueue(findingsByLens, dedupeRule) {
   const notices = []
   const dedupe = dedupeRule === FINGERPRINT_RULE
