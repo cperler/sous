@@ -2639,7 +2639,13 @@ class Engine:
 
     @staticmethod
     def _review_fixup_tail_ineligibility(task: Task) -> str | None:
-        """Explain why the pipeline cannot safely auto-apply a review fixup."""
+        """Return a hold reason unless a fixup can be reimplemented and re-delivered.
+
+        A fixup becomes durable application evidence only after the pipeline can run
+        IMPLEMENT, DELIVER, and REVIEW in that order.  Both standalone and combined
+        rejection/fixup paths use this result so bespoke pipelines surface an audit hold
+        instead of later claiming an un-delivered change was applied.
+        """
         required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
         if not all(stage in task.pipeline for stage in required_tail):
             return "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
