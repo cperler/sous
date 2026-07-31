@@ -853,7 +853,9 @@ class Engine:
         ``supervisor_min_remaining_pct`` of the window plus a conservative prompt cost.
         Insufficient or unavailable context parks the run with
         ``supervisor_resume_command`` before any prompt artifact, event, or lease is
-        written. If other task leases are still live, it instead raises
+        written. This decision and each fresh lease commit are serialized per run, so a
+        parked run cannot gain a concurrent lease. If other task leases are still live, it
+        instead raises
         ``SupervisorParkDeferred`` so the caller can drain them to a safe boundary.
         ``resume=True`` never applies this gate because it recovers an existing lease.
 
@@ -3165,8 +3167,9 @@ class Engine:
         next prompt. ``reason`` and ``resume_command`` are persisted in the run status
         and the single ``supervisor_parked`` audit event; ``context`` may retain the
         failed projection for diagnosis. Repeated calls are idempotent: one park episode
-        has one event. Raises ``ContractError`` for missing handoff details, a paused or
-        terminal run, or any outstanding dispatch lease.
+        has one event. The park transition is serialized with fresh dispatch commits, so
+        it cannot race a new lease onto a parked run. Raises ``ContractError`` for missing
+        handoff details, a paused or terminal run, or any outstanding dispatch lease.
         """
         with self.store.with_dispatch_lock(run_id):
             return self._park_supervisor_locked(

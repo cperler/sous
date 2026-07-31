@@ -236,8 +236,10 @@ def read_supervisor_context(
     """Read ``cwd``'s snapshot, failing closed when it is unavailable or too old.
 
     ``max_age_s`` bounds how long a status-line observation may authorize a dispatch.
-    Missing, unreadable, corrupt, and stale cache data produces an unavailable snapshot
-    with a reason instead of raising, allowing the caller to park at a stage boundary.
+    Missing, unreadable, syntactically corrupt, schema-invalid, and stale cache data
+    produces an unavailable snapshot with a reason instead of raising. Cached counters
+    must have finite numeric values and valid ranges before they can authorize a dispatch,
+    allowing callers to fail closed at a stage boundary.
     """
     target = _cache_root(cache_root) / f"{_cwd_key(cwd)}.json"
     try:
