@@ -176,20 +176,18 @@ workflow review reads as one stage with a visible internal breakdown.
 ## 5. Lanes and selection
 
 - **headless×claude** — reference implementation (transport-level, §2).
-- **interactive×claude** — *planned, NOT built (#262).* `workflow_shim.js` is to grow a
-  per-WorkItem branch: a plan-bearing item runs finders via its existing
-  `agent()`/`parallel()` primitives (this is precisely the "shim grows stage-internal
-  fan-out support" trigger the issue named), fills verify slots mechanically, and returns
-  the same `sub_results`/`sub_calls` StageResult shape. It would do **no folding** —
+- **interactive×claude** — *built (#262).* `workflow_shim.js` has a per-WorkItem branch: a
+  plan-bearing item runs finders and verifiers via its existing `agent()` primitive (the
+  "shim grows stage-internal fan-out support" trigger the issue named), fills verify slots
+  mechanically, and returns the same `sub_results`/`sub_calls` StageResult shape. It does
+  **no folding** —
   synthesis happens in Python when the supervisor persists via `orchestrator record`, so
-  the two lanes share one implementation, and the interactive≡headless conformance test
-  extends to a plan-bearing review.
-  **Until that branch lands the cell declares `supports_plan=False`** (#288): having the
-  primitives is not executing the plan, and a descriptor that over-promises does not
-  degrade gracefully — it degrades *silently*, since the engine has nothing to veto and so
-  emits no `review_workflow_skipped`. Declaring False routes through the honest
-  `lane_cannot_execute_plan` veto instead. Flip it back to True in the same PR that lands
-  plan execution. **Today headless×claude is the only lane a panel actually runs on.**
+  the two lanes share one fold, and the interactive≡headless conformance test covers a
+  plan-bearing review with a fake `agent()` harness versus a fake transport.
+  The cell therefore declares `supports_plan=True`. #288 remains the invariant behind that
+  flag: a descriptor that over-promises does not degrade gracefully — it degrades
+  *silently*, since the engine has nothing to veto and emits no `review_workflow_skipped`.
+  Both claude lanes now execute panels; codex still does not.
 - **codex** — v1 ignores the plan and dispatches the single-reviewer prompt (codex exec
   has no sub-agent primitive). `next_work` therefore only attaches a plan when the
   resolved lane supports it (a runner capability flag in the execution registry, like

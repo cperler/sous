@@ -102,9 +102,9 @@ def build_registry(
                 provider=Provider.CLAUDE,
                 in_process=False,
                 schema_enforced=True,
-                # #288: the shim has agent()/parallel() but no plan-execution branch yet, and
-                # a flag that over-promises degrades silently. Flip to True with #262.
-                supports_plan=False,
+                # #262: the Workflow shim executes the same finder/verifier contract as the
+                # headless review-panel driver; #288 requires the flag to follow that behavior.
+                supports_plan=True,
                 # #302 (decided, not deferred again): stays False — `run_targets/
                 # workflow_shim.js` calls `agent(prompt, {model, effort, agentType, schema})`,
                 # which exposes NO tool restriction, so True would be the same silent

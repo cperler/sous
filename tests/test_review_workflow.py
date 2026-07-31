@@ -16,6 +16,7 @@ import json
 
 import pytest
 
+import orchestrator.review_workflow as review_workflow
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.review_workflow import (
@@ -251,6 +252,20 @@ def test_fingerprint_matching_is_normalized() -> None:
     assert review["issues"] == []
     assert review["approved"] is True
     assert notices == ()
+
+
+def test_fingerprint_casefold_is_pinned_to_unicode_15(monkeypatch) -> None:
+    """Newer Unicode case pairs cannot change an existing fingerprint rule's identity."""
+    # U+1C89/U+1C8A became uppercase/lowercase partners after Unicode 15.  The v1 table
+    # predates that mapping, so they intentionally remain different fingerprint characters.
+    assert issue_fingerprint("\u1c89.py:BUG") == "\u1c89.py:bug"
+    assert issue_fingerprint("\u1c8a.py:BUG") == "\u1c8a.py:bug"
+
+    # This interpreter still has Unicode 15, where ``str.casefold()`` happens to return the
+    # same result. Prove the public path is wired to the pinned helper, so reverting it to
+    # runtime ``casefold()`` fails here rather than only on a newer Python.
+    monkeypatch.setattr(review_workflow, "_casefold_v1", lambda text: "pinned-result")
+    assert issue_fingerprint("any input") == "pinned-result"
 
 
 def test_shuffled_lens_order_folds_identically() -> None:
@@ -578,13 +593,11 @@ def test_ledger_still_writes_one_row_for_a_sub_results_bearing_result(tmp_path, 
 
 # ---------------------------------- (#285/#268) panel telemetry + the runner-notice contract
 #
-# Fixture-driven by necessity, not preference: the panel has never executed inside the
-# engine and cannot on the interactive lane (the shim ignores ``wi.plan``, so that lane's
-# descriptor declares ``supports_plan=False`` until #262 lands and the engine vetoes the plan
-# outright — #288). Everything below is therefore constructed ``sub_results``, which is also
-# what the fold's purity contract makes sufficient: the summary is a function of that input
-# and nothing else. (These results carry no dispatched plan, so they never trip the #288
-# ``review_plan_not_executed`` marker — that path is pinned in tests/test_review_plan.py.)
+# Fixture-driven because the fold's purity contract makes constructed ``sub_results``
+# sufficient: the summary is a function of that input and nothing else. These results carry
+# no dispatched plan, so they never trip the #288 ``review_plan_not_executed`` marker — that
+# path is pinned in tests/test_review_plan.py. Actual interactive/headless panel execution is
+# covered by the shim conformance harness.
 
 ONLY_CODE = {"severity": "critical", "file": "d.py", "description": "code alone"}
 ONLY_DESIGN = {"severity": "critical", "file": "e.py", "description": "design gap alone"}

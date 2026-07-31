@@ -317,7 +317,7 @@ def test_headless_lanes_declare_enforcement() -> None:
     for provider in (Provider.CLAUDE, Provider.CODEX):
         lane = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=provider)
         assert reg.describe(lane).enforces_tool_policy, provider
-    # the interactive shim's agent() call takes no tool restriction (#262)
+    # the interactive shim's agent() call takes no tool restriction (#302)
     interactive = LanePolicy(execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE)
     assert not reg.describe(interactive).enforces_tool_policy
     assert not default_registry().describe(interactive).enforces_tool_policy
