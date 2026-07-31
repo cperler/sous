@@ -197,6 +197,14 @@ def test_every_finder_shares_the_cache_stable_framing_and_differs_only_by_lens()
         assert all(other not in finder.prompt for other in others)
 
 
+def test_every_finder_requests_meta_authoring_target_metadata() -> None:
+    """The panel path must capture the same targeted retrospective as one reviewer."""
+    plan = _plan(diff_stat=_BIG)
+    for finder in plan.finders:
+        assert "retrospective ({title, detail, target?}" in finder.prompt
+        assert "kind: stage-template|agent|skill|stage-schema|kit" in finder.prompt
+
+
 def test_prior_attempt_learnings_ride_every_finder() -> None:
     """A review fix cycle's learnings must reach the panel, exactly as they reach the
     single-reviewer prompt."""
