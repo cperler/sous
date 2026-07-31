@@ -167,21 +167,31 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     Each input dict supplies ``text`` (required) + optional ``run_id, task_id, kind, files,
     failure_kind, stage, target, ts, id``; missing ``id``/``ts`` are minted here. With
     ``dedupe`` enabled, ordinary learnings use a global normalized-text fingerprint, while
-    ``process`` observations include ``run_id`` in that key. The latter keeps replay within
-    one run idempotent without erasing the cross-run repetition the proposal detector needs.
+    ``process`` observations include ``run_id`` and normalized target identity in that key.
+    The latter keeps replay within one run idempotent without erasing either cross-run
+    repetition or same-run observations about different artifacts.
     """
     path = Path(path)
 
-    def dedupe_key(entry: dict) -> tuple[str, str | None] | tuple[str]:
+    def dedupe_key(
+        entry: dict,
+    ) -> tuple[str, str | None, str | None, str | None] | tuple[str]:
         """Process observations must recur across runs to be useful detector fuel.
 
         Ordinary task learnings retain their historical global text dedupe. Process
-        observations dedupe only within a run, making task-finalize replay idempotent
-        without erasing the same complaint when a later run independently repeats it.
+        observations dedupe only within a run and target, making task-finalize replay
+        idempotent without erasing a same-worded observation about another artifact or the
+        same complaint when a later run independently repeats it.
         """
         fp = _fingerprint(entry.get("text", ""))
         if entry.get("kind") == "process":
-            return (fp, entry.get("run_id"))
+            target = entry.get("target")
+            kind: str | None = None
+            ref: str | None = None
+            if isinstance(target, dict):
+                kind = re.sub(r"\s+", " ", str(target.get("kind") or "")).strip().casefold()
+                ref = re.sub(r"\s+", " ", str(target.get("ref") or "")).strip().casefold()
+            return (fp, entry.get("run_id"), kind or None, ref or None)
         return (fp,)
 
     seen = {dedupe_key(e) for e in read_entries(path)} if dedupe else set()

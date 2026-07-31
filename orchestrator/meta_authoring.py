@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from .status_store import file_lock
@@ -99,6 +101,23 @@ def read_filing_ledger(path: str | Path) -> list[dict]:
 def filed_keys(path: str | Path) -> set[str]:
     """Return cluster keys already recorded in the tolerant filing ledger at ``path``."""
     return {str(row["key"]) for row in read_filing_ledger(path)}
+
+
+@contextmanager
+def proposal_filing_guard(path: str | Path, key: str) -> Iterator[bool]:
+    """Serialize the filing decision and side effect for one proposal cluster.
+
+    The caller must keep the context open across both the external tracker call and
+    :func:`append_filing`. The yielded value is ``False`` when another finalizer already
+    ledgered ``key``. A per-cluster lock lets unrelated proposals file independently while
+    preventing two engines from creating duplicate tracker issues for the same evidence.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lock_key = hashlib.sha256(str(key).encode("utf-8")).hexdigest()[:20]
+    guard_path = path.with_name(f"{path.name}.{lock_key}.filing")
+    with file_lock(guard_path):
+        yield str(key) not in filed_keys(path)
 
 
 def append_filing(path: str | Path, row: dict) -> bool:

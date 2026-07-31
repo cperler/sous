@@ -53,8 +53,8 @@ from .learnings_kb import (
 )
 from .meta_authoring import (
     append_filing,
-    filed_keys,
     proposal_body,
+    proposal_filing_guard,
     proposal_title,
     recurring_proposals,
 )
@@ -5278,7 +5278,6 @@ class Engine:
         try:
             proposals = recurring_proposals(read_kb_entries(self._learnings_kb_path()))
             ledger_path = self._meta_proposals_path()
-            already_filed = filed_keys(ledger_path)
         except Exception as exc:  # noqa: BLE001 - detection is best-effort evidence-out
             self.store.append_event(
                 run_id,
@@ -5287,22 +5286,25 @@ class Engine:
             )
             return
         for proposal in proposals:
-            if proposal["key"] in already_filed:
-                continue
             title = proposal_title(proposal)
             try:
-                ref = file_followup(
-                    title=title,
-                    body=proposal_body(proposal),
-                    labels=["meta-authoring", "enhancement"],
-                )
-                if not ref:
-                    raise RuntimeError("file_followup returned no reference")
-                append_filing(
-                    ledger_path,
-                    {"key": proposal["key"], "ref": str(ref), "filed_at": _now(),
-                     "run_id": run_id},
-                )
+                with proposal_filing_guard(ledger_path, proposal["key"]) as should_file:
+                    if not should_file:
+                        continue
+                    ref = file_followup(
+                        title=title,
+                        body=proposal_body(proposal),
+                        labels=["meta-authoring", "enhancement"],
+                    )
+                    if not ref:
+                        raise RuntimeError("file_followup returned no reference")
+                    appended = append_filing(
+                        ledger_path,
+                        {"key": proposal["key"], "ref": str(ref), "filed_at": _now(),
+                         "run_id": run_id},
+                    )
+                    if not appended:
+                        raise RuntimeError("proposal filing claim was not recorded")
             except Exception as exc:  # noqa: BLE001 - filing must never break finalize
                 self.store.append_event(
                     run_id,
@@ -5310,7 +5312,6 @@ class Engine:
                      "key": proposal["key"], "title": title, "error": str(exc)},
                 )
                 continue
-            already_filed.add(proposal["key"])
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "meta_proposal_filed", "run_id": run_id,

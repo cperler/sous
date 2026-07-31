@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+
+import orchestrator.engine as engine_module
 from orchestrator import learnings_kb as kb
 from orchestrator import meta_authoring as meta
 from orchestrator.cost_ledger import CostLedger
@@ -45,6 +48,14 @@ def test_process_entries_dedupe_per_run_and_never_reach_recall(tmp_path) -> None
     row = {"kind": "process", "text": "Review prompt hides the baseline", "target": TARGET}
     assert len(kb.append_learnings(path, [{**row, "run_id": "r1"}])) == 1
     assert kb.append_learnings(path, [{**row, "run_id": "r1"}]) == []
+    other_target = {"kind": "skill", "ref": "review-evidence"}
+    assert len(kb.append_learnings(
+        path, [{**row, "run_id": "r1", "target": other_target}]
+    )) == 1
+    assert kb.append_learnings(
+        path,
+        [{**row, "run_id": "r1", "target": {"kind": " SKILL ", "ref": " REVIEW-EVIDENCE "}}],
+    ) == []
     assert len(kb.append_learnings(path, [{**row, "run_id": "r2"}])) == 1
     assert kb.relevant_learnings(path, {"title_tokens": ["review", "baseline"]}) == []
 
@@ -121,6 +132,39 @@ def test_second_run_files_one_meta_task_and_ledger_prevents_refiling(tmp_path, p
 
     eng._file_meta_proposals("r2")
     assert len(project.task_source.followups) == 1
+
+
+def test_concurrent_finalizers_file_one_meta_task(tmp_path, project, monkeypatch) -> None:
+    path = tmp_path / "learnings-kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "process", "run_id": "r1", "text": "first", "target": TARGET},
+        {"kind": "process", "run_id": "r2", "text": "second", "target": TARGET},
+    ])
+    engines = [_engine(tmp_path, project), _engine(tmp_path, project)]
+
+    # Force both finalizers to finish detection before either can enter the per-cluster
+    # guard. Without the locked ledger recheck, both would create an external issue.
+    barrier = threading.Barrier(2)
+    original_detector = engine_module.recurring_proposals
+
+    def synchronized_detector(entries):
+        proposals = original_detector(entries)
+        barrier.wait(timeout=10)
+        return proposals
+
+    monkeypatch.setattr(engine_module, "recurring_proposals", synchronized_detector)
+    threads = [
+        threading.Thread(target=engine._file_meta_proposals, args=(f"r{index}",))
+        for index, engine in enumerate(engines, start=1)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(project.task_source.followups) == 1
+    assert len(meta.read_filing_ledger(engines[0]._meta_proposals_path())) == 1
 
 
 def test_filing_failure_is_evented_without_ledger_and_can_retry(tmp_path, project) -> None:
