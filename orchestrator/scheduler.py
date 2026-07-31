@@ -316,7 +316,10 @@ class Scheduler:
         reclaims nothing, because stealing a live lease would double-dispatch the stage.
         In that case the loop does not pretend to be finished: it returns
         ``scheduler.exit_reason == "blocked_on_orphaned_dispatches"`` (``run-headless``
-        exits non-zero), naming the tasks and pointing at ``orchestrator abandon``.
+        exits non-zero), naming the tasks and pointing at ``orchestrator abandon``. A
+        supervisor-context PARKED run similarly stops cleanly with
+        ``scheduler.exit_reason == "supervisor_parked"``; it needs a fresh interactive
+        supervisor, not an unpause or stale-run recovery.
 
         Batch-wide circuit breaker (#58): ``batch_failure_threshold`` consecutive task
         failures (no completion in between) PAUSE the run and stop dispatching — a

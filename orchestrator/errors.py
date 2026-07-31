@@ -51,7 +51,13 @@ class CapacityExhausted(OrchestratorError):
 
 
 class SupervisorParkDeferred(OrchestratorError):
-    """Supervisor context is low, but live dispatches must drain before parking."""
+    """Signal that a low-context park must wait for existing leases to drain.
+
+    ``in_flight`` identifies the leases that keep the run away from a safe stage
+    boundary; ``projection`` preserves the failed context calculation for reporting.
+    The interactive driver should stop refilling work, record those results, then retry
+    the guarded dispatch so it can park without stranding a lease.
+    """
 
     def __init__(self, in_flight: list[str], projection: dict) -> None:
         self.in_flight = in_flight

@@ -189,13 +189,15 @@ def watch(
     activity: bool = False,
     stall_after_s: int = 300,
 ) -> dict:
-    """Poll ``run_id`` to a terminal run state, firing stall notifications with the
-    shared once-per-episode dedupe. Usable for ANY run — including single-task
+    """Poll ``run_id`` until terminal or supervisor-parked, firing stall notifications
+    with the shared once-per-episode dedupe. Usable for ANY run — including single-task
     engine-lane runs that no scheduler loop is watching.
 
     Each pass: read ``status`` (with ``stale_after_s``), emit any newly-due stall
     notifications (project hook + audit row via ``engine.emit_notification``, plus a
-    human line via ``emit``), and return the final status once the run is terminal.
+    human line via ``emit``), and return the final status once the run is terminal. A
+    PARKED run is also a stop condition: it emits the persisted fresh-supervisor resume
+    command but does not classify the clean handoff as stale or human-blocked.
     ``sleeper`` is injected (``time.sleep`` in production, a stub in tests) so the loop
     is drivable without real sleeping.
 

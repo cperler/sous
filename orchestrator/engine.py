@@ -846,8 +846,20 @@ class Engine:
         smaller, less-eager DOWNGRADE band (the ledger read is confined to the band-edge
         util region and gated on a minimum sample). Emitting stamps the dispatch lease
         (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
-        supervisor crash instead. Raises ``CapacityExhausted`` at the per-call gate or
-        during a rate-limit cooldown, ``ContractError`` on a lease conflict.
+        supervisor crash instead.
+
+        For an interactive, fresh model dispatch, supplying ``supervisor_context`` adds a
+        final pre-lease gate after the exact prompt has been rendered. It reserves
+        ``supervisor_min_remaining_pct`` of the window plus a conservative prompt cost.
+        Insufficient or unavailable context parks the run with
+        ``supervisor_resume_command`` before any prompt artifact, event, or lease is
+        written. If other task leases are still live, it instead raises
+        ``SupervisorParkDeferred`` so the caller can drain them to a safe boundary.
+        ``resume=True`` never applies this gate because it recovers an existing lease.
+
+        Raises ``CapacityExhausted`` at the per-call gate or during a rate-limit cooldown,
+        ``ContractError`` on a lease conflict, and ``SupervisorParkDeferred`` when a
+        requested park must wait for in-flight work.
         """
         # Budget backpressure (#34): consult the run's metered spend against its budget at
         # this dispatch point. Once spend >= budget, do NOT dispatch new work — PAUSE the
@@ -3132,7 +3144,11 @@ class Engine:
 
         Unlike PAUSED (budget/breaker) and BLOCKED_ON_HUMAN (a decision gate), PARKED
         means the current Claude Code session lacks enough context to safely carry the
-        next prompt. Repeated calls are idempotent: one park episode has one event.
+        next prompt. ``reason`` and ``resume_command`` are persisted in the run status
+        and the single ``supervisor_parked`` audit event; ``context`` may retain the
+        failed projection for diagnosis. Repeated calls are idempotent: one park episode
+        has one event. Raises ``ContractError`` for missing handoff details, a paused or
+        terminal run, or any outstanding dispatch lease.
         """
         run = self.store.load_run(run_id)
         if run.state is RunState.PARKED:
@@ -3179,7 +3195,14 @@ class Engine:
     def resume_supervisor(
         self, run_id: str, *, supervisor_session_id: str | None = None
     ) -> Run:
-        """Release a supervisor-context park for a fresh interactive session."""
+        """Release a supervisor-context park after a fresh interactive handoff.
+
+        The method clears the parked metadata, returns the run to ``RUNNING``, and emits
+        ``supervisor_resumed``. If the park recorded a session id, callers must provide a
+        different ``supervisor_session_id``; this prevents the exhausted supervisor from
+        immediately refilling the run. Raises ``ContractError`` unless the run is parked
+        and that freshness check succeeds.
+        """
         run = self.store.load_run(run_id)
         if run.state is not RunState.PARKED:
             raise ContractError(f"run {run_id} is not parked (state {run.state.value})")

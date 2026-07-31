@@ -25,7 +25,12 @@ PROMPT_BYTES_PER_TOKEN = 3  # deliberately conservative for mixed prose/JSON pro
 
 @dataclass(frozen=True)
 class SupervisorContext:
-    """One fresh (or explicitly unavailable) Claude Code context observation."""
+    """One Claude Code context observation used to gate an interactive dispatch.
+
+    ``available=False`` represents a missing, malformed, or stale observation and is
+    deliberately fail-closed: callers must park rather than risk leasing work to a
+    supervisor that may run out of context mid-stage.
+    """
 
     available: bool
     observed_at: float | None = None
@@ -38,12 +43,18 @@ class SupervisorContext:
 
     @property
     def remaining_tokens(self) -> int | None:
+        """Return the floored remaining-window estimate, if the snapshot is complete."""
         if self.context_window_size is None or self.remaining_percentage is None:
             return None
         return max(0, math.floor(self.context_window_size * self.remaining_percentage / 100))
 
     def projected(self, prompt: str, *, min_remaining_pct: float) -> dict:
-        """Return the conservative gate calculation for one rendered prompt."""
+        """Calculate whether ``prompt`` fits while preserving the configured reserve.
+
+        The estimate conservatively converts UTF-8 prompt bytes to tokens, so the
+        returned ``should_park`` is suitable for a pre-lease safety gate. ``ValueError``
+        is raised when ``min_remaining_pct`` is not a finite percentage in ``[0, 100]``.
+        """
         if not math.isfinite(min_remaining_pct) or not 0 <= min_remaining_pct <= 100:
             raise ValueError("min_remaining_pct must be a finite percentage from 0 to 100")
         prompt_chars = len(prompt)
@@ -104,7 +115,13 @@ def _finite_number(value: object) -> float | None:
 def capture_statusline_context(
     payload: dict, *, cache_root: Path | None = None, now: float | None = None
 ) -> Path | None:
-    """Persist the context portion of one Claude Code status-line payload atomically."""
+    """Persist a valid Claude Code status-line context snapshot atomically.
+
+    ``payload`` must provide a working directory and a complete ``context_window``
+    observation. Invalid or incomplete status-line data returns ``None`` without
+    creating a cache entry; a successful write returns the cwd-keyed cache path. The
+    cache deliberately stores counters only, never prompts or model output.
+    """
     context = payload.get("context_window")
     if not isinstance(context, dict):
         return None
@@ -157,7 +174,12 @@ def read_supervisor_context(
     max_age_s: float = DEFAULT_MAX_AGE_S,
     now: float | None = None,
 ) -> SupervisorContext:
-    """Read the cwd's latest snapshot, failing closed when absent, corrupt, or stale."""
+    """Read ``cwd``'s snapshot, failing closed when it is unavailable or too old.
+
+    ``max_age_s`` bounds how long a status-line observation may authorize a dispatch.
+    Missing, unreadable, corrupt, and stale cache data produces an unavailable snapshot
+    with a reason instead of raising, allowing the caller to park at a stage boundary.
+    """
     target = _cache_root(cache_root) / f"{_cwd_key(cwd)}.json"
     try:
         data = json.loads(target.read_text(encoding="utf-8"))
