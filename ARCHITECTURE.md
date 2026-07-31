@@ -76,12 +76,25 @@ written.
   `StageSpec.tool_policy` declares what a stage's dispatch may *do* in the engine's own
   provider-neutral words (`allow_file_writes`, `allow_command_execution`) — never a claude tool
   name — and each transport translates it: claude `--disallowedTools Write,Edit,NotebookEdit`,
-  codex `--sandbox read-only` (on the resume call too, so continuity can't revert the posture).
+  codex `--sandbox read-only` (on the resume call too, so continuity can't revert the posture)
+  unless REVIEW is already inside the disposable workspace described below.
   **SCOPE and REVIEW** declare one (#303): both read the repo and return a document, so both get
   writes denied with **command execution deliberately retained** — a scoper reads and greps, an
   adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
   it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
   prompted), independent of the permission gate below.
+- **REVIEW execution isolation** (#301). Every in-process headless REVIEW transport call runs
+  in an independent throwaway local clone seeded with the live worktree payload (including
+  ignored dependencies and dirty state, excluding its linked `.git`). The clone has its own
+  object database and no `origin`, so shell writes, caches, Codex persona materialization, and
+  accidental Git writes cannot alter the judged tree. A plan's finder/verifier calls each get
+  a fresh clone rather than inheriting a prior panel member's artifacts. Projects that opt into
+  ports also allocate one temporary block per call; the panel holds all of them until it ends,
+  so sequential sub-calls cannot reuse a block, then releases them on every exit path. Setup or
+  port exhaustion fails the call instead of falling back to the task worktree/block. Within
+  that disposable checkout Codex uses `workspace-write`, allowing pytest/build caches despite
+  its coarse sandbox; Claude keeps its finer write-tool deny-list. Interactive REVIEW remains
+  outside this in-process runner boundary and retains #302's explicit unenforced posture.
 - **Permission gate: a lane decision, not a constant** (#304, superseding #272's "the flag
   stays"). `--dangerously-skip-permissions` used to be appended to *every* headless dispatch
   from `transport.py`. It is now derived: `CapabilityDescriptor.permission_posture` declares a
@@ -98,7 +111,8 @@ written.
   `Bash` runs (in subagents too), default read tools run unlisted, `Write` is refused by the
   deny-list, and an ungranted tool is refused in-band rather than stalling. codex has no blanket grant to withhold (`codex exec` is
   sandboxed on every path we emit and the true bypass is never used), so there a lane-level
-  RESTRICTED changes nothing and only a write-denying stage reaches `--sandbox read-only`. A lane
+  RESTRICTED changes nothing and a write-denying stage reaches `--sandbox read-only` unless its
+  REVIEW call is already contained by #301's disposable workspace. A lane
   that must never hold blanket permission (shared/production checkout) now declares that on its
   descriptor instead of editing the transport.
 - **Where a lane can't enforce, the degradation is explicit** (#302 — decided, not deferred

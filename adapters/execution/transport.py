@@ -899,13 +899,21 @@ def _codex_permission_read_only(work: WorkItem) -> bool:
     (``--sandbox read-only``), which is COARSER than claude's tool deny-list: a command that
     writes anywhere (a pytest cache, a build dir) fails under it. That is the price of real
     enforcement on this lane, and it is why the posture maps to the sandbox rather than being
-    dropped as untranslatable.
+    dropped as untranslatable. #301's runner-isolated REVIEW is the exception: there the
+    process may write inside a disposable clone so ordinary verification commands work.
 
     A RESTRICTED posture from the LANE alone (no write-denying stage policy) does NOT go
     read-only: it would break every writing stage on that lane, and there is nothing else to
     translate — ``codex exec`` is sandboxed on every path this transport emits and the true
     bypass (``--dangerously-bypass-approvals-and-sandbox``) is never used, so codex has no
     blanket-permission grant to withhold in the first place."""
+    # #301: a REVIEW running in an independent throwaway checkout needs workspace-write so
+    # pytest/build commands can create their ordinary caches and outputs.  The live task tree
+    # and its port block are not reachable from that call, so the coarse process sandbox no
+    # longer has to make the verifier brittle to contain those writes.  Claude retains its
+    # finer Write/Edit deny-list inside the same isolation.
+    if work.workspace_isolated:
+        return False
     if resolve_permission_posture(work) is not PermissionPosture.RESTRICTED:
         return False
     policy = work.tool_policy
@@ -1494,10 +1502,10 @@ def codex_cli_transport(
             tail = ["-m", work.model, *effort_cfg, "--skip-git-repo-check", *schema_flags,
                     "--json", "--output-last-message", str(last), work.prompt]
             # #272: a write-denying posture swaps the write sandbox for codex's read-only one on
-            # BOTH call shapes, so the posture survives session continuity instead of silently
-            # reverting to workspace-write on the second call of the stage. The writable-root
-            # grant is dropped with it — granting write roots under a read-only sandbox would
-            # contradict the posture. Unset policy keeps the pre-#272 argv byte-identical.
+            # BOTH call shapes, so continuity cannot silently revert it. #301 deliberately
+            # keeps workspace-write for a REVIEW already moved into a disposable clone; caches
+            # and build output then work without reaching the live task tree. Unset policy
+            # keeps the pre-#272 argv byte-identical.
             read_only = _codex_permission_read_only(work)
             if session_ref:
                 # Resume carries the warm session. It takes no sandbox/approval/--add-dir flags,

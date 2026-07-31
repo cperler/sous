@@ -169,6 +169,8 @@ def test_posture_is_excluded_from_content_hash(tmp_path, project) -> None:
     policed = _work(tool_policy=READ_ONLY)
     assert policed.tool_policy == READ_ONLY
     assert policed.content_hash == _work().content_hash
+    assert policed.model_copy(update={"workspace_isolated": True}).content_hash == \
+        policed.content_hash
     assert policed.content_hash == compute_content_hash(
         stage=policed.stage, prompt=policed.prompt, schema_ref=policed.schema_ref,
         model=policed.model, lane_policy=policed.lane_policy, attempt=policed.attempt,
@@ -257,6 +259,24 @@ def test_codex_resume_keeps_the_posture(monkeypatch) -> None:
     assert 'sandbox_mode="read-only"' in argv
     assert 'sandbox_mode="workspace-write"' not in argv
     assert not any("writable_roots" in str(a) for a in argv)
+
+
+def test_codex_isolated_review_uses_writable_sandbox_fresh_and_resume(monkeypatch) -> None:
+    """#301: the coarse sandbox may write only after the runner moved REVIEW off the live
+    tree, so pytest/build caches work on both call shapes without dropping ToolPolicy."""
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_run(calls))
+    isolated = _work(
+        model="gpt-5.5", tool_policy=READ_ONLY, cwd=None, workspace_isolated=True
+    )
+    codex_cli_transport()(isolated)
+    assert "--full-auto" in calls[0]
+    assert "--sandbox" not in calls[0]
+
+    calls.clear()
+    codex_cli_transport()(isolated.model_copy(update={"session_ref": "thread-1"}))
+    assert 'sandbox_mode="workspace-write"' in calls[0]
+    assert 'sandbox_mode="read-only"' not in calls[0]
 
 
 def test_codex_argv_without_a_posture_is_unchanged(monkeypatch) -> None:

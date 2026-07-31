@@ -131,7 +131,7 @@ def build_registry(
         if run_log_root is not None:
             inner = stream_teeing_transport(inner, run_log_root)
         headless_transport = checkpointing_transport(inner)
-    reg.register_runner(HeadlessClaudeRunner(headless_transport))
+    reg.register_runner(HeadlessClaudeRunner(headless_transport, review_project=setup_project))
     if codex_transport is None and (codex_schema_provider is not None or run_log_root is not None):
         # Mirror the headless×claude wiring: thread the project's stage schema into the codex
         # transport so it enforces `--output-schema` AND runs the schema-validate-and-retry loop
@@ -145,7 +145,9 @@ def build_registry(
         if run_log_root is not None:
             inner = stream_teeing_transport(inner, run_log_root)
         codex_transport = checkpointing_transport(inner)
-    reg.register_runner(CodexRunner(codex_transport, codex_schema_provider))
+    reg.register_runner(CodexRunner(
+        codex_transport, codex_schema_provider, review_project=setup_project
+    ))
     if setup_project is not None:
         from .deterministic_setup import DeterministicSetupRunner
 
