@@ -281,10 +281,17 @@ The engine assigns a model **per stage by role** — it's never a CLI flag. Two 
 ```bash
 $ORCH status          # progress + cost summary + lane-attribution audit
 $ORCH cost-report     # per-stage / per-task breakdown + the session-reuse win
+$ORCH --root runs panel-report --limit 20  # cross-run panel yield + review cost
 $ORCH retrospective   # failure patterns + what the retries learned (on a failed run)
 $ORCH util            # 5h/7d account utilization (JSON) — the --util sensor
 $ORCH statusline      # the same numbers as one line, for the status bar
 ```
+
+`panel-report` reads the newest run stores directly, comparing panel and plain review
+costs while breaking panel yield down by finder lens, verifier verdict, and cap hits. It is
+observational: the panel replaces the single-reviewer path, so the report explicitly does
+not claim what a single reviewer would have caught on the same diff. It also flags low panel
+sample sizes and incomplete/unmetered cost data instead of presenting either as certainty.
 
 **At-a-glance utilization while supervising runs (#61).** `orchestrator statusline`
 prints one line — `⧗ 5h 87% (resets 3h0m) · 7d 41% (resets 4d9h)` — off the same
