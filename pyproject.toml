@@ -126,6 +126,7 @@ module = [
     "orchestrator.lane_loader",
     "orchestrator.learnings_kb",
     "orchestrator.model_table",
+    "orchestrator.panel_report",
     "orchestrator.port_registry",
     "orchestrator.ports",
     "orchestrator.ports.execution",

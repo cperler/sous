@@ -63,6 +63,17 @@ def _budget_usd(raw: str) -> float:
     return value
 
 
+def _positive_int(raw: str) -> int:
+    """Argparse type for cross-run report limits."""
+    try:
+        value = int(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not an integer") from None
+    if value < 1:
+        raise argparse.ArgumentTypeError(f"must be at least 1, got {raw}")
+    return value
+
+
 def _auto_util_provider() -> Callable[[], float]:
     """A live 5-hour-usage util probe: re-probes each tick so the gate tracks reality
     (0.0 when no usage snapshot is available). Shared by the queue-drive and headless
@@ -221,7 +232,8 @@ def main(argv: list[str] | None = None) -> int:
     * **Engine commands** (``init-run``, ``add-task``, ``next``, ``record``, ``run-headless``,
       ``batch-plan``, …) — all route through ``_engine()`` which resolves ``--root``/``--run``
       to a per-run store directory, builds an ``Engine``, and delegates.
-    * **Read-only board** (``dashboard``) — reads every store under ``--root`` via
+    * **Cross-run reports** (``dashboard`` / ``panel-report``) — read stores beneath
+      ``--root`` without constructing a single-run Engine.  ``dashboard`` uses
       ``dashboard_snapshot`` and renders to the terminal.  Two non-default modes are available:
       ``--watch`` (clear-screen polling loop) and ``--serve`` (HTTP server mode added by #94).
       ``--serve`` binds ``web_dashboard.serve`` on ``--host``/``--port`` and forwards
@@ -495,6 +507,12 @@ def main(argv: list[str] | None = None) -> int:
     cr.add_argument("--by-effort", action="store_true",
                     help="instead of the default report, split spend/duration/retry+failure "
                          "rates by (stage, effort, model) to tune the #96 per-stage effort table (#141)")
+    pr = sub.add_parser(
+        "panel-report",
+        help="cross-run review-panel yield + cost report (--root is the shared runs-root)",
+    )
+    pr.add_argument("--limit", type=_positive_int, default=20,
+                    help="newest runs to include (default 20)")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
     sp = sub.add_parser("spec", help="front door (#18): idea → validated spec → dependency-ordered issues")
@@ -757,6 +775,16 @@ def main(argv: list[str] | None = None) -> int:
                              interval=args.interval, **snap_kw)
             return 0
         print(render_dashboard(dashboard_snapshot(args.root, **snap_kw)))
+        return 0
+
+    if args.cmd == "panel-report":
+        # Cross-run and artifact-only: no project adapter or Engine is needed, and --run
+        # would be actively misleading because the point is to compare many run stores.
+        from .panel_report import build_panel_report, render_panel_report
+
+        if not args.root:
+            p.error("--root is required for panel-report (the shared runs-root, e.g. runs/)")
+        print(render_panel_report(build_panel_report(args.root, limit=args.limit)))
         return 0
 
     if args.cmd == "util":
