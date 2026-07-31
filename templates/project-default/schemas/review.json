@@ -37,7 +37,7 @@
     },
     "non_blocking": {
       "type": "array",
-      "description": "findings that do NOT block approval; each carries a `disposition` that gates what the engine does with it at finalize. Only `file` (or an absent disposition, for backward compatibility) becomes a deferred-scope issue — and only up to a small per-task cap; `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
+      "description": "findings that do NOT block approval; each may carry a `disposition` that gates what the engine does with it at finalize. Only an explicit `file`, chosen deliberately with justification, becomes a deferred-scope issue — and only up to a small per-task cap. An absent disposition and `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
       "items": {
         "type": "object",
         "required": ["title"],
@@ -47,7 +47,7 @@
           "disposition": {
             "type": "string",
             "enum": ["fix_now", "file", "drop"],
-            "description": "filing threshold. `file`: a maintainer would put this on the backlog independently — out-of-scope (different subsystem / needs its own design) OR non-trivial (real work/risk). NEVER `file` these — they are `drop` (or `fix_now` if trivial-in-blast-radius): cosmetic consistency ('move X to match Y', rename for symmetry), speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards/metrics for a feature not yet exercised), redundant convenience (a wrapper for already-exposed capability). `fix_now`: a trivial nit WITHIN the blast radius of this change (a docstring the edit made stale, a guard/type on a touched line) the implementer should have absorbed in place — not worth a ticket. `drop`: a real-but-untracked observation, noted and moved on. Absent disposition defaults to `file` (backward-compatible)."
+            "description": "filing threshold. Choose `file` deliberately, with justification, only when a maintainer would put this on the backlog independently — out-of-scope (different subsystem / needs its own design) OR non-trivial (real work/risk). NEVER `file` these — they are `drop` (or `fix_now` if trivial-in-blast-radius): cosmetic consistency ('move X to match Y', rename for symmetry), speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards/metrics for a feature not yet exercised), redundant convenience (a wrapper for already-exposed capability). `fix_now`: a trivial nit WITHIN the blast radius of this change (a docstring the edit made stale, a guard/type on a touched line) the implementer should have absorbed in place — not worth a ticket. `drop`: a real-but-untracked observation, noted and moved on. An absent disposition is noted, not filed; filing requires explicit `file`."
           }
         },
         "additionalProperties": true
@@ -55,7 +55,7 @@
     },
     "improvement": {
       "type": "object",
-      "description": "self-improvement loop: the single highest-value forward-looking improvement this task suggests for the PROJECT/roadmap (not a fix for this PR). Emit one ONLY if a maintainer would independently prioritize it — a concrete trigger or demonstrated need, not a nice-to-have. Do NOT emit: speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards for a feature not yet exercised), or convenience wrappers for already-exposed capability. Omit if none clears the bar (it is optional). The engine files a `file`/absent-disposition improvement as an enhancement issue at finalize.",
+      "description": "self-improvement loop: the single highest-value forward-looking improvement this task suggests for the PROJECT/roadmap (not a fix for this PR). Emit one ONLY if a maintainer would independently prioritize it — a concrete trigger or demonstrated need, not a nice-to-have. Do NOT emit: speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards for a feature not yet exercised), or convenience wrappers for already-exposed capability. Omit if none clears the bar (it is optional). The engine files an improvement as an enhancement issue at finalize only when it carries an explicit `file` disposition, chosen deliberately with justification.",
       "required": ["title"],
       "properties": {
         "title": {"type": "string", "description": "one-line enhancement title"},
@@ -63,7 +63,7 @@
         "disposition": {
           "type": "string",
           "enum": ["fix_now", "file", "drop", "fixup"],
-          "description": "same filing threshold as a non_blocking finding, plus `fixup`. `file` (or absent, backward-compatible): file as an enhancement issue. `fixup`: apply as a trivial in-place change in THIS PR — do not file. `fix_now`/`drop`: surfaced in the completion note, not filed. Absent defaults to `file`."
+          "description": "same filing threshold as a non_blocking finding, plus `fixup`. Choose `file` deliberately, with justification, to file an enhancement issue. `fixup`: apply as a trivial in-place change in THIS PR — do not file. `fix_now`/`drop`: surfaced in the completion note, not filed. An absent disposition is noted, not filed; filing requires explicit `file`."
         }
       },
       "additionalProperties": true

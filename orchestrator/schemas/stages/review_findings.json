@@ -39,7 +39,7 @@
         "disposition": {
           "type": "string",
           "enum": ["fix_now", "file", "drop", "fixup"],
-          "description": "same filing threshold as review.json's improvement. `file` (or absent): file as an enhancement issue. `fixup`: apply in-place this PR. `fix_now`/`drop`: surfaced in the completion note, not filed."
+          "description": "same filing threshold as review.json's improvement. Choose `file` deliberately, with justification, to file an enhancement issue. `fixup`: apply in-place this PR. `fix_now`/`drop` and an absent disposition are surfaced in the completion note, not filed."
         }
       },
       "additionalProperties": true

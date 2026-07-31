@@ -227,21 +227,16 @@ DEFAULT_ABANDON_MIN_IDLE_S = 300
 
 # Filing threshold for review evidence-out (#188): a review can surface any number of
 # non-blocking findings, but task completion must not become a hydra (one task spawning
-# a dozen follow-ups, as batch-queue-1 did). Only findings dispositioned `file` (or with
-# an absent disposition, for backward compatibility) are filed, and only up to this cap
-# per task; `fix_now`/`drop` findings — and any `file` finding over the cap — are surfaced
-# in the completion note's "Noted, not filed" section instead, so nothing is silently
-# dropped without ballooning the backlog. This is the engine-wide DEFAULT (#191): it is
-# overridable at engine-construction / run-create time via ``max_filed_followups`` and,
-# more granularly, per task via ``add_task(max_filed_followups=...)`` — a micro-pipeline
-# and a full-pipeline have very different expected review surfaces.
+# a dozen follow-ups, as batch-queue-1 did). Only findings explicitly dispositioned
+# `file` are filed, and only up to this cap per task; absent, empty, or unrecognized
+# dispositions, `fix_now`/`drop` findings, and any `file` finding over the cap are
+# surfaced in the completion note's "Noted, not filed" section instead, so nothing is
+# silently dropped without ballooning the backlog. This is the engine-wide DEFAULT
+# (#191): it is overridable at engine-construction / run-create time via
+# ``max_filed_followups`` and, more granularly, per task via
+# ``add_task(max_filed_followups=...)`` — a micro-pipeline and a full-pipeline have very
+# different expected review surfaces.
 MAX_FILED_FOLLOWUPS_PER_TASK = 2
-
-# Dispositions the engine must NOT file (they are noted in the completion note instead).
-# Anything else — including an absent disposition — files. `fixup` is improvement-only
-# (#223: apply in place in THIS PR, do not file); it is inert for non-blocking findings,
-# whose schema enum doesn't offer it, so sharing the set is safe.
-_UNFILED_DISPOSITIONS = frozenset({"fix_now", "drop", "fixup"})
 
 
 # Failure kinds whose committed work is NOT implicated by the failure itself, so any
@@ -2372,7 +2367,8 @@ class Engine:
             nb = list(out.get("non_blocking") or [])
             nb.extend(
                 {"title": str(f.get("description"))[:80],
-                 "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"})}
+                 "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"}),
+                 "disposition": "file"}
                 for f in advisory
             )
             out["non_blocking"] = nb
@@ -4687,8 +4683,8 @@ class Engine:
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
         """File non-blocking review findings as deferred-scope follow-up issues — but only
         the ones that clear the #188 filing threshold, so task completion doesn't become a
-        hydra. A finding is filed only when its ``disposition`` is ``file`` (or absent, for
-        backward compatibility) AND the filing cap (``Task.max_filed_followups``, falling
+        hydra. A finding is filed only when its ``disposition`` is explicitly ``file`` AND
+        the filing cap (``Task.max_filed_followups``, falling
         back to the run-wide ``Run.max_filed_followups`` then the engine-wide default —
         #191/#196) is not yet reached; ``fix_now``/``drop`` findings and cap overflow are skipped here and
         surfaced in the completion note's "Noted, not filed" section instead (nothing is
@@ -4721,12 +4717,10 @@ class Engine:
             title = str(finding.get("title") or "").strip()  # coerce: a model may emit non-strings
             if not title:
                 continue
-            # #188 gate: skip findings the reviewer marked as fix-in-place or drop; they are
-            # surfaced in the completion note, not filed. An absent/unknown disposition
-            # defaults to filing (preserves the pre-#188 behavior for the un-validated
-            # interactive lane and older reviews).
+            # #188/#228 gate: filing is opt-in. Absent, empty, unrecognized, fix-in-place,
+            # and drop dispositions are surfaced in the completion note, not filed.
             disposition = str(finding.get("disposition") or "").strip().casefold()
-            if disposition in _UNFILED_DISPOSITIONS:
+            if disposition != "file":
                 continue
             # #188 cap: past the per-task limit, additional `file` findings are also noted,
             # not filed — the completion note lists them as "over per-task cap".
@@ -4766,12 +4760,11 @@ class Engine:
 
         Suppression cases (all return None):
 
-        * (#223) The improvement carries a ``disposition`` of ``fix_now``, ``drop``, or
-          ``fixup`` — the reviewer judged it unworthy of a standing issue.  An
+        * (#223/#228) The improvement does not carry an explicit ``file`` disposition —
+          the reviewer did not opt it into a standing issue.  An
           ``improvement_not_filed`` event is emitted so the decision is auditable.
           ``fixup`` means the change should be applied in place in the current PR; the
-          other two are noted in the completion note.  An absent or ``file`` disposition
-          files unconditionally, preserving pre-#223 behaviour.
+          other non-file dispositions are noted in the completion note.
         * (#188) The idea fingerprint-matches an already-filed follow-up
           (``skip_fingerprints``) — one observation must not be filed twice as both a
           non-blocking finding and an enhancement."""
@@ -4785,16 +4778,16 @@ class Engine:
         title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
             return None
-        # #223 disposition gate: an improvement the reviewer marked `fix_now`/`drop`/`fixup`
-        # is NOT filed as an enhancement — `fixup` is applied in place in this PR, the others
-        # are noted in the completion note. An absent/`file` disposition still files (the
-        # pre-#223 default), so existing behavior is preserved.
+        # #223/#228 disposition gate: filing is opt-in. `fixup` is applied in place in this
+        # PR; every other non-file disposition is noted in the completion note.
         disposition = str(improvement.get("disposition") or "").strip().casefold()
-        if disposition in _UNFILED_DISPOSITIONS:
+        if disposition != "file":
+            event_disposition = disposition if "disposition" in improvement else None
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "improvement_not_filed", "run_id": run_id,
-                 "task_id": task.task_id, "title": title, "disposition": disposition},
+                 "task_id": task.task_id, "title": title,
+                 "disposition": event_disposition},
             )
             return None
         if skip_fingerprints and self._issue_fingerprint(title) in skip_fingerprints:
