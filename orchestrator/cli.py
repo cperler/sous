@@ -142,7 +142,7 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
 # the flag, so passing it there is a no-op worth warning about (mis-positioned flag).
 _ENGINE_COMMANDS = frozenset({
     "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
-    "hold", "approve", "unpause", "reject", "abandon", "resume", "status",
+    "hold", "approve", "unpause", "reject", "abandon", "retire", "resume", "status",
     "watch", "cost-report", "retrospective", "trunk-gate",
 })
 
@@ -429,6 +429,16 @@ def main(argv: list[str] | None = None) -> int:
                          f"{DEFAULT_ABANDON_MIN_IDLE_S}")
     ab.add_argument("--force", action="store_true",
                     help="override the liveness guard (the process is known dead)")
+    rt = sub.add_parser("retire", help="retire a run the human superseded (#257): drive every "
+                                       "non-terminal task to SUPERSEDED and finalize the run, "
+                                       "with NO note published to any issue")
+    rt.add_argument("--reason", required=True, help="why the run is being retired")
+    rt.add_argument("--by", required=True, help="who is retiring the run")
+    rt.add_argument("--superseded-by", default=None,
+                    help="run id of the successor that replaces this run, when there is one")
+    rt.add_argument("--force", action="store_true",
+                    help="retire even though a task still holds an outstanding dispatch "
+                         "(the process is known dead)")
     tg = sub.add_parser("trunk-gate",
                         help="post-merge integrity gate (#229): run the project adapter's "
                              "verification commands over a merged-trunk checkout and auto-file "
@@ -1192,6 +1202,13 @@ def main(argv: list[str] | None = None) -> int:
                            force=args.force)
         _emit({"abandoned": task.task_id, "state": task.state.value,
                "disposition": disposition})
+    elif args.cmd == "retire":
+        run = eng.retire(args.run, reason=args.reason, retired_by=args.by,
+                         superseded_by=args.superseded_by, force=args.force)
+        progress = run.progress()
+        _emit({"retired": run.run_id, "state": run.state.value,
+               "superseded": progress.superseded, "superseded_by": run.superseded_by,
+               "by": args.by, "reason": args.reason})
     elif args.cmd == "trunk-gate":
         result = eng.trunk_gate(args.run, cwd=args.cwd, file_fix=args.file_fix)
         _emit(result)

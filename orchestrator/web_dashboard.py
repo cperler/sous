@@ -371,7 +371,7 @@ INDEX_HTML = """<!doctype html>
       head.appendChild(h("span", "run-id", row.run_id));
       head.appendChild(h("span", "badge " + (row.state || ""), row.state));
       var prog = row.progress || {};
-      var done = (prog.completed || 0) + (prog.closed_infeasible || 0);
+      var done = (prog.completed || 0) + (prog.closed_infeasible || 0) + (prog.superseded || 0);
       head.appendChild(h("span", "muted", done + "/" + (prog.total || 0)));
       var cost = (typeof row.cost_usd === "number") ? "$" + row.cost_usd.toFixed(4) : "$?";
       head.appendChild(h("span", "muted", cost));

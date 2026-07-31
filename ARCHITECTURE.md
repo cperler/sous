@@ -191,6 +191,22 @@ conversation:
   cascade/release-ports/harvest/finalize effects `reject` does. A liveness guard (the `#66`
   stream probe) refuses while the dispatch's provider stream grew within `--min-idle-s`; `--force`
   overrides when the operator knows the process is dead.
+- **Retire path for a superseded run.** `Engine.retire()` (`orchestrator retire`) finalizes a
+  whole run the human deliberately SUPERSEDED — the issue was amended and the batch rebuilt
+  as a successor run. It is run-level, needs NO lease (the common case is a cleanly-recorded
+  run the human walked away from; `--force` covers an outstanding one, billing it unmetered
+  like `abandon`), and drives every non-terminal task — including `blocked_on_human`, which
+  no other path can move without a rejection — to the terminal `superseded` state, then to
+  run state `superseded` with a `run_superseded` event carrying the reason and successor run
+  id. The defining property is that it publishes NOTHING to the task source: a superseded
+  run's issues are typically live in the successor run, so `reject`/`abandon --rejected`
+  marking them infeasible would be actively wrong. It also skips cascade-blocking (a
+  dependent is superseded by the same call, not failed) and the `task_failed` alert, but does
+  release ports and harvest learnings. Unlike the derived rollups, the run state is DECLARED,
+  so a later finalize can never rewrite it. The run log dir is retained as always — this is
+  about state, not cleanup. Previously the only workaround was `hold`, which silenced the
+  stale alarms but left the run `running` forever, permanently occupying the monitor's
+  "needs you" list.
 - **Cross-run learnings KB.** `orchestrator/learnings_kb.py` persists a shared
   `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior

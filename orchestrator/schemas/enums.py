@@ -158,14 +158,32 @@ class TaskState(StrEnum):
     # a deliberate close, NOT an execution failure — so status/cost retrospectives can
     # tell the two apart, and the batch circuit breaker never counts it as a failure.
     CLOSED_INFEASIBLE = "closed_infeasible"
+    # The human retired the whole RUN as superseded (Engine.retire(), #257): a TERMINAL
+    # state distinct from both FAILED and CLOSED_INFEASIBLE. The work was neither executed
+    # to failure nor judged infeasible — it was rebuilt elsewhere (typically a successor
+    # run), so the task simply stops here. Critically it carries NO task-source mutation:
+    # a superseded task's issue is normally live in the successor run, so publishing the
+    # "closed infeasible" note reject() publishes would be actively wrong. Like
+    # CLOSED_INFEASIBLE it is not a failure, so the batch circuit breaker never counts it.
+    SUPERSEDED = "superseded"
 
 
 # Terminal task states — the DAG/state machine treats these as "done".
 # BLOCKED_ON_HUMAN is deliberately NOT terminal: a held task keeps its run open.
 # CLOSED_INFEASIBLE IS terminal (a human closed the task): it counts for run-finalization
 # and dispatchability exactly like the other terminals, but is semantically not a failure.
+# SUPERSEDED IS terminal for the same reason (#257): a retired run must be able to REACH
+# terminal — the whole point of the operator path is that the run stops occupying the
+# monitor's attention budget — and a non-terminal "superseded" would reproduce the very
+# `hold` workaround it replaces.
 TERMINAL_TASK_STATES: frozenset[TaskState] = frozenset(
-    {TaskState.COMPLETED, TaskState.FAILED, TaskState.CASCADE_BLOCKED, TaskState.CLOSED_INFEASIBLE}
+    {
+        TaskState.COMPLETED,
+        TaskState.FAILED,
+        TaskState.CASCADE_BLOCKED,
+        TaskState.CLOSED_INFEASIBLE,
+        TaskState.SUPERSEDED,
+    }
 )
 
 
@@ -180,11 +198,23 @@ class RunState(StrEnum):
     COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
     FAILED = "failed"
     PAUSED = "paused"
+    # #257: the human retired the run as superseded (Engine.retire()). Declared, not
+    # derived: unlike the three rollups above — which _maybe_finalize_run computes from the
+    # task states — this one is asserted by the operator, so it does NOT follow the
+    # "execution failure dominates" rule. A retired run whose tasks include a FAILED one is
+    # still SUPERSEDED, because the honest headline is "a human stopped this run", not
+    # "this run failed". The reason and successor run id live on the Run doc.
+    SUPERSEDED = "superseded"
 
 
 # Terminal run states: the run has finalized and no task will move again.
 TERMINAL_RUN_STATES: frozenset[RunState] = frozenset(
-    {RunState.COMPLETED, RunState.COMPLETED_WITH_REJECTIONS, RunState.FAILED}
+    {
+        RunState.COMPLETED,
+        RunState.COMPLETED_WITH_REJECTIONS,
+        RunState.FAILED,
+        RunState.SUPERSEDED,
+    }
 )
 
 

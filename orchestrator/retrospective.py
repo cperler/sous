@@ -126,6 +126,7 @@ def build_retrospective(
     cascaded = [t for t in tasks if t.state is TaskState.CASCADE_BLOCKED]
     completed = [t for t in tasks if t.state is TaskState.COMPLETED]
     rejected = [t for t in tasks if t.state is TaskState.CLOSED_INFEASIBLE]
+    superseded = [t for t in tasks if t.state is TaskState.SUPERSEDED]
     rejections = rejections or {}
 
     # cascade map: failed task -> dependents it blocked (from cascade_blocked events).
@@ -160,6 +161,10 @@ def build_retrospective(
             "failed": len(failed),
             "cascade_blocked": len(cascaded),
             "closed_infeasible": len(rejected),
+            # #257: tasks the human retired with the run. Counted so a retrospective's
+            # totals still add up to `total` — an uncounted terminal state reads as
+            # silently-missing work.
+            "superseded": len(superseded),
         },
         "failed_tasks": task_reports,
         "cascade_blocked_tasks": [t.task_id for t in cascaded],

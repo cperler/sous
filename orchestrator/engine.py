@@ -126,6 +126,19 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _elapsed_s(started_at: str | None) -> float | None:
+    """Wall-clock seconds since an ISO stage-start stamp, for a cost-ledger row an
+    operator path synthesizes for a dispatch that never reported back (``abandon``,
+    ``retire --force``). ``None`` when the stamp is absent or unparsable — an unknown
+    duration must read as unknown, never as 0.0."""
+    if not started_at:
+        return None
+    try:
+        return max(0.0, (datetime.now(UTC) - datetime.fromisoformat(started_at)).total_seconds())
+    except ValueError:
+        return None
+
+
 def _hash_preview(value: str | None) -> str | None:
     """Short, comparable rendering of a content_hash for an audit event / error text (#311).
 
@@ -3418,17 +3431,9 @@ class Engine:
             error=f"dispatch_abandoned: {reason}",
             completed_at=completed_at,
         )
-        duration_s: float | None = None
-        if dispatched.started_at:
-            try:
-                duration_s = max(
-                    0.0,
-                    (datetime.now(UTC) - datetime.fromisoformat(dispatched.started_at))
-                    .total_seconds(),
-                )
-            except ValueError:
-                duration_s = None
-        abandon_row = self.ledger.record(synthetic, duration_s=duration_s)
+        abandon_row = self.ledger.record(
+            synthetic, duration_s=_elapsed_s(dispatched.started_at)
+        )
         cost = abandon_row["cost_usd"]
         cost_metered = bool(abandon_row.get("metered", True))
 
@@ -3514,6 +3519,236 @@ class Engine:
         # on the FAILED path (#107), and run finalize. Delegated so this path can never drift
         # from reject()'s (each new operator finalize path stays correct by construction).
         self._finalize_task_terminal(run_id, task, disposition=disposition, reason=reason)
+        return task
+
+    # --- retire a superseded run (#257) ----------------------------------------
+    def retire(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        retired_by: str,
+        superseded_by: str | None = None,
+        force: bool = False,
+    ) -> Run:
+        """Sanctioned finalize for a whole run the human deliberately SUPERSEDED (#257).
+
+        The gap this fills: every other finalize path is built for a different failure
+        mode. ``abandon`` requires an outstanding lease (a cleanly-recorded run has none)
+        and, on ``--disposition rejected``, publishes a "closed infeasible" note to the
+        task source; ``reject`` requires an already-held task and publishes the same note.
+        Both are wrong for a superseded run, whose issues are typically LIVE in the
+        successor run. ``hold`` only silences the stale alarms — the run stays ``running``
+        forever, and "blocked on human" is a lie when no human action is pending. So a
+        superseded run could never reach terminal, permanently occupying the monitor's
+        "needs you" list, which is exactly the signal that must stay unignorable.
+
+        Run-level, not per-task: transitions EVERY non-terminal task (including
+        ``BLOCKED_ON_HUMAN``, which no other path can drive terminal without a rejection
+        artifact) to the terminal ``SUPERSEDED`` state, then finalizes the run to
+        ``RunState.SUPERSEDED``. Already-terminal tasks are left exactly as they are — a
+        task that genuinely COMPLETED or FAILED before the run was retired keeps its own
+        honest outcome.
+
+        No lease requirement (the common case is a cleanly-recorded run the human walked
+        away from). When a lease IS outstanding, ``force=True`` is required: the operator
+        asserting the dispatch is dead. The forced path then follows ``abandon``'s honesty
+        (#319) — it clears the lease, marks the in-flight stage FAILED, and records an
+        UNMETERED $0 cost-ledger row, because an orphaned provider process may have burned
+        real spend before being retired, so the figure must read as UNKNOWN rather than as
+        a confident zero. Unlike ``abandon`` there is no stream-liveness probe: retiring is
+        a whole-run decision the human has already made out of band, and `force` is the
+        explicit assertion the probe would otherwise be second-guessing.
+
+        Per-task effects — enumerated rather than described as "the same as reject", since
+        a peer's call chain is invisible in a plan and gets under-copied (the #110 lesson,
+        where ``abandon`` shipped missing ``emit_notification`` and ``_surface_rejection``).
+        This path deliberately runs a SUBSET of ``_finalize_task_terminal``'s chain:
+
+          RUN — ``_release_ports`` (#5, best-effort: a retired task must not leak its port
+                block) and ``_harvest_task_learnings`` (#72: a superseded task may still
+                have learned something worth keeping), plus ``write_task_index`` and
+                ``_set_ref_state`` so the derived artifacts match the doc.
+          SKIP — ``_cascade_from``: a dependent of a superseded task is itself being
+                superseded by this very call, and CASCADE_BLOCKED is an execution-failure
+                state that would poison the run rollup and the batch circuit breaker.
+          SKIP — ``write_rejection`` / ``_surface_rejection`` / the task source's
+                ``publish_note``: NO task-source mutation is the defining property of this
+                path. The issue is live in the successor run; "closed infeasible" on it
+                would be actively wrong.
+          SKIP — the ``task_failed`` notification: nothing failed, and re-alerting the
+                operator is the opposite of what retiring is for.
+          SKIP — ``_maybe_finalize_run``: its rollup is derived and failure-dominated,
+                so a retired run containing one FAILED task would finalize FAILED. The
+                run state here is DECLARED, and is set once at the end of this method.
+
+        Raises ``ContractError`` if the run is already terminal, or if any task holds an
+        outstanding lease and ``force`` is not set."""
+        run = self.store.load_run(run_id)
+        if run.state in TERMINAL_RUN_STATES:
+            raise ContractError(
+                f"run {run_id} is already terminal ({run.state.value}); nothing to retire"
+            )
+        # Load the authoritative task docs (TaskRef.state is an explicit derived cache, and
+        # the lease lives on the task doc only).
+        tasks = [self.store.load_task(run_id, ref.task_id) for ref in run.task_refs]
+        non_terminal = [t for t in tasks if t.state not in TERMINAL_TASK_STATES]
+        leased = [t.task_id for t in non_terminal if t.pending_work_item_id is not None]
+        if leased and not force:
+            raise ContractError(
+                f"run {run_id} has {len(leased)} task(s) holding an outstanding dispatch "
+                f"({', '.join(sorted(leased))}); a dispatch may still be running. Record "
+                "the result, or pass --force if you know the process is dead."
+            )
+        for task in non_terminal:
+            self._supersede_task(
+                run_id, task, reason=reason, superseded_by=superseded_by, forced=force
+            )
+        retired_at = _now()
+
+        def _retire(r: Run) -> None:
+            r.state = RunState.SUPERSEDED
+            r.superseded_at = retired_at
+            r.superseded_by = superseded_by
+            r.superseded_reason = reason
+            r.retired_by = retired_by
+
+        self.store.update_run(run_id, _retire)
+        # The audit trail the operator reads later: why this run stops, who stopped it, and
+        # where the work went — so a retired run is an explained stop, not a mystery
+        # half-run. Emitted AFTER the run doc is durable, so the event never describes a
+        # state that was not written.
+        self.store.append_event(
+            run_id,
+            {"ts": retired_at, "type": "run_superseded", "run_id": run_id,
+             "reason": reason, "retired_by": retired_by, "superseded_by": superseded_by,
+             "retired_tasks": [t.task_id for t in non_terminal],
+             "forced": force, "leased_tasks": sorted(leased)},
+        )
+        run = self.store.load_run(run_id)
+        progress = run.progress()
+        # The same "this run is done, stop watching it" ping every other finalize path
+        # fires (#55), under its own kind so an operator can tell a retired run from a
+        # completed one without parsing the summary.
+        self.emit_notification(
+            run_id, "run_superseded",
+            {"run_id": run_id, "kind": "run_superseded", "state": run.state.value,
+             "summary": f"run {run_id} retired as superseded — {len(non_terminal)} task(s) "
+                        f"superseded of {progress.total}"
+                        + (f", superseded by {superseded_by}" if superseded_by else "")
+                        + f": {reason}",
+             "reason": reason, "superseded_by": superseded_by, "retired_by": retired_by},
+        )
+        # A terminal run gets its final cost artifacts on every path (#281: this run's rows
+        # only), then the lock sweep — no task can move again, so no writer remains. The
+        # run LOG DIR itself is retained: retiring is about state, never cleanup.
+        self._write_final_cost_artifacts(run_id, run)
+        self.store.sweep_locks()
+        return run
+
+    def _supersede_task(
+        self, run_id: str, task: Task, *, reason: str, superseded_by: str | None, forced: bool
+    ) -> Task:
+        """Drive ONE non-terminal task to the terminal ``SUPERSEDED`` state for ``retire``.
+
+        Clearing the lease is unconditional (it is already ``None`` on the common,
+        cleanly-recorded task) so a retired task can never be left holding one — including
+        ``pending_plan``, whose marker must never outlive its lease (#288)."""
+        task_id = task.task_id
+        stage = task.current_stage
+        work_item_id = task.pending_work_item_id
+        error = f"superseded: {reason}"
+        completed_at = _now()
+        # The stage to charge and fold, or None when there is nothing in flight. A lease
+        # WITHOUT a current stage is a corrupt doc: ``abandon`` refuses there because it
+        # exists to finalize that one stage, but retire clears the lease and supersedes
+        # anyway — refusing would leave the run unretireable, the exact trap this path
+        # exists to open. There is simply no stage record to charge.
+        in_flight = stage if (work_item_id is not None and stage is not None) else None
+        cost: float | None = None
+        cost_metered = True
+        attempt: int | None = None
+        lane = None
+        if in_flight is not None:
+            dispatched = task.stages[in_flight]
+            attempt = dispatched.attempt
+            lane = self.router.lane_for(in_flight, task)
+            # Same honesty as abandon (#319): no model call COMPLETED, and the orphaned
+            # process may have burned real spend, so the row lands UNMETERED
+            # (usage_recovered=False) rather than as a confident, metered $0.00.
+            synthetic = StageResult(
+                work_item_id=work_item_id or "",
+                content_hash=task.pending_content_hash or "",
+                run_id=run_id,
+                task_id=task_id,
+                stage=in_flight,
+                attempt=dispatched.attempt,
+                model=ModelId(dispatched.model or ENGINE_MODEL),
+                effort=dispatched.effort,
+                status=ResultStatus.FAILURE,
+                raw_output=f"Run retired as superseded (no model call completed): {reason}",
+                lane_used=LaneUsed(
+                    execution_mode=lane.execution_mode,
+                    provider=lane.provider,
+                    invocation=f"superseded: run retired mid-dispatch ({reason})",
+                ),
+                token_usage=TokenUsage(),
+                usage_recovered=False,
+                error=error,
+                completed_at=completed_at,
+            )
+            row = self.ledger.record(synthetic, duration_s=_elapsed_s(dispatched.started_at))
+            cost = row["cost_usd"]
+            cost_metered = bool(row.get("metered", True))
+
+        def _supersede(t: Task) -> None:
+            t.pending_work_item_id = None
+            t.pending_content_hash = None
+            t.pending_plan = False  # #288: the plan marker never outlives its lease
+            t.pending_fallback_model = None
+            if in_flight is not None and lane is not None:
+                d = t.stages[in_flight]
+                d.status = StageStatus.FAILED
+                d.completed_at = completed_at
+                d.error = error
+                d.provider = lane.provider
+                d.lane = lane.execution_mode
+                d.cost_usd = cost
+                d.metered = cost_metered
+                t.last_error = error
+                t.stage_counter += 1
+            t.state = TaskState.SUPERSEDED
+
+        task = self.store.commit_task_events(
+            run_id, task_id, _supersede,
+            [{"ts": completed_at, "type": "task_superseded", "run_id": run_id,
+              "task_id": task_id, "reason": reason, "superseded_by": superseded_by,
+              "stage": stage.value if stage else None, "attempt": attempt,
+              "work_item_id": work_item_id, "forced": forced}],
+        )
+        if in_flight is not None:
+            seq = task.stage_counter
+            payload = {
+                "work_item_id": work_item_id,
+                "stage": in_flight.value,
+                "task_id": task_id,
+                "attempt": attempt,
+                "status": ResultStatus.FAILURE.value,
+                "outcome": "superseded",
+                "model": task.stages[in_flight].model,
+                "effort": task.stages[in_flight].effort,
+                "cost_usd": cost,
+                "error": error,
+                "completed_at": completed_at,
+            }
+            self.store.write_stage_log(task_id, seq, in_flight.value, payload)
+            self.store.write_stage_markdown(task_id, seq, in_flight.value, render_stage(payload))
+        # Derived artifacts, matching the now-durable doc. No rejection_reason is passed:
+        # a superseded task has no rejection artifact and must not render as one.
+        self.store.write_task_index(task_id, render_task_index(task))
+        self._set_ref_state(run_id, task_id, TaskState.SUPERSEDED)
+        self._release_ports(run_id, task)
+        self._harvest_task_learnings(run_id, task)
         return task
 
     # --- driver claim / orphaned-lease reclaim (#313) --------------------------
@@ -3808,6 +4043,14 @@ class Engine:
             # age + state) — so "the model went quiet", "the driver is sleeping out a
             # capacity stall", and "nobody is driving this run any more" are all
             # distinguishable from a poll (watch renders the difference).
+            # #257: why a SUPERSEDED run stops, read off the Run doc (None on every other
+            # run). Without it a retired run is a terminal mystery from a poll — the
+            # explanation would live only in events.jsonl.
+            "superseded": (
+                {"reason": run.superseded_reason, "superseded_by": run.superseded_by,
+                 "retired_by": run.retired_by, "at": run.superseded_at}
+                if run.state is RunState.SUPERSEDED else None
+            ),
             "driver": self.driver_liveness(run_id, run=run),
             "lane_audit": self.lane_audit(run_id, rows=rows),
             # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
@@ -4777,10 +5020,34 @@ class Engine:
                  "task_id": tid, "caused_by": failed_task_id},
             )
 
+    def _write_final_cost_artifacts(self, run_id: str, run: Run) -> None:
+        """Write a terminal run's cost artifacts (the per-record write was removed for
+        O(N^2)) — this run's rows only (#281 defense in depth). Shared by the derived
+        finalize rollup and the declared ``retire`` path (#257), so a retired run gets the
+        same durable cost record as any other terminal run."""
+        rows = self.run_rows(run_id)
+        self.store.write_run_artifact(
+            "cost-summary.md",
+            render_cost_summary(
+                run_id, self.ledger.summary(rows=rows),
+                budget=self._budget_status(run, rows),  # #34
+            ),
+        )
+        self.store.write_run_artifact(
+            "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
+        )
+
     def _maybe_finalize_run(self, run_id: str) -> None:
         """Finalize the run once every task is terminal (multi-task aware)."""
         run = self.store.load_run(run_id)
         if not run.task_refs or not all(r.state in TERMINAL_TASK_STATES for r in run.task_refs):
+            return
+        # #257: a SUPERSEDED run state is DECLARED by the human via retire(), not derived
+        # from the task states — so this rollup must never recompute over it. Without the
+        # guard, a retired run containing one FAILED task would be rewritten to FAILED by
+        # any later call, contradicting the run_superseded event and the Run doc's own
+        # reason. Retiring is terminal in both senses: no task moves, and no rollup rules.
+        if run.state is RunState.SUPERSEDED:
             return
         # Honest three-way run-level rollup (#67). An execution failure (FAILED or
         # CASCADE_BLOCKED) on ANY task dominates → the run is FAILED, even if other tasks
@@ -4816,19 +5083,7 @@ class Engine:
                  "summary": f"run {run_id} finalized {new_state.value} — "
                             f"{progress.completed}/{progress.total} tasks completed"},
             )
-        # Final cost artifacts (the per-record write was removed for O(N^2)) — this
-        # run's rows only (#281 defense in depth).
-        rows = self.run_rows(run_id)
-        self.store.write_run_artifact(
-            "cost-summary.md",
-            render_cost_summary(
-                run_id, self.ledger.summary(rows=rows),
-                budget=self._budget_status(run, rows),  # #34
-            ),
-        )
-        self.store.write_run_artifact(
-            "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
-        )
+        self._write_final_cost_artifacts(run_id, run)
         # Auto-generate the failure retrospective only when the run actually failed —
         # there is nothing to retrospect on a clean run.
         if new_state is RunState.FAILED:
