@@ -27,6 +27,54 @@ ModelId = NewType("ModelId", str)
 # (ExecutionMode.ENGINE × Provider.NONE); additive — pre-v3 docs never name it.
 SCHEMA_VERSION = "3"
 
+# ---- compatibility policy (#275) ------------------------------------------------------
+#
+# Before #275 ``schema_version`` was an unconstrained string that documented intent without
+# protecting anything: a status doc marked "999" carrying a field this engine has never
+# heard of loaded fine, and the next write dropped the unknown field while faithfully
+# preserving the misleading version. The policy below makes the field load-bearing in both
+# directions — OLD is migrated, NEW is refused — for the two planes that carry it:
+#
+#   * STATUS docs (Run/Task, persisted under ``runs/<run>/``) are long-lived and read by
+#     future engines, so they are MIGRATED forward from every version this engine has ever
+#     written (``MIGRATABLE_STATUS_VERSIONS``) and REFUSED when they come from the future.
+#   * The WORK plane (WorkItem/StageResult) is in-flight wire traffic between the engine
+#     and a runner, not an archive: nothing re-reads yesterday's WorkItem. There is
+#     therefore exactly ONE supported wire version (``SCHEMA_VERSION``) and no migration
+#     ladder — a result on any other version is refused at the engine boundary
+#     (``Engine._lease_mismatch``) rather than guessed at.
+#
+# Unknown FIELDS are refused too (``extra="forbid"`` on the status and work models). The two
+# halves are deliberately paired: version-gating alone still lets a same-version writer
+# smuggle a field through, and forbidding extras alone turns every future doc into an opaque
+# validation error instead of the explicit "this run was written by a newer engine" refusal.
+
+# Status-doc versions this engine can read and migrate forward to SCHEMA_VERSION. "0" is the
+# synthetic name for a doc with NO ``schema_version`` key at all (the original pre-versioning
+# shape); every entry must have an explicit migration test (tests/test_schema_compat.py).
+MIGRATABLE_STATUS_VERSIONS = ("0", "1", "2")
+
+# Every status-doc version this engine accepts: the migratable ladder plus the current one.
+SUPPORTED_STATUS_VERSIONS = frozenset((*MIGRATABLE_STATUS_VERSIONS, SCHEMA_VERSION))
+
+# The single WorkItem/StageResult wire version this engine speaks (see above — no ladder).
+SUPPORTED_WORK_VERSIONS = frozenset({SCHEMA_VERSION})
+
+
+def is_future_version(version: str) -> bool:
+    """Is ``version`` newer than this engine's ``SCHEMA_VERSION``?
+
+    Versions are decimal integers rendered as strings ("3"), so the comparison is numeric —
+    "10" is newer than "9", which a string compare would get backwards the first time the
+    major hits double digits. A version that is NOT a decimal integer is not orderable and
+    so is not classified as future here; callers treat unparseable and future alike (both
+    are refused), but the distinction gives the human a precise error message.
+    """
+    try:
+        return int(version) > int(SCHEMA_VERSION)
+    except ValueError:
+        return False
+
 
 class Stage(StrEnum):
     """The stage VOCABULARY (target.md §6.1): the dispatchable stage kinds, each with a

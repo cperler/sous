@@ -79,7 +79,7 @@ class GitHubIssuesSource:
         num = _issue_number(task_id)
         raw = self._run(
             ["gh", "issue", "view", num, "--repo", self.repo,
-             "--json", "number,title,body,labels,state"]
+             "--json", "number,title,body,labels,state,updatedAt"]
         )
         data = json.loads(raw)
         # Already-closed early exit (ports implement-orchestrator.sh:519): a batch over
@@ -99,6 +99,10 @@ class GitHubIssuesSource:
             issue_number=data.get("number"),
             depends_on=[],  # no analysis step yet; add-task --depends-on supplies edges
             labels=labels,
+            # #271: when GitHub last touched the issue. Stamped onto the Task doc beside the
+            # snapshot so ``refresh-spec`` / ``status --check-spec`` can say when the upstream
+            # moved. Absent from an older `gh` payload → None, which reads as "unknown".
+            updated_at=data.get("updatedAt") or None,
         )
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:

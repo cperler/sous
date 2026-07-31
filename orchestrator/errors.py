@@ -18,6 +18,22 @@ class StatusNotFoundError(StatusStoreError):
     existence can catch ONLY this and let real I/O/parse failures bubble up (#112)."""
 
 
+class SchemaVersionError(StatusStoreError):
+    """A status document's ``schema_version`` is one this engine cannot safely read (#275).
+
+    Raised for a FUTURE version (written by a newer engine) or an unparseable one — never
+    for a version on the migration ladder, which loads normally. A subclass of
+    ``StatusStoreError`` so existing ``except StatusStoreError`` call sites still cover it,
+    and deliberately NOT a subclass of ``StatusNotFoundError``: the document exists and is
+    valid JSON, so probing for existence must not mistake "too new to read" for "absent"
+    and go on to create a fresh doc over it.
+
+    The refusal happens at READ, before any mutation, which is what makes it fail CLOSED: a
+    doc this engine cannot fully understand is never loaded, so it is never re-serialized
+    from a lossy in-memory model and written back with its unknown fields dropped.
+    """
+
+
 class RunExistsError(StatusStoreError):
     """A run document already exists for the requested run id (#280). Creation refuses
     rather than replacing it: an overwrite would orphan the run's task documents (they

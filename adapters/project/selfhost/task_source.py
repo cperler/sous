@@ -36,6 +36,10 @@ class LocalFileTaskSource:
             body=t.get("body", ""),
             depends_on=list(t.get("depends_on", [])),
             provider_tag=t.get("provider_tag"),
+            # #271: optional per-task last-modified stamp, mirroring the GitHub source's
+            # ``updatedAt``. Absent from the file → None ("unknown"); the engine's staleness
+            # verdict compares content fingerprints, so nothing depends on it being present.
+            updated_at=t.get("updated_at"),
         )
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:

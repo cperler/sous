@@ -294,6 +294,18 @@ INDEX_HTML = """<!doctype html>
     return Math.floor(s / 3600) + "h";
   }
 
+  // Aggregate cost cell — the JS twin of render.aggregate_cost_cell (#319/#331). Unmetered
+  // calls sum into the total at $0, so a partly-unmetered bucket is a FLOOR ("≥$X") and a
+  // wholly-unmetered one is unknown ("n/a (unmetered)") — never a bare, confident figure.
+  function costCell(cost, unmetered, invocations) {
+    if (typeof cost !== "number") return "$?";
+    unmetered = unmetered || 0;
+    invocations = invocations || 0;
+    if (unmetered && invocations && unmetered >= invocations) return "n/a (unmetered)";
+    if (unmetered) return "≥$" + cost.toFixed(4);
+    return "$" + cost.toFixed(4);
+  }
+
   function attnLine(it) {
     var run = it.run_id;
     if (it.kind === "blocked_on_human")
@@ -373,8 +385,15 @@ INDEX_HTML = """<!doctype html>
       var prog = row.progress || {};
       var done = (prog.completed || 0) + (prog.closed_infeasible || 0) + (prog.superseded || 0);
       head.appendChild(h("span", "muted", done + "/" + (prog.total || 0)));
-      var cost = (typeof row.cost_usd === "number") ? "$" + row.cost_usd.toFixed(4) : "$?";
-      head.appendChild(h("span", "muted", cost));
+      // #331: an unmetered call contributes $0 to the run total, so a bare figure would be a
+      // confident understatement. Mirror the text board: "≥$X" when some calls are unmetered,
+      // "n/a (unmetered)" when none were metered, "$?" when there is no cost data at all.
+      var cost = costCell(row.cost_usd, row.unmetered_calls, row.total_invocations);
+      var costSpan = h("span", "muted", cost);
+      if (row.unmetered_calls)
+        costSpan.title = row.unmetered_calls + " unmetered call(s) of unknown cost — "
+          + "no per-call usage was recorded for them (not $0)";
+      head.appendChild(costSpan);
       head.appendChild(h("span", "grow muted", "last " + fmtAge(row.last_event_age_s) + " ago"));
       if (row.flags && row.flags.length)
         head.appendChild(h("span", "flags", "[" + row.flags.join(", ") + "]"));
@@ -434,9 +453,21 @@ INDEX_HTML = """<!doctype html>
       ? ("usage 5h " + Math.round(usage.five_hour_pct) + "% / 7d "
          + Math.round(usage.seven_day_pct || 0) + "%")
       : "usage unavailable";
+    // #331: qualify the board-wide spend the same way the text board does — unmetered calls
+    // add $0 to total_spend_usd, so an unqualified total silently understates real spend.
+    var unmetered = hd.unmetered_calls || 0;
+    var invocations = hd.total_invocations || 0;
+    var spendStr;
+    if (unmetered && invocations && unmetered >= invocations)
+      spendStr = "spend n/a — all " + unmetered + " call(s) unmetered";
+    else if (unmetered)
+      spendStr = "spend ≥$" + (hd.total_spend_usd || 0).toFixed(4)
+        + " (" + unmetered + " unmetered call(s) of unknown cost excluded)";
+    else
+      spendStr = "spend $" + (hd.total_spend_usd || 0).toFixed(4);
     document.getElementById("summary").textContent =
       (hd.all_quiet ? "ALL QUIET" : ("ATTENTION — " + hd.attention_count + " item(s)"))
-      + "  ·  spend $" + (hd.total_spend_usd || 0).toFixed(4)
+      + "  ·  " + spendStr
       + " across " + (hd.shown || 0) + " run(s)  ·  " + usageStr
       + (bits.length ? "  ·  " + bits.join(" ") : "");
     document.getElementById("clock").textContent = hd.generated_at || "";

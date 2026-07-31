@@ -142,7 +142,7 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
 # the flag, so passing it there is a no-op worth warning about (mis-positioned flag).
 _ENGINE_COMMANDS = frozenset({
     "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
-    "hold", "approve", "unpause", "reject", "abandon", "retire", "resume", "status",
+    "hold", "approve", "unpause", "reject", "abandon", "retire", "resume", "status", "refresh-spec",
     "watch", "cost-report", "retrospective", "trunk-gate",
 })
 
@@ -449,7 +449,22 @@ def main(argv: list[str] | None = None) -> int:
                     help="report only — do NOT auto-file a remediation task on red")
     tg.set_defaults(file_fix=True)
     sub.add_parser("resume")
-    sub.add_parser("status")
+    st = sub.add_parser("status")
+    st.add_argument("--check-spec", action="store_true",
+                    help="also re-read each non-terminal task's spec from the task source "
+                         "and flag one whose upstream issue has diverged from the snapshot "
+                         "its prompts render from (#271; costs one source round-trip per "
+                         "task, so the default poll stays offline)")
+    rs = sub.add_parser("refresh-spec",
+                        help="re-read a task's title/body from the task source onto its Task "
+                             "doc (#271): the sanctioned way to land an amended issue on an "
+                             "in-flight run, instead of rebuilding it or hand-patching JSON")
+    rs.add_argument("--task", required=True)
+    rs.add_argument("--check", action="store_true",
+                    help="dry run: report what a refresh would change, write nothing")
+    rs.add_argument("--force", action="store_true",
+                    help="refresh even while the task holds a dispatch lease — that stage's "
+                         "prompt was already rendered from the old snapshot and keeps it")
     wt = sub.add_parser("watch", help="poll a run to terminal, alerting (project notify "
                                       "hook) on stalls and terminal states — works for "
                                       "any run, incl. single-task engine-lane runs")
@@ -1217,7 +1232,10 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
-        _emit(eng.status(args.run))
+        _emit(eng.status(args.run, check_spec=args.check_spec))
+    elif args.cmd == "refresh-spec":
+        _emit(eng.refresh_spec(args.run, args.task, force=args.force,
+                               check_only=args.check))
     elif args.cmd == "watch":
         import time
 

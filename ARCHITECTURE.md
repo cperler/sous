@@ -207,6 +207,24 @@ conversation:
   about state, not cleanup. Previously the only workaround was `hold`, which silenced the
   stale alarms but left the run `running` forever, permanently occupying the monitor's
   "needs you" list.
+- **Task spec snapshot + sanctioned refresh.** A task's `title`/`body` are snapshotted onto the
+  Task doc once, at `add_task` (`add-task` / `batch-plan apply`), and every stage prompt for the
+  rest of the run renders from that copy — that is deliberate: it is what makes a run reproducible
+  and stage prompts byte-stable. What it cost was amendability: editing the upstream issue mid-run
+  reached nothing and nothing said so, so the only workarounds were rebuilding the run or
+  hand-patching the status JSON behind the engine. `Engine.refresh_spec()`
+  (`orchestrator refresh-spec --task '#N'`) is the sanctioned move: re-resolve the task source,
+  write the new title/body under the per-task lock, and emit `task_spec_refreshed` carrying a diff
+  summary — emitted even when nothing changed, so "verified identical" and "never looked" don't
+  read alike. `--check` is a dry run. It refuses a terminal task, and refuses while a dispatch
+  lease is outstanding because that stage's prompt was ALREADY rendered from the old copy (the
+  `#256` failure: a plan contradicting its own task's spec); `--force` overrides and stamps
+  `leased_dispatch` on the event. Refreshing is never automatic — the engine does not re-resolve
+  per stage. Staleness is visible rather than hidden: `add_task` records `spec_captured_at` /
+  `spec_source_updated_at` / `spec_fingerprint`, and `orchestrator status --check-spec` (opt-in,
+  like `--activity`, so the cheap poll path stays offline) flags a task whose upstream content
+  fingerprint has diverged. An unreachable source degrades to `spec_check_error`, never a failed
+  status dump.
 - **Cross-run learnings KB.** `orchestrator/learnings_kb.py` persists a shared
   `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
