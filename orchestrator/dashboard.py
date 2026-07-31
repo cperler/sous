@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from .alerting import _fmt_activity
+from .render import aggregate_cost_cell
 from .schemas.enums import TERMINAL_RUN_STATES
 from .stream_probe import find_current_stream
 
@@ -222,6 +223,8 @@ def _run_row(
             "flags": ["unreadable status"],
             "progress": {},
             "cost_usd": None,
+            "unmetered_calls": None,
+            "total_invocations": None,
             "budget": None,
             "last_event_age_s": None,
             "attention_items": [{"kind": "unreadable", "run_id": loc.run_id}],
@@ -239,6 +242,8 @@ def _run_row(
             "flags": ["unreadable status"],
             "progress": {},
             "cost_usd": None,
+            "unmetered_calls": None,
+            "total_invocations": None,
             "budget": None,
             "last_event_age_s": None,
             "attention_items": [{"kind": "unreadable", "run_id": loc.run_id}],
@@ -324,6 +329,12 @@ def _run_row(
         "progress": progress,
         "inflight": inflight,
         "cost_usd": round(float(cost.get("total_cost_usd") or 0.0), 4),
+        # #331: `cost` is `ledger.summary()`, whose total sums unmetered rows in at their
+        # 0.0. Carry the unmetered/total call counts onto the row so every consumer (the
+        # text board, the web skin) can qualify the figure instead of printing a confident
+        # dollar amount for a run whose spend is partly or wholly unknown.
+        "unmetered_calls": int(cost.get("unmetered_calls") or 0),
+        "total_invocations": int(cost.get("total_invocations") or 0),
         "budget": budget,
         "last_event_age_s": _last_event_age_s(events, now_epoch=now_epoch),
         "flags": flags,
@@ -424,18 +435,26 @@ def dashboard_snapshot(
             attention.append({**item, "_mtime": row["mtime"]})
     attention.sort(key=lambda it: (_ATTENTION_RANK.get(it["kind"], 9), -it.pop("_mtime")))
 
-    # Header counts + spend over the SHOWN rows.
+    # Header counts + spend over the SHOWN rows. The unmetered/total call counts are summed
+    # alongside the dollars (#331) so the board-wide figure can be qualified the same way a
+    # single run's is: unmetered calls contribute $0 to `total_spend_usd`, making it a floor.
     counts: dict[str, int] = {}
     total_spend = 0.0
+    unmetered_calls = 0
+    total_invocations = 0
     for row in shown:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
         if isinstance(row.get("cost_usd"), (int, float)):
             total_spend += row["cost_usd"]
+        unmetered_calls += row.get("unmetered_calls") or 0
+        total_invocations += row.get("total_invocations") or 0
 
     header = {
         "generated_at": datetime.fromtimestamp(now_epoch, tz=UTC).isoformat(),
         "usage": _read_usage(usage_reader),
         "total_spend_usd": round(total_spend, 4),
+        "unmetered_calls": unmetered_calls,
+        "total_invocations": total_invocations,
         "counts": counts,
         "shown": len(shown),
         "total_discovered": total_discovered,
@@ -524,10 +543,21 @@ def render_dashboard(snapshot: dict) -> str:
         lines.append("usage: unavailable")
 
     state_bits = " ".join(f"{s}={n}" for s, n in sorted(counts.items()))
-    lines.append(
-        f"spend: ${header['total_spend_usd']:.4f} across {header['shown']} run(s)"
-        f"  |  {state_bits}"
-    )
+    # #331: unmetered calls sum into total_spend_usd at $0, so an unqualified figure would
+    # understate the board's real spend while looking exact. Same honesty rule as
+    # cost-summary.md, in one header-width phrase.
+    unmetered = header.get("unmetered_calls") or 0
+    invocations = header.get("total_invocations") or 0
+    if unmetered and invocations and unmetered >= invocations:
+        spend_str = f"n/a — all {unmetered} call(s) unmetered"
+    elif unmetered:
+        spend_str = (
+            f"≥${header['total_spend_usd']:.4f} "
+            f"({unmetered} unmetered call(s) of unknown cost excluded)"
+        )
+    else:
+        spend_str = f"${header['total_spend_usd']:.4f}"
+    lines.append(f"spend: {spend_str} across {header['shown']} run(s)  |  {state_bits}")
 
     # --- attention band ---
     if attention:
@@ -545,8 +575,16 @@ def render_dashboard(snapshot: dict) -> str:
         if row.get("unreadable"):
             lines.append(f"  {icon} {row['run_id']:<24} <unreadable status>")
             continue
+        # #331: `≥$X` / `n/a (unmetered)` rather than a bare figure when this run's spend is
+        # partly or wholly unknown; `$?` stays the marker for "no cost data at all".
         cost = row.get("cost_usd")
-        cost_str = f"${cost:.4f}" if isinstance(cost, (int, float)) else "$?"
+        cost_str = (
+            aggregate_cost_cell(
+                cost, row.get("unmetered_calls") or 0, row.get("total_invocations") or 0
+            )
+            if isinstance(cost, (int, float))
+            else "$?"
+        )
         flags = f"  [{', '.join(row['flags'])}]" if row["flags"] else ""
         age = _fmt_age(row.get("last_event_age_s"))
         lines.append(
