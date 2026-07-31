@@ -14,9 +14,11 @@ from collections.abc import Callable
 from jsonschema import Draft202012Validator
 
 from orchestrator.ports.execution import EXPLICIT_EMPTY, SUPPORTED, CapabilityDescriptor
+from orchestrator.ports.project import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
+from .review_isolation import ReviewIsolation
 from .transport import (
     RawResult,
     Transport,
@@ -33,12 +35,14 @@ SchemaProvider = Callable[[str], dict | None]
 
 class CodexRunner:
     def __init__(
-        self, transport: Transport | None = None, schema_provider: SchemaProvider | None = None
+        self, transport: Transport | None = None, schema_provider: SchemaProvider | None = None,
+        *, review_project: ProjectConfig | None = None,
     ) -> None:
         # The real transport gets the checkpoint protocol (design pass §3); an
         # injected transport is the caller's choice (tests wrap explicitly).
         self._transport = transport or checkpointing_transport(codex_cli_transport())
         self._schema_provider = schema_provider
+        self._review_isolation = ReviewIsolation(review_project)
 
     def capabilities(self) -> list[CapabilityDescriptor]:
         return [
@@ -51,9 +55,9 @@ class CodexRunner:
                 # primitive, so this cell can't fan a REVIEW plan out below the seam. The
                 # engine therefore never attaches one here and codex keeps dispatching the
                 # single-reviewer prompt — lane and content_hash stay consistent.
-                # #272: the transport DOES translate a ToolPolicy — into codex's sandbox mode
-                # (`--sandbox read-only` fresh, `sandbox_mode="read-only"` on resume), so the
-                # posture survives session continuity.
+                # #272: the transport translates ToolPolicy into codex's sandbox mode. #301
+                # uses workspace-write only after moving REVIEW into an independent disposable
+                # checkout; every non-isolated write-denying call remains read-only.
                 enforces_tool_policy=True,
                 status=SUPPORTED,
             ),
@@ -67,7 +71,8 @@ class CodexRunner:
         ]
 
     def dispatch(self, work: WorkItem) -> StageResult:
-        raw: RawResult = self._transport(work)
+        with self._review_isolation.session(work, self._transport) as transport:
+            raw: RawResult = transport(work)
         status = self._verdict(work, raw)
         return to_stage_result(work, raw, status, mode=ExecutionMode.HEADLESS, provider=Provider.CODEX)
 

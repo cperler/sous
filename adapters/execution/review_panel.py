@@ -83,9 +83,9 @@ _MAX_NOTICE_DETAIL = 200  # bounded like the fold's notices
 def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
     """Execute ``work.plan`` as a panel of sub-calls and return ONE StageResult.
 
-    Sequential by design — concurrency is a runner freedom, not a contract, and the sub-calls
-    share one worktree and one per-task port block, so parallelism here is a real hazard for
-    at most a few minutes of wall time (filed as deferred scope).
+    Sequential by design — concurrency is a runner freedom, not a contract. The production
+    headless runner supplies #301's isolation-wrapped transport, which gives each invocation a
+    fresh worktree and held temporary port block; direct callers may supply a plain transport.
     """
     plan = work.plan
     if plan is None:  # pragma: no cover - the caller gates on `work.plan is not None`

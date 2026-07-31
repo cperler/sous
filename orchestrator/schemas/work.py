@@ -297,6 +297,12 @@ class WorkItem(BaseModel):
     # same reason as ``tool_policy``: it is derived from the stage and the lane, both already
     # hashed, so no two dispatches of the same work can legitimately disagree about it.
     permission_posture: PermissionPosture | None = None
+    # True only on the runner's disposable copy for a REVIEW call (#301). Codex's sole tool
+    # posture primitive is a process sandbox, so this lets its transport use workspace-write
+    # inside the throwaway checkout: verification commands may create caches/build outputs,
+    # while the task's live tree remains unreachable. Runner metadata, never engine-authored
+    # content, and therefore excluded from ``compute_content_hash`` like ``cwd``/``env``.
+    workspace_isolated: bool = False
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -326,6 +332,7 @@ class WorkItem(BaseModel):
         plan: ReviewPlan | None = None,
         tool_policy: ToolPolicy | None = None,
         permission_posture: PermissionPosture | None = None,
+        workspace_isolated: bool = False,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -362,6 +369,7 @@ class WorkItem(BaseModel):
             plan=plan,
             tool_policy=tool_policy,
             permission_posture=permission_posture,
+            workspace_isolated=workspace_isolated,
             created_at=created_at,
         )
 
