@@ -75,6 +75,12 @@ class RawResult:
     # the stage log, like ``stream_files``; it never feeds a verdict or a transition. None on
     # the claude lane (persona arrives via ``--agent``) and when no agent resolved.
     persona_injected: dict | None = None
+    # Did ``usage`` come from a report the PROVIDER actually returned (#319)? A FAILED call
+    # keeps whatever usage its terminal event carried — a connection drop 12 minutes into a
+    # high-effort Opus stage really did spend that money — so the zeros of a call that died
+    # BEFORE any terminal event must be distinguishable from a measured zero. False makes the
+    # ledger row unpriced/unmetered (an honest unknown) instead of a confident $0.0000.
+    usage_recovered: bool = True
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -476,7 +482,13 @@ def _run_teed(
         if tee is not None:
             tee.close()
     if killed["timeout"]:
-        raise subprocess.TimeoutExpired(argv, timeout or 0)
+        # #319: carry the partial stdout/stderr already buffered onto the exception, the same
+        # way `subprocess.run` does. A timed-out call may have printed a terminal usage report
+        # before the watchdog killed it, and the transports recover spend from it — dropping
+        # the buffer here would make every timeout look free.
+        raise subprocess.TimeoutExpired(
+            argv, timeout or 0, output="".join(parts), stderr=stderr_box["data"]
+        )
     return proc.returncode, "".join(parts), stderr_box["data"]
 
 
@@ -572,6 +584,7 @@ def to_stage_result(
         sub_results=sub_results,
         sub_calls=sub_calls,
         token_usage=raw.usage,
+        usage_recovered=raw.usage_recovered,
         completed_at=datetime.now(UTC).isoformat(),
     )
 
@@ -586,6 +599,14 @@ def _usage_from(d: dict) -> TokenUsage:
         cache_read=(u.get("cache_read_input_tokens") or u.get("cached_input_tokens") or 0),
         cache_write=u.get("cache_creation_input_tokens", 0) or 0,
     )
+
+
+def _has_tokens(usage: TokenUsage) -> bool:
+    """Did a usage report actually land? (#319) Used where the only evidence a call reported
+    its spend is the numbers themselves — a lane like codex whose partial event stream has no
+    single terminal envelope to point at. All-zero counts a report as MISSING, which errs
+    toward 'unknown' over a confident $0."""
+    return (usage.input + usage.output + usage.cache_read + usage.cache_write) > 0
 
 
 def _codex_usage(events_stdout: str) -> TokenUsage:
@@ -963,6 +984,51 @@ def _last_result_event(stdout: str) -> dict | None:
     return result
 
 
+def _json_envelope(stdout: str) -> dict | None:
+    """The ``--output-format json`` envelope from a single-shot claude stdout, or None if it
+    isn't decodable JSON (a banner/notice, or a stream torn mid-write)."""
+    try:
+        data = json.loads(stdout) if stdout.strip() else None
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _recover_usage(stdout: str, *, streaming: bool) -> tuple[TokenUsage, str | None, bool]:
+    """Best-effort ``(usage, session_ref, recovered)`` for a claude call that did NOT return
+    an exit-0 success (#319).
+
+    A non-zero exit — or a timeout — does not mean nothing was spent: the CLI emits its
+    terminal ``result`` envelope carrying real ``usage`` and ``session_id`` even when it sets
+    ``is_error: true`` (the live case: a connection dropped 11.8 minutes into a high-effort
+    Opus stage that had already burned $4.25). Parsing it here is what keeps a failed attempt
+    billed to the ledger and its session available to warm retry (#8).
+
+    ``recovered`` is False when no envelope could be read at all (the process was killed
+    before it printed one). The caller propagates that to the ledger, which then writes the
+    row unpriced/unmetered — an honest unknown — instead of a confident $0.0000.
+    """
+    data = _last_result_event(stdout) if streaming else _json_envelope(stdout)
+    if data is None:
+        return TokenUsage(), None, False
+    session_id = data.get("session_id")
+    return (
+        _usage_from(data),
+        session_id if isinstance(session_id, str) else None,
+        True,
+    )
+
+
+def _timeout_stdout(exc: subprocess.TimeoutExpired) -> str:
+    """The partial stdout a timed-out call had produced before it was killed, as text ('' if
+    none). ``_run_teed`` attaches what it already buffered; ``subprocess.run`` attaches its
+    own. Bytes are decoded leniently — this is evidence, and must never raise into a caller."""
+    out = exc.output
+    if out is None:
+        return ""
+    return out.decode("utf-8", errors="replace") if isinstance(out, bytes) else str(out)
+
+
 def claude_cli_transport(
     schema_json_for: Callable[[str], str | None] | None = None,
     *,
@@ -1052,11 +1118,20 @@ def claude_cli_transport(
                                       timeout=work.timeout_s, cwd=work.cwd, env=proc_env)
                 returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
         except FileNotFoundError as exc:  # pragma: no cover - env dependent
+            # No process ever ran, so zero usage here is a MEASURED zero, not an unknown —
+            # usage_recovered stays True (nothing was spent, and the ledger may say so).
             return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
-        except subprocess.TimeoutExpired:
-            # A hung CLI must not hang the scheduler — fail the dispatch on timeout.
-            return RawResult(None, exit_code=124,
-                             error=f"timed out after {work.timeout_s}s", invocation=invocation)
+        except subprocess.TimeoutExpired as exc:
+            # A hung CLI must not hang the scheduler — fail the dispatch on timeout. #319: a
+            # timeout is one of the costliest failures a run has, so recover whatever usage the
+            # partial stream had already reported; with no terminal event the spend is
+            # genuinely unknown and the row must say so rather than claim $0.
+            usage, session_id, recovered = _recover_usage(
+                _timeout_stdout(exc), streaming=streaming
+            )
+            return RawResult(None, usage=usage, exit_code=124,
+                             error=f"timed out after {work.timeout_s}s", invocation=invocation,
+                             session_ref=session_id, usage_recovered=recovered)
         # #93: on the streaming path, raw_output is the model's readable final text (result
         # event / last assistant text), falling back to a bounded stream-tail note — NOT the
         # raw JSONL event stream (already teed to `.stream.jsonl`). The single-shot path keeps
@@ -1066,26 +1141,38 @@ def claude_cli_transport(
             raw_out = stdout
             if streaming:
                 raw_out = claude_final_text(stdout) or stream_tail_note(stdout, stream_rel)
-            return RawResult(None, exit_code=returncode, error=stderr.strip()[:500],
+            # #319: a failed call still SPENT what it spent. The terminal envelope carries the
+            # usage and session id even under `is_error: true`, so parse it regardless of the
+            # exit code — dropping it billed a real $4.25 attempt as free and threw away the
+            # session warm retry (#8) needs for exactly this mechanical-failure case.
+            usage, session_id, recovered = _recover_usage(stdout, streaming=streaming)
+            return RawResult(None, usage=usage, exit_code=returncode,
+                             error=stderr.strip()[:500],
                              raw_output=raw_out, raw_stderr=stderr,
-                             invocation=invocation, stream_files=stream_files)
+                             invocation=invocation, stream_files=stream_files,
+                             session_ref=session_id, usage_recovered=recovered)
         if streaming:
             data = _last_result_event(stdout)
             if data is None:
-                # Exit 0 but no result event (partial/killed stream): fail the dispatch.
+                # Exit 0 but no result event (partial/killed stream): fail the dispatch. The
+                # stream ended before any usage report, so the spend is unknown (#319) — flag
+                # it rather than let zeros read as a metered $0.
                 return RawResult(None, raw_output=stream_tail_note(stdout, stream_rel),
                                  raw_stderr=stderr, exit_code=0,
                                  error="no result event in stream-json output",
-                                 invocation=invocation, stream_files=stream_files)
+                                 invocation=invocation, stream_files=stream_files,
+                                 usage_recovered=False)
             raw_output_value = claude_final_text(stdout) or stream_tail_note(stdout, stream_rel)
         else:
             try:
                 data = json.loads(stdout) if stdout.strip() else {}
             except json.JSONDecodeError as exc:
                 # Exit 0 but non-JSON stdout (banner/notice): fail the dispatch, never
-                # let the exception escape (every dispatch must yield a StageResult).
+                # let the exception escape (every dispatch must yield a StageResult). No
+                # decodable envelope means no usage report — an unknown, not $0 (#319).
                 return RawResult(None, raw_output=stdout, raw_stderr=stderr, exit_code=0,
-                                 error=f"non-JSON output: {exc}", invocation=invocation)
+                                 error=f"non-JSON output: {exc}", invocation=invocation,
+                                 usage_recovered=False)
             raw_output_value = None  # single-shot: default raw_output=stdout (the JSON envelope)
         # NB: the shape-gate is deliberately NOT applied here — the `run` loop below
         # validates (and, on failure, retries with a corrective prompt). Nulling out an
@@ -1361,10 +1448,20 @@ def codex_cli_transport(
                                           timeout=work.timeout_s, cwd=work.cwd, env=proc_env)
                     returncode, stdout, stderr = proc.returncode, proc.stdout, proc.stderr
             except FileNotFoundError as exc:  # pragma: no cover - env dependent
+                # Nothing ran, so the zeros are measured, not unknown (see the claude lane).
                 return RawResult(None, exit_code=127, error=str(exc), invocation=invocation)
-            except subprocess.TimeoutExpired:
-                return RawResult(None, exit_code=124,
-                                 error=f"timed out after {work.timeout_s}s", invocation=invocation)
+            except subprocess.TimeoutExpired as exc:
+                # #319: recover whatever the partial `--json` event stream already reported —
+                # codex emits cumulative `usage` per turn, so a long timed-out call is billed
+                # for the turns it completed instead of recorded as free. No events at all
+                # leaves usage unknown, and the row says so.
+                partial = _timeout_stdout(exc)
+                usage = _codex_usage(partial)
+                return RawResult(None, usage=usage, exit_code=124,
+                                 error=f"timed out after {work.timeout_s}s",
+                                 invocation=invocation,
+                                 session_ref=_codex_session_id(partial),
+                                 usage_recovered=_has_tokens(usage))
             structured = None
             last_txt: str | None = None
             if last.exists():
@@ -1393,10 +1490,19 @@ def codex_cli_transport(
                 final_text = last_txt
             if final_text is None:
                 final_text = stream_tail_note(stdout, (stream_files or {}).get("stream"))
-            return RawResult(structured, usage=_codex_usage(stdout), raw_output=final_text,
+            # #319: same honest-unknown rule as the timeout branch above, and for the same
+            # reason — a codex call can also exit non-zero having printed no usable event
+            # (killed mid-dispatch, truncated/corrupt stdout). The event stream has no single
+            # terminal envelope to point at, so the numbers themselves are the only evidence a
+            # usage report landed: no tokens on a FAILED call means the spend is unknown, and
+            # the ledger row must say so instead of asserting a metered $0.00. A successful
+            # call is left as-measured (exit 0 IS the provider's report).
+            usage = _codex_usage(stdout)
+            return RawResult(structured, usage=usage, raw_output=final_text,
                              raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
                              error=error,
-                             invocation=invocation, session_ref=_codex_session_id(stdout))
+                             invocation=invocation, session_ref=_codex_session_id(stdout),
+                             usage_recovered=(not returncode) or _has_tokens(usage))
 
     def run(work: WorkItem) -> RawResult:
         # #74: refresh the worktree's AGENTS.md with this stage's persona BEFORE dispatch (fresh

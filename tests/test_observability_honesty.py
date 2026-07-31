@@ -61,7 +61,11 @@ def test_mixed_run_states_the_unmetered_exclusion() -> None:
         "total_invocations": 6, "total_cost_usd": 1.23, "unmetered_calls": 2,
         "total_wall_s": 0, "by_model": {},
     })
-    assert "metered lanes only" in md and "2 interactive call(s)" in md
+    assert "metered calls only" in md and "2 unmetered call(s)" in md
+    # #319 generalized the wording: an unmetered call is no longer necessarily an
+    # interactive-lane one — a metered lane loses a call's usage report whenever an attempt
+    # dies before printing it — so the line must not attribute the exclusion to one lane.
+    assert "interactive call(s)" not in md
 
 
 def test_duration_recorded_and_wall_time_rendered(tmp_path, project) -> None:

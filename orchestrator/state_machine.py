@@ -126,9 +126,15 @@ def apply_result(
     *,
     now: str,
     cost_usd: float | None,
+    metered: bool = True,
     iteration: int | None = None,
 ) -> FoldNotices:
     """Fold a StageResult into the task's stage record (status + attribution).
+
+    ``cost_usd`` and ``metered`` travel TOGETHER (#319) — they are the ledger row's own
+    two fields and mean nothing apart. ``metered=False`` says the cost is an unknown, not
+    a measured zero, so a consumer of the task doc can render it honestly instead of as a
+    confident ``$0.0000``. Defaulting to True keeps every existing call site's meaning.
 
     Returns the drop notices produced by ``_absorb_outputs`` (all empty on the
     non-SUCCESS branch, which folds nothing) so the engine can emit the warning-grade
@@ -144,6 +150,7 @@ def apply_result(
     rec.provider = result.lane_used.provider
     rec.lane = result.lane_used.execution_mode
     rec.cost_usd = cost_usd
+    rec.metered = metered
     rec.input_tokens = result.token_usage.input
     rec.output_tokens = result.token_usage.output
     rec.output = result.structured_output

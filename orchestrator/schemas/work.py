@@ -129,6 +129,11 @@ class SubCall(BaseModel):
     # own count, so its ledger row — not the dispatch, and not a sibling sub-call — carries the
     # extra turns (design §4). 0 on the first-try-valid path and on lanes without the loop.
     schema_retries: int = 0
+    # Same honest-unknown flag as ``StageResult.usage_recovered`` (#319), one level down: a
+    # finder/verifier sub-call whose usage could not be read writes ITS row unpriced/unmetered
+    # instead of a confident $0, and ``_dispatch_view``'s ``all(...)`` propagates that to the
+    # dispatch aggregate.
+    usage_recovered: bool = True
 
 
 def compute_content_hash(
@@ -409,6 +414,14 @@ class StageResult(BaseModel):
     sub_results: dict | None = None
     sub_calls: tuple[SubCall, ...] | None = None
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
+    # Did ``token_usage`` come from a usage report the PROVIDER actually returned (#319)?
+    # False means the call ran but its usage could not be read (killed before the terminal
+    # event, a timeout with no partial result), so the zeros are an UNKNOWN, not a measured
+    # $0 — the ledger writes such a row ``priced=False``/``metered=False`` rather than
+    # asserting a confident $0.0000 for a call that may have cost real money. True (the
+    # default) on every metered success, on genuinely-$0 lanes (deterministic ENGINE), and on
+    # a call that never dispatched at all (missing CLI binary — nothing was spent).
+    usage_recovered: bool = True
     cost_usd: float | None = None
     pricing_ref: str | None = None
     error: str | None = None

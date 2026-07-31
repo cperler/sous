@@ -214,6 +214,8 @@ def _dispatch_sub(
         session_id=raw.session_ref,
         stream_file=(raw.stream_files or {}).get("stream"),
         schema_retries=raw.schema_retries,
+        # #319: a sub-call that died before reporting usage must not bill as a metered $0.
+        usage_recovered=raw.usage_recovered,
     )
 
 
@@ -388,6 +390,10 @@ def _panel_raw(
         invocation=f"review panel ({len(sub_calls)} sub-calls)",
         stream_files=_panel_stream_files(sub_calls),
         schema_retries=sum(call.schema_retries for call in sub_calls),
+        # One sub-call with unreadable usage makes the dispatch-level sum an understatement,
+        # and saying so is the honest direction (#319) — the same `all(...)` rule the ledger's
+        # `_dispatch_view` applies to the rows.
+        usage_recovered=all(call.usage_recovered for call in sub_calls),
     )
 
 
@@ -413,6 +419,7 @@ def _panel_failure(
         raw_stderr=raw.raw_stderr,
         stream_files=files,
         schema_retries=sum(call.schema_retries for call in sub_calls),
+        usage_recovered=all(call.usage_recovered for call in sub_calls),
     )
     return to_stage_result(
         work, failed, status,

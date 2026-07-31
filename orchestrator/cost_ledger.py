@@ -148,6 +148,7 @@ class CostLedger:
                     duration_s=sub.duration_s,
                     schema_retries=sub.schema_retries,
                     phase=sub.phase,
+                    usage_recovered=sub.usage_recovered,
                 )
                 for sub in result.sub_calls
             ]
@@ -160,6 +161,7 @@ class CostLedger:
                     duration_s=duration_s,
                     schema_retries=result.schema_retries,
                     phase=None,
+                    usage_recovered=result.usage_recovered,
                 )
             ]
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -253,6 +255,7 @@ class CostLedger:
         duration_s: float | None,
         schema_retries: int,
         phase: str | None,
+        usage_recovered: bool = True,
     ) -> dict:
         """Build one ledger row for a single model call within ``result``.
 
@@ -274,6 +277,15 @@ class CostLedger:
         metered = not (
             result.lane_used.execution_mode.value == "interactive" and tokens_seen == 0
         )
+        # #319: the SAME honesty rule for a call whose usage could not be read at all — a
+        # stage killed before its provider printed a usage report. Its zeros are an unknown,
+        # not a measurement, so the row must not claim to be a priced, metered $0.00: that
+        # reads as "this attempt was free" when it may have burned minutes of Opus. Marking
+        # it unmetered also keeps it OUT of `metered_spend`, so the budget gate reports what
+        # it can actually account for rather than silently absorbing a guess of zero.
+        if not usage_recovered:
+            priced = False
+            metered = False
         row = {
             "ts": result.completed_at,
             "run_id": result.run_id,
@@ -326,6 +338,7 @@ class CostLedger:
             duration_s=duration_s,
             schema_retries=result.schema_retries,
             phase=None,
+            usage_recovered=result.usage_recovered,
         )
         view.update(
             {
@@ -585,7 +598,12 @@ class CostLedger:
         Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once.
         Tolerant of malformed rows (``.get`` defaults) and of models absent from the
         price table — those still count toward spend but are excluded from the
-        counterfactual (and named in ``unpriced_models``)."""
+        counterfactual (and named in ``unpriced_models``).
+
+        ``unmetered_calls``/``total_invocations`` (#319, mirroring ``summary()``): a row
+        whose usage was never recoverable still contributes its ``cost_usd: 0.0`` to
+        ``total_cost_usd`` like any other row, so a caller (``render_cost_report``) needs
+        the unmetered count to say the total is a floor, not a complete figure."""
         rows = self.rows() if rows is None else rows
 
         def _bump(d: dict, key: str, cost: float, ci: int, co: int, cr: int, cw: int) -> None:
@@ -601,6 +619,8 @@ class CostLedger:
         by_stage: dict[str, dict] = {}
         by_task: dict[str, dict] = {}
         total_cost = 0.0
+        total_invocations = 0
+        unmetered_calls = 0
         fresh_input = output = cache_read = cache_write = 0
         cache_read_savings = 0.0  # money saved: reads billed at read_mult, not full input
         cache_write_premium = 0.0  # money spent: writes billed above plain input
@@ -609,6 +629,13 @@ class CostLedger:
         for row in rows:
             cost = row.get("cost_usd") or 0.0
             model = row.get("model", "unknown")
+            total_invocations += 1
+            # #319: mirror summary()'s unmetered count. An unmetered row contributes its 0.0
+            # to the totals like any other, so without this the report's bottom line silently
+            # absorbs calls of UNKNOWN cost as free — the exact confident-$0 defect #319
+            # exists to remove, one artifact over.
+            if row.get("metered") is False:
+                unmetered_calls += 1
             ci = row.get("input_tokens", 0) or 0
             co = row.get("output_tokens", 0) or 0
             cr = row.get("cache_read_tokens", 0) or 0
@@ -636,6 +663,8 @@ class CostLedger:
         input_side = fresh_input + cache_read + cache_write
         return {
             "total_cost_usd": round(total_cost, 6),
+            "total_invocations": total_invocations,
+            "unmetered_calls": unmetered_calls,
             "by_stage": by_stage,
             "by_task": by_task,
             "session_reuse": {

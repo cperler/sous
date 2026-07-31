@@ -86,6 +86,17 @@ class StageRecord(_StatusModel):
     provider: Provider | None = None
     lane: ExecutionMode | None = None
     cost_usd: float | None = None
+    # Is ``cost_usd`` a MEASUREMENT or an unknown rendered as zero (#319)? The ledger row
+    # already answers this (its ``metered`` key); before #319 the answer died at the ledger
+    # and every task-doc consumer saw only a bare float, so a stage whose usage was never
+    # recoverable — an interactive-lane stage (#54), or a metered-lane attempt killed before
+    # its provider printed a usage report — rendered as a confident ``$0.0000`` that reads as
+    # "free" when the truth is "unknown, possibly minutes of Opus". Folded from the ledger
+    # row in apply_result so the renderers (_cost_cell, render_progress' cost-to-date,
+    # render_completion_note) can say ``unmetered`` instead. Additive field defaulting to
+    # True: pre-#319 task docs load as metered — the same reading they already got — so no
+    # SCHEMA_VERSION bump is needed.
+    metered: bool = True
     input_tokens: int | None = None
     output_tokens: int | None = None
     error: str | None = None
