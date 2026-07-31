@@ -61,6 +61,8 @@ def test_append_claim_complete_unclaim_ordering(tmp_path) -> None:
     assert claimed["claim"]["run_id"] == "run-a"
     assert claimed["claim"]["owner"] == "cron"
     assert claimed["claim"]["claimed_at"]
+    assert isinstance(claimed["claim"]["host"], str) and claimed["claim"]["host"]
+    assert isinstance(claimed["claim"]["pid"], int) and claimed["claim"]["pid"] > 0
     assert [e["tasks"] for e in qf.read()] == [["a"], ["b"], ["c"]]  # still queued
 
     # unclaim strips the claim in place (the ingest-failure undo) — entry stays head.
@@ -102,6 +104,10 @@ def test_release_dead_owner_claim_allows_another_owner_to_claim(tmp_path) -> Non
     qf = QueueFile(tmp_path / "queue.json")
     qf.append(make_entry(["a"]))
     stale = qf.claim_head("retired-cron", "run-a")["claim"]
+
+    with pytest.raises(QueueError, match="not expected owner"):
+        qf.release_head_claim(expect_owner="other-owner")
+    assert qf.peek_head()["claim"] == stale
 
     released = qf.release_head_claim()
 
@@ -407,7 +413,11 @@ def test_restart_after_claim_resumes_the_claimed_run(tmp_path) -> None:
     qf = QueueFile(tmp_path / "queue.json")
     entry = qf.append(make_entry(["t1"], enqueued_at="2026-07-05T10:00:00+00:00"))
     run_id = run_id_for(entry)
-    qf.claim_head("cron", run_id)  # … and the process dies here
+    # The first consumer owns the process-lifetime lock when it writes the claim. Leaving
+    # the context simulates its death: the kernel releases the lock, so a same-owner
+    # relaunch must be able to acquire it and adopt this claim.
+    with consumer_guard(qf, "cron"):
+        qf.claim_head("cron", run_id)  # … and the process dies here
 
     # durable: the claimed entry is still in the queue file on disk
     on_disk = json.loads((tmp_path / "queue.json").read_text())
