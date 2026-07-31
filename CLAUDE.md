@@ -90,8 +90,11 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   invokes it after the batch's PRs land.
 
 ## Running a batch: headless is the default lane
-Use the **`orchestrate-batch-headless`** skill for ordinary batches. The human runs one
-foreground `run-headless` driver; the engine's `Scheduler` supervises and spawns `claude -p`
+Use the **`orchestrate-batch-headless`** skill for ordinary batches. One `run-headless` driver
+owns the run — backgrounded from the session, detached via fork+`os.setsid()`, or run in a
+foreground terminal (the skill's modes (a)/(c)/(b), and note that a session-tracked background
+task is reaped on a ~30-minute wall-clock cadence, so anything longer must be (c) or (b)); the
+engine's `Scheduler` supervises and spawns `claude -p`
 per stage, so no stage prompt or output passes through the session. Measured on
 `batch-headless-1`: 92–96% cache hits on long stages (provider sessions chain via `--resume`),
 real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.

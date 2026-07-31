@@ -1,9 +1,9 @@
 # Batch runner — headless×claude lane
 
-Set up a batch and hand the human a command that drives it to completion **outside this
-session**. The engine's own `Scheduler` is the supervisor here — not you. Your job is
-scaffolding (create the run, add the tasks, sanity-check the DAG), the **handoff**, and
-reading the result afterwards.
+Set up a batch and get the driver running. The engine's own `Scheduler` is the supervisor
+here — not you. Your job is scaffolding (create the run, add the tasks, sanity-check the
+DAG), **launching or handing off** the driver, and reading the result afterwards. No stage
+prompt or output passes through the session either way.
 
 **Prefer this skill over `orchestrate-batch-interactive` for ordinary batches.** On the
 interactive lane every stage's prompt and result flows through the session context, and the
@@ -40,32 +40,87 @@ Run-level settings must be chosen **now**: `--lane`, `--budget-usd`, `--review-w
 `--max-filed-followups`, `--progress-comments` all live on the Run doc and cannot be added
 later (every subcommand rebuilds the Engine from constructor defaults — see CLAUDE.md).
 
-## 2. Hand off (do NOT run this yourself)
-Give the human the driver command as a **single clean line, in its own code block, with no
-trailing `#` comments** — interactive zsh has `interactive_comments` off and will choke:
+## 2. Start the driver — three ways, all sanctioned
+The driver command is the same in every case:
 
 ```
 uv run orchestrator --root runs --shared-root --run RUN --project PROJECT run-headless --wait
 ```
 
-Say these three things with it, every time:
-
-1. **The driver runs in the foreground and owns the run for its whole duration.** Leave that
-   terminal alone. Ctrl-C sends SIGINT to the process group and kills the `claude -p`
-   children mid-stage — the failure that produced #313.
-2. **Monitor from a second terminal** — `dashboard --watch`, or `watch --activity`. The
-   driver also narrates itself to stderr and to `runs/<run>/driver.jsonl` (#323): heartbeats
-   carrying tick, utilization, dispatch limit, and — while it sleeps — the wait reason. A
-   long silence there is a stalled or dead driver, not a quiet one.
-3. **What it will do outwardly** — how many PRs it may open, against which repo. For a live
-   run against a real product repo, the human picks the issues and approves *before* any
-   write or PR (CLAUDE.md hard checkpoint).
-
 `--wait` sleeps through capacity stalls and rate-limit cooldowns instead of returning;
 without it the driver returns on the first stall. `--util auto` probes real 5h utilization.
 `--max-concurrent` defaults to 3.
 
-## 3. Read the result (after the human reports it finished)
+**(a) Backgrounded from this session — the default.** Launch it yourself with the Bash tool
+and `run_in_background: true`. This is the preferred shape: the human doesn't have to babysit
+a terminal, and you get notified when the driver exits so you can run step 3 unprompted.
+Because you launched it, own the consequences:
+
+- **Say that interrupting the session kills the driver.** A backgrounded driver is a child of
+  the session's shell, so an interrupt reaches its process group and kills the `claude -p`
+  children mid-stage — the #313 failure. Recoverable, not fatal: re-invoking the same
+  `run-headless` command resumes the same attempt from the last checkpoint and spends no
+  retry budget (#313), but the human should know before it happens, not after.
+- **Confirm it actually started** — poll `status` once and report `driver.alive`,
+  `last_state`, and which tasks went `running`. A driver that died on startup and one that is
+  working look identical if you never look.
+- **Give the human the monitor command anyway** so they can watch independently.
+
+**Mode (a) has a hard ceiling of ~25 minutes.** Tracked background Bash tasks are reaped on a
+30-minute wall-clock-aligned schedule — measured kills at `:13:18` and `:43:18` past the hour,
+within 0.6s, across four sessions on two days (the phase has drifted before: two 2026-07-04
+kills sat at `:01:59`/`:31:59`, same 30-minute period). Because the launch time is arbitrary
+relative to that boundary, a driver's life is uniformly 0–30 minutes, which reads as "randomly
+terminating" but is not random. This is harness-side and reaches the CLI as readily as the
+remote/mobile control — nothing in the engine sends SIGTERM. **If the batch could run longer
+than ~25 minutes, do not use mode (a)** — use (c) or (b).
+
+**(c) Detached — on request, and the right default for any long batch.** Escapes the reaper by
+putting the driver in its own session and process group, so the group-kill cannot reach it.
+macOS has no `setsid` binary, so fork + `os.setsid()` in Python. Substitute RUN/PROJECT; it
+returns immediately, leaving the driver running with `PPID 1`:
+
+```
+python3 -c "
+import os,sys,subprocess
+if os.fork(): sys.exit(0)
+os.setsid()
+log=open('runs/RUN/driver.log','a')
+subprocess.run(['uv','run','orchestrator','--root','runs','--shared-root','--run','RUN',
+                '--project','PROJECT','run-headless','--wait'],
+               stdout=log,stderr=log,stdin=subprocess.DEVNULL)
+"
+```
+
+The trade is that you get **no exit notification** — nothing is tracking the process — so you
+must tell the human that, and verify liveness yourself rather than waiting to be told:
+
+- Confirm detachment right after launch: `pgrep -f "run-headless"`, then
+  `ps -o pid,ppid,pgid -p <pid>` — `PPID` must be `1` and `PGID` must differ from the session
+  shell's. If `PPID` is not 1 it did not detach and the reaper still owns it.
+- Poll `status` when you want to know where it is; `driver.alive` + `heartbeat_age_s` (#323)
+  are authoritative, and `runs/<run>/driver.log` holds the stdout the notification would have
+  carried.
+- Killing it is now manual: `kill <pid>` from the `driver.jsonl` start record.
+
+**(b) Handed to the human to run in the foreground.** Prefer this when the human said they
+want to run it themselves, when the batch is long enough to outlive the session, or when it
+is a live run against a real product repo. Give the command as a **single clean line, in its
+own code block, with no trailing `#` comments** — interactive zsh has `interactive_comments`
+off and will choke. Tell them the driver owns the run for its whole duration and to leave
+that terminal alone.
+
+In every mode, say these two things:
+
+1. **Monitor from a second terminal** — `dashboard --watch`, or `watch --activity`. The
+   driver also narrates itself to stderr and to `runs/<run>/driver.jsonl` (#323): heartbeats
+   carrying tick, utilization, dispatch limit, and — while it sleeps — the wait reason. A
+   long silence there is a stalled or dead driver, not a quiet one.
+2. **What it will do outwardly** — how many PRs it may open, against which repo. For a live
+   run against a real product repo, the human picks the issues and approves *before* any
+   write or PR (CLAUDE.md hard checkpoint), and mode (b) is the right choice.
+
+## 3. Read the result (on the driver's exit notification, or when the human reports it done)
 ```
 uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" status
 ```
