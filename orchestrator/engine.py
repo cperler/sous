@@ -3167,9 +3167,12 @@ class Engine:
         next prompt. ``reason`` and ``resume_command`` are persisted in the run status
         and the single ``supervisor_parked`` audit event; ``context`` may retain the
         failed projection for diagnosis. Repeated calls are idempotent: one park episode
-        has one event. The park transition is serialized with fresh dispatch commits, so
-        it cannot race a new lease onto a parked run. Raises ``ContractError`` for missing
-        handoff details, a paused or terminal run, or any outstanding dispatch lease.
+        has one event. The run state and event commit together with the event first, so a
+        retry after an interrupted write repairs the document without duplicating the
+        event. The park transition is serialized with fresh dispatch commits, and its
+        state is revalidated under the run lock so it cannot overwrite a concurrent pause
+        or finalization. Raises ``ContractError`` for missing handoff details, a paused or
+        terminal run, or any outstanding dispatch lease.
         """
         with self.store.with_dispatch_lock(run_id):
             return self._park_supervisor_locked(
@@ -3267,10 +3270,12 @@ class Engine:
         """Release a supervisor-context park after a fresh interactive handoff.
 
         The method clears the parked metadata, returns the run to ``RUNNING``, and emits
-        ``supervisor_resumed``. If the park recorded a session id, callers must provide a
-        different ``supervisor_session_id``; this prevents the exhausted supervisor from
-        immediately refilling the run. Raises ``ContractError`` unless the run is parked
-        and that freshness check succeeds.
+        ``supervisor_resumed``. The event is committed before the run document and a
+        retry after an interrupted write reuses that event rather than emitting another.
+        If the park recorded a session id, callers must provide a different
+        ``supervisor_session_id``; this prevents the exhausted supervisor from immediately
+        refilling the run. Raises ``ContractError`` unless the run is parked and that
+        freshness check succeeds.
         """
         resume_event: dict | None = None
         append_resume_event = True

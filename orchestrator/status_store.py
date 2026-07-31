@@ -341,13 +341,16 @@ class StatusStore:
         This is the run-document counterpart to :meth:`commit_task_events`: the
         events are appended first and the run document is written last as the durable
         commit point. Consequently, a persisted run transition always has its audit
-        evidence already on disk. ``events`` may be computed from the freshly mutated
-        run when transition details are only known inside the locked mutation.
+        evidence already on disk. The returned run includes the committed mutation;
+        exceptions from the mutator or an append/write leave the run document unchanged.
+        ``events`` may be computed from the freshly mutated run when transition details
+        are only known inside the locked mutation.
 
         A crash after an event append but before the run write can leave the safe
         inverse (event present, document unchanged). Callers whose transition must be
         idempotent should give the event a stable transition key and suppress a matching
-        append when retrying against that unchanged document.
+        append when retrying against that unchanged document. The caller supplies events
+        for this method because the store cannot infer an event's semantic identity.
         """
         path = self._run_path(run_id)
         with self.with_lock(path):
