@@ -874,7 +874,10 @@ class Engine:
         self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
-        dispatch (terminal/parked task, budget pause, or pipeline exhausted).
+        dispatch (terminal/parked task, decomposition umbrella, budget pause, or pipeline
+        exhausted). Before selecting a stage, a normal dispatch resumes any approved,
+        partially-filed SCOPE decomposition so its parent cannot advance into IMPLEMENT;
+        completed umbrellas leave execution to their children on the run DAG.
 
         The single dispatch-resolution point: picks the stage, routes the lane
         (deterministic stages -> the in-process ENGINE lane), and resolves BOTH routing
