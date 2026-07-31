@@ -139,10 +139,14 @@ class _UnicodePanelTransport:
                  "description": "BROKEN"},
                 {"severity": "important", "file": "", "line": 2,
                  "description": f"{'a' * 158}😀discarded"},
+                {"severity": "critical", "file": "\u1c89.py", "line": 3,
+                 "description": "PINNED"},
             ]},
             "find:spec": {"findings": [
                 {"severity": "critical", "file": "STRASSE.PY", "line": 99,
                  "description": "broken"},
+                {"severity": "critical", "file": "\u1c8a.py", "line": 4,
+                 "description": "pinned"},
             ]},
             "verify:1": {
                 "fingerprint": "strasse.py:broken",
@@ -150,6 +154,16 @@ class _UnicodePanelTransport:
                 "reasoning": "confirmed across lanes",
             },
             "verify:2": {
+                "fingerprint": "\u1c89.py:pinned",
+                "verdict": "confirmed",
+                "reasoning": "confirmed across lanes",
+            },
+            "verify:3": {
+                "fingerprint": "\u1c8a.py:pinned",
+                "verdict": "confirmed",
+                "reasoning": "confirmed across lanes",
+            },
+            "verify:4": {
                 "fingerprint": long_fingerprint,
                 "verdict": "confirmed",
                 "reasoning": "confirmed across lanes",
@@ -204,7 +218,7 @@ def test_plan_bearing_shim_conforms_to_the_headless_panel(monkeypatch) -> None:
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
 def test_plan_bearing_shim_matches_headless_unicode_fingerprints(monkeypatch) -> None:
-    """Casefold expansions and astral truncation obey fingerprint-v1 on both lanes."""
+    """Version-pinned casefolding and code-point truncation match on both lanes."""
     actual = StageResult.model_validate(_run_shim("panel-unicode")["panelResult"])
     work = WorkItem.create(
         id="wi-headless", run_id="r", task_id="#1", stage=Stage.REVIEW,
@@ -221,13 +235,16 @@ def test_plan_bearing_shim_matches_headless_unicode_fingerprints(monkeypatch) ->
     assert [c.model_dump(mode="json") for c in actual.sub_calls or ()] == [
         c.model_dump(mode="json") for c in expected.sub_calls or ()
     ]
-    # The sharp-s variants consume one verifier slot, while the astral-boundary finding
-    # consumes the other. UTF-16 slicing or lowercase-only folding would produce three calls.
+    # The sharp-s variants consume one verifier slot; U+1C89/U+1C8A remain two distinct
+    # fingerprints under the pinned Unicode-15 contract even on runtimes that know their
+    # newer case pairing; and the astral-boundary finding consumes the final slot.
     assert [c.phase for c in actual.sub_calls or ()] == [
-        "find:code", "find:spec", "verify:1", "verify:2",
+        "find:code", "find:spec", "verify:1", "verify:2", "verify:3", "verify:4",
     ]
     assert [v["fingerprint"] for v in actual.sub_results["verdicts"]] == [
         "strasse.py:broken",
+        "\u1c89.py:pinned",
+        "\u1c8a.py:pinned",
         f":{'a' * 158}😀",
     ]
 

@@ -153,12 +153,13 @@ function subCall(phaseName, wi, call) {
   }
 }
 
-// `fingerprint-v1` is pinned to Python's Unicode 15 casefold table (the table used by
-// Python 3.12; Python 3.11's Unicode 14 table has the same case mappings). JavaScript has
-// no casefold primitive. Upper-then-lower per CODE POINT produces the full folds (including
-// expansions such as ß -> ss); these exceptions cover the mappings where Unicode casefold
-// intentionally differs from that operation. The final two ranges and singleton set keep a
-// newer Workflow runtime from applying case mappings added after the v1 table was named.
+// `fingerprint-v1` is pinned to Unicode 15's case mappings, independent of either lane's
+// runtime Unicode version. JavaScript has no casefold primitive. Upper-then-lower per CODE
+// POINT produces the full folds (including expansions such as ß -> ss); these exceptions
+// cover the mappings where Unicode casefold intentionally differs from that operation. The
+// final two ranges and singleton set keep a newer runtime from applying case mappings added
+// after the v1 table was named. Keep this algorithm/table identical to
+// orchestrator/review_workflow.py::_casefold_v1.
 const CASEFOLD_V1_IDENTITY = new Set([
   0x0131, 0x1c89, 0xa7cb, 0xa7cc, 0xa7ce, 0xa7d2, 0xa7d4, 0xa7da, 0xa7dc,
 ])

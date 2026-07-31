@@ -36,6 +36,9 @@ const agent = async (prompt, opts) => {
           { severity: 'critical', file: 'Straße.py', line: 1, description: 'BROKEN' },
           { severity: 'important', file: '', line: 2,
             description: `${'a'.repeat(158)}😀discarded` },
+          // U+1C89/U+1C8A acquired a case pair after fingerprint-v1's Unicode-15
+          // table. They must remain distinct even when Node knows the newer mapping.
+          { severity: 'critical', file: '\u1c89.py', line: 3, description: 'PINNED' },
         ] }
       }
       if (mode === 'panel-cap') {
@@ -53,6 +56,7 @@ const agent = async (prompt, opts) => {
       if (mode === 'panel-unicode') {
         return { findings: [
           { severity: 'critical', file: 'STRASSE.PY', line: 99, description: 'broken' },
+          { severity: 'critical', file: '\u1c8a.py', line: 4, description: 'pinned' },
         ] }
       }
       return { findings: [
@@ -64,9 +68,11 @@ const agent = async (prompt, opts) => {
     if (prompt.startsWith('VERIFY ')) {
       if (mode === 'panel-verifier-error') throw new Error('verifier exploded')
       if (mode === 'panel-unicode') {
-        const fingerprint = prompt.includes('strasse.py:broken')
-          ? 'strasse.py:broken'
-          : `:${'a'.repeat(158)}😀`
+        let fingerprint
+        if (prompt.includes('strasse.py:broken')) fingerprint = 'strasse.py:broken'
+        else if (prompt.includes('\u1c89.py:pinned')) fingerprint = '\u1c89.py:pinned'
+        else if (prompt.includes('\u1c8a.py:pinned')) fingerprint = '\u1c8a.py:pinned'
+        else fingerprint = `:${'a'.repeat(158)}😀`
         return { fingerprint, verdict: 'confirmed', reasoning: 'confirmed across lanes' }
       }
       return {

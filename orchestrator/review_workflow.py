@@ -71,6 +71,16 @@ from .render import format_review_issue
 # ``file:description`` fingerprint, whitespace-collapsed, casefolded, 160 chars.
 FINGERPRINT_RULE = "fingerprint-v1"
 
+# ``fingerprint-v1`` is pinned to Unicode 15's case mappings.  Python's
+# ``str.casefold`` follows the interpreter's Unicode database, so using it directly makes
+# persisted fingerprints change when a newer supported Python learns new case pairs.  This
+# is the same compact algorithm/table used by ``run_targets/workflow_shim.js``: upper/lower
+# supplies the established full folds, these exceptions capture casefold-specific behavior,
+# and the identity ranges exclude case mappings introduced after Unicode 15.
+_CASEFOLD_V1_IDENTITY = frozenset(
+    {0x0131, 0x1C89, 0xA7CB, 0xA7CC, 0xA7CE, 0xA7D2, 0xA7D4, 0xA7DA, 0xA7DC}
+)
+
 # Fixed fold order. A differently-ordered ``findings_by_lens`` dict MUST fold identically,
 # so the walk is driven by this tuple (then any unknown lenses, sorted by name) — never by
 # the input dict's own key order.
@@ -108,6 +118,30 @@ _NOTICE_VERIFIER_CAP = "verifier_cap"
 _NOTICE_VERIFIER_INCONCLUSIVE = "verifier_inconclusive"
 
 
+def _casefold_v1(text: str) -> str:
+    """Return the runtime-independent Unicode-15 fold named by ``fingerprint-v1``."""
+    folded: list[str] = []
+    for character in text:
+        point = ord(character)
+        if (
+            point in _CASEFOLD_V1_IDENTITY
+            or 0x10D50 <= point <= 0x10D65
+            or 0x16EA0 <= point <= 0x16EB8
+        ):
+            folded.append(character)
+        elif point == 0x1E9E:
+            folded.append("ss")
+        elif 0x13A0 <= point <= 0x13F5:
+            folded.append(character)
+        elif 0x13F8 <= point <= 0x13FD:
+            folded.append(chr(point - 8))
+        elif 0xAB70 <= point <= 0xABBF:
+            folded.append(chr(point - 0x97D0))
+        else:
+            folded.append(character.upper().lower())
+    return "".join(folded)
+
+
 def issue_fingerprint(issue: object) -> str:
     """Stable convergence/dedupe key for one review finding — the named
     ``fingerprint-v1`` rule (#15, ports the as-built ``file:description`` fingerprint,
@@ -120,7 +154,7 @@ def issue_fingerprint(issue: object) -> str:
         base = f"{str(issue.get('file') or '').strip()}:{str(issue.get('description') or '').strip()}"
     else:
         base = str(issue)
-    return re.sub(r"\s+", " ", base).casefold()[:160]
+    return _casefold_v1(re.sub(r"\s+", " ", base))[:160]
 
 
 class SynthesisResult(NamedTuple):

@@ -253,6 +253,14 @@ def test_fingerprint_matching_is_normalized() -> None:
     assert notices == ()
 
 
+def test_fingerprint_casefold_is_pinned_to_unicode_15() -> None:
+    """Newer Unicode case pairs cannot change an existing fingerprint rule's identity."""
+    # U+1C89/U+1C8A became uppercase/lowercase partners after Unicode 15.  The v1 table
+    # predates that mapping, so they intentionally remain different fingerprint characters.
+    assert issue_fingerprint("\u1c89.py:BUG") == "\u1c89.py:bug"
+    assert issue_fingerprint("\u1c8a.py:BUG") == "\u1c8a.py:bug"
+
+
 def test_shuffled_lens_order_folds_identically() -> None:
     """The walk is driven by LENS_ORDER, never by the input dict's key order."""
     lenses = {
