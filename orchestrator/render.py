@@ -600,7 +600,10 @@ def render_completion_note(
       "Noted, not filed" section with a short reason.
     * An improvement idea without an explicit ``file`` disposition is surfaced with its
       reason instead of an issue link, keeping the idea durable in the note even though
-      no enhancement issue was opened."""
+      no enhancement issue was opened.
+    * A ``fixup`` is called applied only from ``task.review_fixups`` after its subsequent
+      IMPLEMENT→…→REVIEW pass approved; disposition text alone is never treated as
+      evidence that code changed."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -666,22 +669,31 @@ def render_completion_note(
     # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
-    if improvement and str(improvement.get("title", "")).strip():
+    applied_fixups = [fixup for fixup in task.review_fixups if fixup.applied]
+    improvement_title = str((improvement or {}).get("title", "")).strip()
+    improvement_disp = str((improvement or {}).get("disposition", "")).strip().casefold()
+    # Normally the final approving review has no fixup (the request lived in the prior
+    # review record that was reset).  Defensively avoid rendering it twice if a hand-built
+    # task carries both the old output and the durable applied record.
+    show_improvement = bool(improvement_title) and not (
+        improvement_disp == "fixup"
+        and any(fixup.title == improvement_title for fixup in applied_fixups)
+    )
+    if improvement and show_improvement:
         # #223/#228 — nothing silently dropped: an improvement not explicitly filed has
         # no enhancement issue, so surface WHY it wasn't filed instead of a link.
         _improvement_reason = {
-            "fixup": "applied in place, not filed",
-            "fix_now": "applied in place, not filed",
+            "fixup": "requested in-place fixup — not applied",
+            "fix_now": "noted for in-place handling, not filed",
             "drop": "noted, not tracked",
         }
-        disp = str(improvement.get("disposition", "")).strip().casefold()
         if improvement_ref:
             suffix = f" → {improvement_ref}"
-        elif disp in _improvement_reason:
-            suffix = f" — {_improvement_reason[disp]}"
-        elif not disp:
+        elif improvement_disp in _improvement_reason:
+            suffix = f" — {_improvement_reason[improvement_disp]}"
+        elif not improvement_disp:
             suffix = " — no disposition given — not filed"
-        elif disp != "file":
+        elif improvement_disp != "file":
             suffix = " — unrecognized disposition — not filed"
         else:
             suffix = ""
@@ -689,9 +701,18 @@ def render_completion_note(
         lines += ["", "### Self-improvement", head]
         if str(improvement.get("detail", "")).strip():
             lines.append(str(improvement["detail"]).strip())
+    if applied_fixups:
+        if not show_improvement:
+            lines += ["", "### Self-improvement"]
+        for fixup in applied_fixups:
+            lines.append(
+                f"💡 **Improvement fixup:** {fixup.title} — applied in place, not filed"
+            )
+            if fixup.detail:
+                lines.append(fixup.detail)
     retro = review.get("retrospective") if isinstance(review.get("retrospective"), dict) else None
     if retro and str(retro.get("title", "")).strip():
-        if not (improvement and str(improvement.get("title", "")).strip()):
+        if not show_improvement and not applied_fixups:
             lines += ["", "### Self-improvement"]
         lines += ["", f"🔍 **Process retrospective:** {retro['title']}"]
         if str(retro.get("detail", "")).strip():

@@ -7,8 +7,11 @@ Suggestion-only rejections auto-approve (the old severity gate)."""
 
 from __future__ import annotations
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
+from orchestrator.errors import ContractError
 from orchestrator.render import format_review_issue
 from orchestrator.schemas.enums import ResultStatus, Stage, StageStatus, TaskState
 from orchestrator.status_store import StatusStore
@@ -80,6 +83,146 @@ def test_fix_cycle_then_approval_completes(tmp_path, project) -> None:
     out = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
     assert out["outcome"] == "task_completed"
     assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
+
+
+FIXUP = {
+    "title": "Keep the completion evidence honest",
+    "detail": "Render applied only after the re-review accepts the in-place edit.",
+    "disposition": "fixup",
+}
+
+
+def _drive_fixup_tail(eng: Engine):
+    """Drive the re-opened IMPLEMENT→TEST→DELIVER tail and return its REVIEW."""
+    stages = []
+    for _ in range(3):
+        work = eng.next_work("r1", "t1")
+        stages.append(work.stage)
+        eng.record("r1", make_result(work))
+    assert stages == [Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER]
+    work = eng.next_work("r1", "t1")
+    assert work.stage is Stage.REVIEW
+    return work
+
+
+def test_approved_fixup_reimplements_redelivers_and_records_application(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    review = _advance_to_review(eng)
+    result = make_result(
+        review,
+        structured_output={"approved": True, "issues": [], "improvement": FIXUP},
+    )
+
+    out = eng.record("r1", result)
+    assert out["outcome"] == "review_fixup_cycle"
+    assert out["next_stage"] == "implement"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1
+    assert len(task.review_fixups) == 1 and task.review_fixups[0].applied is False
+    assert FIXUP["title"] in task.learnings[-1]
+    assert FIXUP["detail"] in task.learnings[-1]
+    for stage in (Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER, Stage.REVIEW):
+        assert task.stages[stage].status is StageStatus.PENDING
+
+    # A result replay cannot schedule a second pass: the closed lease rejects it before
+    # mutation, and the atomic stage-event batch contains one scheduled event.
+    with pytest.raises(ContractError):
+        eng.record("r1", result)
+    assert len([
+        event for event in eng.store.read_events("r1")
+        if event["type"] == "review_fixup_scheduled"
+    ]) == 1
+
+    final_review = _drive_fixup_tail(eng)
+    out = eng.record(
+        "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
+    )
+    assert out["outcome"] == "task_completed"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_fixups[0].applied is True
+    events = eng.store.read_events("r1")
+    assert len([event for event in events if event["type"] == "review_fixup_applied"]) == 1
+    # The original request survived the REVIEW-record reset and is reported from actual
+    # application evidence.  It never became a backlog issue.
+    note = project.task_source.notes[0]["body"]
+    assert FIXUP["title"] in note
+    assert "applied in place, not filed" in note
+    assert not any(followup["labels"] == ["enhancement"]
+                   for followup in project.task_source.followups)
+
+
+def test_rejected_review_combines_fixup_with_its_existing_cycle(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    rejected = {**REJECTION, "improvement": FIXUP}
+
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output=rejected))
+
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1  # one combined pass, not two resets/cycles
+    assert len(task.review_fixups) == 1
+    assert "blocking issues" in task.learnings[-2]
+    assert FIXUP["title"] in task.learnings[-1]
+    event = next(e for e in eng.store.read_events("r1")
+                 if e["type"] == "review_fixup_scheduled")
+    assert event["reason"] == "combined with blocking-review fix cycle"
+
+
+def test_repeated_fixup_parks_instead_of_looping(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    output = {"approved": True, "issues": [], "improvement": FIXUP}
+    eng.record("r1", make_result(_advance_to_review(eng), structured_output=output))
+
+    out = eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output=output))
+
+    assert out["outcome"] == "review_fixup_held"
+    assert out["task_state"] == "blocked_on_human"
+    task = eng.store.load_task("r1", "t1")
+    assert task.stages[Stage.REVIEW].status is StageStatus.FAILED
+    assert len(task.review_fixups) == 1 and task.review_fixups[0].applied is False
+    held = [e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held"]
+    assert len(held) == 1 and "requested again" in held[0]["reason"]
+
+
+@pytest.mark.parametrize(
+    ("pipeline", "reason"),
+    [
+        ([Stage.INTAKE, Stage.REVIEW], "no IMPLEMENT→DELIVER→REVIEW tail"),
+        (
+            [Stage.REVIEW, Stage.IMPLEMENT, Stage.DELIVER],
+            "does not order IMPLEMENT→DELIVER→REVIEW",
+        ),
+    ],
+)
+def test_fixup_parks_when_pipeline_cannot_reimplement(
+    tmp_path, project, pipeline, reason
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1", pipeline=pipeline)
+    while (review := eng.next_work("r1", "t1")).stage is not Stage.REVIEW:
+        eng.record("r1", make_result(review))
+
+    out = eng.record(
+        "r1",
+        make_result(
+            review,
+            structured_output={"approved": True, "issues": [], "improvement": FIXUP},
+        ),
+    )
+
+    assert out["outcome"] == "review_fixup_held"
+    task = eng.store.load_task("r1", "t1")
+    assert task.state is TaskState.BLOCKED_ON_HUMAN
+    assert task.review_fixups == []
+    held = next(e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held")
+    assert reason in held["reason"]
 
 
 def test_rejection_parks_when_cycles_exhausted(tmp_path, project) -> None:
