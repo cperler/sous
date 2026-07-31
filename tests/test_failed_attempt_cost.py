@@ -31,14 +31,22 @@ from adapters.execution.headless_claude import HeadlessClaudeRunner
 from adapters.execution.transport import claude_cli_transport, codex_cli_transport
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.render import render_cost_summary
+from orchestrator.render import (
+    render_completion_note,
+    render_cost_report,
+    render_cost_summary,
+    render_progress,
+    render_task_index,
+)
 from orchestrator.schemas.enums import (
     ExecutionLane,
     ExecutionMode,
     Provider,
     ResultStatus,
     Stage,
+    StageStatus,
 )
+from orchestrator.schemas.status import Task
 from orchestrator.schemas.work import LanePolicy, TokenUsage, WorkItem
 from orchestrator.status_store import StatusStore
 from tests.conftest import FakeProject, make_result
@@ -458,3 +466,190 @@ def test_codex_success_stays_measured(monkeypatch) -> None:
     raw = codex_cli_transport()(_codex_wi())
 
     assert raw.exit_code == 0 and raw.usage_recovered is True
+
+
+# --- the flag reaches the TASK DOC and every cost surface --------------------------------
+#
+# The ledger row knowing the truth is only half of it: `cost-summary.md` and `--budget-usd`
+# read the ledger, but `_cost_cell`, `render_progress`'s live "Cost to date" (the most-visible
+# cost surface — upserted onto the driving issue/PR mid-run), `render_completion_note` (the
+# PR evidence artifact) and `cost-report.md` all read `StageRecord.cost_usd` off the task doc
+# instead. Before the flag was folded onto the record they had no way to tell a measured $0
+# from an unknown, so a failed metered-lane attempt rendered as a confident `$0.0000` — the
+# same defect this issue exists to remove, relocated one layer out.
+
+
+def _unmetered_result(work):
+    """A FAILED attempt whose usage report was never recoverable (killed mid-dispatch).
+
+    Pinned to the HEADLESS lane on purpose: the interactive lane has its own long-standing
+    unmetered rule (#54), and letting these stages default to it would make every assertion
+    below pass through that older branch instead of the one #319 adds — green for the wrong
+    reason. A metered lane is exactly where a confident $0.00 is a lie."""
+    return make_result(
+        work, status=ResultStatus.FAILURE, error="killed before any usage report",
+        tokens=TokenUsage(), mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE,
+    ).model_copy(update={"usage_recovered": False})
+
+
+def _failed_unmetered_task(tmp_path) -> tuple[Engine, Task]:
+    """Drive a real FAILED, usage-unrecoverable metered-lane attempt through the engine and
+    hand back the resulting task doc — no hand-built fixture, so this pins the whole thread
+    (transport flag -> ledger row -> apply_result fold -> renderers), not just the renderer."""
+    eng = _engine(tmp_path, FakeProject())
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake, $0 engine lane
+    scope = eng.next_work("r1", "t1")
+    assert scope.stage is Stage.SCOPE
+    eng.record("r1", _unmetered_result(scope))
+    task = eng.store.load_task("r1", "t1")
+    assert task.stages[Stage.SCOPE].lane is ExecutionMode.HEADLESS  # not the #54 branch
+    return eng, task
+
+
+def _stage_row(md: str, stage: Stage) -> str:
+    """The stage's row out of a rendered stage table — the ``_cost_cell`` surface.
+
+    Covers both table shapes: render_progress leads with the stage name, while the task
+    index and completion note lead with a sequence number."""
+    return next(ln for ln in md.splitlines()
+                if ln.startswith("|") and f"| {stage.value} |" in ln)
+
+
+def test_unrecoverable_usage_marks_the_stage_record_unmetered(tmp_path) -> None:
+    eng, task = _failed_unmetered_task(tmp_path)
+    rec = task.stages[Stage.SCOPE]
+    assert rec.status is StageStatus.FAILED
+    assert rec.cost_usd == 0.0
+    # the ledger's own honesty flag survived the fold onto the task doc
+    assert rec.metered is False
+    assert eng.ledger.rows()[-1]["metered"] is False
+
+
+def test_a_measured_stage_stays_metered_on_the_task_doc(tmp_path) -> None:
+    # Guard the other direction: the honest-unknown flag must not leak onto normal stages,
+    # or every ordinary row would render as "unmetered" and the signal would be worthless.
+    eng = _engine(tmp_path, FakeProject())
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    scope = eng.next_work("r1", "t1")
+    eng.record("r1", make_result(scope, tokens=TokenUsage(input=200_000, output=0),
+                                 mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE))
+
+    task = eng.store.load_task("r1", "t1")
+    rec = task.stages[Stage.SCOPE]
+    assert rec.metered is True and rec.cost_usd == 1.0
+    assert "$1.0000" in _stage_row(render_progress(task), Stage.SCOPE)
+    assert "unmetered" not in render_progress(task)  # no caveat noise on a measured run
+
+
+def test_stage_tables_flag_an_unmetered_stage_instead_of_showing_zero(tmp_path) -> None:
+    # _cost_cell feeds all three stage tables (progress, per-task index, completion note),
+    # so the PR evidence artifact inherits whatever the live progress body says.
+    _, task = _failed_unmetered_task(tmp_path)
+    for md in (render_progress(task), render_task_index(task), render_completion_note(task)):
+        row = _stage_row(md, Stage.SCOPE)
+        assert "$0.0000" not in row  # THE regression: a confident zero for an unknown cost
+        assert "n/a (unmetered)" in row
+        # the deterministic ENGINE-lane stage keeps its genuine, MEASURED $0 tag — the flag
+        # must not turn a real zero into an unknown
+        assert "$0 (engine)" in _stage_row(md, Stage.INTAKE)
+
+
+def test_progress_cost_to_date_does_not_report_unknown_spend_as_free(tmp_path) -> None:
+    # The live body upserted onto the driving issue/PR while the run is in flight. The only
+    # metered stage here is the deterministic engine intake (a true $0), so the headline
+    # figure is $0.0000 — but it must never stand BARE, which is what read as "free".
+    _, task = _failed_unmetered_task(tmp_path)
+    line = next(ln for ln in render_progress(task).splitlines() if "Cost to date" in ln)
+    assert line.strip() != "- **Cost to date:** $0.0000"
+    assert "1 unmetered stage(s) of UNKNOWN cost" in line
+    assert "the true total is higher" in line
+
+
+def test_progress_says_n_a_when_no_stage_is_metered(tmp_path) -> None:
+    # Nothing measured at all: the headline is an explicit unknown, not a $0 figure.
+    _, task = _failed_unmetered_task(tmp_path)
+    task.stages[Stage.INTAKE].cost_usd = None  # drop the engine lane's measured $0
+    line = next(ln for ln in render_progress(task).splitlines() if "Cost to date" in ln)
+    assert "$0.0000" not in line
+    assert "cost unknown (not $0)" in line
+
+
+def test_progress_cost_to_date_separates_metered_spend_from_unknowns(tmp_path) -> None:
+    # A mixed task: the metered figure is still shown, but it is labelled as a FLOOR rather
+    # than silently absorbing the unknown stage as $0.
+    eng, _ = _failed_unmetered_task(tmp_path)
+    task = eng.store.load_task("r1", "t1")
+    task.stages[Stage.IMPLEMENT].status = StageStatus.COMPLETED
+    task.stages[Stage.IMPLEMENT].lane = ExecutionMode.HEADLESS
+    task.stages[Stage.IMPLEMENT].cost_usd = 2.5
+
+    line = next(ln for ln in render_progress(task).splitlines() if "Cost to date" in ln)
+    assert "$2.5000 metered" in line
+    assert "1 unmetered stage(s)" in line and "the true total is higher" in line
+
+
+def test_cost_report_calls_out_unmetered_rows(tmp_path) -> None:
+    # The artifact this issue's acceptance criteria names explicitly: cost-report must
+    # surface an unrecoverable-usage row as unmetered rather than free. analysis() summed
+    # `cost_usd` across every row with no notion of metered, so its bottom line read as
+    # complete while quietly including calls of unknown cost at $0.
+    eng, _ = _failed_unmetered_task(tmp_path)
+    implement = eng.next_work("r1", "t1")  # SCOPE failed -> retry is dispatched
+    eng.record("r1", make_result(implement, tokens=TokenUsage(input=200_000, output=0)))
+
+    analysis = eng.ledger.analysis()
+    assert analysis["unmetered_calls"] == 1
+    assert analysis["total_invocations"] == 3  # engine intake + the two model calls
+
+    md = render_cost_report("r1", analysis)
+    assert "1 unmetered call(s) have UNKNOWN cost" in md
+    assert "the true total is higher" in md
+    assert "$1.0000" in md  # the metered spend is still reported, just qualified
+
+
+def test_cost_report_says_n_a_when_nothing_is_metered(tmp_path) -> None:
+    md = render_cost_report("r1", {"total_cost_usd": 0.0, "total_invocations": 2,
+                                   "unmetered_calls": 2, "by_stage": {}, "by_task": {},
+                                   "session_reuse": {}})
+    assert "all 2 call(s) are unmetered" in md and "not $0" in md
+    assert "Total cost: **$0.0000**" not in md
+
+
+def test_cost_report_is_unchanged_when_every_call_is_metered(tmp_path) -> None:
+    # No caveat noise on a clean run: the honesty line appears only when it is true.
+    eng = _engine(tmp_path, FakeProject())
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    eng.record("r1", make_result(eng.next_work("r1", "t1"),
+                                 tokens=TokenUsage(input=200_000, output=0)))
+
+    md = render_cost_report("r1", eng.ledger.analysis())
+    assert "Total cost: **$1.0000**" in md
+    assert "unmetered" not in md
+
+
+def test_abandoned_dispatch_records_an_honest_unknown(tmp_path) -> None:
+    # An orphaned dispatch is the canonical unrecoverable case — it is literally how the
+    # #317 attempt that motivated this issue ended (the driver's SIGINT killed the `claude -p`
+    # child mid-stage). The engine has nothing to bill, but the provider may have burned
+    # minutes of Opus first, so the row must read UNKNOWN rather than a metered $0.00.
+    eng = _engine(tmp_path, FakeProject())
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    eng.next_work("r1", "t1")  # SCOPE dispatched; the lease is never answered
+    task = eng.abandon("r1", "t1", reason="driver killed mid-dispatch", force=True)
+    assert task.stages[Stage.SCOPE].status is StageStatus.FAILED
+    assert task.stages[Stage.SCOPE].metered is False
+    row = next(r for r in eng.ledger.rows() if r["stage"] == "scope")
+    assert row["cost_usd"] == 0.0 and row["metered"] is False and row["priced"] is False
+    assert eng.ledger.summary()["unmetered_calls"] == 1
+    # ...and the progress body counts it as an unknown rather than a free stage.
+    md = render_progress(task)
+    assert "$0.0000" not in _stage_row(md, Stage.SCOPE)
+    assert "1 unmetered stage(s) of UNKNOWN cost" in md

@@ -1518,7 +1518,13 @@ class Engine:
         # rows without appending; the flag additionally gates the stage_recorded
         # event dedupe at the commit below.
         replayed_after_charge = bool(self.ledger.existing_rows_for(result.work_item_id))
-        cost = self.ledger.record(result, duration_s=duration_s)["cost_usd"]
+        # #319: keep the row's ``metered`` flag with its ``cost_usd`` — a 0.0 from an
+        # unrecoverable usage report is an UNKNOWN, not a measured zero, and dropping the
+        # flag here is exactly what let a $4.25 failed attempt render as a confident $0.0000
+        # on the task doc, the progress comment and the completion note.
+        cost_row = self.ledger.record(result, duration_s=duration_s)
+        cost = cost_row["cost_usd"]
+        cost_metered = bool(cost_row.get("metered", True))
 
         # Attributed/clean iff the lane actually used is a sanctioned (registered) cell.
         lane_clean = (
@@ -1740,7 +1746,9 @@ class Engine:
                     t.not_before = cooldown_until
                     outcome = "stage_rate_limited_cooldown"
             else:
-                fold_notices = apply_result(t, effective, now=_now(), cost_usd=cost)
+                fold_notices = apply_result(
+                    t, effective, now=_now(), cost_usd=cost, metered=cost_metered
+                )
                 # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
                 # the fold is no longer invisible — surface each drop as a warning-grade audit
                 # event, mirroring effort_downgraded/model_downgraded ('never silent').
@@ -3220,9 +3228,14 @@ class Engine:
                     f"--min-idle-s, or pass --force if you know the process is dead."
                 )
 
-        # Synthesize the lease-matching abandonment honestly. No model ran, so the lane_used
-        # invocation says exactly that and the token usage is empty (the ledger reprices to
-        # $0). We reuse the intended lane cell (router) for accurate attribution.
+        # Synthesize the lease-matching abandonment honestly. No model call COMPLETED, so the
+        # lane_used invocation says exactly that and the token usage is empty. #319: empty is
+        # not the same as zero here — an abandoned dispatch is the canonical unrecoverable-usage
+        # case (the provider process was orphaned or killed before printing a usage report, and
+        # it may have burned minutes of Opus first), so the row is flagged usage_recovered=False
+        # and lands unpriced/unmetered rather than as a confident, metered $0.00. The figure
+        # itself is unchanged — the engine has nothing to bill — but it now reads as UNKNOWN.
+        # We reuse the intended lane cell (router) for accurate attribution.
         dispatched = task.stages[stage]
         lane = self.router.lane_for(stage, task)
         completed_at = _now()
@@ -3246,6 +3259,7 @@ class Engine:
                 invocation=f"abandoned: dispatch orphaned, no model call ({reason})",
             ),
             token_usage=TokenUsage(),
+            usage_recovered=False,
             error=f"dispatch_abandoned: {reason}",
             completed_at=completed_at,
         )
@@ -3259,7 +3273,9 @@ class Engine:
                 )
             except ValueError:
                 duration_s = None
-        cost = self.ledger.record(synthetic, duration_s=duration_s)["cost_usd"]
+        abandon_row = self.ledger.record(synthetic, duration_s=duration_s)
+        cost = abandon_row["cost_usd"]
+        cost_metered = bool(abandon_row.get("metered", True))
 
         # Clear the lease and fold the abandonment into the stage record + task state DIRECTLY
         # (not via apply_result / record — an abandoned dispatch never converges, so none of
@@ -3283,6 +3299,7 @@ class Engine:
             d.provider = lane.provider
             d.lane = lane.execution_mode
             d.cost_usd = cost
+            d.metered = cost_metered
             t.last_error = error
             t.state = (
                 TaskState.CLOSED_INFEASIBLE if disposition == "rejected"

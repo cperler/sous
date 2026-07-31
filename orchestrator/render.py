@@ -26,11 +26,17 @@ def _cost_cell(rec: StageRecord) -> str:
     genuine $0 is tagged ``$0 (engine)`` (#68/#120) — a visible deterministic-stage win, not
     a bare $0 that reads as free-because-unmetered. The interactive lane can't meter
     per-stage cost in-session, so it records 0.0 — render that as ``n/a`` rather than
-    ``$0.0000``. Metered lanes (headless/codex) show the real figure."""
+    ``$0.0000``. Metered lanes (headless/codex) show the real figure — UNLESS that stage's
+    own usage was never recoverable (#319: an attempt killed before its provider printed a
+    usage report), in which case its 0.0 is an unknown and prints as ``n/a (unmetered)``. The
+    ENGINE lane is checked first and unconditionally: it runs no model, so its $0 is a true
+    measurement no matter what the flag says."""
     if rec.lane is ExecutionMode.ENGINE:
         return "$0 (engine)"
     if rec.lane is ExecutionMode.INTERACTIVE:
         return "n/a"
+    if not rec.metered:
+        return "n/a (unmetered)"
     return f"${rec.cost_usd:.4f}" if isinstance(rec.cost_usd, (int, float)) else "—"
 
 
@@ -129,10 +135,25 @@ def render_cost_report(run_id: str, analysis: dict) -> str:
     total = analysis.get("total_cost_usd") or 0.0
     uncached = reuse.get("uncached_cost_usd") or 0.0
     net = reuse.get("net_win_usd") or 0.0
+    # Same honesty rule as render_cost_summary (#319): an unmetered call has UNKNOWN cost,
+    # and it sits in these rows contributing 0.0. Saying so is the difference between "this
+    # run cost $2.43" and "this run cost at least $2.43" — the latter being the true claim
+    # when a failed attempt's usage report was never recovered.
+    unmetered = analysis.get("unmetered_calls") or 0
+    invocations = analysis.get("total_invocations") or 0
+    if unmetered and unmetered == invocations:
+        total_line = (f"- Total cost: **n/a — all {unmetered} call(s) are unmetered** "
+                      f"(no per-call usage was recorded for them — not $0)")
+    elif unmetered:
+        total_line = (f"- Total cost: **${total:.4f}** (metered calls only — "
+                      f"⚠️ {unmetered} unmetered call(s) have UNKNOWN cost and are NOT "
+                      f"included; the true total is higher)")
+    else:
+        total_line = f"- Total cost: **${total:.4f}**"
     lines = [
         f"# Cost report — {run_id}",
         "",
-        f"- Total cost: **${total:.4f}**",
+        total_line,
         "",
         "## Session-reuse win",
         "",
@@ -656,8 +677,14 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
     if task.pr_url:
         lines.append(f"- **PR:** {task.pr_url}")
 
-    # Metered cost-to-date: sum the recorded per-stage costs. Interactive stages record
-    # 0.0 (they cannot meter in-session), so note them rather than implying "free".
+    # Metered cost-to-date: sum ONLY the per-stage costs that are real measurements, and
+    # count the rest rather than absorbing them as zero. Two ways a stage lands unmetered:
+    # the interactive lane cannot meter per-stage cost in-session (#54), and any lane can
+    # lose a stage's usage report when it dies before printing one (#319) — a failed
+    # headless attempt that may have spent real money. Adding either to the total would
+    # understate spend while LOOKING precise, so they are reported alongside it, not in it.
+    # The interactive test stays as its own clause: it keeps the pre-#319 reading for task
+    # docs written before ``metered`` existed (they load with the True default).
     total = 0.0
     metered = False
     unmetered_stages = 0
@@ -665,15 +692,19 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
         rec = task.stages[stage]
         if rec.status is StageStatus.COMPLETED and rec.lane is ExecutionMode.INTERACTIVE:
             unmetered_stages += 1
+        elif rec.lane is not None and not rec.metered:
+            # A stage that actually ran (lane stamped) whose usage was unrecoverable.
+            unmetered_stages += 1
         elif isinstance(rec.cost_usd, (int, float)):
             total += rec.cost_usd
             metered = True
     if metered and unmetered_stages:
-        cost_str = f"${total:.4f} (+{unmetered_stages} unmetered interactive stage(s))"
+        cost_str = (f"${total:.4f} metered (+{unmetered_stages} unmetered stage(s) of "
+                    f"UNKNOWN cost — the true total is higher)")
     elif metered:
         cost_str = f"${total:.4f}"
     elif unmetered_stages:
-        cost_str = "n/a (interactive lane — unmetered)"
+        cost_str = f"n/a — {unmetered_stages} unmetered stage(s), cost unknown (not $0)"
     else:
         cost_str = "—"
     lines.append(f"- **Cost to date:** {cost_str}")

@@ -614,6 +614,8 @@ class CostLedger:
         by_stage: dict[str, dict] = {}
         by_task: dict[str, dict] = {}
         total_cost = 0.0
+        total_invocations = 0
+        unmetered_calls = 0
         fresh_input = output = cache_read = cache_write = 0
         cache_read_savings = 0.0  # money saved: reads billed at read_mult, not full input
         cache_write_premium = 0.0  # money spent: writes billed above plain input
@@ -622,6 +624,13 @@ class CostLedger:
         for row in rows:
             cost = row.get("cost_usd") or 0.0
             model = row.get("model", "unknown")
+            total_invocations += 1
+            # #319: mirror summary()'s unmetered count. An unmetered row contributes its 0.0
+            # to the totals like any other, so without this the report's bottom line silently
+            # absorbs calls of UNKNOWN cost as free — the exact confident-$0 defect #319
+            # exists to remove, one artifact over.
+            if row.get("metered") is False:
+                unmetered_calls += 1
             ci = row.get("input_tokens", 0) or 0
             co = row.get("output_tokens", 0) or 0
             cr = row.get("cache_read_tokens", 0) or 0
@@ -649,6 +658,8 @@ class CostLedger:
         input_side = fresh_input + cache_read + cache_write
         return {
             "total_cost_usd": round(total_cost, 6),
+            "total_invocations": total_invocations,
+            "unmetered_calls": unmetered_calls,
             "by_stage": by_stage,
             "by_task": by_task,
             "session_reuse": {
