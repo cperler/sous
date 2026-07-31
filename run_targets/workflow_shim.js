@@ -163,6 +163,16 @@ const CASEFOLD_V1_IDENTITY = new Set([
   0x0131, 0x1c89, 0xa7cb, 0xa7cc, 0xa7ce, 0xa7d2, 0xa7d4, 0xa7da, 0xa7dc,
 ])
 
+/**
+ * Return the Unicode-15 casefold representation used by ``fingerprint-v1``.
+ *
+ * JavaScript lacks a casefold API, so this preserves the Python engine's identity
+ * semantics with per-code-point folding and the exceptional mappings above. Callers must
+ * truncate only after this function returns: one input code point can fold into several.
+ *
+ * @param {string} text - Untruncated finding text after whitespace normalization.
+ * @returns {string} The portable casefolded text used for cross-lane comparison.
+ */
 function casefoldV1(text) {
   return Array.from(text, (character) => {
     const point = character.codePointAt(0)
@@ -179,6 +189,15 @@ function casefoldV1(text) {
   }).join('')
 }
 
+/**
+ * Build the bounded ``fingerprint-v1`` key that deduplicates findings and addresses verdicts.
+ *
+ * The 160-character limit is measured in Unicode code points, matching Python's string
+ * slicing, so an astral character is never split into an unmatchable surrogate.
+ *
+ * @param {object|string} issue - A finding record or an already-rendered fingerprint value.
+ * @returns {string} Normalized key shared with the engine's review workflow.
+ */
 function issueFingerprint(issue) {
   const base = isRecord(issue)
     ? `${String(issue.file || '').trim()}:${String(issue.description || '').trim()}`
