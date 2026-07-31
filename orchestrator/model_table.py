@@ -66,11 +66,23 @@ _MODELS: dict[str, ModelInfo] = {
     # prior row unpriced (`priced=False`) and corrupt historical cost reports.
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
-    # codex (OpenAI) — the ids passed to `codex exec -m`. On a ChatGPT-plan account only
-    # gpt-5.5 is accepted (probed live 2026-07-04: gpt-5-codex/gpt-5/gpt-5.5-mini all 400
-    # "not supported when using Codex with a ChatGPT account"). Older ids are kept below
-    # for pricing historical ledger rows, not for dispatch.
+    # codex (OpenAI) — the ids passed to `codex exec -m`. Re-probed live 2026-07-31 against
+    # codex-cli 0.145.0 on this ChatGPT-plan account: the SIX ids below marked "accepted" all
+    # dispatch, and gpt-5-codex/gpt-5/gpt-5.5-mini still 400 "not supported when using Codex
+    # with a ChatGPT account" — same rejection set as the 2026-07-04 probe, but the plan now
+    # exposes a real TIER LADDER where it previously exposed only gpt-5.5, so the role map and
+    # fallback chain below are no longer degenerate.
+    # Prices are the 2026-07-30 rates: Terra was cut 20% and Luna 80% from the June launch
+    # ($2.50/$15 and $1.00/$6); Sol was not cut. Sol "Fast" mode bills at 2x Standard and is
+    # NOT modelled here — nothing in this engine requests it.
+    "gpt-5.6-sol": ModelInfo(id="gpt-5.6-sol", input_per_mtok=5.0, output_per_mtok=30.0),
+    "gpt-5.6-terra": ModelInfo(id="gpt-5.6-terra", input_per_mtok=2.0, output_per_mtok=12.0),
+    "gpt-5.6-luna": ModelInfo(id="gpt-5.6-luna", input_per_mtok=0.20, output_per_mtok=1.20),
     "gpt-5.5": ModelInfo(id="gpt-5.5", input_per_mtok=1.25, output_per_mtok=10.0),
+    "gpt-5.4": ModelInfo(id="gpt-5.4", input_per_mtok=2.5, output_per_mtok=15.0),
+    "gpt-5.4-mini": ModelInfo(id="gpt-5.4-mini", input_per_mtok=0.75, output_per_mtok=4.5),
+    # Rejected by this plan (400) — retained ONLY so historical ledger rows dispatched when
+    # they worked still price cleanly. Never dispatch these.
     "gpt-5-codex": ModelInfo(id="gpt-5-codex", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5": ModelInfo(id="gpt-5", input_per_mtok=1.25, output_per_mtok=10.0),
     "gpt-5-mini": ModelInfo(id="gpt-5-mini", input_per_mtok=0.25, output_per_mtok=2.0),
@@ -87,12 +99,14 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
         Role.REVIEW: "claude-sonnet-5",
         Role.CHEAP_SHELL: "claude-haiku-4-5",
     },
-    # Single supported model on the ChatGPT plan (see _MODELS note) — every role pins to
-    # it. Re-tier when the plan (or an API key) exposes distinct codex tiers again.
+    # The 5.6 ladder maps 1:1 onto the three roles, mirroring the claude tiering: sol is the
+    # frontier agentic-coding tier, terra the balanced everyday tier, luna the fast/cheap one.
+    # This replaces the degenerate all-gpt-5.5 map that existed only because the plan used to
+    # expose a single tier (#84).
     Provider.CODEX: {
-        Role.DEEP_REASON: "gpt-5.5",
-        Role.REVIEW: "gpt-5.5",
-        Role.CHEAP_SHELL: "gpt-5.5",
+        Role.DEEP_REASON: "gpt-5.6-sol",
+        Role.REVIEW: "gpt-5.6-terra",
+        Role.CHEAP_SHELL: "gpt-5.6-luna",
     },
 }
 
@@ -110,9 +124,12 @@ _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
     # priceable in _MODELS for historical rows, but a rate-limited Opus 5 degrades straight
     # to Sonnet 5 rather than sideways into a previous generation.
     Provider.CLAUDE: ("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"),
-    # Single-entry chain: no cheaper supported codex tier to degrade to on this plan. A
-    # floor rate-limit therefore goes straight to cooldown (or #7 fallthrough if enabled).
-    Provider.CODEX: ("gpt-5.5",),
+    # A REAL descending chain now that the plan exposes tiers: a rate-limited sol degrades to
+    # terra, terra to luna, and only luna (the floor) goes to cooldown or the #7 cross-provider
+    # fallthrough. gpt-5.5/5.4/5.4-mini are deliberately NOT in the chain — like the superseded
+    # claude tiers they stay priceable and pinnable, but a rate-limited 5.6 degrades down its
+    # own generation rather than sideways into a previous one.
+    Provider.CODEX: ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"),
 }
 
 # Back-compat alias: the claude chain (the default lane). fallback_after searches all
@@ -166,13 +183,17 @@ class ModelTable:
 
 
 # Friendly aliases for the per-task model pin (#84): the human types `--model fable`, not the
-# full table id. Only the claude tiers get short names; codex ids have no alias (a single
-# supported tier) and pass through by their exact id.
+# full table id. The codex 5.6 tiers get short names for the same reason the claude ones do —
+# they are now a real ladder, not the single tier that made an alias pointless. Older codex ids
+# (gpt-5.5/5.4/5.4-mini) stay alias-free and pass through by their exact id.
 _MODEL_ALIASES: dict[str, str] = {
     "fable": "claude-fable-5",
     "opus": "claude-opus-5",
     "sonnet": "claude-sonnet-5",
     "haiku": "claude-haiku-4-5",
+    "sol": "gpt-5.6-sol",
+    "terra": "gpt-5.6-terra",
+    "luna": "gpt-5.6-luna",
 }
 
 

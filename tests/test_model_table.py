@@ -33,10 +33,13 @@ def test_model_for_role_is_provider_aware() -> None:
     assert t.model_for_role(Role.DEEP_REASON, Provider.CLAUDE) == "claude-opus-5"
     # a codex-routed stage resolves to a codex model id, not a claude one
     codex_deep = t.model_for_role(Role.DEEP_REASON, Provider.CODEX)
-    assert codex_deep == "gpt-5.5"
+    assert codex_deep == "gpt-5.6-sol"
     assert not codex_deep.startswith("claude")
-    # single supported codex model on the ChatGPT plan: every role pins to it
-    assert t.model_for_role(Role.CHEAP_SHELL, Provider.CODEX) == "gpt-5.5"
+    # the 5.6 ladder tiers by role the way claude does — no longer one model for every role
+    assert t.model_for_role(Role.REVIEW, Provider.CODEX) == "gpt-5.6-terra"
+    assert t.model_for_role(Role.CHEAP_SHELL, Provider.CODEX) == "gpt-5.6-luna"
+    assert len({t.model_for_role(r, Provider.CODEX)
+                for r in (Role.DEEP_REASON, Role.REVIEW, Role.CHEAP_SHELL)}) == 3
 
 
 def test_codex_models_are_priced_from_their_own_row() -> None:
@@ -51,7 +54,11 @@ def test_codex_models_are_priced_from_their_own_row() -> None:
 def test_fallback_stays_within_provider_chain() -> None:
     t = DEFAULT_MODEL_TABLE
     assert t.fallback_after("claude-opus-5") == "claude-sonnet-5"
-    # single-entry codex chain: gpt-5.5 is both head and floor
+    # codex degrades down its OWN generation: sol -> terra -> luna, and luna is the floor
+    assert t.fallback_after("gpt-5.6-sol") == "gpt-5.6-terra"
+    assert t.fallback_after("gpt-5.6-terra") == "gpt-5.6-luna"
+    assert t.fallback_after("gpt-5.6-luna") is None
+    # priceable-but-off-chain ids never degrade sideways into another generation
     assert t.fallback_after("gpt-5.5") is None
     assert t.fallback_after("nonexistent") is None
 
@@ -158,5 +165,5 @@ def test_next_work_routes_codex_stage_to_codex_model(tmp_path: Path, project) ->
     work = eng.next_work("r1", "t1")  # scope -> first model stage, routed to codex
     assert work.lane_policy.provider is Provider.CODEX
     # the WorkItem model is a codex id (not a claude id shelled to `codex exec -m`)
-    assert work.model == "gpt-5.5"
+    assert work.model == "gpt-5.6-sol"
     assert not work.model.startswith("claude")

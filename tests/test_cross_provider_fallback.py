@@ -112,7 +112,7 @@ def test_codex_runner_maps_provider_unavailable(monkeypatch) -> None:
 def test_provider_unavailable_falls_through_to_claude(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     w = _advance_codex_task_to(eng, Stage.IMPLEMENT)
-    assert w.lane_policy.provider is Provider.CODEX and w.model == "gpt-5.5"
+    assert w.lane_policy.provider is Provider.CODEX and w.model == "gpt-5.6-sol"
 
     out = eng.record("r1", _codex_result(
         w, status=ResultStatus.PROVIDER_UNAVAILABLE, structured_output={},
@@ -216,13 +216,24 @@ def test_genuine_codex_failure_retries_codex_not_claude(tmp_path, project) -> No
 # --- floor rate-limit with the wait budget exhausted -> fallthrough ----------
 
 def test_rate_limit_floor_exhausted_falls_through(tmp_path, project) -> None:
-    """The codex chain is single-entry (gpt-5.5 is head AND floor on the ChatGPT plan), so
-    a floor rate-limit with no wait budget re-routes to claude immediately (same-provider
-    options exhausted on the first rate-limit)."""
+    """Fallthrough happens at the codex FLOOR, not on the first rate-limit. The 5.6 ladder
+    (sol -> terra -> luna) means a rate-limited head degrades within codex twice before the
+    provider is exhausted; only a luna rate-limit with no wait budget re-routes to claude.
+    Guards the seam that used to be untestable when the chain was single-entry."""
     eng = _engine(tmp_path, project, max_rate_limit_waits=0, breaker_threshold=9)
     w = _advance_codex_task_to(eng, Stage.IMPLEMENT)
-    assert w.model == "gpt-5.5"
-    # at the codex floor (gpt-5.5, single-entry chain) with waits exhausted -> fallthrough
+    assert w.model == "gpt-5.6-sol"
+
+    # sol and terra rate-limits degrade DOWN the codex chain — no fallthrough yet.
+    for expect_next in ("gpt-5.6-terra", "gpt-5.6-luna"):
+        out = eng.record("r1", _codex_result(w, status=ResultStatus.RATE_LIMITED,
+                                             structured_output={}))
+        assert out["outcome"] != "provider_fallthrough", f"fell through before {expect_next}"
+        assert not _fallthrough_events(eng)
+        w = eng.next_work("r1", "t1")
+        assert w.lane_policy.provider is Provider.CODEX and w.model == expect_next
+
+    # at the floor (luna) with waits exhausted -> fallthrough to claude
     out = eng.record("r1", _codex_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "provider_fallthrough"
     ev = _fallthrough_events(eng)
