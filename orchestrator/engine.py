@@ -30,6 +30,7 @@ from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
+from .driver_log import liveness_from_log
 from .errors import (
     CapacityExhausted,
     ContractError,
@@ -3403,6 +3404,29 @@ class Engine:
             return {**out, "state": "live", "reclaimable": False}
         return {**out, "state": "dead", "reclaimable": True}
 
+    def driver_liveness(
+        self,
+        run_id: str,
+        *,
+        alive: Callable[[int], bool] | None = None,
+        run: Run | None = None,
+    ) -> dict:
+        """The driver claim (#313) PLUS what its own log says it was doing (#323).
+
+        ``driver_claim`` answers "does that pid still exist"; a pid that exists says
+        nothing about a loop that stopped looping, and a claim alone could not distinguish
+        a driver sleeping out a capacity stall from a dead one. Merging in
+        ``runs/<run>/driver.jsonl`` adds the last heartbeat, its age, the state it named,
+        and whether the driver recorded an exit — so ``status`` shows a dead driver as
+        visibly different from a working one.
+
+        Reported by ``status`` as its ``driver`` block. The CLAIM's own fields
+        (``state``/``reclaimable``) pass through unchanged: lease reclaim safety is decided
+        by the pid probe, never by a heartbeat.
+        """
+        claim = self.driver_claim(run_id, alive=alive, run=run)
+        return liveness_from_log(self.store.root, claim, run_id=run_id)
+
     def claim_run_driver(
         self, run_id: str, *, alive: Callable[[int], bool] | None = None
     ) -> dict:
@@ -3627,10 +3651,12 @@ class Engine:
             "tasks": tasks,
             "cost": summary,
             "budget": budget,  # #34: metered spend vs. budget (None when no budget set)
-            # #313: who is driving this run's scheduler loop, and whether that process is
-            # still alive — so "the model went quiet" and "nobody is driving this run any
-            # more" are distinguishable from a poll (watch renders the difference).
-            "driver": self.driver_claim(run_id, run=run),
+            # #313/#323: who is driving this run's scheduler loop, whether that process is
+            # still alive, and what its own log says it was last doing (last heartbeat +
+            # age + state) — so "the model went quiet", "the driver is sleeping out a
+            # capacity stall", and "nobody is driving this run any more" are all
+            # distinguishable from a poll (watch renders the difference).
+            "driver": self.driver_liveness(run_id, run=run),
             "lane_audit": self.lane_audit(run_id, rows=rows),
             # #175: dispatch/record balance — flags orphaned leases (the #142 failure mode)
             # automatically at every poll / batch completion instead of by hand-count.

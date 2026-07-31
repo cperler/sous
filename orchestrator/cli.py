@@ -41,6 +41,7 @@ from adapters.execution.runners import build_registry
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
 
 from .cost_ledger import CostLedger
+from .driver_log import DEFAULT_HEARTBEAT_INTERVAL_S
 from .engine import DEFAULT_ABANDON_MIN_IDLE_S, Engine
 from .project_loader import load_project, validate_config
 from .routing import Router
@@ -362,6 +363,10 @@ def main(argv: list[str] | None = None) -> int:
     rh.add_argument("--wait", action="store_true",
                     help="sleep through capacity stalls / rate-limit cooldowns instead of "
                          "returning (the old capacity_wait_loop)")
+    rh.add_argument("--heartbeat-interval", type=int, default=DEFAULT_HEARTBEAT_INTERVAL_S,
+                    help="seconds between driver heartbeats while WAITING out a capacity "
+                         "stall or cooldown (#323); each is a line in runs/<run>/driver.jsonl "
+                         f"and on stderr (default {DEFAULT_HEARTBEAT_INTERVAL_S})")
     eq = sub.add_parser("enqueue", help="append one batch entry to a queue file for the "
                                         "unattended run-queue loop (#1); no engine needed")
     eq.add_argument("--queue-file", required=True, help="ralph-queue.json-style queue file")
@@ -1142,11 +1147,19 @@ def main(argv: list[str] | None = None) -> int:
 
         from .scheduler import EXIT_BLOCKED_ORPHANED, Scheduler
 
-        sched = Scheduler(eng, max_concurrent=args.max_concurrent)
+        # #323: the driver's own telemetry goes to `runs/<run>/driver.jsonl` (durable,
+        # retained) AND is mirrored to stderr as it is written, so the terminal that
+        # launched a 45-minute driver is no longer silent for its whole life — while stdout
+        # stays exactly one JSON status document for scripted callers.
+        sched = Scheduler(
+            eng, max_concurrent=args.max_concurrent,
+            driver_echo=lambda line: print(line, file=sys.stderr, flush=True),
+        )
         util_provider = _auto_util_provider() if args.util == "auto" else None
         result = sched.run(
             args.run, registry_runner(eng.registry), util_pct=util_pct,
             util_provider=util_provider, sleeper=time.sleep if args.wait else None,
+            heartbeat_interval_s=args.heartbeat_interval,
         )
         _emit(result)
         # #313: stopping with orphaned dispatch leases we may not reclaim is NOT a

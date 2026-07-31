@@ -39,6 +39,26 @@ FAILS the task (`--min-idle-s` / `--force` govern its own liveness guard). There
 `watch --activity` distinguishes the two shapes of a frozen stream: `STREAM STALLED` (the
 model went quiet) vs `NO LIVE DRIVER` (the claiming process is gone — re-invoke the driver).
 
+### Dating the death: `runs/<run>/driver.jsonl` (#323)
+
+The driver's own log — the record that did not exist when `batch-headless-2`'s driver died
+undiagnosably. `tail runs/<run>/driver.jsonl` (or `status`'s `driver` block) answers:
+
+- **when it started, as what** — `driver_start` carries pid, ppid, full argv and the
+  RESOLVED settings (`max_concurrent`, `drain_wait_s`, `stale_after_s`, util mode/value);
+- **what it was doing** — the last `driver_heartbeat` names the tick, the state
+  (`dispatching` / `waiting_on_capacity` / `waiting_on_cooldown`), the utilization, the
+  computed `dispatch_limit`, and — while sleeping — the wait reason and how much is left;
+- **how it ended** — a `driver_exit` record for every catchable termination: an exit reason,
+  an `exception:<Type>`, or `signal:SIGTERM`/`SIGINT`/`SIGHUP` (trapped, recorded, then
+  re-raised unchanged). **No exit record at all means an uncatchable kill** (SIGKILL, OOM,
+  power) — the last heartbeat is then the time-of-death bound.
+
+`status`'s `driver` block merges this with the #313 pid claim: `alive` is false once the
+process is gone, an exit was recorded, or the driver missed its own promised next heartbeat.
+A `dispatching` heartbeat promises nothing (a stage may legitimately take an hour), so
+quiet there is never reported as stale — use `watch --activity` for that half.
+
 ## Genuine crash resume (no orphaned leases)
 
 If the driver died *between* stages rather than mid-dispatch, just re-run the driver command.
