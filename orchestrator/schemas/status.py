@@ -137,6 +137,19 @@ class Task(_StatusModel):
     max_filed_followups: int | None = None
     title: str = ""
     body: str = ""  # task-source description (e.g. the GitHub issue body) — feeds prompts
+    # Provenance for the title/body SNAPSHOT above (#271). The snapshot is taken once at
+    # add_task and every stage prompt renders from it; these three fields make the copy
+    # auditable rather than invisible: when it was captured, what the source said its own
+    # last-modified time was at capture (None when the source cannot report one), and the
+    # content fingerprint (``spec_refresh.fingerprint``) that ``status --check-spec``
+    # compares against a freshly-resolved spec to decide staleness. ``spec_refreshed_at``
+    # is set only by ``Engine.refresh_spec``, so None means "still the original capture".
+    # Additive fields: pre-#271 task docs load with None (which reads as "unknown", never
+    # as "fresh"), so no SCHEMA_VERSION bump is needed.
+    spec_captured_at: str | None = None
+    spec_source_updated_at: str | None = None
+    spec_fingerprint: str | None = None
+    spec_refreshed_at: str | None = None
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
     # Per-task model pin (#84): a canonical model id (e.g. "claude-fable-5") that overrides the
     # role default on a model-lane stage so a brainstorm/heavy-architecture task runs on a higher

@@ -31,6 +31,13 @@ class TaskSpec(BaseModel):
     depends_on: list[str] = Field(default_factory=list)
     labels: list[str] = Field(default_factory=list)
     provider_tag: str | None = None  # e.g. "codex" — per-task provider routing tag
+    # When the SOURCE last changed this task, as the source reports it (#271). Recorded
+    # alongside the snapshot the engine takes at add_task so a later refresh/staleness check
+    # can say WHEN the upstream diverged, not just THAT it did. Optional and purely
+    # informational — the engine's staleness verdict compares content fingerprints, never
+    # this string, so a source that cannot report it (leaving None) is fully supported and
+    # needs no ADAPTER_CONTRACT_VERSION bump.
+    updated_at: str | None = None
 
 
 @runtime_checkable

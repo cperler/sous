@@ -28,6 +28,11 @@ class FakeTaskSource:
         self.followups: list[dict] = []  # file_followup calls
         self.progress: list[dict] = []  # publish_progress calls (mid-run, #64)
         self.candidates: list[TaskSpec] = []  # list_tasks output (batch-plan #57)
+        # task_id -> field overrides applied to what resolve() returns (#271): how a test
+        # expresses "the upstream issue was edited after the snapshot was taken".
+        self.spec_overrides: dict[str, dict] = {}
+        # Raise this instead of resolving (#271): an unreachable/refusing task source.
+        self.resolve_error: Exception | None = None
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
         pool = self.candidates
@@ -36,13 +41,17 @@ class FakeTaskSource:
         return pool[:limit]
 
     def resolve(self, task_id: str) -> TaskSpec:
-        return TaskSpec(
-            task_id=task_id,
-            title=f"Fake {task_id}",
-            body="do it",
-            issue_number=42,
-            depends_on=self.deps.get(task_id, []),
-        )
+        if self.resolve_error is not None:
+            raise self.resolve_error
+        fields: dict = {
+            "task_id": task_id,
+            "title": f"Fake {task_id}",
+            "body": "do it",
+            "issue_number": 42,
+            "depends_on": self.deps.get(task_id, []),
+        }
+        fields.update(self.spec_overrides.get(task_id, {}))
+        return TaskSpec(**fields)
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         self.completed.append((task_id, pr_url))
