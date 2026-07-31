@@ -115,6 +115,14 @@ function classifyAgentError(error) {
   return 'failure'
 }
 
+/**
+ * Run one panel sub-call without letting a provider error abort sibling attribution.
+ *
+ * The returned shape deliberately separates a structured object from an error: finder
+ * failures terminate the panel, while verifier failures are retained as inconclusive evidence
+ * so the engine's fold leaves the finding blocking. `phaseName` is audit-only; the parent
+ * WorkItem remains the single engine-visible dispatch.
+ */
 async function dispatchSubCall(wi, phaseName, prompt, schemaRef, agentType) {
   try {
     const res = await agent(prompt, {
@@ -254,6 +262,13 @@ function verifierVerdict(call, fingerprint) {
   }, '']
 }
 
+/**
+ * Build the one StageResult that represents an entire review panel.
+ *
+ * Provider usage is summed only for the dispatch-level view. Every individual call remains in
+ * `sub_calls` for ledger attribution; unavailable Workflow usage is marked unrecovered rather
+ * than presented as a metered zero-cost call.
+ */
 function panelResult(wi, status, subCalls, extras = {}) {
   const usage = sumUsage(subCalls)
   return {
@@ -268,6 +283,15 @@ function panelResult(wi, status, subCalls, extras = {}) {
   }
 }
 
+/**
+ * Execute a ReviewPlan and return its raw, unfolded panel evidence as one StageResult.
+ *
+ * Finders run in plan order and fail the dispatch as a whole, because a missing lens is a
+ * missing review. Blocking findings are deduped in the fold's lens order, capped, and sent to
+ * independent verifiers. Verifier failure never removes scrutiny: it produces a notice and no
+ * verdict. This function intentionally does not synthesize review.json; `orchestrator record`
+ * owns the shared deterministic fold for both execution lanes.
+ */
 async function runReviewPanel(wi) {
   const plan = wi.plan
   const notices = []
