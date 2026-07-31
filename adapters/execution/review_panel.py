@@ -124,7 +124,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
         phase = f"verify:{index}"
         raw, call = _dispatch_sub(
             work, transport, phase=phase,
-            prompt=_verify_prompt(plan.verify_template, fingerprint, finding),
+            prompt=_verify_prompt(plan.verify_template, plan.diff_hint, fingerprint, finding),
             schema_ref=plan.verify_schema_ref, agent=None,
         )
         sub_calls.append(call)
@@ -291,13 +291,13 @@ def _verify_queue(
 # --- the verifier sub-call ---------------------------------------------------------------
 
 
-def _verify_prompt(template: str, fingerprint: str, finding: object) -> str:
+def _verify_prompt(template: str, diff_hint: str, fingerprint: str, finding: object) -> str:
     """Fill the ENGINE-AUTHORED ``verify_template``'s mechanical slots for one finding.
 
     Mechanical substitution only — never authorship (the ``_corrective_prompt`` precedent):
-    the runner renders the finding it was handed and the file:line it already carries, and
-    writes not one word of instruction. Not ``str.format``, so a finding containing braces
-    cannot break the template.
+    the runner renders the finding it was handed and inserts the engine-rendered diff hint
+    carried by the plan, writing not one word of instruction. Not ``str.format``, so a
+    finding containing braces cannot break the template.
 
     ONE pass, not chained ``str.replace``s: chaining lets a LATER placeholder's substitution
     re-scan text an EARLIER one just injected, so a finding whose description contains the
@@ -306,7 +306,7 @@ def _verify_prompt(template: str, fingerprint: str, finding: object) -> str:
     verbatim, so the trigger is on-path, not hypothetical). A single ``re.sub`` walks the
     template once and never revisits what it emitted, which is what makes the finding text
     survive VERBATIM in both directions rather than only for non-placeholder braces."""
-    values = {"finding": _finding_block(fingerprint, finding), "diff_hint": _diff_hint(finding)}
+    values = {"finding": _finding_block(fingerprint, finding), "diff_hint": diff_hint}
     return _SLOT_RE.sub(lambda m: values[m.group(1)], template)
 
 
@@ -325,21 +325,6 @@ def _finding_block(fingerprint: str, finding: object) -> str:
         if value is not None and str(value).strip():
             lines.append(f"- {key}: {value}")
     return "\n".join(lines)
-
-
-def _diff_hint(finding: object) -> str:
-    """Where the verifier should look. The runner can only fill this MECHANICALLY from what
-    the finding already names (a model-lane WorkItem carries no structural ``context``), so a
-    finding without a file gets an honest "look at the change" pointer rather than an
-    invented one."""
-    if isinstance(finding, dict):
-        file = str(finding.get("file") or "").strip()
-        line = finding.get("line")
-        if file and isinstance(line, int):
-            return f"{file}:{line}"
-        if file:
-            return file
-    return "the change under review in this working tree"
 
 
 def _verdict_of(raw: RawResult, fingerprint: str) -> tuple[dict | None, str]:

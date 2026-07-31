@@ -772,7 +772,8 @@ _BASE_LENSES: tuple[_Lens, ...] = (_LENS_CODE, _LENS_SPEC, _LENS_TESTS)
 # Adversarial verification (design §2). Engine-AUTHORED with mechanical slots the runner
 # fills per finding — the same `_corrective_prompt` precedent: runners substitute, never
 # author. `{finding}` is the deduped finding (fingerprint + severity + file/line +
-# description); `{diff_hint}` points the verifier at where to look.
+# description); `{diff_hint}` receives the engine-rendered changed-files context carried by
+# ``ReviewPlan.diff_hint``.
 _VERIFY_TEMPLATE = (
     "## VERIFY: try to refute this finding\n"
     "You are the ADVERSARY on a review panel. Another agent reported the finding below "
@@ -793,11 +794,13 @@ _VERIFY_TEMPLATE = (
 class DiffStat:
     """Deterministic size of the change under review — ``files`` touched and ``lines``
     added+deleted, read by the ENGINE lane from ``git diff --numstat`` (never from a model's
-    self-report). The ONLY size signal the finder-set relaxation ladder is allowed to key
-    off; see ``render_review_plan`` for why."""
+    self-report). ``changed_files`` retains that same read's paths for the verifier hint.
+    This is the ONLY size signal the finder-set relaxation ladder is allowed to key off; see
+    ``render_review_plan`` for why."""
 
     files: int
     lines: int
+    changed_files: tuple[str, ...] = ()
 
 
 # Relaxation thresholds (both must hold to call a diff trivial). Sized so a one-line typo
@@ -806,6 +809,7 @@ class DiffStat:
 # constants, not magic numbers, so re-tuning them with evidence is a one-line change.
 _TRIVIAL_DIFF_MAX_FILES = 2
 _TRIVIAL_DIFF_MAX_LINES = 20
+_DIFF_HINT_MAX_FILES = 50
 
 
 def _is_trivial_diff(diff_stat: DiffStat | None) -> bool:
@@ -817,6 +821,38 @@ def _is_trivial_diff(diff_stat: DiffStat | None) -> bool:
     return (
         diff_stat.files <= _TRIVIAL_DIFF_MAX_FILES and diff_stat.lines <= _TRIVIAL_DIFF_MAX_LINES
     )
+
+
+def _review_diff_hint(diff_stat: DiffStat | None, files_changed: object) -> str:
+    """Render bounded change context for verifiers from signals already available here.
+
+    Prefer paths measured by the engine's own ``git diff --numstat`` read. If that read was
+    unavailable, the implementation stage's folded ``files_changed`` is still more useful
+    than making every verifier rediscover the change. Unlike the relaxation ladder, this
+    hint cannot reduce scrutiny; it only points the verifier at likely starting locations.
+    """
+    measured = diff_stat.changed_files if diff_stat is not None else ()
+    if measured:
+        heading = "Engine-measured changed files (`git diff --numstat`):"
+        paths = measured
+    elif isinstance(files_changed, list):
+        heading = "Changed files reported by the implementation stage:"
+        paths = tuple(
+            item.strip() for item in files_changed
+            if isinstance(item, str) and item.strip()
+        )
+    else:
+        paths = ()
+
+    if not paths:
+        return "the change under review in this working tree (no changed-files list available)"
+
+    shown = paths[:_DIFF_HINT_MAX_FILES]
+    lines = [heading, *(f"- {path}" for path in shown)]
+    omitted = len(paths) - len(shown)
+    if omitted:
+        lines.append(f"- ... and {omitted} more changed file(s)")
+    return "\n".join(lines)
 
 
 def render_review_plan(
@@ -913,6 +949,7 @@ def render_review_plan(
     return ReviewPlan(
         finders=tuple(finders),
         verify_template=_VERIFY_TEMPLATE,
+        diff_hint=_review_diff_hint(diff_stat, (context or {}).get("files_changed")),
         verify_schema_ref=_VERDICT_SCHEMA_REF,
         dedupe_rule=_DEDUPE_RULE,
     )

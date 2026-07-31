@@ -53,6 +53,7 @@ def _plan(*lenses: str, dedupe_rule: str = "fingerprint-v1") -> ReviewPlan:
             for lens in lenses
         ),
         verify_template=_VERIFY_TEMPLATE,
+        diff_hint="Engine-measured changed files (`git diff --numstat`):\n- changed.py",
         verify_schema_ref="review_verdict",
         dedupe_rule=dedupe_rule,
     )
@@ -396,7 +397,7 @@ def test_the_verify_prompt_is_mechanical_slot_substitution_only() -> None:
     assert f"- fingerprint: {issue_fingerprint(finding)}" in prompt
     assert "- severity: critical" in prompt
     assert "off-by-one in the loop {not a slot}" in prompt  # braces survive verbatim
-    assert "### Where to look\nloop.py:42" in prompt
+    assert "### Where to look\nEngine-measured changed files (`git diff --numstat`):\n- changed.py" in prompt
     # No slot left unfilled. Sound only because THIS finding's own text contains neither
     # token — see the test below for the case where it does.
     assert "{finding}" not in prompt and "{diff_hint}" not in prompt
@@ -426,10 +427,11 @@ def test_a_finding_quoting_a_slot_name_survives_verbatim_and_is_not_re_substitut
         "- description: the template's {diff_hint} slot is filled after {finding}, "
         "which corrupts it"
     ) in prompt
-    # ...and the real slots were still filled: the pointer is the finding's own file:line,
-    # and it appears ONCE (the pre-fix chain also injected it into the description above).
-    assert "### Where to look\nreview_panel.py:277" in prompt
-    assert prompt.count("review_panel.py:277") == 1
+    # ...and the real slots were still filled from engine-authored change context. The
+    # finding's location remains only in the finding block, not duplicated as the hint.
+    assert "### Where to look\nEngine-measured changed files" in prompt
+    assert prompt.count("- file: review_panel.py") == 1
+    assert prompt.count("- line: 277") == 1
 
 
 # --- failure directions: the verifier fails OPEN toward blocking -------------------------

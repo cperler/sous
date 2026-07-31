@@ -211,11 +211,27 @@ def test_prior_attempt_learnings_ride_every_finder() -> None:
 
 
 def test_verify_template_is_engine_authored_with_mechanical_slots() -> None:
-    plan = _plan(diff_stat=_BIG)
+    plan = _plan(diff_stat=DiffStat(files=2, lines=30, changed_files=("a.py", "tests/test_a.py")))
     assert "{finding}" in plan.verify_template and "{diff_hint}" in plan.verify_template
+    assert plan.diff_hint == (
+        "Engine-measured changed files (`git diff --numstat`):\n- a.py\n- tests/test_a.py"
+    )
     assert "refute" in plan.verify_template.lower()
     assert plan.verify_schema_ref == "review_verdict"
     assert plan.dedupe_rule == "fingerprint-v1"
+
+
+def test_diff_hint_falls_back_to_reported_files_and_changes_plan_identity() -> None:
+    """Even without a measurable git diff the engine authors useful change context, and
+    changing that verifier context changes what the dispatch is."""
+    first = _plan(context={"files_changed": ["src/a.py"]}, diff_stat=None)
+    second = _plan(context={"files_changed": ["src/b.py"]}, diff_stat=None)
+    assert first.diff_hint == "Changed files reported by the implementation stage:\n- src/a.py"
+
+    base = dict(stage=Stage.REVIEW, prompt="p", schema_ref="review",
+                model="claude-opus-5", attempt=0,
+                lane_policy=_lane(ExecutionMode.HEADLESS, Provider.CLAUDE))
+    assert compute_content_hash(**base, plan=first) != compute_content_hash(**base, plan=second)
 
 
 # --- agent resolution -------------------------------------------------------------------
@@ -643,6 +659,7 @@ def test_diff_stat_is_read_from_a_real_git_diff(tmp_path, project) -> None:
     task.context.update({"base_sha": base, "worktree": str(repo)})
     stat = eng._deterministic_diff_stat(task)
     assert stat is not None and stat.files == 2 and stat.lines >= 30
+    assert stat.changed_files == ("a.py", "b.py")
 
 
 def test_diff_stat_is_none_when_it_cannot_be_measured(tmp_path, project) -> None:

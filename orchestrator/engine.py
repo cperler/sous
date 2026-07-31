@@ -1356,17 +1356,19 @@ class Engine:
         if proc.returncode != 0:
             return None
         files = lines = 0
+        changed_files: list[str] = []
         for row in proc.stdout.splitlines():
             cols = row.split("\t")
             if len(cols) < 3:
                 continue
             files += 1
+            changed_files.append("\t".join(cols[2:]))
             # A binary file reports "-\t-\t<path>": it counts as a touched FILE but adds no
             # line count — never inflate, never crash on the sentinel.
             for col in cols[:2]:
                 if col.isdigit():
                     lines += int(col)
-        return DiffStat(files=files, lines=lines)
+        return DiffStat(files=files, lines=lines, changed_files=tuple(changed_files))
 
     def _review_plan_for(
         self,
