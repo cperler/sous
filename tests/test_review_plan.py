@@ -302,6 +302,11 @@ def test_flag_off_dispatches_a_byte_identical_plan_less_review(tmp_path, project
         Stage.REVIEW, task_id="t1", title=task.title, body=task.body,
         learnings="\n".join(task.learnings), context=task.context,
         project_commands=eng._project_commands(),
+        # #302: this engine's default lane is interactive×claude, which cannot enforce
+        # REVIEW's tool posture, so its prompt carries the in-band posture directive. Still
+        # the plan-less path — the equality being asserted is "the engine renders exactly
+        # what render_prompt renders for THIS dispatch", which is what #73 was about.
+        tool_posture_unenforced=True,
     )
     # The pre-#73 hash formula (no plan part in the blob).
     assert w.content_hash == compute_content_hash(

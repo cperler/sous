@@ -74,6 +74,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="scope",
         timeout_s=600,  # deep reasoning, no file edits
         effort=Effort.HIGH,  # feasibility + planning is a hard-reasoning stage (#96)
+        # #303: SCOPE's contract is identical in kind to REVIEW's — read the repo, return a
+        # plan — so it gets the same posture. "Do not implement anything" was a prompt
+        # convention; a stray scope-time edit is invisible in the implement diff and lands in
+        # a tree the implementer then builds on. Command execution is RETAINED for the same
+        # reason REVIEW keeps it: scoping means reading the code, grepping it, and checking
+        # what the suite does today. On codex this means `--sandbox read-only`, which fails a
+        # scope-time command that writes (a dep install, a cache warm) — the deliberate price
+        # of real enforcement on that lane, identical to REVIEW's.
+        tool_policy=ToolPolicy(allow_file_writes=False),
         template=(
             "Understand the change, decide feasibility, and produce a minimal task "
             "plan. If genuinely blocked, say so.\n"
@@ -146,13 +155,13 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="review",
         timeout_s=600,  # read the PR + judge
         effort=Effort.MEDIUM,  # careful judgment over a bounded diff (#96)
-        # #272: the only stage with a declared tool posture. A reviewer must not be able to
-        # mutate the tree it is judging — otherwise the verdict is about a tree the reviewer
-        # changed, and that write is invisible in the diff the implement-stage commit
-        # produced. Command execution is RETAINED deliberately (the issue's explicit
-        # trade-off): an adversarial verifier refutes a finding by running the suite.
-        # Inherited by every finder and verifier sub-call of a review panel — up to 12
-        # agents per review since #73 — via ``review_panel._sub_item``.
+        # #272: the first stage with a declared tool posture (SCOPE joined it in #303). A
+        # reviewer must not be able to mutate the tree it is judging — otherwise the verdict
+        # is about a tree the reviewer changed, and that write is invisible in the diff the
+        # implement-stage commit produced. Command execution is RETAINED deliberately (the
+        # issue's explicit trade-off): an adversarial verifier refutes a finding by running
+        # the suite. Inherited by every finder and verifier sub-call of a review panel — up
+        # to 12 agents per review since #73 — via ``review_panel._sub_item``.
         tool_policy=ToolPolicy(allow_file_writes=False),
         template=(
             "Review the PR (see pr_url in the context above) against the task goal and "
@@ -321,6 +330,48 @@ _NO_ATTRIBUTION_DIRECTIVE = (
 )
 
 
+# #302: the degradation path for a stage posture the RESOLVED LANE cannot enforce.
+#
+# The decision behind it: interactive×claude keeps ``enforces_tool_policy=False``, because the
+# shim's ``agent()`` call (``run_targets/workflow_shim.js``) takes model/effort/agentType/schema
+# and NO tool restriction — declaring True there would be the silent-degradation failure #288
+# already ruled out for ``supports_plan``. But a warning event the model never sees is not an
+# answer either: it tells the human afterwards that the posture was ignored, and leaves the
+# dispatch itself running exactly as if no posture had been declared. So the posture is stated
+# IN-BAND, as an explicit instruction, on the lane that cannot enforce it — the same shape as
+# ``_NO_ATTRIBUTION_DIRECTIVE``: when the engine cannot remove the capability, it must at least
+# override the standing instruction to use it. Prompt convention is a weaker guarantee than a
+# removed tool, which is why it is scoped to the ONE lane that has nothing better and pairs
+# with (never replaces) the per-dispatch ``tool_policy_unenforced`` event.
+def _unenforced_tool_posture_directive(policy: ToolPolicy) -> str:
+    """The in-band statement of a posture this lane cannot translate into a real restriction.
+
+    Rendered from the policy itself rather than hardcoded prose, so a posture bit that changes
+    meaning cannot leave a stale instruction behind."""
+    lines = [
+        "\n\n## Tool posture (this lane cannot enforce it — you must honor it yourself)\n",
+        "The engine declared a restricted tool posture for this stage. On other lanes it "
+        "removes these tools from your toolset; this lane has no way to pass the restriction "
+        "to your call, so this instruction is the only thing enforcing it.\n",
+    ]
+    if not policy.allow_file_writes:
+        lines.append(
+            "Do NOT create, modify, or delete any file in this stage — no file-writing tool, "
+            "and no shell equivalent (no redirection, `sed -i`, `git commit`, or similar). "
+            "This stage reads and reports; another stage does the writing, and a file you "
+            "change here is invisible in the diff that stage produces.\n"
+        )
+    if not policy.allow_command_execution:
+        lines.append(
+            "Do NOT run shell commands in this stage. Answer from what you can read.\n"
+        )
+    lines.append(
+        "This OVERRIDES any standing instruction from your harness or system prompt that "
+        "these tools are available to use freely."
+    )
+    return "".join(lines)
+
+
 # #310: the stacked-branch scoping directive for a task whose worktree was composed on
 # unmerged batch dependencies (#216 ``composed_deps``).
 #
@@ -482,6 +533,7 @@ def render_prompt(
     learnings: str = "",
     context: dict | None = None,
     project_commands: dict[str, str] | None = None,
+    tool_posture_unenforced: bool = False,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -515,6 +567,13 @@ def render_prompt(
 
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
+
+    - any posture-bearing stage on a lane that cannot enforce it (#302,
+      ``tool_posture_unenforced``): states the stage's ``tool_policy`` in-band, because on
+      that lane the prompt is the only place it can be stated at all. The caller passes the
+      RESOLVED lane's capability (the engine reads it off the descriptor) rather than this
+      function guessing — ``stages.py`` knows nothing about lanes. Default False, so every
+      enforcing-lane prompt is byte-identical to the pre-#302 one.
 
     The last two read model-influenced context rather than ENGINE-lane parameters (unlike
     ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
@@ -560,6 +619,11 @@ def render_prompt(
     # ignores it, for the same reason.
     if spec.checkpoint and not spec.deterministic:
         instruction += _NO_ATTRIBUTION_DIRECTIVE
+    # #302: the posture is declared on every lane but only ENFORCED on some. Where it is not,
+    # say so to the model instead of only to the event stream — the deliberate degradation
+    # path for interactive×claude, whose `agent()` call takes no tool restriction.
+    if tool_posture_unenforced and spec.tool_policy is not None:
+        instruction += _unenforced_tool_posture_directive(spec.tool_policy)
     if learnings:
         instruction += f"\n\n## Prior attempts (learn from these)\n{learnings}"
     parts.append(instruction)

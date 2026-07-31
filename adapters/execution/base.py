@@ -18,7 +18,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import BaseModel, ConfigDict
 
 from orchestrator.errors import NoRunnerError
-from orchestrator.schemas.enums import ExecutionMode, Provider
+from orchestrator.schemas.enums import ExecutionMode, PermissionPosture, Provider
 from orchestrator.schemas.work import LanePolicy, StageResult, WorkItem
 
 
@@ -64,6 +64,15 @@ class CapabilityDescriptor(BaseModel):
     # tool restriction on its ``agent()`` call — pairs with #262) and for the deterministic
     # ENGINE lane (no model, hence no toolset to narrow).
     enforces_tool_policy: bool = False
+    # #304: the PERMISSION gate this cell dispatches under when the stage declares no tool
+    # posture — lane-declared vocabulary rather than a constant buried in ``transport.py``,
+    # which is what "usually right" (headless dispatch has no human to answer a prompt) was
+    # before. BYPASS is every shipped lane's declaration, so their argv is byte-identical to
+    # pre-#304; a lane that must NOT hold blanket permission (a shared/production checkout,
+    # a customer repo) declares RESTRICTED here and nothing else changes. A write-denying
+    # ``ToolPolicy`` downgrades the STAGE to RESTRICTED regardless of this default — the
+    # posture can only ever be tightened by the stage, never loosened.
+    permission_posture: PermissionPosture = PermissionPosture.BYPASS
     status: CellStatus = SUPPORTED
 
     @property
@@ -147,6 +156,11 @@ def default_registry() -> Registry:
             # #288: the shim has agent()/parallel() but no plan-execution branch yet, and a
             # flag that over-promises degrades silently. Flip to True with #262.
             supports_plan=False,
+            # #302: decided to STAY False — the shim's `agent()` call takes no tool
+            # restriction to translate into. The degradation is the in-band posture directive
+            # `render_prompt` adds for a non-enforcing lane, plus the per-dispatch
+            # `tool_policy_unenforced` event. See `runners.build_registry` for the full note.
+            enforces_tool_policy=False,
             status=SUPPORTED,
         )
     )
