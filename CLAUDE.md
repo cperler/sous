@@ -15,8 +15,10 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
 
 ## Working norms
 - **Tests + lint + types, every change:** `uv run pytest`, `uv run ruff check .`, and
-  `uv run mypy` must stay green (the same trio CI enforces — `.github/workflows/ci.yml`).
-  Add a regression test with each fix.
+  the bare `uv run mypy` (no path arguments) must stay green (the same trio CI enforces —
+  `.github/workflows/ci.yml`). `tests/` is intentionally outside the mypy gate via
+  `[tool.mypy] files` in `pyproject.toml`; explicit paths surface pre-existing, out-of-gate
+  errors. Add a regression test with each fix.
 - **GitHub issues are the scope ledger** (`gh issue list -R cperler/orchestration-template`).
   Nothing is silently dropped: anything cut, thinned, or found-missing gets an issue labeled
   `deferred-scope` (with source / why / trigger-to-revisit), re-dispositioned at each gate
