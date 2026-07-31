@@ -22,7 +22,12 @@ def _text_fingerprint(text: object) -> str:
 
 
 def cluster_key(entry: dict) -> str:
-    """Stable grouping key: an explicit target wins, otherwise exact normalized text."""
+    """Return a stable grouping key for one process entry.
+
+    An explicit artifact target groups differently worded complaints about the same
+    harness surface. Targetless entries group only when their whitespace-normalized,
+    case-folded text matches.
+    """
     target = entry.get("target")
     if isinstance(target, dict):
         kind = str(target.get("kind") or "").strip().casefold()
@@ -33,7 +38,12 @@ def cluster_key(entry: dict) -> str:
 
 
 def recurring_proposals(entries: list[dict], *, min_runs: int = 2) -> list[dict]:
-    """Return process clusters represented by at least ``min_runs`` distinct runs."""
+    """Return deterministic process clusters spanning at least ``min_runs`` runs.
+
+    Non-process or provenance-free rows are ignored, and repetitions within one run do
+    not count toward the threshold. Each result carries its cluster key, optional target,
+    and stably ordered evidence rows. ``min_runs < 1`` raises ``ValueError``.
+    """
     if min_runs < 1:
         raise ValueError("min_runs must be >= 1")
     grouped: dict[str, list[dict]] = {}
@@ -87,11 +97,16 @@ def read_filing_ledger(path: str | Path) -> list[dict]:
 
 
 def filed_keys(path: str | Path) -> set[str]:
+    """Return cluster keys already recorded in the tolerant filing ledger at ``path``."""
     return {str(row["key"]) for row in read_filing_ledger(path)}
 
 
 def append_filing(path: str | Path, row: dict) -> bool:
-    """Append one filing once, under the repository's shared JSONL lock contract."""
+    """Append one filing under the shared JSONL lock contract.
+
+    Returns ``True`` when the row is written and ``False`` when its cluster key is already
+    present. The parent directory and append-only ledger are created as needed.
+    """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with file_lock(path):
@@ -103,6 +118,7 @@ def append_filing(path: str | Path, row: dict) -> bool:
 
 
 def proposal_title(proposal: dict) -> str:
+    """Render a tracker title naming the target, or a bounded targetless complaint."""
     target = proposal.get("target")
     if isinstance(target, dict):
         return f"Meta-authoring: revise {target.get('kind')} {target.get('ref')}"
@@ -112,7 +128,7 @@ def proposal_title(proposal: dict) -> str:
 
 
 def proposal_body(proposal: dict) -> str:
-    """Render evidence plus the fixed instruction that turns the issue into a diff task."""
+    """Render provenance and the fixed instruction that turns a cluster into a diff task."""
     target = proposal.get("target")
     lines = [
         "A process retrospective repeated across independent orchestration runs.",

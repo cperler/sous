@@ -165,9 +165,11 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     """Append ``entries`` to the JSONL KB, returning the entries actually written.
 
     Each input dict supplies ``text`` (required) + optional ``run_id, task_id, kind, files,
-    failure_kind, stage, ts, id``; missing ``id``/``ts`` are minted here. When ``dedupe`` is
-    on (default), an entry whose normalized-text fingerprint already exists (in the file OR
-    earlier in this batch) is skipped — re-learning the same lesson never grows the KB."""
+    failure_kind, stage, target, ts, id``; missing ``id``/``ts`` are minted here. With
+    ``dedupe`` enabled, ordinary learnings use a global normalized-text fingerprint, while
+    ``process`` observations include ``run_id`` in that key. The latter keeps replay within
+    one run idempotent without erasing the cross-run repetition the proposal detector needs.
+    """
     path = Path(path)
 
     def dedupe_key(entry: dict) -> tuple[str, str | None] | tuple[str]:
@@ -332,7 +334,8 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
     failure-kind > stage > title-token overlap, recency (ts) as the tiebreak. Only entries
     with at least ONE positive signal are returned — a task matching nothing gets nothing
     (the fold is advisory 'may or may not apply', never random noise). Texts are already
-    bounded at write time."""
+    bounded at write time. ``process`` entries are excluded unconditionally because they
+    are harness-maintainer evidence, not advice for a product task."""
     scored: list[tuple[tuple[int, int, int, int], str, dict]] = []
     for entry in read_entries(path):
         if entry.get("kind") == "process":

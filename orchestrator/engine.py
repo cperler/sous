@@ -853,8 +853,10 @@ class Engine:
         smaller, less-eager DOWNGRADE band (the ledger read is confined to the band-edge
         util region and gated on a minimum sample). Emitting stamps the dispatch lease
         (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
-        supervisor crash instead. Raises ``CapacityExhausted`` at the per-call gate or
-        during a rate-limit cooldown, ``ContractError`` on a lease conflict.
+        supervisor crash instead. When the resolved stage matches ``Task.hold_before``,
+        dispatch parks until both the matching approval identity and durable artifact are
+        present. Raises ``CapacityExhausted`` at the per-call gate or during a rate-limit
+        cooldown, ``ContractError`` on a lease conflict.
         """
         # Budget backpressure (#34): consult the run's metered spend against its budget at
         # this dispatch point. Once spend >= budget, do NOT dispatch new work — PAUSE the
@@ -2976,7 +2978,8 @@ class Engine:
         """Park a task at the human gate. Refuses while a dispatch is outstanding
         (record the in-flight result first — a held task must be quiescent). If the
         result can never arrive because the run was killed mid-dispatch, use
-        ``abandon()`` to release the lease and drive the task terminal instead."""
+        ``abandon()`` to release the lease and drive the task terminal instead. ``what``
+        is persisted on the task so approval releases the exact pending checkpoint."""
 
         def _hold(t: Task) -> None:
             if t.state in TERMINAL_TASK_STATES:
@@ -3002,7 +3005,10 @@ class Engine:
 
     def approve(self, run_id: str, task_id: str, *, approved_by: str, what: str = "") -> Task:
         """Release a held task. The durable ``approval-<run>-<task>.json`` artifact IS
-        the gate record (who/when/what) — prose norms stay documentation."""
+        the gate record (who/when/what) — prose norms stay documentation. A pending hold's
+        identity takes precedence over the optional caller note and is recorded in both
+        the task's approved-hold set and the artifact, preventing approval reuse across
+        different checkpoints."""
 
         approved_what = what
 
@@ -5254,10 +5260,16 @@ class Engine:
             )
 
     def _meta_proposals_path(self) -> Path:
+        """Return the filing ledger beside the resolved cross-run learnings KB."""
         return self._learnings_kb_path().with_name("meta-proposals.jsonl")
 
     def _file_meta_proposals(self, run_id: str) -> None:
-        """File newly recurring process complaints through the current task source."""
+        """File newly recurring process complaints through the current task source.
+
+        Detection and filing are best-effort run-finalize effects. A successful tracker
+        reference is ledgered; a missing/raising hook is non-fatal and leaves the cluster
+        eligible for a later run to retry.
+        """
         if not self._learnings_kb_enabled():
             return
         file_followup = getattr(self.project.task_source, "file_followup", None)
