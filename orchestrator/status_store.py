@@ -27,8 +27,18 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .errors import RunExistsError, StatusNotFoundError, StatusStoreError
-from .schemas.enums import SCHEMA_VERSION
+from .errors import (
+    RunExistsError,
+    SchemaVersionError,
+    StatusNotFoundError,
+    StatusStoreError,
+)
+from .schemas.enums import (
+    MIGRATABLE_STATUS_VERSIONS,
+    SCHEMA_VERSION,
+    SUPPORTED_STATUS_VERSIONS,
+    is_future_version,
+)
 from .schemas.status import Run, Task
 
 try:  # fcntl is POSIX-only; mkdir fallback covers the rest.
@@ -200,17 +210,45 @@ class StatusStore:
     # ---- versioning -----------------------------------------------------
 
     @staticmethod
-    def _migrate(raw: dict) -> dict:
-        """Reader-tolerant migration. A doc without ``schema_version`` is v0."""
+    def _migrate(raw: dict, *, path: Path | None = None) -> dict:
+        """Apply the status-doc compatibility policy (#275): migrate OLD, refuse NEW.
 
-        if "schema_version" not in raw:
-            raw = {**raw, "schema_version": SCHEMA_VERSION}
-        # v1 -> v2: task docs gained `pipeline`. The derivation itself lives on the Task
-        # model's before-validator (lane preset), so here we only stamp the version —
-        # a doc read through this migration validates as v2-shaped.
-        if raw.get("schema_version") == "1":
-            raw = {**raw, "schema_version": SCHEMA_VERSION}
-        return raw
+        Tolerant DOWNWARD — every version this engine has ever written
+        (``MIGRATABLE_STATUS_VERSIONS``; "0" is the synthetic name for a doc with no
+        ``schema_version`` key at all) is stamped forward to ``SCHEMA_VERSION``. Each of
+        the ladder's steps has been purely additive so far, so the migration is a version
+        stamp: the fields v2 gained are supplied by the models' own defaults and
+        before-validators (e.g. Task derives ``pipeline`` from its lane preset), and a doc
+        read through here validates as current-shaped.
+
+        Strict UPWARD — a doc from a FUTURE engine (or carrying an unparseable version)
+        raises ``SchemaVersionError`` instead of loading. This is the half that protects
+        data rather than just documenting intent: the models are ``extra="forbid"``, so a
+        future doc cannot round-trip through them anyway, and loading it "successfully"
+        would mean the very next write silently discarded whatever the newer engine had
+        stored while preserving its now-false version number. Refusing at read means no
+        mutation ever begins (``update_run``/``update_task`` load before they write), so
+        the file is left byte-identical for the newer engine that owns it.
+        """
+        version = raw.get("schema_version", "0")
+        if version in MIGRATABLE_STATUS_VERSIONS:
+            return {**raw, "schema_version": SCHEMA_VERSION}
+        if version == SCHEMA_VERSION:
+            return raw
+        where = f" ({path})" if path is not None else ""
+        detail = (
+            f"was written by a newer engine (this engine speaks schema_version "
+            f"{SCHEMA_VERSION})"
+            if is_future_version(str(version))
+            else f"is not a schema version this engine recognizes (expected one of "
+                 f"{', '.join(sorted(SUPPORTED_STATUS_VERSIONS, key=int))})"
+        )
+        raise SchemaVersionError(
+            f"status document{where} declares schema_version {version!r}, which {detail}. "
+            "Refusing to read it: loading a document this engine cannot fully represent "
+            "would drop its unknown fields on the next write. Upgrade the engine, or point "
+            "it at a run directory it wrote."
+        )
 
     def _read_json(self, path: Path) -> dict:
         try:
@@ -223,7 +261,7 @@ class StatusStore:
             raw = json.loads(text)
         except json.JSONDecodeError as exc:
             raise StatusStoreError(f"corrupt status file {path}: {exc}") from exc
-        return self._migrate(raw)
+        return self._migrate(raw, path=path)
 
     # ---- run API --------------------------------------------------------
 

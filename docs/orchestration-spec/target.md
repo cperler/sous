@@ -374,11 +374,25 @@ at the first stage whose `status ∉ {completed, skipped}`; a `running` stage wi
 set and `completed_at` null is a crash marker → bump `attempt`, re-run (stages idempotent).
 PIDs nulled on resume.
 
-**Versioning (reader-tolerant):** top-level `schema_version`; a v1 reader backfills a v0 file
-(add `started_at:null`, drop `brainstorm_*`, re-key old stage names → the 6) and treats it as
-v1. **Open issue flagged for review:** the stage re-key is the one genuine breaking change
-(B1-W1) — any external v0 reader loses history; we accept it because there are no external v0
-readers of *this* template's files (the as-built files stay in Hey Soo!).
+**Versioning (tolerant downward, strict upward — #275):** top-level `schema_version`.
+*Downward*, a reader backfills and migrates every version this engine has ever written
+(`MIGRATABLE_STATUS_VERSIONS`; a file with no `schema_version` at all is v0 — add
+`started_at:null`, drop `brainstorm_*`, re-key old stage names → the 6) and stamps it
+current. *Upward*, a doc from a NEWER engine — or carrying an unparseable version — is
+**refused at read** (`SchemaVersionError`) instead of loaded: the models are `extra="forbid"`,
+so a future doc cannot round-trip anyway, and loading it would mean the next write silently
+dropped the newer engine's fields while preserving its now-false version. Every write path
+loads first, so refusing at read leaves the file byte-identical. **Open issue flagged for
+review:** the stage re-key is the one genuine breaking change (B1-W1) — any external v0 reader
+loses history; we accept it because there are no external v0 readers of *this* template's
+files (the as-built files stay in Hey Soo!).
+
+The **work plane** (`WorkItem`/`StageResult`, §4) versions differently on purpose: it is
+in-flight wire traffic, not an archive, so there is no migration ladder — exactly one version
+is supported (`SUPPORTED_WORK_VERSIONS`) and `Engine.record` refuses an off-version result
+with a `result_rejected` event (`reason: schema_version_unsupported`) rather than guessing.
+The interactive shim therefore **echoes** the dispatching WorkItem's version rather than
+restating a literal of its own, which is how it drifted to `'1'` against an engine on `"3"`.
 
 **Audit sidecar (optional, append-only):** `events.jsonl` of `cost_recorded` / `stage_*` /
 `lane_assigned` events (B3) gives an append-only audit trail + cheap concurrent writes for

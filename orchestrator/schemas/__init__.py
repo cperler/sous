@@ -5,8 +5,11 @@ from __future__ import annotations
 from .enums import (
     LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
+    MIGRATABLE_STATUS_VERSIONS,
     SCHEMA_VERSION,
     STAGE_ORDER,
+    SUPPORTED_STATUS_VERSIONS,
+    SUPPORTED_WORK_VERSIONS,
     TERMINAL_TASK_STATES,
     ExecutionLane,
     ExecutionMode,
@@ -37,6 +40,10 @@ from .work import (
 
 __all__ = [
     "SCHEMA_VERSION",
+    # The #275 compatibility policy: which versions each plane accepts.
+    "MIGRATABLE_STATUS_VERSIONS",
+    "SUPPORTED_STATUS_VERSIONS",
+    "SUPPORTED_WORK_VERSIONS",
     "STAGE_ORDER",
     "LANE_STAGES",
     "LANE_DETERMINISTIC_STAGES",
