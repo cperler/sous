@@ -26,7 +26,7 @@ source (label ``brainstorm``, provenance line in the body).
 
 Pure and project-agnostic: it calls no model and knows nothing about a specific repo.
 Issue creation reuses the same duck-typed ``create_task`` hook that ``spec_intake`` files
-through (``adapters/project/base.py``) — one filing seam across all the producers, not two.
+through (``orchestrator/ports/project.py``) — one filing seam across all the producers, not two.
 """
 
 from __future__ import annotations

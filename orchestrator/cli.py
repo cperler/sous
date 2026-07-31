@@ -37,12 +37,11 @@ from typing import TYPE_CHECKING, Literal, cast
 if TYPE_CHECKING:
     from collections.abc import Callable
 
-from adapters.execution.runners import build_registry
-from adapters.project.base import ADAPTER_CONTRACT_VERSION
-
 from .cost_ledger import CostLedger
 from .driver_log import DEFAULT_HEARTBEAT_INTERVAL_S
 from .engine import DEFAULT_ABANDON_MIN_IDLE_S, Engine
+from .lane_loader import build_registry
+from .ports.project import ADAPTER_CONTRACT_VERSION
 from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
@@ -664,9 +663,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "gc":
         # Checkpoint tags (task/<run>/<task>/<stage>/<attempt>) outlive their run; list
         # them newest-first, hold back --keep-latest N, and delete the rest under --prune.
-        from adapters.execution.transport import _git
-
         from .engine import _ref_safe
+        from .gitcmd import run_git as _git
 
         scope = f"task/{_ref_safe(args.run)}/*" if args.run else "task/*"
         listing = _git(args.repo, "tag", "-l", "--sort=-creatordate", scope)
@@ -994,8 +992,7 @@ def main(argv: list[str] | None = None) -> int:
         # --root, so enqueue producers and kb/dashboard discovery are unchanged.
         import time
 
-        from adapters.execution.runners import registry_runner
-
+        from .lane_loader import registry_runner
         from .queue_file import QueueError, QueueFile, drive_queue
         from .scheduler import AnyRunner
         from .status_store import StatusStore
@@ -1168,8 +1165,7 @@ def main(argv: list[str] | None = None) -> int:
     elif args.cmd == "run-headless":
         import time
 
-        from adapters.execution.runners import registry_runner
-
+        from .lane_loader import registry_runner
         from .scheduler import EXIT_BLOCKED_ORPHANED, Scheduler
 
         # #323: the driver's own telemetry goes to `runs/<run>/driver.jsonl` (durable,

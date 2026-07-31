@@ -13,7 +13,7 @@ import re
 import subprocess
 from collections.abc import Callable
 
-from adapters.project.base import TaskSpec
+from orchestrator.ports.project import TaskSpec
 
 Runner = Callable[[list[str]], str]
 

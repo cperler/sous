@@ -15,11 +15,11 @@ from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from adapters.project.base import ProjectConfig
+from orchestrator.ports.execution import SUPPORTED, CapabilityDescriptor, Registry
+from orchestrator.ports.project import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from .base import SUPPORTED, CapabilityDescriptor, Registry
 from .codex import CodexRunner, SchemaProvider
 from .headless_claude import HeadlessClaudeRunner
 from .transport import (

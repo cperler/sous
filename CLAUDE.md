@@ -35,6 +35,17 @@ issues. Ongoing work is incremental — pick from the issue tracker or fix-forwa
   a project-owned `<repo>/.orchestration/` adapter (loaded by path, contract-checked) or
   `adapters/project/<name>/` for in-repo reference adapters; new execution lanes via
   `adapters/execution/`. Don't add project-specific logic to `orchestrator/`.
+- **The dependency arrow points inward — no module under `orchestrator/` may import
+  `adapters`** (#273). The contracts are engine-owned ports (`orchestrator/ports/execution.py`,
+  `orchestrator/ports/project.py`) that adapters implement; `adapters/*/base.py` are
+  back-compat re-export shims for externally-scaffolded adapters (same objects, so the
+  `EXPLICIT_EMPTY` identity check keeps working). When the composition root needs a CONCRETE
+  adapter it resolves it by NAME, never by import: `orchestrator/lane_loader.py` (the
+  `orchestrator.execution_lanes` entry point → `adapters.execution.runners`) and
+  `orchestrator/project_loader.py`. Both a ruff `TID251` ban and
+  `tests/test_dependency_direction.py` (AST-level, empty allowlist, catches lazy imports and
+  `importlib.import_module("adapters…")`) fail on a violation — if you need an exception,
+  argue it in review rather than appending to the allowlist.
 - **Pure fold/state-machine functions return what they dropped; only the engine caller
   emits events.** The `state_machine` fold layer is pure (no wall-clock/random/I/O) so
   replay/resume is deterministic — never give it an event sink. When a fold silently drops

@@ -37,6 +37,7 @@ from .stream_probe import find_current_stream
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .engine import Engine
+    from .lane_loader import build_registry
 
 # Terminal run states as bare strings (this module works off the JSON snapshot, not enums).
 _TERMINAL = {s.value for s in TERMINAL_RUN_STATES}
@@ -121,8 +122,6 @@ def default_engine_factory(
     Engine on it exactly like ``orchestrator status`` would. The dashboard only calls
     ``engine.status``, so no interactive/model wiring runs — but the registry is built so the
     lane audit inside ``status`` still resolves. Imported lazily to avoid an import cycle."""
-    from adapters.execution.runners import build_registry
-
     from .cost_ledger import CostLedger
     from .engine import Engine
     from .project_loader import load_project

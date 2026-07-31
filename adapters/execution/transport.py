@@ -24,6 +24,7 @@ from pathlib import Path
 from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as _JSONSchemaError
 
+from orchestrator.gitcmd import run_git
 from orchestrator.schemas.enums import (
     ExecutionMode,
     PermissionPosture,
@@ -768,9 +769,12 @@ def _codex_failure_cause(events_stdout: str) -> str | None:
     return _unwrap_codex_error_message(cause) if cause is not None else None
 
 
-def _git(cwd: str, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True,  # noqa: S603, S607
-                          text=True, timeout=60)
+# The git helper moved inward to ``orchestrator.gitcmd`` (#273) so the engine's ``gc``
+# subcommand no longer imports a private symbol out of an execution adapter. Aliased under
+# its historical private name because every call site in this package (and in
+# deterministic_setup/deterministic_test, which import ``_git`` FROM this module) spells it
+# that way.
+_git = run_git
 
 
 # --- tool-policy translation (#272) ------------------------------------------------------

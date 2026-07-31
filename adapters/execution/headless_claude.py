@@ -14,10 +14,10 @@ and verifier sub-calls over this same transport and returns one StageResult.
 
 from __future__ import annotations
 
+from orchestrator.ports.execution import SUPPORTED, CapabilityDescriptor
 from orchestrator.schemas.enums import ExecutionMode, Provider
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from .base import SUPPORTED, CapabilityDescriptor
 from .review_panel import run_review_panel
 from .transport import (
     RawResult,
