@@ -918,6 +918,22 @@ class Engine:
         # with the terminal guard above — next_work must be self-safe for direct callers.
         if task.state is TaskState.BLOCKED_ON_HUMAN:
             return None
+        # Direct callers (notably the CLI ``next`` drain) bypass ``dispatchable()``, which
+        # normally reconciles a SCOPE decomposition saga before selecting work. Resume an
+        # approved/partially-filed saga here as well, before ``next_stage`` can incorrectly
+        # advance the umbrella into IMPLEMENT. A completed decomposition is never itself
+        # dispatchable; only its children run on the task-level DAG.
+        if not resume:
+            scope = task.stages.get(Stage.SCOPE)
+            output = scope.output if scope and scope.status is StageStatus.COMPLETED else None
+            if (
+                not task.decomposition_children
+                and isinstance(output, dict)
+                and output.get("subtasks") is not None
+            ):
+                task = self._apply_scope_decomposition(run_id, task, output)
+            if task.decomposition_children or task.state is TaskState.BLOCKED_ON_HUMAN:
+                return None
         # Rate-limit cooldown: the task is parked until the window resets — refuse
         # dispatch loudly (the caller waits/sleeps), never silently. Explicit resume
         # bypasses (a human who knows better can force it).

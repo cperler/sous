@@ -36,6 +36,19 @@ class CreatingSource(FakeTaskSource):
         return [*self.created.values(), *super().list_tasks(label=label, limit=limit)][:limit]
 
 
+class FailOnceCreatingSource(CreatingSource):
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail_on_call = 2
+
+    def create_task(self, title: str, body: str, labels=None) -> str:
+        if self.create_calls + 1 == self.fail_on_call:
+            self.create_calls += 1
+            self.fail_on_call = 0
+            raise RuntimeError("temporary filing failure")
+        return super().create_task(title, body, labels)
+
+
 def _engine(tmp_path, project) -> Engine:
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "cost.jsonl"), project)
 
@@ -92,6 +105,7 @@ def test_scope_emits_children_with_controls_and_existing_dag(tmp_path, project) 
     eng, source = _decompose(tmp_path, project)
     parent = eng.store.load_task("r1", "parent")
     assert parent.state is TaskState.BLOCKED
+    assert eng.next_work("r1", "parent") is None
     assert parent.decomposition_mapping == {
         "api": "child-1", "docs": "child-2", "client": "child-3"
     }
@@ -217,3 +231,28 @@ def test_crash_window_reuses_source_task_by_marker(tmp_path, project) -> None:
     parent = eng.store.load_task("r1", "parent")
     assert parent.decomposition_mapping == {"a": "child-existing"}
     assert source.create_calls == 0
+
+
+def test_direct_next_resumes_approved_partial_decomposition(tmp_path, project) -> None:
+    source = FailOnceCreatingSource()
+    project._task_source = source
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "parent", pipeline=[Stage.SCOPE, Stage.IMPLEMENT])
+
+    result = eng.record(
+        "r1",
+        make_result(eng.next_work("r1", "parent"), structured_output=_scope_output()),
+    )
+    assert result["outcome"] == "scope_decomposition_held"
+    parent = eng.store.load_task("r1", "parent")
+    assert parent.state is TaskState.BLOCKED_ON_HUMAN
+    assert parent.decomposition_mapping == {"api": "child-1"}
+
+    eng.approve("r1", "parent", approved_by="operator")
+    assert eng.next_work("r1", "parent") is None
+
+    parent = eng.store.load_task("r1", "parent")
+    assert parent.state is TaskState.BLOCKED
+    assert parent.decomposition_children == ["child-1", "child-2", "child-3"]
+    assert eng.registered_task_ids("r1") == {"parent", "child-1", "child-2", "child-3"}
