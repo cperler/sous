@@ -120,6 +120,9 @@ class ReviewPlan(BaseModel):
 
     finders: tuple[FinderSpec, ...]
     verify_template: str  # prompt template with mechanical slots the runner fills per finding
+    # Fully rendered by the engine from its view of the change. The runner substitutes this
+    # verbatim; it must not try to reconstruct change context from a model-authored finding.
+    diff_hint: str = "the change under review in this working tree"
     verify_schema_ref: str
     dedupe_rule: str
 
