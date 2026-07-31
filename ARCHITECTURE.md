@@ -132,8 +132,7 @@ written.
 
 ## The pipeline
 
-Six collapsed stages (`Stage` in `orchestrator/schemas/enums.py`), collapsed from the
-reference system's ~12–15:
+The standing six-stage pipeline, collapsed from the reference system's ~12–15:
 
 ```
   intake ──▶ scope ──▶ implement ──▶ test ──▶ deliver ──▶ review
@@ -141,8 +140,15 @@ reference system's ~12–15:
    baseline)   feasible?) commit)     suite)   open PR)    reject → fix cycle)
 ```
 
-- **Per-task pipeline (schema v2/v3).** `STAGE_ORDER` is only the display order and the FULL
-  preset; the state machine (`orchestrator/state_machine.py`) walks each task's own
+`simplify` is an additional stage-vocabulary member, not a seventh step in the standing
+FULL preset. SCOPE may opt a decomposed child with `quality_tier: full` into
+`intake → implement → simplify → test → deliver → review`; `light` omits simplify and
+`none` omits both simplify and review. The pass has its own WorkItem, checkpoint, agent,
+timeout, and ledger row, so its cost and failures are visible without restoring the old
+opaque quality loop.
+
+- **Per-task pipeline (schema v2–v4).** `STAGE_ORDER` is the display order; the state
+  machine (`orchestrator/state_machine.py`) walks each task's own
   `Task.pipeline`, never the constant. Lane presets `full | lite | micro` (`LANE_STAGES`)
   resolve to a concrete pipeline at `add_task`; e.g. `micro` drops scope and test.
 - **Deterministic stage executors** run on the `engine×none` lane — no model, $0. Intake
@@ -166,6 +172,16 @@ reference system's ~12–15:
   heaviest-key-first) and deterministic, so replay reproduces it. `DETERMINISTIC_ONLY_KEYS`
   (`change_class`) fold only from the ENGINE lane — a model can't claim "docs-only" to relax
   its own review.
+- **SCOPE decomposition.** A large task may return a validated `subtasks` DAG with local
+  ids, agent roles, quality tiers, implementation budgets, and local dependency edges.
+  The engine files durable child tasks through the task-source `create_task` hook, records
+  the local-id mapping after every acknowledged filing, and registers each child on the
+  existing run DAG. The original task becomes an umbrella that depends on the child leaves:
+  independent children can complete even if another branch fails, dependency failures use
+  the existing transitive cascade, and the umbrella auto-completes only after every leaf
+  succeeds. A deterministic marker plus the source's `list_tasks` hook closes the external
+  create/record crash window; an unsupported or failed source parks the parent for approval
+  instead of silently falling through to monolithic implementation.
 
 ## The three front doors (upstream of any run)
 

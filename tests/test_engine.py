@@ -7,7 +7,7 @@ import pytest
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import ContractError
-from orchestrator.schemas.enums import ExecutionLane, ResultStatus, Stage
+from orchestrator.schemas.enums import LANE_STAGES, ExecutionLane, ResultStatus, Stage
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
@@ -35,13 +35,17 @@ def test_full_task_runs_all_six_stages(tmp_path, project) -> None:
     outcomes = _drive_to_completion(eng)
 
     stages_run = [o["stage"] for o in outcomes]
-    assert stages_run == [s.value for s in Stage]  # intake..review in order
+    assert stages_run == [s.value for s in LANE_STAGES[ExecutionLane.FULL]]
     assert outcomes[-1]["outcome"] == "task_completed"
 
     status = eng.status("r1")
     assert status["tasks"]["t1"]["state"] == "completed"
     assert status["tasks"]["t1"]["pr_url"].endswith("/1234")
-    assert all(v == "completed" for v in status["tasks"]["t1"]["stages"].values())
+    assert all(
+        status["tasks"]["t1"]["stages"][stage.value] == "completed"
+        for stage in LANE_STAGES[ExecutionLane.FULL]
+    )
+    assert status["tasks"]["t1"]["stages"][Stage.SIMPLIFY.value] == "skipped"
 
 
 def test_every_call_is_cost_attributed_clean(tmp_path, project) -> None:

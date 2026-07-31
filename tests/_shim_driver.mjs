@@ -123,7 +123,7 @@ const argsObj = {
 if (mode.startsWith('panel')) {
   argsObj.dispatchLimit = 1
   argsObj.workItems = [{
-    id: 'wi-panel', schema_version: '3', content_hash: 'c'.repeat(64), run_id: 'r',
+    id: 'wi-panel', schema_version: '4', content_hash: 'c'.repeat(64), run_id: 'r',
     task_id: '#1', stage: 'review', attempt: 0, model: 'claude-opus-5',
     schema_ref: 'review', prompt: 'ordinary single-reviewer prompt', effort: 'high',
     plan: {

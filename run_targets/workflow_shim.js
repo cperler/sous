@@ -448,13 +448,13 @@ function toStageResult(wi, agentResult) {
   const out = agentResult && agentResult.structured_output ? agentResult.structured_output : null
   return {
     // #275: ECHO the dispatching WorkItem's version rather than restating one. This shim
-    // hardcoded '1' while the engine had moved to "3", and nothing caught it because the
+    // hardcoded '1' while the engine had moved on, and nothing caught it because the
     // engine ignored the field entirely; it now refuses an off-version result at record().
     // Echoing means this lane cannot drift again — the engine that emitted the WorkItem is
     // by definition the engine that will record the result. The literal is only a fallback
     // for a WorkItem assembled without the field, and tests/test_schema_compat.py pins it
     // to SCHEMA_VERSION so it cannot silently rot the way '1' did.
-    schema_version: wi.schema_version || '3',
+    schema_version: wi.schema_version || '4',
     work_item_id: wi.id,
     content_hash: wi.content_hash,
     run_id: wi.run_id,

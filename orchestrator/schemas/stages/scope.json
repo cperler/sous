@@ -11,6 +11,24 @@
       "type": "array",
       "items": {"type": "string"},
       "description": "ordered subtasks for the implement stage"
+    },
+    "subtasks": {
+      "type": "array",
+      "minItems": 1,
+      "description": "optional child-task DAG; when present the current task becomes an umbrella",
+      "items": {
+        "type": "object",
+        "required": ["id", "description"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1, "maxLength": 80},
+          "description": {"type": "string", "minLength": 1},
+          "agent": {"type": ["string", "null"]},
+          "quality_tier": {"type": "string", "enum": ["full", "light", "none"], "default": "full"},
+          "implementation_budget": {"type": "string", "enum": ["standard", "short"], "default": "standard"},
+          "depends_on": {"type": "array", "items": {"type": "string"}, "default": []}
+        },
+        "additionalProperties": false
+      }
     }
   },
   "additionalProperties": true

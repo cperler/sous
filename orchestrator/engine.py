@@ -28,6 +28,7 @@ from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
+from .decomposition import DecompositionError, leaf_ids, parse_subtasks, topological_order
 from .driver_log import liveness_from_log
 from .errors import (
     CapacityExhausted,
@@ -86,9 +87,11 @@ from .schemas.enums import (
     ExecutionLane,
     ExecutionMode,
     FailureKind,
+    ImplementationBudget,
     ModelId,
     PermissionPosture,
     Provider,
+    QualityTier,
     ResultStatus,
     RunState,
     Stage,
@@ -136,9 +139,41 @@ def _elapsed_s(started_at: str | None) -> float | None:
     if not started_at:
         return None
     try:
-        return max(0.0, (datetime.now(UTC) - datetime.fromisoformat(started_at)).total_seconds())
+        return max(
+            0.0,
+            (datetime.now(UTC) - datetime.fromisoformat(started_at)).total_seconds(),
+        )
     except ValueError:
         return None
+
+
+_CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
+    QualityTier.FULL: (
+        Stage.INTAKE,
+        Stage.IMPLEMENT,
+        Stage.SIMPLIFY,
+        Stage.TEST,
+        Stage.DELIVER,
+        Stage.REVIEW,
+    ),
+    QualityTier.LIGHT: (
+        Stage.INTAKE,
+        Stage.IMPLEMENT,
+        Stage.TEST,
+        Stage.DELIVER,
+        Stage.REVIEW,
+    ),
+    QualityTier.NONE: (
+        Stage.INTAKE,
+        Stage.IMPLEMENT,
+        Stage.TEST,
+        Stage.DELIVER,
+    ),
+}
+_IMPLEMENT_TIMEOUTS: dict[ImplementationBudget, int] = {
+    ImplementationBudget.STANDARD: 1800,
+    ImplementationBudget.SHORT: 900,
+}
 
 
 def _hash_preview(value: str | None) -> str | None:
@@ -511,6 +546,9 @@ class Engine:
         estimate: str | float | None = None,
         model: str | None = None,
         effort: str | None = None,
+        agent_role: str | None = None,
+        quality_tier: str | QualityTier | None = None,
+        implementation_budget: str | ImplementationBudget | None = None,
         max_filed_followups: int | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
@@ -526,7 +564,9 @@ class Engine:
         ``82:codex`` tag / ralph dependency analysis, human-supplied). ``model`` pins a
         per-task model tier (#84); ``effort`` pins a per-task reasoning effort
         (low/medium/high, #96) that overrides the stage-spec defaults the same way.
-        ``max_filed_followups`` (#191) caps how many non-blocking review findings THIS task
+        ``agent_role``/``quality_tier``/``implementation_budget`` carry SCOPE-authored
+        child controls (#60). The role is resolved through the project adapter; the budget
+        selects the IMPLEMENT timeout. ``max_filed_followups`` (#191) caps how many non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
         engine default, a negative value is rejected. Validation (non-empty, duplicate-free)
@@ -582,6 +622,11 @@ class Engine:
         effort_pin: Effort | None = None
         if effort is not None:
             effort_pin = resolve_effort(effort)
+        resolved_quality = QualityTier(quality_tier) if quality_tier is not None else None
+        resolved_budget = (
+            ImplementationBudget(implementation_budget)
+            if implementation_budget is not None else None
+        )
         # Per-task filing cap (#191): validated BEFORE any state is written, like the pins.
         # None inherits the engine default; a negative cap is nonsensical (a cap of 0 already
         # means "file nothing").
@@ -688,6 +733,9 @@ class Engine:
                 spec_source_updated_at=getattr(spec, "updated_at", None),
                 spec_fingerprint=spec_fingerprint(spec.title, spec.body),
                 provider_tag=tag,
+                agent_role=agent_role,
+                quality_tier=resolved_quality,
+                implementation_budget=resolved_budget,
                 model_pin=model_pin,
                 effort_pin=effort_pin,
                 issue_number=spec.issue_number,
@@ -767,6 +815,8 @@ class Engine:
         which was wrong for the scheduler: it excluded RETRYING tasks (a retry must be
         re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
         """
+        self._resume_pending_decompositions(run_id)
+        self._complete_ready_umbrellas(run_id)
         run = self.store.load_run(run_id)
         states = {ref.task_id: ref.state for ref in run.task_refs}
         dag = Dag(run.dependency_graph)
@@ -781,6 +831,8 @@ class Engine:
             if dag.unmet_deps(ref.task_id, states):
                 continue
             doc = self.store.load_task(run_id, ref.task_id)
+            if doc.decomposition_children:
+                continue
             # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
             # re-dispatchable on the normal path — it needs explicit resume, never a
             # silent re-pick that would overwrite the outstanding WorkItem.
@@ -1078,7 +1130,8 @@ class Engine:
             project_commands=self._project_commands(),
             tool_posture_unenforced=unenforced_policy,
         )
-        agent = self.project.agent_for(stage, spec.agent_role)
+        role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
+        agent = self.project.agent_for(stage, role)
         # Multi-agent REVIEW (#73): one gate, consulted only for a model-lane REVIEW. It
         # re-reads the opt-in off the loaded Run doc and applies the lane/preset/capacity/
         # budget vetoes; None (the default, and every other stage) dispatches the byte-
@@ -1104,7 +1157,11 @@ class Engine:
             lane_policy=lane,
             created_at=_now(),
             attempt=attempt,
-            timeout_s=spec.timeout_s,
+            timeout_s=(
+                _IMPLEMENT_TIMEOUTS[task.implementation_budget]
+                if stage is Stage.IMPLEMENT and task.implementation_budget is not None
+                else spec.timeout_s
+            ),
             # Run in the task's worktree (folded from intake) so the headless lane stops
             # depending on process CWD. None on intake itself (it creates the worktree).
             cwd=task.context.get("worktree"),
@@ -2255,6 +2312,20 @@ class Engine:
         # cost-summary.md is written at run finalization and on status() — NOT on
         # every record (that re-read the whole ledger each time: O(N^2) on long runs).
         self._set_ref_state(run_id, result.task_id, task.state)
+        # A valid child graph turns this task into a DAG umbrella after its SCOPE result is
+        # durably recorded. Filing is deliberately outside the task-result transaction: it
+        # is an external side effect, while the mapping persisted after each child makes a
+        # retry/reconciliation resume from the last acknowledged ref.
+        if (
+            result.stage is Stage.SCOPE
+            and effective.status is ResultStatus.SUCCESS
+            and (effective.structured_output or {}).get("subtasks") is not None
+        ):
+            task = self._apply_scope_decomposition(run_id, task, effective.structured_output)
+            outcome = (
+                "task_decomposed"
+                if task.decomposition_children else "scope_decomposition_held"
+            )
         # #322: verify, after the fact, that the commits this stage actually produced carry
         # no model/agent attribution trailer. #317's directive is an instruction, not a
         # guarantee; this is the deterministic check that says so in ``events.jsonl`` when it
@@ -2331,6 +2402,7 @@ class Engine:
                 # a later run doesn't re-pay to learn the same lesson. Skips a clean task
                 # (empty learnings); best-effort — never breaks the terminal transition.
                 self._harvest_task_learnings(run_id, task)
+            self._complete_ready_umbrellas(run_id)
             self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
@@ -2339,8 +2411,195 @@ class Engine:
             "stage": result.stage.value,
             "cost_usd": cost,
             "lane_attributed": lane_clean,
-            "next_stage": (s.value if (s := next_stage(task)) else None),
+            "next_stage": (
+                None
+                if task.decomposition_children
+                else (s.value if (s := next_stage(task)) else None)
+            ),
         }
+
+    def _apply_scope_decomposition(
+        self, run_id: str, parent: Task, output: dict | None
+    ) -> Task:
+        """File/register a validated child DAG and park ``parent`` as its umbrella.
+
+        External issue creation cannot share the status store's filesystem transaction.
+        The durable local-id mapping is therefore advanced after every acknowledged
+        ``create_task`` call; a resumed call skips mapped children and continues with the
+        first unacknowledged one. Registration itself is already crash-idempotent.
+        """
+        tasks = parse_subtasks(output)
+        if not tasks:
+            return parent
+        if parent.decomposition_children:
+            return parent
+        source = self.project.task_source
+        create = getattr(source, "create_task", None)
+        if not callable(create):
+            return self._hold_decomposition(
+                run_id, parent.task_id,
+                "task source cannot create child tasks (missing create_task hook)",
+            )
+
+        by_id = {task.id: task for task in tasks}
+        mapping = dict(parent.decomposition_mapping)
+        try:
+            for local_id in topological_order(tasks):
+                child = by_id[local_id]
+                dep_refs = [mapping[dep] for dep in child.depends_on]
+                if local_id not in mapping:
+                    marker = f"Decomposition-key: {parent.task_id}/{local_id}"
+                    controls = (
+                        f"Agent-role: {child.agent or 'default'}\n"
+                        f"Quality-tier: {child.quality_tier.value}\n"
+                        f"Implementation-budget: {child.implementation_budget.value}"
+                    )
+                    deps = f"\nDepends-on: {', '.join(dep_refs)}" if dep_refs else ""
+                    body = (
+                        f"Decomposed from {parent.task_id} ({local_id}).\n\n"
+                        f"{marker}\n{controls}{deps}\n\n{child.description}"
+                    )
+                    ref = self._find_decomposition_child(source, marker)
+                    if ref is None:
+                        ref = create(
+                            f"{parent.title or parent.task_id}: {local_id}", body, []
+                        )
+                    if not ref:
+                        raise DecompositionError(
+                            f"task source returned no ref for child {local_id!r}"
+                        )
+                    mapping[local_id] = str(ref)
+                    self.store.update_task(
+                        run_id,
+                        parent.task_id,
+                        lambda task, saved=dict(mapping): setattr(
+                            task, "decomposition_mapping", saved
+                        ),
+                    )
+
+            registered = self.registered_task_ids(run_id)
+            for local_id in topological_order(tasks):
+                child = by_id[local_id]
+                ref = mapping[local_id]
+                if ref in registered:
+                    continue
+                self.add_task(
+                    run_id,
+                    ref,
+                    pipeline=_CHILD_PIPELINES[child.quality_tier],
+                    depends_on=[mapping[dep] for dep in child.depends_on],
+                    provider_tag=parent.provider_tag,
+                    agent_role=child.agent,
+                    quality_tier=child.quality_tier,
+                    implementation_budget=child.implementation_budget,
+                )
+                registered.add(ref)
+
+            leaves = [mapping[local_id] for local_id in leaf_ids(tasks)]
+            # Graph first: once the parent is parked, its unmet leaf dependencies are the
+            # durable reason it cannot be dispatched. All children are registered, so the
+            # graph remains known-node and acyclic at every read after this write.
+            self.store.update_run(
+                run_id,
+                lambda run: run.dependency_graph.__setitem__(parent.task_id, leaves),
+            )
+
+            def _park(task: Task) -> None:
+                task.decomposition_mapping = dict(mapping)
+                task.decomposition_children = [mapping[t.id] for t in tasks]
+                task.state = TaskState.BLOCKED
+
+            parent = self.store.update_task(run_id, parent.task_id, _park)
+            self._set_ref_state(run_id, parent.task_id, parent.state)
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "task_decomposed", "run_id": run_id,
+                 "task_id": parent.task_id, "children": parent.decomposition_children,
+                 "leaf_children": leaves, "mapping": mapping},
+            )
+            return parent
+        except Exception as exc:  # noqa: BLE001 - park partial external work for recovery
+            return self._hold_decomposition(run_id, parent.task_id, str(exc))
+
+    @staticmethod
+    def _find_decomposition_child(source: object, marker: str) -> str | None:
+        """Best-effort crash-window dedupe through the source's existing list hook."""
+        list_tasks = getattr(source, "list_tasks", None)
+        if not callable(list_tasks):
+            return None
+        try:
+            tasks = list_tasks(limit=100)
+        except Exception:  # noqa: BLE001 - absence/failure falls back to create_task
+            return None
+        for task in tasks or []:
+            if marker in str(getattr(task, "body", "")):
+                return str(task.task_id)
+        return None
+
+    def _resume_pending_decompositions(self, run_id: str) -> None:
+        """Resume a scope-filing saga after a crash or an operator approval.
+
+        A human-held failure remains quiescent. ``approve`` moves it to PENDING; the next
+        scheduler eligibility pass then continues from its persisted mapping.
+        """
+        run = self.store.load_run(run_id)
+        for ref in list(run.task_refs):
+            if ref.state in TERMINAL_TASK_STATES or ref.state is TaskState.BLOCKED_ON_HUMAN:
+                continue
+            task = self.store.load_task(run_id, ref.task_id)
+            if task.decomposition_children:
+                continue
+            scope = task.stages.get(Stage.SCOPE)
+            output = scope.output if scope and scope.status is StageStatus.COMPLETED else None
+            if isinstance(output, dict) and output.get("subtasks") is not None:
+                self._apply_scope_decomposition(run_id, task, output)
+
+    def _hold_decomposition(self, run_id: str, task_id: str, reason: str) -> Task:
+        def _hold(task: Task) -> None:
+            task.state = TaskState.BLOCKED_ON_HUMAN
+            task.last_error = f"scope decomposition: {reason}"
+
+        task = self.store.update_task(run_id, task_id, _hold)
+        self._set_ref_state(run_id, task_id, task.state)
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "scope_decomposition_held", "level": "warning",
+             "run_id": run_id, "task_id": task_id, "reason": reason,
+             "mapping": task.decomposition_mapping},
+        )
+        return task
+
+    def _complete_ready_umbrellas(self, run_id: str) -> None:
+        """Complete decomposed parents whose leaf children all completed successfully."""
+        run = self.store.load_run(run_id)
+        states = {ref.task_id: ref.state for ref in run.task_refs}
+        for ref in list(run.task_refs):
+            if ref.state in TERMINAL_TASK_STATES:
+                continue
+            parent = self.store.load_task(run_id, ref.task_id)
+            if not parent.decomposition_children:
+                continue
+            leaves = run.dependency_graph.get(parent.task_id, [])
+            if not leaves or any(states.get(child) is not TaskState.COMPLETED for child in leaves):
+                continue
+
+            def _complete(task: Task) -> None:
+                for rec in task.stages.values():
+                    if rec.status is StageStatus.PENDING:
+                        rec.status = StageStatus.SKIPPED
+                task.state = TaskState.COMPLETED
+
+            parent = self.store.update_task(run_id, parent.task_id, _complete)
+            self._set_ref_state(run_id, parent.task_id, TaskState.COMPLETED)
+            self.store.write_task_index(parent.task_id, render_task_index(parent))
+            self._on_task_completed(run_id, parent)
+            self._release_ports(run_id, parent)
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "decomposition_parent_completed",
+                 "run_id": run_id, "task_id": parent.task_id,
+                 "children": parent.decomposition_children},
+            )
 
     def _stage_gate(self, result: StageResult) -> str | None:
         """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.
@@ -2365,6 +2624,12 @@ class Engine:
         REVIEW rejection carries its blocking ``issues``. The veto string below is
         load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
         failure streak → ``task.last_error``): enrich the learning, not this reason."""
+        if result.stage is Stage.SCOPE:
+            try:
+                parse_subtasks(result.structured_output)
+            except DecompositionError as exc:
+                return f"scope decomposition gate: {exc}"
+            return None
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
@@ -4376,6 +4641,20 @@ class Engine:
                     and task.state is not TaskState.BLOCKED_ON_HUMAN
                 ),
             }
+            if task.quality_tier is not None:
+                task_status.update({
+                    "agent_role": task.agent_role,
+                    "quality_tier": task.quality_tier.value,
+                    "implementation_budget": (
+                        task.implementation_budget.value
+                        if task.implementation_budget is not None else None
+                    ),
+                })
+            if task.decomposition_children:
+                task_status["decomposition"] = {
+                    "mapping": task.decomposition_mapping,
+                    "children": task.decomposition_children,
+                }
             # A human-closed-infeasible task surfaces WHY it was closed — read back from the
             # durable rejection artifact (#52), so status output is self-explanatory.
             if task.state is TaskState.CLOSED_INFEASIBLE:
@@ -4833,7 +5112,7 @@ class Engine:
         improvement_ref: str | None = None
         try:
             ts = self.project.task_source
-            if task.pr_url:
+            if task.pr_url or task.decomposition_children:
                 ts.mark_complete(task.task_id, task.pr_url)
             followups = self._file_review_followups(run_id, task, ts)
             # #188 dedup: don't file the improvement as a separate enhancement when it is

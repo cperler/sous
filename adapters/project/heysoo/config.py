@@ -32,6 +32,7 @@ from .task_source import GitHubIssuesSource
 # role point at it, so a design-tagged stage draws on the same design-system knowledge.
 _ROSTER: dict[str, str] = {
     "implement": "python-backend-developer",
+    "simplify": "code-simplifier",
     "implement:frontend": "bulletproof-frontend-developer",
     "implement:design": "bulletproof-frontend-developer",
     "test": "python-backend-developer",

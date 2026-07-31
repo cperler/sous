@@ -25,7 +25,9 @@ ModelId = NewType("ModelId", str)
 # execution_lane on load (2026-07-01 design pass §1).
 # v3: deterministic stages (e.g. intake) run on the non-model ENGINE lane
 # (ExecutionMode.ENGINE × Provider.NONE); additive — pre-v3 docs never name it.
-SCHEMA_VERSION = "3"
+# v4: SIMPLIFY extends the stage vocabulary; v3 task maps gain a pending record while
+# retaining their exact stored pipeline.
+SCHEMA_VERSION = "4"
 
 # ---- compatibility policy (#275) ------------------------------------------------------
 #
@@ -52,7 +54,7 @@ SCHEMA_VERSION = "3"
 # Status-doc versions this engine can read and migrate forward to SCHEMA_VERSION. "0" is the
 # synthetic name for a doc with NO ``schema_version`` key at all (the original pre-versioning
 # shape); every entry must have an explicit migration test (tests/test_schema_compat.py).
-MIGRATABLE_STATUS_VERSIONS = ("0", "1", "2")
+MIGRATABLE_STATUS_VERSIONS = ("0", "1", "2", "3")
 
 # Every status-doc version this engine accepts: the migratable ladder plus the current one.
 SUPPORTED_STATUS_VERSIONS = frozenset((*MIGRATABLE_STATUS_VERSIONS, SCHEMA_VERSION))
@@ -84,18 +86,20 @@ class Stage(StrEnum):
     INTAKE = "intake"
     SCOPE = "scope"
     IMPLEMENT = "implement"
+    SIMPLIFY = "simplify"
     TEST = "test"
     DELIVER = "deliver"
     REVIEW = "review"
 
 
-# The default FULL pipeline (and the canonical *display* order for stage records).
-# Its ONLY sequencing duty is defining the FULL preset below — the state machine walks
-# task.pipeline, never this constant.
+# Canonical display order for stage records. SIMPLIFY is opt-in through a decomposed
+# child's full quality tier; the standing FULL lane remains the deliberate six-stage
+# pipeline and is declared explicitly below.
 STAGE_ORDER: tuple[Stage, ...] = (
     Stage.INTAKE,
     Stage.SCOPE,
     Stage.IMPLEMENT,
+    Stage.SIMPLIFY,
     Stage.TEST,
     Stage.DELIVER,
     Stage.REVIEW,
@@ -289,10 +293,32 @@ class ExecutionLane(StrEnum):
     MICRO = "micro"
 
 
+class QualityTier(StrEnum):
+    """Per-child quality depth emitted by SCOPE decomposition."""
+
+    FULL = "full"
+    LIGHT = "light"
+    NONE = "none"
+
+
+class ImplementationBudget(StrEnum):
+    """Per-child implementation wall-clock budget from the historical planner."""
+
+    STANDARD = "standard"
+    SHORT = "short"
+
+
 # Lane PRESETS: named pipelines (ported from full/lite/micro). A lane is resolved to a
 # concrete task.pipeline at add_task; the engine sequences on the pipeline, not the lane.
 LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
-    ExecutionLane.FULL: STAGE_ORDER,
+    ExecutionLane.FULL: (
+        Stage.INTAKE,
+        Stage.SCOPE,
+        Stage.IMPLEMENT,
+        Stage.TEST,
+        Stage.DELIVER,
+        Stage.REVIEW,
+    ),
     ExecutionLane.LITE: (Stage.INTAKE, Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER, Stage.REVIEW),
     ExecutionLane.MICRO: (Stage.INTAKE, Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW),
 }

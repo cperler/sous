@@ -1,6 +1,6 @@
 """Canonical per-stage output schemas (target.md §4/§7; closes the codex-validation gap).
 
-The 6 collapsed stages each have a JSON Schema describing the structured output a
+Each stage has a JSON Schema describing the structured output a
 runner must return (the ``Return:`` contract in ``stages.py``). These are **universal
 engine contracts**, not project-specific, so they live with the engine and every
 project-config adapter can expose them via ``schema_for`` for free — giving the codex

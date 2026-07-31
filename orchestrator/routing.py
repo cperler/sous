@@ -20,7 +20,9 @@ from .schemas.work import LanePolicy
 
 # The file-patching stages a per-task :codex tag may route to codex (ports
 # CODEX_ELIGIBLE_STAGES = implement-task-*/fix-* into the collapsed stage map).
-DEFAULT_CODEX_ELIGIBLE: frozenset[Stage] = frozenset({Stage.IMPLEMENT, Stage.TEST})
+DEFAULT_CODEX_ELIGIBLE: frozenset[Stage] = frozenset(
+    {Stage.IMPLEMENT, Stage.SIMPLIFY, Stage.TEST}
+)
 
 
 @dataclass(frozen=True)

@@ -30,6 +30,7 @@ _NOOP = ["true"]  # this project has no e2e / shell / infra layer
 # ``claude -p --agent <name>``.
 _ROSTER: dict[str, str] = {
     "implement": "python-backend-developer",
+    "simplify": "code-simplifier",
     "test": "test-validator",
     "review": "code-reviewer",
     "docstring": "docstring-writer",

@@ -22,7 +22,9 @@ from .enums import (
     Effort,
     ExecutionLane,
     ExecutionMode,
+    ImplementationBudget,
     Provider,
+    QualityTier,
     RunState,
     Stage,
     StageStatus,
@@ -186,6 +188,12 @@ class Task(_StatusModel):
     spec_fingerprint: str | None = None
     spec_refreshed_at: str | None = None
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
+    # SCOPE-authored child controls (#60). ``agent_role`` is resolved through the project
+    # roster at dispatch time; quality/budget remain durable provenance rather than being
+    # hidden in an issue body.
+    agent_role: str | None = None
+    quality_tier: QualityTier | None = None
+    implementation_budget: ImplementationBudget | None = None
     # Per-task model pin (#84): a canonical model id (e.g. "claude-fable-5") that overrides the
     # role default on a model-lane stage so a brainstorm/heavy-architecture task runs on a higher
     # tier. Resolved + provider-validated at add_task (an alias like "fable" is normalized to the
@@ -206,6 +214,12 @@ class Task(_StatusModel):
     effort_pin: Effort | None = None
     issue_number: int | None = None
     depends_on: list[str] = Field(default_factory=list)
+    # A decomposition parent is an umbrella, not another implementation task. Once its
+    # SCOPE result has filed/registered children, these fields hold the stable local-id →
+    # task-id mapping. The run DAG makes the parent depend on every leaf; the engine
+    # completes it without another model dispatch after all leaves complete.
+    decomposition_mapping: dict[str, str] = Field(default_factory=dict)
+    decomposition_children: list[str] = Field(default_factory=list)
     # Provenance: the lane preset this task was added under. Sequencing reads
     # ``pipeline``, never this field (kept for rendering/audit — design pass §1 Q1).
     execution_lane: ExecutionLane = ExecutionLane.FULL
@@ -316,6 +330,13 @@ class Task(_StatusModel):
         if isinstance(data, dict) and not data.get("pipeline"):
             lane = data.get("execution_lane") or ExecutionLane.FULL
             data["pipeline"] = LANE_STAGES[ExecutionLane(lane)]
+        # v3 status docs predate SIMPLIFY. Their persisted stage map is otherwise complete,
+        # so a normal field default cannot supply the new vocabulary member.
+        if isinstance(data, dict) and isinstance(data.get("stages"), dict):
+            stages = dict(data["stages"])
+            for stage in Stage:
+                stages.setdefault(stage.value, StageRecord().model_dump())
+            data["stages"] = stages
         return data
 
     @model_validator(mode="after")

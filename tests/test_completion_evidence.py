@@ -706,6 +706,16 @@ def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
     assert data["t2"] == {"title": "New", "body": "body", "labels": ["spec:x"]}
 
 
+def test_localfile_source_preserves_created_dependency_metadata(tmp_path) -> None:
+    path = tmp_path / "tasks.json"
+    path.write_text("{}")
+    src = LocalFileTaskSource(path)
+    ref = src.create_task("Child", "work\n\nDepends-on: t1, t2", labels=["child"])
+
+    assert src.resolve(ref).depends_on == ["t1", "t2"]
+    assert [task.task_id for task in src.list_tasks(label="child")] == [ref]
+
+
 # --- review schema -----------------------------------------------------------------
 
 

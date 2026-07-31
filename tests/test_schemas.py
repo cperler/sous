@@ -93,7 +93,7 @@ def test_stageresult_ok_property() -> None:
 
 def test_task_initializes_all_six_stages_with_started_at() -> None:
     t = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
-    assert list(t.stages.keys()) == list(STAGE_ORDER)
+    assert list(t.stages.keys()) == list(Stage)
     # started_at ALWAYS present (null until running) — fixes the as-built omission.
     for rec in t.stages.values():
         dumped = rec.model_dump()
@@ -102,7 +102,8 @@ def test_task_initializes_all_six_stages_with_started_at() -> None:
 
 
 def test_lane_stage_sets() -> None:
-    assert LANE_STAGES[ExecutionLane.FULL] == STAGE_ORDER
+    assert Stage.SIMPLIFY not in LANE_STAGES[ExecutionLane.FULL]
+    assert set(LANE_STAGES[ExecutionLane.FULL]) == set(STAGE_ORDER) - {Stage.SIMPLIFY}
     assert Stage.SCOPE not in LANE_STAGES[ExecutionLane.LITE]
     assert Stage.TEST not in LANE_STAGES[ExecutionLane.MICRO]
     # intake/implement/deliver/review always run

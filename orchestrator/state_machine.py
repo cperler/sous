@@ -183,6 +183,7 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
                    "port_base", "port_count", "composed_deps"),
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
+    Stage.SIMPLIFY: (),
     Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
