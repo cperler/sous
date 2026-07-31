@@ -595,13 +595,12 @@ def render_completion_note(
 
     Nothing silently dropped (#188/#223):
 
-    * Non-blocking findings the engine did NOT file (dispositioned ``fix_now``/``drop``,
-      or ``file`` findings past the per-task cap) appear in a "Noted, not filed" section
-      with a short reason.
-    * An improvement idea dispositioned away from filing (``fix_now``/``fixup`` →
-      "applied in place, not filed"; ``drop`` → "noted, not tracked") is surfaced with
-      that reason instead of an issue link, keeping the idea durable in the note even
-      though no enhancement issue was opened."""
+    * Non-blocking findings the engine did NOT file (absent/unrecognized dispositions,
+      ``fix_now``/``drop``, or ``file`` findings past the per-task cap) appear in a
+      "Noted, not filed" section with a short reason.
+    * An improvement idea without an explicit ``file`` disposition is surfaced with its
+      reason instead of an issue link, keeping the idea durable in the note even though
+      no enhancement issue was opened."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -639,9 +638,9 @@ def render_completion_note(
             lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
 
     # #188: the "noted, moving on" destination. A non-blocking finding the engine did NOT
-    # file — dispositioned `fix_now`/`drop`, or a `file` finding past the per-task cap — is
-    # surfaced here so the drop bucket is durable in the PR/issue note (nothing silently
-    # dropped). Derived from the review's findings minus the titles that got filed above.
+    # file — absent/unrecognized, dispositioned `fix_now`/`drop`, or an explicit `file`
+    # finding past the per-task cap — is surfaced here so the drop bucket is durable in
+    # the PR/issue note. Derived from the review's findings minus the filed titles.
     filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
     _noted_reason = {"fix_now": "fixed in place (boy-scout)", "drop": "noted, not tracked"}
     noted: list[str] = []
@@ -652,7 +651,14 @@ def render_completion_note(
         if not title or title in filed_titles:
             continue
         disposition = str(finding.get("disposition") or "").strip().casefold()
-        reason = _noted_reason.get(disposition, "over per-task cap")
+        if disposition == "file":
+            reason = "over per-task cap"
+        elif disposition in _noted_reason:
+            reason = _noted_reason[disposition]
+        elif disposition:
+            reason = "unrecognized disposition — not filed"
+        else:
+            reason = "no disposition given — not filed"
         noted.append(f"- {title} — {reason}")
     if noted:
         lines += ["", "### Noted, not filed"] + noted
@@ -661,9 +667,8 @@ def render_completion_note(
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
     if improvement and str(improvement.get("title", "")).strip():
-        # #223 — nothing silently dropped: an improvement dispositioned away from filing
-        # (fixup/fix_now/drop) has no enhancement issue, so surface WHY it wasn't filed
-        # instead of a link, keeping the idea durable in the note.
+        # #223/#228 — nothing silently dropped: an improvement not explicitly filed has
+        # no enhancement issue, so surface WHY it wasn't filed instead of a link.
         _improvement_reason = {
             "fixup": "applied in place, not filed",
             "fix_now": "applied in place, not filed",
@@ -674,6 +679,10 @@ def render_completion_note(
             suffix = f" → {improvement_ref}"
         elif disp in _improvement_reason:
             suffix = f" — {_improvement_reason[disp]}"
+        elif not disp:
+            suffix = " — no disposition given — not filed"
+        elif disp != "file":
+            suffix = " — unrecognized disposition — not filed"
         else:
             suffix = ""
         head = f"💡 **Improvement idea:** {improvement['title']}{suffix}"

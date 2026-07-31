@@ -491,6 +491,7 @@ def test_a_refutation_the_verifier_earned_does_demote_the_finding() -> None:
     review, _, _ = synthesize(result.sub_results)
     assert review["approved"] is True and review["issues"] == []
     assert review["non_blocking"][0]["title"].startswith("refuted:")
+    assert review["non_blocking"][0]["disposition"] == "file"
 
 
 # --- failure direction: a finder failing kills the whole dispatch ------------------------

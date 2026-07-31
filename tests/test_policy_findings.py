@@ -75,6 +75,8 @@ def test_advisory_finding_becomes_tracked_followup(tmp_path) -> None:
     assert out["outcome"] == "task_completed"  # advisory never blocks
     filed = project.task_source.followups
     assert any("API contract" in f["title"] for f in filed)  # filed at finalize
+    review = eng.store.load_task("r1", "t1").stages[Stage.REVIEW].output
+    assert review["non_blocking"][0]["disposition"] == "file"
 
 
 def test_raising_hook_never_breaks_record(tmp_path) -> None:

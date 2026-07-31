@@ -161,8 +161,8 @@ def synthesize(sub_results: object) -> SynthesisResult:
        through UNCHANGED so ``format_review_issue`` / the convergence fingerprint keep
        working on them.
     5. ``non_blocking`` = suggestion findings, plus every refuted finding prefixed
-       ``refuted:`` and carrying the verifier's reasoning. Disposition is deliberately
-       absent so evidence-out files them (schema default: ``file``).
+       ``refuted:`` and carrying the verifier's reasoning. Both are explicitly
+       dispositioned ``file`` so evidence-out keeps the panel's human-review loop open.
     6. ``tests_meaningful`` = ``find:tests``'s report VERBATIM, or ``null`` when no lens
        supplied a boolean one; only an explicit ``false`` is vacuous (fail-OPEN preserved),
        so a docs-only plan that omits the lens folds to ``null`` — "not judged", never a
@@ -583,18 +583,26 @@ def _description(finding: object) -> str:
 
 def _advisory_entry(finding: object) -> dict[str, str]:
     """A suggestion-severity finding as a ``non_blocking`` entry — same shape
-    ``_merge_policy_findings`` gives an advisory policy finding."""
-    return {"title": _description(finding)[:_MAX_TITLE], "detail": format_review_issue(finding)}
+    ``_merge_policy_findings`` gives an advisory policy finding. It is explicitly filed
+    because engine-authored entries do not rely on the model's opt-in disposition."""
+    return {
+        "title": _description(finding)[:_MAX_TITLE],
+        "detail": format_review_issue(finding),
+        "disposition": "file",
+    }
 
 
 def _refuted_entry(finding: object, reasoning: str) -> dict[str, str]:
     """A refuted finding as a ``non_blocking`` entry. The adversary killed it, so it must
-    not block — but it must not vanish either: evidence-out files it (no ``disposition``
-    key => the schema's ``file`` default) with the refutation attached, so a human closes
-    the false-negative loop the verifier just opened."""
+    not block — but it must not vanish either: evidence-out explicitly files it with the
+    refutation attached, so a human closes the false-negative loop the verifier opened."""
     detail = format_review_issue(finding)
     detail += (
         f"\n\nRefuted by the adversarial verifier: {reasoning}" if reasoning
         else "\n\nRefuted by the adversarial verifier (no reasoning given)."
     )
-    return {"title": f"refuted: {_description(finding)}"[:_MAX_TITLE], "detail": detail}
+    return {
+        "title": f"refuted: {_description(finding)}"[:_MAX_TITLE],
+        "detail": detail,
+        "disposition": "file",
+    }

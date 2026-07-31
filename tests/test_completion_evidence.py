@@ -1,7 +1,7 @@
 """Evidence-out at task finalize (the 'publish the reasoning' half of the seam).
 
-When a task completes the engine files each non-blocking review finding as a
-deferred-scope follow-up and posts a completion note — both via OPTIONAL duck-typed
+When a task completes the engine files explicitly opted-in non-blocking review findings
+as deferred-scope follow-ups and posts a completion note — both via OPTIONAL duck-typed
 task-source hooks, so an adapter without them is a graceful no-op and a flaky hook can
 never un-complete a finished task.
 """
@@ -45,8 +45,10 @@ _REVIEW_WITH_FINDINGS = {
     "approved": True,
     "issues": [],
     "non_blocking": [
-        {"title": "Handle a nonexistent --repo path", "detail": "raises FileNotFoundError"},
-        {"title": "Guard negative --keep-latest", "detail": "a negative N is nonsensical"},
+        {"title": "Handle a nonexistent --repo path", "detail": "raises FileNotFoundError",
+         "disposition": "file"},
+        {"title": "Guard negative --keep-latest", "detail": "a negative N is nonsensical",
+         "disposition": "file"},
     ],
 }
 
@@ -97,7 +99,8 @@ _REVIEW_WITH_SELF_IMPROVEMENT = {
     "approved": True,
     "issues": [],
     "improvement": {"title": "Add a schema-validate-retry loop to the transport",
-                    "detail": "Retire the postamble band-aid with a real retry."},
+                    "detail": "Retire the postamble band-aid with a real retry.",
+                    "disposition": "file"},
     "retrospective": {"title": "Terse stage prompts under-elicit structured output",
                       "detail": "Tune prompts against real run transcripts."},
 }
@@ -161,9 +164,9 @@ def test_finalize_no_findings_files_nothing_but_still_notes(tmp_path, project) -
 # --- #188 filing threshold (disposition gate / per-task cap / dedup) ----------------
 
 
-def test_disposition_gate_files_only_file_and_absent(tmp_path, project) -> None:
-    # `fix_now`/`drop` findings are NOT filed; `file` and an absent disposition ARE — and
-    # the skipped ones are surfaced in the completion note so nothing is silently dropped.
+def test_disposition_gate_files_only_explicit_file(tmp_path, project) -> None:
+    # Filing is opt-in; every non-file value is surfaced in the completion note so neither
+    # a dispositionless finding nor a dispositionless improvement disappears silently.
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
@@ -172,26 +175,32 @@ def test_disposition_gate_files_only_file_and_absent(tmp_path, project) -> None:
         "approved": True, "issues": [],
         "non_blocking": [
             {"title": "Automate the events-balance audit", "detail": "d", "disposition": "file"},
-            {"title": "Legacy finding without a disposition", "detail": "d"},  # absent -> file
+            {"title": "Finding without a disposition", "detail": "d"},
+            {"title": "Finding with an empty disposition", "detail": "d", "disposition": ""},
+            {"title": "Finding with an unknown disposition", "detail": "d",
+             "disposition": "maybe"},
             {"title": "Stale docstring after #133", "detail": "d", "disposition": "fix_now"},
             {"title": "Cosmetic wording nit", "detail": "d", "disposition": "drop"},
         ],
+        "improvement": {"title": "Dispositionless improvement", "detail": "d"},
     })
 
     ts = project.task_source
     filed_titles = [f["title"] for f in ts.followups]
-    assert filed_titles == [
-        "Automate the events-balance audit",
-        "Legacy finding without a disposition",
-    ]
-    # the two unfiled findings are durable in the note, with their reason
+    assert filed_titles == ["Automate the events-balance audit"]
+    # all unfiled findings and the improvement are durable in the note, with their reason
     note = ts.notes[0]["body"]
     assert "### Noted, not filed" in note
+    assert "Finding without a disposition — no disposition given — not filed" in note
+    assert "Finding with an empty disposition — no disposition given — not filed" in note
+    assert "Finding with an unknown disposition — unrecognized disposition — not filed" in note
     assert "Stale docstring after #133 — fixed in place (boy-scout)" in note
     assert "Cosmetic wording nit — noted, not tracked" in note
-    # ...and neither leaked into a filed issue
-    assert "Stale docstring after #133" not in filed_titles
-    assert "Cosmetic wording nit" not in filed_titles
+    assert "Dispositionless improvement — no disposition given — not filed" in note
+
+    events = _events(tmp_path)
+    not_filed = [e for e in events if e["type"] == "improvement_not_filed"]
+    assert len(not_filed) == 1 and not_filed[0]["disposition"] is None
 
 
 def test_per_task_cap_bounds_filed_followups(tmp_path, project) -> None:
@@ -340,7 +349,8 @@ def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
     _drive(eng, review_output={
         "approved": True, "issues": [],
         "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
-        "improvement": {"title": shared, "detail": "same idea, restated"},
+        "improvement": {"title": shared, "detail": "same idea, restated",
+                        "disposition": "file"},
     })
 
     ts = project.task_source
@@ -365,18 +375,18 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     _drive(eng, review_output={
         "approved": True, "issues": [],
         "non_blocking": [{"title": "Guard the --repo path", "detail": "d", "disposition": "file"}],
-        "improvement": {"title": "Add a run-finalize dedup pass", "detail": "different idea"},
+        "improvement": {"title": "Add a run-finalize dedup pass", "detail": "different idea",
+                        "disposition": "file"},
     })
 
     ts = project.task_source
     assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
 
 
-@pytest.mark.parametrize("disposition", ["fix_now", "drop", "fixup"])
+@pytest.mark.parametrize("disposition", ["fix_now", "drop", "fixup", "", "maybe"])
 def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, disposition) -> None:
-    # #223: an improvement the reviewer marked fix_now/drop/fixup is NOT filed as an
+    # A recognized non-file, empty, or unrecognized disposition is NOT filed as an
     # enhancement — but it IS surfaced in the completion note (nothing silently dropped).
-    # This assertion fails if the disposition gate regresses to always-file.
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
@@ -394,7 +404,11 @@ def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, dispo
     # ...but it is durable in the completion note, with a why-not-filed reason
     note = ts.notes[0]["body"]
     assert "Expose a retry-count knob" in note
-    reason = "noted, not tracked" if disposition == "drop" else "applied in place, not filed"
+    reason = {
+        "drop": "noted, not tracked",
+        "": "no disposition given — not filed",
+        "maybe": "unrecognized disposition — not filed",
+    }.get(disposition, "applied in place, not filed")
     assert reason in note
 
     events = _events(tmp_path)
@@ -405,19 +419,14 @@ def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, dispo
     assert completed["improvement_filed"] is False
 
 
-@pytest.mark.parametrize("disposition", ["file", None])
-def test_improvement_with_file_or_absent_disposition_still_files(
-    tmp_path, project, disposition
-) -> None:
-    # #223 backward compat: an explicit `file` disposition — and an absent one — still file
-    # the improvement as an enhancement, exactly as before the disposition field existed.
+def test_improvement_with_explicit_file_disposition_still_files(tmp_path, project) -> None:
+    # The allowlist gate still files an explicitly opted-in improvement as an enhancement.
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
 
-    improvement = {"title": "Add a schema-validate-retry loop", "detail": "real need"}
-    if disposition is not None:
-        improvement["disposition"] = disposition
+    improvement = {"title": "Add a schema-validate-retry loop", "detail": "real need",
+                   "disposition": "file"}
     _drive(eng, review_output={"approved": True, "issues": [], "improvement": improvement})
 
     ts = project.task_source
@@ -471,7 +480,8 @@ def test_failed_followup_does_not_dedup_a_matching_improvement(tmp_path, project
     _drive(eng, review_output={
         "approved": True, "issues": [],
         "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
-        "improvement": {"title": shared, "detail": "same idea, restated"},
+        "improvement": {"title": shared, "detail": "same idea, restated",
+                        "disposition": "file"},
     })
 
     ts = project.task_source
@@ -556,7 +566,7 @@ def test_render_completion_note_content() -> None:
     task.stages[Stage.IMPLEMENT].status = StageStatus.COMPLETED
     task.stages[Stage.REVIEW].output = {
         "approved": True, "issues": ["a lingering blocker"],
-        "non_blocking": [{"title": "polish", "detail": "d"}],
+        "non_blocking": [{"title": "polish", "detail": "d", "disposition": "file"}],
     }
 
     note = render_completion_note(
@@ -686,6 +696,16 @@ def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
 def test_review_schema_accepts_non_blocking() -> None:
     schema = resolve_stage_schema("review")
     assert "non_blocking" in schema["properties"]
+    non_blocking_schema = schema["properties"]["non_blocking"]
+    assert "Only an explicit `file`" in non_blocking_schema["description"]
+    disposition_schema = non_blocking_schema["items"]["properties"]["disposition"]
+    assert "absent disposition is noted, not filed" in disposition_schema["description"]
+    improvement_schema = schema["properties"]["improvement"]
+    assert "only when it carries an explicit `file`" in improvement_schema["description"]
+    assert (
+        "absent disposition is noted, not filed"
+        in improvement_schema["properties"]["disposition"]["description"]
+    )
     validator = jsonschema.Draft202012Validator(schema)
 
     validator.validate({
@@ -707,7 +727,7 @@ def test_review_schema_accepts_non_blocking() -> None:
             {"title": "c", "disposition": "drop"},
         ],
     })
-    # ...a missing disposition still validates (backward-compatible default = file)...
+    # ...a missing disposition still validates (and degrades safely to note-only)...
     validator.validate({"approved": True, "issues": [], "non_blocking": [{"title": "d"}]})
     # ...and an out-of-enum disposition is rejected
     with pytest.raises(jsonschema.ValidationError):

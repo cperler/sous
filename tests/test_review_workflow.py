@@ -100,8 +100,7 @@ def test_confirmed_critical_finding_rejects() -> None:
 def test_all_refuted_approves_but_files_the_refutations() -> None:
     """An adversary killing a finding must not silently erase it: the review approves,
     and every refuted finding survives in non_blocking with the verifier's reasoning and
-    NO disposition (so evidence-out still files it — the false-negative loop stays open
-    to a human)."""
+    an explicit file disposition so the false-negative loop stays open to a human."""
     review, notices, _ = synthesize(_panel(
         {"find:code": {"findings": [CRITICAL]}, "find:spec": {"findings": [IMPORTANT]}},
         [_verdict(CRITICAL, "refuted", "the guard is three lines up"),
@@ -113,7 +112,7 @@ def test_all_refuted_approves_but_files_the_refutations() -> None:
     assert titles == ["refuted: breaks the invariant", "refuted: drops the error path"]
     assert "the guard is three lines up" in review["non_blocking"][0]["detail"]
     assert "breaks the invariant" in review["non_blocking"][0]["detail"]  # the finding too
-    assert all("disposition" not in n for n in review["non_blocking"])
+    assert all(n["disposition"] == "file" for n in review["non_blocking"])
     assert notices == ()
 
 
@@ -223,7 +222,8 @@ def test_suggestions_are_non_blocking_and_approve() -> None:
     assert review["approved"] is True
     assert review["issues"] == []
     assert review["non_blocking"] == [
-        {"title": "rename the helper", "detail": "suggestion — c.py — rename the helper"}
+        {"title": "rename the helper", "detail": "suggestion — c.py — rename the helper",
+         "disposition": "file"}
     ]
     assert notices == ()
 
@@ -401,7 +401,7 @@ def test_synthesized_rejection_records_identically_to_a_hand_written_review(
 
 
 def test_synthesized_approval_records_identically_and_completes(tmp_path, project) -> None:
-    panel = _panel({"find:code": {"findings": [CRITICAL]},
+    panel = _panel({"find:code": {"findings": [CRITICAL, SUGGESTION]},
                     "find:tests": {"findings": [], "tests_meaningful": True}},
                    [_verdict(CRITICAL, "refuted", "the guard is three lines up")])
     folded, _, _ = synthesize(panel)
@@ -420,9 +420,11 @@ def test_synthesized_approval_records_identically_and_completes(tmp_path, projec
     )
     assert out_a["outcome"] == out_b["outcome"] == "task_completed"
     assert eng_a.store.load_task("r1", "t1").state is TaskState.COMPLETED
-    # the refuted finding still reached evidence-out as a follow-up (never erased)
+    # Engine-authored refuted and advisory entries still reach evidence-out after filing
+    # became opt-in because the fold explicitly stamps both as `file`.
     filed = [f["title"] for f in project.task_source.followups]
     assert any(t.startswith("refuted: breaks the invariant") for t in filed)
+    assert "rename the helper" in filed
 
 
 def test_synthesis_notices_land_in_the_event_stream(tmp_path, project) -> None:
