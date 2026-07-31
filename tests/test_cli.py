@@ -279,6 +279,21 @@ def test_cli_enqueue_and_run_queue(tmp_path, capsys) -> None:
         assert status["lane_audit"]["total_calls"] == len(rows)
 
 
+def test_cli_run_queue_releases_a_stale_head_claim(tmp_path, capsys) -> None:
+    from orchestrator.queue_file import QueueFile
+
+    queue = tmp_path / "queue.json"
+    _run(capsys, "enqueue", "--queue-file", str(queue), "--tasks", "#42")
+    stale = QueueFile(queue).claim_head("retired-cron", "queue-stale")["claim"]
+
+    result = _run(
+        capsys, "run-queue", "--queue-file", str(queue), "--release-claim"
+    )
+
+    assert result == {"ok": True, "released": stale}
+    assert "claim" not in QueueFile(queue).peek_head()
+
+
 # --- #94: `dashboard --serve` wires the read-only web skin (no blocking serve_forever) ---
 
 def test_cli_dashboard_serve_wires_web_dashboard(tmp_path, capsys, monkeypatch) -> None:

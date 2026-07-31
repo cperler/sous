@@ -388,7 +388,14 @@ def main(argv: list[str] | None = None) -> int:
     rq.add_argument("--owner", default="default",
                     help="stable consumer identity for the claim protocol (#279): a "
                          "restarted consumer with the same owner resumes its own stale "
-                         "claims; a head claimed by a different owner is refused")
+                         "claims. Each concurrent consumer must use a distinct owner; "
+                         "sharing one would otherwise double-drive a run (guarded on "
+                         "this host by a process-lifetime lock)")
+    rq.add_argument("--release-claim", action="store_true",
+                    help="admin recovery: release the head claim without draining the "
+                         "queue; refuses a provably live local owner")
+    rq.add_argument("--force", action="store_true",
+                    help="with --release-claim, override the live-owner refusal")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
     sl = sub.add_parser("statusline",
                         help="one-line 5h/7d utilization for the Claude Code status bar "
@@ -997,6 +1004,18 @@ def main(argv: list[str] | None = None) -> int:
         from .scheduler import AnyRunner
         from .status_store import StatusStore
 
+        queue = QueueFile(args.queue_file)
+        if args.force and not args.release_claim:
+            p.error("--force requires --release-claim")
+        if args.release_claim:
+            try:
+                released = queue.release_head_claim(force=args.force)
+            except QueueError as exc:
+                _emit({"ok": False, "error": str(exc)})
+                return 1
+            _emit({"ok": True, "released": released})
+            return 0
+
         if not args.root or not args.project:
             p.error("--root and --project are required for run-queue")
         from .usage_probe import resolve_util
@@ -1033,7 +1052,7 @@ def main(argv: list[str] | None = None) -> int:
 
         try:
             summary = drive_queue(
-                QueueFile(args.queue_file), _queue_engine, owner=args.owner,
+                queue, _queue_engine, owner=args.owner,
                 lane=ExecutionLane(args.lane), util_pct=util_pct,
                 util_provider=util_provider,
                 sleeper=time.sleep if args.wait else None,

@@ -11,26 +11,28 @@ Two halves live here:
 
 * ``QueueFile`` — a thin, project-agnostic abstraction over the queue JSON. Every
   mutation (``append`` at the tail, the consumer's ``claim_head`` / ``complete_head`` /
-  ``unclaim_head``) is a read-modify-write of the whole array, so each is guarded by an
-  exclusive advisory lock (``fcntl.flock``, mkdir-spin fallback) and finished with an
-  atomic temp-file + ``os.replace``. The lock is what makes concurrent producers safe:
+  ``unclaim_head`` / ``release_head_claim``) is a read-modify-write of the whole array,
+  so each is guarded by an exclusive advisory lock (``fcntl.flock``, mkdir-spin fallback)
+  and finished with an atomic temp-file + ``os.replace``. The lock is what makes
+  concurrent producers safe:
   §1.8's bare append assumed a single enqueuer, but two parallel cron ``--enqueue``
   invocations would otherwise both read the old array and one entry would be lost — the
   lock serializes them instead. Malformed content raises the typed ``QueueError``.
 * ``drive_queue`` — the unattended loop, built on a CLAIM-IN-PLACE protocol (#279): the
   head entry is never popped before the work is durably done. The consumer stamps the
-  head with ``claim = {run_id, owner, claimed_at}`` in one atomic write — the entry STAYS
-  in the queue, so no kill window (SIGKILL, power loss) can ever remove the only durable
-  representation of the batch. The claim names the derived run id BEFORE any run state
-  exists, so a restarted consumer always knows which run a claimed entry became: a head
-  claimed by this ``owner`` is adopted (its recorded ``claim.run_id`` is resumed, not
-  re-derived), a head claimed by a DIFFERENT owner raises ``QueueError`` (two-consumer
-  exclusion). Ingestion then creates-or-reuses that run and adds each task in listed
-  order, ``Scheduler.run`` drives it to terminal, and only THEN is the entry removed
-  (``complete_head``, which verifies the claim still matches). On an ingest failure the
-  claim is stripped in place (``unclaim_head``) so the same head is retried next launch —
-  nothing is silently dropped. Between batches it idle-waits, polling every
-  ``poll_interval_s`` up to ``idle_timeout_s`` before exiting.
+  head with ``claim = {run_id, owner, claimed_at, host, pid}`` in one atomic write — the
+  entry STAYS in the queue, so no kill window (SIGKILL, power loss) can ever remove the
+  only durable representation of the batch. A process-lifetime, per-owner ``flock`` is
+  held for the whole drain: a restarted owner adopts its recorded ``claim.run_id``, while
+  a second live process sharing that owner is refused instead of double-driving it. A
+  head claimed by a DIFFERENT owner also raises ``QueueError``; an operator can recover a
+  permanently abandoned claim explicitly with ``run-queue --release-claim`` (live local
+  owners are refused unless forced). Ingestion then creates-or-reuses that run and adds
+  each task in listed order, ``Scheduler.run`` drives it to terminal, and only THEN is
+  the entry removed (``complete_head``, which verifies the claim still matches). On an
+  ingest failure the claim is stripped in place (``unclaim_head``) so the same head is
+  retried next launch — nothing is silently dropped. Between batches it idle-waits,
+  polling every ``poll_interval_s`` up to ``idle_timeout_s`` before exiting.
 
 The engine is never touched directly for model work — ``drive_queue`` only calls the same
 public ``create_or_reuse_run`` / ``add_task`` / ``Scheduler.run`` surface a supervisor
@@ -43,9 +45,12 @@ cost ledger, or stage-log tree.
 from __future__ import annotations
 
 import contextlib
+import errno
+import hashlib
 import json
 import os
 import re
+import socket
 import tempfile
 import time
 from collections.abc import Callable, Iterator
@@ -108,7 +113,8 @@ def _validate_entry(entry: Any, where: str) -> dict:
     claim = entry.get("claim")
     if claim is not None:
         # An in-place consumer claim (#279): {run_id, owner, claimed_at}, all non-empty
-        # strings. Optional — an unclaimed entry simply has no `claim` key.
+        # strings. New claims also carry host/pid for live-owner classification; both are
+        # optional so queue files written by older versions remain valid.
         if not isinstance(claim, dict):
             raise QueueError(
                 f"{where}: `claim` must be a JSON object or absent, "
@@ -118,6 +124,14 @@ def _validate_entry(entry: Any, where: str) -> dict:
             value = claim.get(field)
             if not isinstance(value, str) or not value.strip():
                 raise QueueError(f"{where}: `claim.{field}` must be a non-empty string")
+        host = claim.get("host")
+        if host is not None and (not isinstance(host, str) or not host.strip()):
+            raise QueueError(f"{where}: `claim.host` must be a non-empty string when present")
+        pid = claim.get("pid")
+        if pid is not None and (
+            not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+        ):
+            raise QueueError(f"{where}: `claim.pid` must be a positive integer when present")
     return entry
 
 
@@ -134,11 +148,13 @@ class QueueFile:
 
     The consumer side is a CLAIM-IN-PLACE protocol (#279), not pop-then-requeue: an entry
     is only ever removed AFTER its derived run reached terminal. ``claim_head`` stamps the
-    head with ``{run_id, owner, claimed_at}`` in one atomic write (the entry stays queued —
-    no kill window between dequeue and durable run state can lose the batch),
+    head with ``{run_id, owner, claimed_at, host, pid}`` in one atomic write (the entry
+    stays queued — no kill window between dequeue and durable run state can lose the batch),
     ``complete_head`` pops the head only when its claim matches the caller, and
-    ``unclaim_head`` strips a matching claim so a failed ingest is retried. All three take
-    the same lock so they never race a producer either.
+    ``unclaim_head`` strips a matching claim so a failed ingest is retried, and
+    ``release_head_claim`` provides explicit recovery when an owner is retired. All four
+    take the same lock so they never race a producer either. A separate process-lifetime
+    owner lock, held by ``drive_queue``, distinguishes a crashed owner from a live one.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -239,10 +255,12 @@ class QueueFile:
             raise QueueError(f"cannot {verb}: `run_id` must be a non-empty string")
 
     def claim_head(self, owner: str, run_id: str) -> dict:
-        """Stamp the head entry with ``claim = {run_id, owner, claimed_at}`` in ONE atomic
-        write and return the claimed entry. The entry STAYS in the queue — claiming is
-        in-place, so at no instant is the batch's only durable representation gone (#279).
-        Idempotent for the same ``(owner, run_id)`` (a consumer that crashed between claim
+        """Stamp the head with ``claim = {run_id, owner, claimed_at, host, pid}`` in ONE
+        atomic write and return it. The entry STAYS in the queue — claiming is in-place,
+        so at no instant is the batch's only durable representation gone (#279).
+        New claims include the current host and pid so an administrator can distinguish a
+        locally live owner from an owner that is no longer provably running. Idempotent
+        for the same ``(owner, run_id)`` (a consumer that crashed between claim
         and ingest re-claims its own head); a head already claimed by anyone else raises
         ``QueueError`` and the queue is untouched. An empty queue also raises — the caller
         peeked a head, so a vanished one is a broken single-consumer assumption."""
@@ -258,11 +276,18 @@ class QueueFile:
                     return head  # already ours — idempotent re-claim after a crash
                 raise QueueError(
                     f"cannot claim_head: head is already claimed by owner "
-                    f"{claim['owner']!r} for run {claim['run_id']!r}"
+                    f"{claim['owner']!r} for run {claim['run_id']!r}; recover it with "
+                    f"`run-queue --release-claim`"
                 )
             head = {
                 **head,
-                "claim": {"run_id": run_id, "owner": owner, "claimed_at": _utc_now_iso()},
+                "claim": {
+                    "run_id": run_id,
+                    "owner": owner,
+                    "claimed_at": _utc_now_iso(),
+                    "host": socket.gethostname(),
+                    "pid": os.getpid(),
+                },
             }
             self._write([head, *entries[1:]])
         return head
@@ -291,6 +316,65 @@ class QueueFile:
             self._write([head, *self.read()[1:]])
         return head
 
+    def release_head_claim(
+        self, *, expect_owner: str | None = None, force: bool = False
+    ) -> dict:
+        """Explicitly strip and return the head claim so another owner may proceed.
+
+        When ``expect_owner`` is supplied, refuse if the head belongs to a different
+        owner. Unless ``force`` is true, a claim made on this host is refused while that
+        owner's process-lifetime consumer lock is held. Old claims without host metadata,
+        claims from other hosts, and claims whose local lock is free are not provably live
+        and may be released. The queue entry itself remains at the head.
+        """
+        if expect_owner is not None and (
+            not isinstance(expect_owner, str) or not expect_owner.strip()
+        ):
+            raise QueueError(
+                "cannot release_head_claim: `expect_owner` must be a non-empty string"
+            )
+        with self._with_lock():
+            entries = self.read()
+            if not entries:
+                raise QueueError("cannot release_head_claim: queue is empty")
+            head = entries[0]
+            claim = head.get("claim")
+            if claim is None:
+                raise QueueError("cannot release_head_claim: head entry is not claimed")
+            if expect_owner is not None and claim["owner"] != expect_owner:
+                raise QueueError(
+                    f"cannot release_head_claim: head is claimed by owner "
+                    f"{claim['owner']!r}, not expected owner {expect_owner!r}"
+                )
+            if not force and self._claim_owner_is_live(claim):
+                raise QueueError(
+                    f"cannot release_head_claim: owner {claim['owner']!r} is live on "
+                    f"host {claim['host']!r}; stop it first or pass --force"
+                )
+            released = dict(claim)
+            unclaimed = {key: value for key, value in head.items() if key != "claim"}
+            self._write([unclaimed, *entries[1:]])
+        return released
+
+    def _claim_owner_is_live(self, claim: dict) -> bool:
+        """Whether ``claim`` is provably held by a live consumer on this host."""
+        if not _HAVE_FCNTL or claim.get("host") != socket.gethostname():
+            return False
+        lock_path = _consumer_lock_path(self.path.parent, claim["owner"])
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "a")  # noqa: SIM115 - lock lifetime is this probe
+        try:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    return True
+                raise
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            return False
+        finally:
+            fh.close()
+
     def _matching_head(self, owner: str, run_id: str, verb: str) -> dict:
         """The head entry, verified (under the caller's lock) to be claimed by exactly
         ``(owner, run_id)``. Raises ``QueueError`` naming what actually holds it."""
@@ -306,6 +390,51 @@ class QueueFile:
                 f"{claim['run_id']!r}) does not match (owner {owner!r}, run {run_id!r})"
             )
         return entries[0]
+
+
+def _consumer_lock_path(queue_dir: Path, owner: str) -> Path:
+    """Return a safe, stable lock path for ``owner`` without aliasing distinct names."""
+    sanitized = re.sub(r"[^0-9A-Za-z_.-]+", "-", owner).strip("-.") or "owner"
+    if sanitized != owner or len(sanitized) > 120:
+        digest = hashlib.sha256(owner.encode("utf-8")).hexdigest()[:12]
+        sanitized = f"{sanitized[:100]}-{digest}"
+    return queue_dir / f"consumer-{sanitized}.lock"
+
+
+@contextmanager
+def consumer_guard(queue: QueueFile, owner: str) -> Iterator[str]:
+    """Hold this queue directory's process-lifetime lock for ``owner``.
+
+    The lock is non-blocking: a second live consumer with the same owner is rejected
+    instead of adopting and double-driving the first consumer's claim. Kernel release on
+    process exit preserves crash/restart adoption. On platforms without ``fcntl`` the
+    context yields ``"unavailable"`` so callers report the missing protection explicitly.
+    """
+    if not isinstance(owner, str) or not owner.strip():
+        raise QueueError("consumer_guard: `owner` must be a non-empty string")
+    if not _HAVE_FCNTL:  # pragma: no cover - platform dependent
+        yield "unavailable"
+        return
+
+    lock_path = _consumer_lock_path(queue.path.parent, owner)
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(lock_path, "a")  # noqa: SIM115 - held across the yield
+    try:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EACCES, errno.EAGAIN):
+                raise QueueError(
+                    f"consumer owner {owner!r} is already live; give each concurrent "
+                    f"consumer a distinct `--owner`"
+                ) from exc
+            raise
+        try:
+            yield "held"
+        finally:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    finally:
+        fh.close()
 
 
 def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
@@ -364,7 +493,49 @@ def drive_queue(
     poll_interval_s: int = 15,
     run_id_prefix: str = "queue",
 ) -> dict:
-    """Drain the queue one batch at a time, driving each to terminal via ``Scheduler.run``.
+    """Drain the queue under a process-lifetime owner guard.
+
+    A non-blocking exclusive ``consumer-<owner>.lock`` is held for the complete drain,
+    including idle waits. This prevents overlapping live invocations sharing an owner
+    from adopting and concurrently driving the same claim, while a process death releases
+    the kernel lock so a restart with that owner can resume. The returned summary includes
+    ``consumer_guard`` (``"held"`` or ``"unavailable"``).
+    """
+    if not isinstance(owner, str) or not owner.strip():
+        raise QueueError("drive_queue: `owner` must be a non-empty string")
+    with consumer_guard(queue, owner) as guard_state:
+        return _drive_queue_held(
+            queue,
+            engine_factory,
+            owner=owner,
+            consumer_guard_state=guard_state,
+            lane=lane,
+            util_pct=util_pct,
+            util_provider=util_provider,
+            sleeper=sleeper,
+            max_concurrent=max_concurrent,
+            idle_timeout_s=idle_timeout_s,
+            poll_interval_s=poll_interval_s,
+            run_id_prefix=run_id_prefix,
+        )
+
+
+def _drive_queue_held(
+    queue: QueueFile,
+    engine_factory: EngineFactory,
+    *,
+    owner: str,
+    consumer_guard_state: str,
+    lane: ExecutionLane,
+    util_pct: float,
+    util_provider: Callable[[], float] | None,
+    sleeper: Callable[[int], None] | None,
+    max_concurrent: int,
+    idle_timeout_s: int,
+    poll_interval_s: int,
+    run_id_prefix: str,
+) -> dict:
+    """Implementation of ``drive_queue`` while its consumer guard is held.
 
     The unattended (cron) loop, restart-safe at every boundary (#279):
 
@@ -389,13 +560,13 @@ def drive_queue(
        the run rather than losing it.
 
     ``owner`` is a STABLE consumer identity (not a pid): a SIGKILLed consumer relaunched
-    with the same owner id reclaims and resumes its own stale claims.
+    with the same owner id reclaims and resumes its own stale claims. A second LIVE
+    consumer using that owner is rejected by the outer process-lifetime guard.
 
     Returns a structured summary: ``{batches_processed, runs_created, runs[...],
-    idle_timed_out}`` where each ``runs`` row is ``{run_id, tasks, added, final_state}``.
+    idle_timed_out, consumer_guard}`` where each ``runs`` row is
+    ``{run_id, tasks, added, final_state}``.
     """
-    if not isinstance(owner, str) or not owner.strip():
-        raise QueueError("drive_queue: `owner` must be a non-empty string")
     runs: list[dict] = []
     created = 0
     idle_waited = 0
@@ -428,7 +599,8 @@ def drive_queue(
         else:
             raise QueueError(
                 f"queue head is claimed by another consumer (owner {claim['owner']!r}, "
-                f"run {claim['run_id']!r}); refusing to process it"
+                f"run {claim['run_id']!r}); refusing to process it. If that owner is "
+                f"gone, recover the entry with `run-queue --release-claim`"
             )
 
         # #281: a FRESH engine rooted at this run's own store — constructed only after
@@ -470,4 +642,5 @@ def drive_queue(
         "runs_created": created,
         "runs": runs,
         "idle_timed_out": idle_timed_out,
+        "consumer_guard": consumer_guard_state,
     }

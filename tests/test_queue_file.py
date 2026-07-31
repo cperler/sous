@@ -29,6 +29,7 @@ from orchestrator.queue_file import (
     QueueError,
     QueueFile,
     _ingest_batch,
+    consumer_guard,
     drive_queue,
     make_entry,
     run_id_for,
@@ -95,6 +96,35 @@ def test_claim_head_refuses_foreign_claim(tmp_path) -> None:
     with pytest.raises(QueueError, match="already claimed"):
         qf.claim_head("consumer-1", "run-b")
     assert qf.peek_head()["claim"]["owner"] == "consumer-1"  # untouched
+
+
+def test_release_dead_owner_claim_allows_another_owner_to_claim(tmp_path) -> None:
+    qf = QueueFile(tmp_path / "queue.json")
+    qf.append(make_entry(["a"]))
+    stale = qf.claim_head("retired-cron", "run-a")["claim"]
+
+    released = qf.release_head_claim()
+
+    assert released == stale
+    assert "claim" not in qf.peek_head()
+    assert qf.claim_head("replacement-cron", "run-b")["claim"]["owner"] == (
+        "replacement-cron"
+    )
+
+
+@pytest.mark.skipif(not _HAVE_FCNTL, reason="consumer liveness guard requires fcntl")
+def test_release_refuses_live_owner_unless_forced(tmp_path) -> None:
+    qf = QueueFile(tmp_path / "queue.json")
+    qf.append(make_entry(["a"]))
+
+    with consumer_guard(qf, "cron"):
+        claim = qf.claim_head("cron", "run-a")["claim"]
+        with pytest.raises(QueueError, match="owner 'cron' is live"):
+            qf.release_head_claim()
+        assert qf.peek_head()["claim"] == claim
+
+        assert qf.release_head_claim(force=True) == claim
+        assert "claim" not in qf.peek_head()
 
 
 def test_complete_and_unclaim_require_a_matching_claim(tmp_path) -> None:
@@ -242,6 +272,10 @@ def test_lock_sentinel_is_not_truncated_on_acquire(tmp_path) -> None:
         '[{"tasks": ["a"], "enqueued_at": "t", "claim": {"run_id": "r"}}]',  # claim missing owner
         '[{"tasks": ["a"], "enqueued_at": "t", '
         '"claim": {"run_id": "r", "owner": "", "claimed_at": "t"}}]',  # blank claim owner
+        '[{"tasks": ["a"], "enqueued_at": "t", '
+        '"claim": {"run_id": "r", "owner": "o", "claimed_at": "t", "host": ""}}]',
+        '[{"tasks": ["a"], "enqueued_at": "t", '
+        '"claim": {"run_id": "r", "owner": "o", "claimed_at": "t", "pid": 0}}]',
     ],
 )
 def test_malformed_queue_raises_queue_error(tmp_path, content) -> None:
@@ -388,6 +422,21 @@ def test_restart_after_claim_resumes_the_claimed_run(tmp_path) -> None:
     assert qf.read() == []
 
 
+@pytest.mark.skipif(not _HAVE_FCNTL, reason="consumer liveness guard requires fcntl")
+def test_second_live_consumer_with_same_owner_is_refused(tmp_path) -> None:
+    qf = QueueFile(tmp_path / "queue.json")
+    qf.append(make_entry(["t1"]))
+
+    # Two independently opened fds contend even in one process, so this models an
+    # overlapping invocation without a subprocess or a scheduler race.
+    with consumer_guard(qf, "cron"), pytest.raises(
+        QueueError, match="owner 'cron' is already live"
+    ):
+        drive_queue(qf, _never_called_factory, owner="cron")
+
+    assert "claim" not in qf.peek_head()
+
+
 def test_restart_after_partial_ingest_converges(tmp_path) -> None:
     # Boundary (b): death after the run exists and tasks were added, before the scheduler
     # started. Both representations exist (claimed entry + run doc); the restart re-ingests
@@ -459,6 +508,7 @@ def test_relaunch_after_complete_is_a_noop(tmp_path) -> None:
     second = drive_queue(qf, _never_called_factory, owner="cron")
     assert second == {
         "batches_processed": 0, "runs_created": 0, "runs": [], "idle_timed_out": False,
+        "consumer_guard": "held",
     }
 
 
@@ -584,7 +634,16 @@ def test_drive_queue_without_sleeper_is_single_pass(tmp_path) -> None:
     summary = drive_queue(qf, _never_called_factory)
     assert summary == {
         "batches_processed": 0, "runs_created": 0, "runs": [], "idle_timed_out": False,
+        "consumer_guard": "held",
     }
+
+
+def test_drive_queue_reports_when_consumer_guard_is_unavailable(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setattr("orchestrator.queue_file._HAVE_FCNTL", False)
+    summary = drive_queue(QueueFile(tmp_path / "queue.json"), _never_called_factory)
+    assert summary["consumer_guard"] == "unavailable"
 
 
 def test_drive_queue_rejects_blank_owner(tmp_path) -> None:
