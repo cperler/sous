@@ -90,6 +90,11 @@ def _age_s(ts: str, *, now: datetime | None = None) -> float | None:
 
 
 def driver_log_path(root: Path) -> Path:
+    """The path a driver log lives at for a run rooted at ``root``.
+
+    Shared by ``DriverLog`` and every reader so there is exactly one place that decides
+    where ``driver.jsonl`` sits alongside ``events.jsonl``.
+    """
     return Path(root) / DRIVER_LOG_NAME
 
 
@@ -285,6 +290,7 @@ def read_records(root: Path, *, run_id: str | None = None) -> list[dict]:
 
 
 def last_record(root: Path, *, run_id: str | None = None) -> dict | None:
+    """The most recent parseable record (any type), or None if the log is empty/absent."""
     records = read_records(root, run_id=run_id)
     return records[-1] if records else None
 
