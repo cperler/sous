@@ -172,6 +172,37 @@ def test_rejected_review_combines_fixup_with_its_existing_cycle(tmp_path, projec
     assert event["reason"] == "combined with blocking-review fix cycle"
 
 
+def test_rejected_review_holds_fixup_when_combined_cycle_cannot_redeliver(
+    tmp_path, project
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1", pipeline=[Stage.INTAKE, Stage.IMPLEMENT, Stage.REVIEW])
+    rejected = {**REJECTION, "improvement": FIXUP}
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    review = eng.next_work("r1", "t1")
+    assert review.stage is Stage.REVIEW
+
+    out = eng.record("r1", make_result(review, structured_output=rejected))
+
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1
+    assert task.review_fixups == []
+    held = next(e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held")
+    assert "no IMPLEMENT→DELIVER→REVIEW tail" in held["reason"]
+
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    final_review = eng.next_work("r1", "t1")
+    assert final_review.stage is Stage.REVIEW
+    out = eng.record(
+        "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
+    )
+    assert out["outcome"] == "task_completed"
+    assert "applied in place, not filed" not in project.task_source.notes[0]["body"]
+
+
 def test_repeated_fixup_parks_instead_of_looping(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")

@@ -2016,12 +2016,19 @@ class Engine:
                         outcome = self._apply_review_rejection(t, review_verdict)
                         if review_fixup is not None:
                             if outcome == "review_rejected_fix_cycle":
-                                fresh = self._remember_review_fixup(t, review_fixup)
-                                review_fixup_action = {
-                                    "disposition": "scheduled",
-                                    "reason": "combined with blocking-review fix cycle",
-                                    "already_scheduled": not fresh,
-                                }
+                                reason = self._review_fixup_tail_ineligibility(t)
+                                if reason is not None:
+                                    review_fixup_action = {
+                                        "disposition": "held",
+                                        "reason": reason,
+                                    }
+                                else:
+                                    fresh = self._remember_review_fixup(t, review_fixup)
+                                    review_fixup_action = {
+                                        "disposition": "scheduled",
+                                        "reason": "combined with blocking-review fix cycle",
+                                        "already_scheduled": not fresh,
+                                    }
                             else:
                                 review_fixup_action = {
                                     "disposition": "held",
@@ -2610,13 +2617,8 @@ class Engine:
         if any(saved.fingerprint == fixup.fingerprint for saved in task.review_fixups):
             reason = "same fixup was requested again after its re-implement pass"
             return self._hold_review_fixup(task, fixup, reason), reason
-        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
-        if not all(stage in task.pipeline for stage in required_tail):
-            reason = "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
-            return self._hold_review_fixup(task, fixup, reason), reason
-        positions = tuple(task.pipeline.index(stage) for stage in required_tail)
-        if positions != tuple(sorted(positions)):
-            reason = "task pipeline does not order IMPLEMENT→DELIVER→REVIEW for a fixup"
+        reason = self._review_fixup_tail_ineligibility(task)
+        if reason is not None:
             return self._hold_review_fixup(task, fixup, reason), reason
         if task.review_cycles >= self.max_review_cycles:
             reason = f"review rework budget exhausted ({task.review_cycles} cycles)"
@@ -2634,6 +2636,17 @@ class Engine:
         task.review_cycles += 1
         task.state = TaskState.RETRYING
         return "review_fixup_cycle", "re-running implement through review in place"
+
+    @staticmethod
+    def _review_fixup_tail_ineligibility(task: Task) -> str | None:
+        """Explain why the pipeline cannot safely auto-apply a review fixup."""
+        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
+        if not all(stage in task.pipeline for stage in required_tail):
+            return "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
+        positions = tuple(task.pipeline.index(stage) for stage in required_tail)
+        if positions != tuple(sorted(positions)):
+            return "task pipeline does not order IMPLEMENT→DELIVER→REVIEW for a fixup"
+        return None
 
     @staticmethod
     def _hold_review_fixup(task: Task, fixup: ReviewFixup, reason: str) -> str:
