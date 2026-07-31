@@ -190,6 +190,10 @@ cross-run `learnings-kb.jsonl` share one parent:
   runs/<run>/
     status-<run>.json, status-<run>-<task>.json   run + per-task documents
     events.jsonl                                   append-only audit sidecar
+    driver.jsonl                                   the DRIVER's own telemetry (#323):
+                                                   start (pid/ppid/argv/settings),
+                                                   a heartbeat per tick + per sleep
+                                                   slice, and an exit record
     stage-costs.jsonl                              per-call cost ledger rows
     cost-summary.md, cost-report.md                rendered rollups
     stages/<task>/NN-<stage>.{json,md}             per-stage record + prose
@@ -205,6 +209,15 @@ cross-run `learnings-kb.jsonl` share one parent:
   all runs, "what needs a human" lifted to an attention band), `cost-report`, `retrospective`,
   `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
   utilization for the Claude Code status bar, off the same usage cache).
+- **Driver telemetry** (`orchestrator/driver_log.py`, #323): `Scheduler.run` — the
+  long-lived foreground process that owns a run — writes `driver.jsonl` and mirrors it to
+  stderr. A heartbeat precedes each tick's dispatch and repeats every
+  `--heartbeat-interval` seconds while sleeping (naming the wait reason and the
+  utilization that gated it), so a driver waiting out a capacity stall is distinguishable
+  from a wedged one; SIGTERM/SIGINT/SIGHUP are trapped for a last-gasp exit record and
+  then re-raised unchanged. `status`'s `driver` block merges the #313 pid claim with the
+  log's last heartbeat (`alive`, `heartbeat_age_s`, `last_state`), so a dead driver does
+  not present identically to a working one.
 - **Seams** (`adapters/project/base.py`, all duck-typed/best-effort): `notify` /
   `emit_notification` for stall + transition alerts (`alerting.py`), `publish_progress` /
   `publish_note` to post progress to the task source, `file_followup` to file follow-up

@@ -100,7 +100,14 @@ are all answerable from a finished `runs/<run>/` (`events_audit` reports the con
 block; a dispatch predating #314 counts as `unknown`, never a false 0%).
 
 The driver owns the run for its whole duration: Ctrl-C kills the `claude -p` children via the
-process group. Monitor from a second terminal. **Re-invoking `run-headless` after a kill now
+process group. Monitor from a second terminal. **The driver is no longer silent (#323):** it
+writes `runs/<run>/driver.jsonl` (start record with pid/ppid/argv/resolved settings, a
+heartbeat per tick and per sleep slice, an exit record for every catchable termination
+including a trapped SIGTERM/SIGINT/SIGHUP) and mirrors each line to stderr, while stdout
+stays one JSON status document. `status`'s `driver` block merges the pid claim with the last
+heartbeat (`alive`, `heartbeat_age_s`, `last_state`), so "sleeping out a capacity stall" and
+"died 40 minutes ago" no longer look identical — and after an uncatchable SIGKILL the last
+heartbeat still bounds the time of death and names what the driver was doing. **Re-invoking `run-headless` after a kill now
 resumes it (#313):** `Scheduler.run` stamps a driver claim (host/pid) on the Run doc and, at
 the next startup, reclaims the leases that claim's now-dead process left — clearing
 `pending_work_item_id` while leaving the stage `RUNNING`, so `next_work` re-dispatches the

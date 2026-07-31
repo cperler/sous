@@ -24,15 +24,31 @@ constructing a fresh Scheduler on the same run directory continues where a kille
 batch left off, INCLUDING a kill that caught dispatches mid-flight: ``run()`` claims
 the run's driver record and reclaims the leases its own dead driver left behind
 before the first tick (#313). See ``Scheduler.run`` for the limits of that guarantee.
+
+The loop is also the run's DRIVER process, and it says so out loud: ``run()`` narrates
+itself into ``runs/<run>/driver.jsonl`` via ``driver_log`` (#323) — start, a heartbeat per
+tick and per sleep slice, and an exit record for every catchable termination — so a driver
+that dies can be dated and a driver that is merely sleeping can be told apart from one that
+is wedged. ``tick()`` (the per-tick supervisor entry point) writes nothing: it is one call
+by a caller who already knows what it asked for.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from typing import Protocol, runtime_checkable
 
 from .alerting import NOTIFY_RUN_BLOCKED, stale_notifications
+from .driver_log import (
+    DEFAULT_HEARTBEAT_INTERVAL_S,
+    STATE_DISPATCHING,
+    STATE_PLANNING,
+    STATE_WAITING_CAPACITY,
+    STATE_WAITING_COOLDOWN,
+    DriverLog,
+)
 from .engine import Engine
 from .errors import CapacityExhausted, ContractError
 from .schemas.enums import TERMINAL_TASK_STATES
@@ -126,10 +142,20 @@ EXIT_MAX_TICKS = "max_ticks"  # the loop bound was hit — a real run should nev
 
 class Scheduler:
     def __init__(
-        self, engine: Engine, *, max_concurrent: int = 3, batch_failure_threshold: int = 3
+        self,
+        engine: Engine,
+        *,
+        max_concurrent: int = 3,
+        batch_failure_threshold: int = 3,
+        driver_echo: Callable[[str], None] | None = None,
     ) -> None:
         self.engine = engine
         self.max_concurrent = max_concurrent
+        # #323: where to MIRROR the durable driver log (``runs/<run>/driver.jsonl``) as it
+        # is written — `run-headless` passes a stderr writer so a watching terminal is not
+        # silent either. The file is the record; this is only an echo, so a driver whose
+        # terminal is gone loses nothing.
+        self.driver_echo = driver_echo
         # Batch-wide circuit breaker (#58, ports batch-orchestrator.sh:784-811): after
         # this many CONSECUTIVE task failures (no completion in between) the run is
         # PAUSED — a systemic cause (broken env, bad base branch) must not burn every
@@ -165,6 +191,18 @@ class Scheduler:
         finally:
             pool.close()
 
+    def _plan(self, run_id: str, util_pct: float) -> tuple[list[str], int]:
+        """What this pass COULD dispatch, and how many slots capacity allows.
+
+        Split out of ``_dispatch`` so the driver heartbeat can report both BEFORE the
+        dispatch blocks (#323) without probing the engine a second time — a driver killed
+        mid-dispatch must leave a record of the pass it was in the middle of.
+        """
+        return (
+            self.dispatchable(run_id),
+            self.engine.capacity.dispatch_limit(util_pct, self.max_concurrent),
+        )
+
     def _dispatch(
         self,
         run_id: str,
@@ -172,6 +210,7 @@ class Scheduler:
         outstanding: dict[str, WorkItem],
         *,
         util_pct: float,
+        plan: tuple[list[str], int] | None = None,
     ) -> dict:
         """Fill the free concurrency slots with dependency-ready work, leases and all.
 
@@ -180,9 +219,11 @@ class Scheduler:
         CONCURRENT dispatches and mid-flight refill would otherwise silently exceed it.
         (``dispatchable`` already excludes leased tasks, so the in-flight ones are never
         re-selected — but they must still count against the cap.)
+
+        ``plan`` passes in an already-computed ``(ready, limit)`` — same values this would
+        derive, just not derived twice when the caller has already reported them.
         """
-        ready = self.dispatchable(run_id)
-        limit = self.engine.capacity.dispatch_limit(util_pct, self.max_concurrent)
+        ready, limit = plan if plan is not None else self._plan(run_id, util_pct)
         selected = ready[: max(0, limit - len(outstanding))]
 
         work: list[WorkItem] = []
@@ -250,6 +291,7 @@ class Scheduler:
         drain_wait_s: int = 300,
         stale_after_s: int = 1800,
         max_ticks: int = 10_000,
+        heartbeat_interval_s: int = DEFAULT_HEARTBEAT_INTERVAL_S,
     ) -> dict:
         """Loop until no task is dispatchable (all terminal or capacity-stalled).
 
@@ -280,12 +322,21 @@ class Scheduler:
         systemic cause fails fast instead of burning every task's retry budget. A
         paused run refuses to schedule until ``orchestrator unpause``.
 
+        Telemetry (#323): the whole loop writes to ``runs/<run>/driver.jsonl`` — a start
+        record with pid/ppid/argv and the RESOLVED settings, a heartbeat per tick BEFORE
+        the dispatch it is about to block on, a heartbeat every ``heartbeat_interval_s``
+        while sleeping (naming the reason and the utilization that gated it), and an exit
+        record for every catchable termination including a trapped SIGTERM/SIGINT/SIGHUP.
+        A SIGKILL leaves no exit record by definition, which is what the heartbeats are
+        for: the last one bounds the time of death and names the state.
+
         Returns the final engine status with an added ``scheduler`` block: why the loop
         stopped (``exit_reason``, one of the ``EXIT_*`` constants), what was reclaimed at
         startup, and any leases still outstanding.
         """
         consecutive_failures = 0
         stale_sent: set[str] = set()
+        log = DriverLog(self.engine.store.root, run_id, echo=self.driver_echo)
         # #5: reclaim any port blocks left behind by crashed/terminal runs before we start
         # dispatching, so this batch doesn't starve on ports a dead run never released.
         # Best-effort + opt-in (a no-op for projects without port needs).
@@ -296,14 +347,36 @@ class Scheduler:
         # that proves those leases are orphans.
         reclaim = self.engine.reclaim_orphaned_dispatches(run_id)
         self.engine.claim_run_driver(run_id)
+        log.start(
+            settings={
+                "max_concurrent": self.max_concurrent,
+                "batch_failure_threshold": self.batch_failure_threshold,
+                "drain_wait_s": drain_wait_s,
+                "stale_after_s": stale_after_s,
+                "max_ticks": max_ticks,
+                "heartbeat_interval_s": heartbeat_interval_s,
+                # "auto" = re-probed every tick; otherwise the fixed value this was launched
+                # with. `batch-headless-2` could not answer "was it gated by utilization?"
+                # precisely because neither the mode nor the value was ever recorded.
+                "util_mode": "auto" if util_provider is not None else "fixed",
+                "util_pct": util_pct,
+                "waits": sleeper is not None,
+            },
+            reclaim=reclaim,
+        )
         exit_reason = EXIT_MAX_TICKS
         # #318: ONE pool for the whole loop, and one ``outstanding`` map alongside it, so a
         # freed slot is refilled while its siblings are still running. With a list runner
         # the pool is the batch-shaped adapter and this degrades to the old behavior.
         pool = as_streaming(runner)
         outstanding: dict[str, WorkItem] = {}
+        # The SIGTERM/SIGINT/SIGHUP trap (#323) is armed for exactly as long as the loop
+        # runs. Entered through an ExitStack rather than a `with` block so the trap's
+        # lifetime is bound to the same try/finally that already owns the pool.
+        traps = ExitStack()
+        traps.enter_context(log.trap_signals())
         try:
-            for _ in range(max_ticks):
+            for tick in range(1, max_ticks + 1):
                 if self.engine.store.load_run(run_id).state.value == "paused":
                     exit_reason = EXIT_PAUSED
                     break  # human-gated: unpause first
@@ -312,12 +385,36 @@ class Scheduler:
                 # `watch` CLI feeds it the same way), so a re-ping is impossible until the
                 # task moves again and re-stalls.
                 stale_sent = self._alert_stale(run_id, stale_sent, stale_after_s)
-                if not self.dispatchable(run_id) and not outstanding:
+                # Probed once per tick and reported BEFORE anything blocks (#323): the
+                # utilization and the limit it produced are the two numbers that explain a
+                # driver that then sits still for an hour.
+                util = util_provider() if util_provider is not None else util_pct
+                ready, limit = self._plan(run_id, util)
+                # `dispatching` is claimed only when work is actually about to be handed to
+                # the lane — that is the state a mid-stage death must be readable as, so it
+                # must not be printed by a pass that was only ever going to wait or exit.
+                about_to_dispatch = bool(ready) and limit > len(outstanding)
+                log.heartbeat(
+                    tick=tick,
+                    state=STATE_DISPATCHING if about_to_dispatch else STATE_PLANNING,
+                    util_pct=util, dispatch_limit=limit,
+                    dispatchable=len(ready), in_flight=len(outstanding),
+                    # No promise: the next beat lands when the lane hands this stage back,
+                    # which is the stage's own duration. Quiet here is normal, so no reader
+                    # may call it stale (`watch --activity` covers a frozen stream).
+                    next_heartbeat_within_s=None,
+                )
+                if not ready and not outstanding:
                     # Nothing dispatchable and nothing of ours in flight — but a rate-limit
                     # cooldown is a wait, not an end.
                     wait = self._cooldown_wait(run_id)
                     if wait is not None and sleeper is not None:
-                        sleeper(wait)
+                        self._sleep(
+                            wait, sleeper, log, tick=tick, state=STATE_WAITING_COOLDOWN,
+                            interval_s=heartbeat_interval_s, util_pct=util,
+                            dispatch_limit=limit, dispatchable=len(ready),
+                            in_flight=len(outstanding), reason="rate-limit cooldown",
+                        )
                         continue
                     # #313: "nothing dispatchable" has TWO very different causes. If tasks
                     # are still holding dispatch leases we could not reclaim, this loop is
@@ -328,8 +425,8 @@ class Scheduler:
                         EXIT_BLOCKED_ORPHANED if self.engine.in_flight(run_id) else EXIT_DONE
                     )
                     break
-                util = util_provider() if util_provider is not None else util_pct
-                res = self._dispatch(run_id, pool, outstanding, util_pct=util)
+                res = self._dispatch(run_id, pool, outstanding, util_pct=util,
+                                     plan=(ready, limit))
                 outcomes = self._harvest(run_id, pool, outstanding) if outstanding else []
                 # CONSTRAINT (#53): only a genuine EXECUTION failure may advance the breaker.
                 # A human closing a task as infeasible (Engine.reject → CLOSED_INFEASIBLE) is
@@ -371,16 +468,71 @@ class Scheduler:
                     # harvesting a pass that only drains in-flight work is progress (the
                     # last stage of a run is exactly that pass), not a throttle.
                     if sleeper is not None:
-                        sleeper(drain_wait_s)
+                        self._sleep(
+                            drain_wait_s, sleeper, log, tick=tick,
+                            state=STATE_WAITING_CAPACITY, interval_s=heartbeat_interval_s,
+                            util_pct=util, dispatch_limit=limit, dispatchable=len(ready),
+                            in_flight=len(outstanding),
+                            reason="dispatch limit 0 at this utilization",
+                        )
                         continue
                     exit_reason = EXIT_CAPACITY
                     break  # caller retries later
             # Bank anything still in flight (a paused/breaker/capacity exit may leave work
             # out) so no finished stage is dropped on the way out.
             self._drain(run_id, pool, outstanding)
+        except BaseException as exc:
+            # Every catchable death gets a record (#323), including the ones nobody was
+            # watching for: an unhandled exception, and the KeyboardInterrupt a Ctrl-C
+            # unwinds with (whose signal handler has already written the more specific
+            # `signal:SIGINT` record — `exit` keeps the FIRST one).
+            log.exit(f"exception:{type(exc).__name__}", error=str(exc)[:500])
+            raise
         finally:
+            traps.close()
             pool.close()
+        log.exit(exit_reason, in_flight=self.engine.in_flight(run_id))
         return self._final_status(run_id, exit_reason, reclaim)
+
+    def _sleep(
+        self,
+        seconds: int,
+        sleeper: Callable[[int], None],
+        log: DriverLog,
+        *,
+        tick: int,
+        state: str,
+        interval_s: int,
+        util_pct: float,
+        dispatch_limit: int,
+        dispatchable: int,
+        in_flight: int,
+        reason: str,
+    ) -> None:
+        """Sleep ``seconds``, but say so on a wall-clock cadence while doing it (#323).
+
+        A silent driver is the expected appearance of BOTH "correctly waiting out a 5h
+        window" and "wedged", which is how `batch-headless-2` was first misread. Sliced at
+        ``interval_s`` so each slice re-states the reason, the utilization that gated it,
+        and how much of the wait is left — a reader can tell "woke at HH:MM, sleeping
+        again" from "last heartbeat 40 minutes ago". The total slept is unchanged, and the
+        injected ``sleeper`` still receives whole seconds.
+        """
+        remaining = max(0, int(seconds))
+        while remaining > 0:
+            chunk = min(remaining, max(1, interval_s))
+            log.heartbeat(
+                tick=tick, state=state, util_pct=util_pct, dispatch_limit=dispatch_limit,
+                # Carried through the wait, not zeroed: "3 tasks ready, limit 0" is the
+                # whole diagnosis of a capacity stall.
+                dispatchable=dispatchable, in_flight=in_flight,
+                reason=reason, sleep_s=chunk, sleep_remaining_s=remaining,
+                # The promise a stale-heartbeat check is judged against: while sleeping,
+                # the next beat is due one slice from now.
+                next_heartbeat_within_s=chunk,
+            )
+            sleeper(chunk)
+            remaining -= chunk
 
     def _final_status(self, run_id: str, exit_reason: str, reclaim: dict) -> dict:
         """The end-of-run status dump, annotated with WHY the loop stopped (#313).

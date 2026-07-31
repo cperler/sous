@@ -53,7 +53,10 @@ Say these three things with it, every time:
 1. **The driver runs in the foreground and owns the run for its whole duration.** Leave that
    terminal alone. Ctrl-C sends SIGINT to the process group and kills the `claude -p`
    children mid-stage — the failure that produced #313.
-2. **Monitor from a second terminal** — `dashboard --watch`, or `watch --activity`.
+2. **Monitor from a second terminal** — `dashboard --watch`, or `watch --activity`. The
+   driver also narrates itself to stderr and to `runs/<run>/driver.jsonl` (#323): heartbeats
+   carrying tick, utilization, dispatch limit, and — while it sleeps — the wait reason. A
+   long silence there is a stalled or dead driver, not a quiet one.
 3. **What it will do outwardly** — how many PRs it may open, against which repo. For a live
    run against a real product repo, the human picks the issues and approves *before* any
    write or PR (CLAUDE.md hard checkpoint).
@@ -73,6 +76,10 @@ Gate on:
   headless path before concluding the run misbehaved.
 - `events_audit` — `dispatched == recorded`. A non-zero `outstanding` alongside
   `"clean": true` means orphaned leases, not a healthy run (see REFERENCE.md).
+- `driver` — `alive`, `heartbeat_age_s`, `last_state`, `exit_reason` (#323). Mid-run this is
+  how you tell a driver sleeping out a capacity stall (`last_state:
+  "waiting_on_capacity"`, fresh heartbeat) from one that is gone (`alive: false`); after a
+  driver dies without an `exited` record, its last heartbeat bounds the time of death.
 
 Then per CLAUDE.md: merge the PRs in dependency order, verify each issue actually closed,
 clean worktrees/branches/checkpoint tags — but **never** `rm -rf runs/<RUN>/`. Run
