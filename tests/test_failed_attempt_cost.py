@@ -26,6 +26,7 @@ import sys
 import pytest
 
 import adapters.execution.transport as T
+from adapters.execution.codex import CodexRunner
 from adapters.execution.headless_claude import HeadlessClaudeRunner
 from adapters.execution.transport import claude_cli_transport, codex_cli_transport
 from orchestrator.cost_ledger import CostLedger
@@ -419,3 +420,41 @@ def test_codex_timeout_with_no_events_is_unmetered(monkeypatch) -> None:
     raw = codex_cli_transport()(_codex_wi())
 
     assert raw.exit_code == 124 and raw.usage_recovered is False
+
+
+def test_codex_failure_with_no_events_is_unmetered(tmp_path, monkeypatch) -> None:
+    # The non-timeout twin of the case above: codex exits non-zero having printed nothing
+    # usable (killed mid-dispatch — the shape this run's own driver hit — or truncated
+    # stdout). The event stream has no terminal envelope to point at, so there is no
+    # evidence a usage report ever landed and the zeros are UNKNOWN, not measured. Without
+    # this the row reads `cost_usd: 0.0, priced: true, metered: true` — the exact defect
+    # #319 exists to kill, one lane over.
+    class _Proc:
+        returncode = 1
+        stdout = ""
+        stderr = "killed"
+
+    monkeypatch.setattr(T.subprocess, "run", lambda *a, **k: _Proc())
+    raw = codex_cli_transport()(_codex_wi())
+
+    assert raw.exit_code == 1
+    assert raw.usage_recovered is False
+
+    result = CodexRunner(transport=lambda w: raw).dispatch(_codex_wi())
+    row = CostLedger(tmp_path / "stage-costs.jsonl").record(result, duration_s=42.0)
+    assert row["cost_usd"] == 0.0
+    assert row["priced"] is False and row["metered"] is False
+
+
+def test_codex_success_stays_measured(monkeypatch) -> None:
+    # Exit 0 IS the provider's report: a successful codex call is measured, never flagged
+    # unmetered — the honest-unknown rule above must not swallow the metered path.
+    class _Proc:
+        returncode = 0
+        stdout = _codex_stream()
+        stderr = ""
+
+    monkeypatch.setattr(T.subprocess, "run", lambda *a, **k: _Proc())
+    raw = codex_cli_transport()(_codex_wi())
+
+    assert raw.exit_code == 0 and raw.usage_recovered is True

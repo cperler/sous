@@ -1490,10 +1490,19 @@ def codex_cli_transport(
                 final_text = last_txt
             if final_text is None:
                 final_text = stream_tail_note(stdout, (stream_files or {}).get("stream"))
-            return RawResult(structured, usage=_codex_usage(stdout), raw_output=final_text,
+            # #319: same honest-unknown rule as the timeout branch above, and for the same
+            # reason — a codex call can also exit non-zero having printed no usable event
+            # (killed mid-dispatch, truncated/corrupt stdout). The event stream has no single
+            # terminal envelope to point at, so the numbers themselves are the only evidence a
+            # usage report landed: no tokens on a FAILED call means the spend is unknown, and
+            # the ledger row must say so instead of asserting a metered $0.00. A successful
+            # call is left as-measured (exit 0 IS the provider's report).
+            usage = _codex_usage(stdout)
+            return RawResult(structured, usage=usage, raw_output=final_text,
                              raw_stderr=stderr, exit_code=returncode, stream_files=stream_files,
                              error=error,
-                             invocation=invocation, session_ref=_codex_session_id(stdout))
+                             invocation=invocation, session_ref=_codex_session_id(stdout),
+                             usage_recovered=(not returncode) or _has_tokens(usage))
 
     def run(work: WorkItem) -> RawResult:
         # #74: refresh the worktree's AGENTS.md with this stage's persona BEFORE dispatch (fresh
