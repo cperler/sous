@@ -28,7 +28,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, TypedDict, Unpack
 
 from .alerting import _fmt_activity
 from .render import aggregate_cost_cell
@@ -345,6 +345,19 @@ def _run_row(
 # --- the snapshot -----------------------------------------------------------------------
 
 
+class DashboardSnapshotKwargs(TypedDict, total=False):
+    """Optional keyword arguments accepted by :func:`dashboard_snapshot`."""
+
+    stale_after_s: int
+    include_activity: bool
+    limit: int
+    show_all: bool
+    recent_terminal: int
+    engine_factory: Callable[[Path], Engine] | None
+    usage_reader: Callable[[], object] | None
+    clock: Callable[[], float]
+
+
 def _read_usage(usage_reader: Callable[[], object] | None) -> dict | None:
     """Best-effort usage header: never block/raise. Returns a small dict or None."""
     if usage_reader is None:
@@ -618,10 +631,7 @@ def render_watch(
     clear: Callable[[], None] | None = None,
     interval: float = 30,
     max_iters: int | None = None,
-    # Forwarded verbatim to dashboard_snapshot's heterogeneous keyword params
-    # (stale_after_s: int, include_activity: bool, engine_factory, clock, ...); a
-    # single value type can't describe that bag, so Any keeps the passthrough honest.
-    **snapshot_kwargs: Any,
+    **snapshot_kwargs: Unpack[DashboardSnapshotKwargs],
 ) -> None:
     """Clear-screen + reprint the board every ``interval`` seconds until interrupted.
 
