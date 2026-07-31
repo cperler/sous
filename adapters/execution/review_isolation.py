@@ -75,6 +75,10 @@ class ReviewIsolation:
             nonlocal call_number
             call_number += 1
             allocation: tuple[PortRegistry, str, dict[str, str]] | None = None
+            # `None` is meaningful here — it is the dispatch's own "inherit the environment"
+            # signal, distinct from an empty mapping — so the unallocated branch passes
+            # `sub.env` through unchanged rather than normalizing it to `{}`.
+            env: dict[str, str] | None = None
             try:
                 allocation = self._allocate_ports(sub, call_number)
                 if allocation is not None:
