@@ -58,8 +58,7 @@ def _engine(tmp_path, project, **kw) -> Engine:
 
 
 def _plan_capable_registry() -> Registry:
-    """A registry whose headless×claude cell really executes plans — since #288 the ONLY
-    cell that declares ``supports_plan`` (the interactive shim ignores ``wi.plan``, #262)."""
+    """A small registry whose headless×claude cell executes plans."""
     reg = Registry()
     for mode, provider, plans in (
         (ExecutionMode.HEADLESS, Provider.CLAUDE, True),
@@ -73,11 +72,7 @@ def _plan_capable_registry() -> Registry:
 
 
 def _panel_engine(tmp_path, project, **kw) -> Engine:
-    """An engine on the one lane a panel can actually ride (headless×claude).
-
-    Every veto below the lane check is only reachable from here: on the DEFAULT
-    interactive×claude lane ``lane_cannot_execute_plan`` vetoes first (#288), which is itself
-    pinned by ``test_the_default_interactive_lane_cannot_carry_a_plan``."""
+    """An engine on headless×claude, used to exercise lane-independent panel vetoes."""
     kw.setdefault("registry", _plan_capable_registry())
     kw.setdefault("router", Router(execution_mode=ExecutionMode.HEADLESS))
     return _engine(tmp_path, project, **kw)
@@ -270,14 +265,12 @@ def test_only_plan_capable_cells_declare_supports_plan() -> None:
     codex_headless = reg.describe(_lane(ExecutionMode.HEADLESS, Provider.CODEX))
     interactive = reg.describe(_lane(ExecutionMode.INTERACTIVE, Provider.CLAUDE))
     engine_lane = reg.describe(_lane(ExecutionMode.ENGINE, Provider.NONE))
-    assert claude_headless.supports_plan  # run_review_panel: the one lane that fans out
+    assert claude_headless.supports_plan  # run_review_panel: the reference panel lane
     assert not codex_headless.supports_plan  # no sub-agent primitive
     assert not engine_lane.supports_plan  # no model at all
-    # workflow_shim.js has agent()/parallel() but NO plan-execution branch (#262) — until it
-    # grows one the descriptor must say so, or the panel silently never runs.
-    assert not interactive.supports_plan
+    assert interactive.supports_plan  # workflow_shim.js runs the finder/verifier panel
     # The 3a default registry declares the same for its interactive cell.
-    assert not default_registry().describe(
+    assert default_registry().describe(
         _lane(ExecutionMode.INTERACTIVE, Provider.CLAUDE)
     ).supports_plan
 
@@ -518,22 +511,20 @@ def test_a_rate_limited_plan_bearing_review_is_not_flagged(tmp_path, project) ->
     assert eng.status("r1")["review_panel"]["clean"] is True
 
 
-def test_the_default_interactive_lane_cannot_carry_a_plan(tmp_path, project) -> None:
-    """Acceptance (c): the honest path. On the interactive lane the descriptor now says it
-    cannot execute a plan, so the existing veto fires — a visible skip instead of a review
-    that merely looks like a panel's."""
+def test_the_default_interactive_lane_can_carry_a_plan(tmp_path, project) -> None:
+    """The capability declaration reaches assignment: an opted-in interactive REVIEW gets
+    the plan that the Workflow shim now executes, with no lane-capability skip."""
     eng = _engine(tmp_path, project)  # default registry + router: interactive×claude
     eng.create_run("r1", review_workflow=True)
     eng.add_task("r1", "t1")
     w = _drive_to_review(eng)
-    assert w.plan is None
-    assert _skip_reasons(eng) == ["lane_cannot_execute_plan"]
+    assert w.plan is not None
+    assert _skip_reasons(eng) == []
 
     audit = eng.status("r1")["review_panel"]
-    assert audit["clean"] is False  # the operator's --review-workflow bought nothing here
-    assert audit["workflow_skipped"] == 1
-    assert audit["workflow_skipped_by_reason"] == {"lane_cannot_execute_plan": 1}
-    assert audit["plan_not_executed"] == 0  # the OTHER path: nothing was dispatched to ignore
+    assert audit["clean"] is True
+    assert audit["workflow_skipped"] == 0
+    assert audit["plan_not_executed"] == 0
 
 
 def test_status_tallies_plan_not_executed_per_task(tmp_path, project) -> None:

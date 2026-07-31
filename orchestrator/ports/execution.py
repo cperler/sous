@@ -52,12 +52,10 @@ class CapabilityDescriptor(BaseModel):
     #
     # #288: the flag describes BEHAVIOR, not intent. Declaring True for a runner that ignores
     # the plan does not degrade gracefully — it degrades SILENTLY, because the engine has
-    # nothing to skip and so emits no ``review_workflow_skipped``; the honest path is to
-    # declare False and let the veto fire. Today only headless×claude qualifies
-    # (``review_panel.run_review_panel``). False for the interactive×claude shim
-    # (``run_targets/workflow_shim.js`` has no plan-execution branch yet — flip it back to
-    # True in the SAME PR that lands one, #262), for codex (``codex exec`` has no sub-agent
-    # primitive), and for the deterministic ENGINE lane (no model at all).
+    # nothing to skip and so emits no ``review_workflow_skipped``. Both claude lanes qualify:
+    # headless via ``review_panel.run_review_panel`` and interactive via the plan branch in
+    # ``run_targets/workflow_shim.js`` (#262). It stays False for codex (``codex exec`` has no
+    # sub-agent primitive) and for the deterministic ENGINE lane (no model at all).
     supports_plan: bool = False
     # #272: does this cell TRANSLATE a ``WorkItem.tool_policy`` into a real provider
     # restriction (claude ``--disallowedTools``, codex ``--sandbox``)? A lane capability flag
@@ -158,9 +156,9 @@ def default_registry() -> Registry:
             provider=Provider.CLAUDE,
             in_process=False,
             schema_enforced=True,
-            # #288: the shim has agent()/parallel() but no plan-execution branch yet, and a
-            # flag that over-promises degrades silently. Flip to True with #262.
-            supports_plan=False,
+            # #262: the Workflow shim executes the same finder/verifier contract as the
+            # headless review-panel driver; #288 requires the flag to follow that behavior.
+            supports_plan=True,
             # #302: decided to STAY False — the shim's `agent()` call takes no tool
             # restriction to translate into. The degradation is the in-band posture directive
             # `render_prompt` adds for a non-enforcing lane, plus the per-dispatch

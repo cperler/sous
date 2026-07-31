@@ -16,9 +16,23 @@ from pathlib import Path
 
 import pytest
 
+from adapters.execution.review_panel import run_review_panel
+from adapters.execution.transport import RawResult
+from orchestrator.review_workflow import synthesize
+from orchestrator.schemas.enums import ExecutionMode, Provider, Stage
+from orchestrator.schemas.work import FinderSpec, LanePolicy, ReviewPlan, StageResult, WorkItem
+
 _ROOT = Path(__file__).resolve().parent.parent
 SHIM = _ROOT / "run_targets" / "workflow_shim.js"
 DRIVER = Path(__file__).resolve().parent / "_shim_driver.mjs"
+
+
+def _run_shim(mode: str) -> dict:
+    proc = subprocess.run(  # noqa: S603
+        [shutil.which("node"), str(DRIVER), str(SHIM), mode],
+        capture_output=True, text=True, check=True,
+    )
+    return json.loads(proc.stdout)
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
@@ -70,3 +84,117 @@ def test_shim_refuses_a_malformed_content_hash_before_dispatching() -> None:
     # The whole batch is refused: the VALID sibling was not dispatched either, so a
     # partial batch can never land results the supervisor thinks it re-ran in full.
     assert data["agentCalls"] == 0
+
+
+def _panel_plan() -> ReviewPlan:
+    return ReviewPlan(
+        finders=(
+            FinderSpec(lens="find:code", prompt="finder-code", agent="code-reviewer",
+                       schema_ref="review_findings"),
+            FinderSpec(lens="find:spec", prompt="finder-spec", agent="spec-reviewer",
+                       schema_ref="review_findings"),
+        ),
+        verify_template="VERIFY {finding}\nAT {diff_hint}",
+        verify_schema_ref="review_verdict",
+        dedupe_rule="fingerprint-v1",
+    )
+
+
+class _PanelTransport:
+    """Headless fake carrying the same script as the Node agent() harness."""
+
+    def __init__(self) -> None:
+        self.seen: list[WorkItem] = []
+
+    def __call__(self, work: WorkItem) -> RawResult:
+        self.seen.append(work)
+        outputs = {
+            "find:code": {"findings": [{
+                "severity": "critical", "file": "a.py", "line": 7,
+                "description": "Null deref in the guard",
+            }]},
+            "find:spec": {"findings": [
+                {"severity": "critical", "file": "a.py", "line": 99,
+                 "description": "null   DEREF in the guard"},
+                {"severity": "suggestion", "file": "b.py", "line": 2,
+                 "description": "rename this"},
+            ]},
+            "verify:1": {
+                "fingerprint": "a.py:null deref in the guard",
+                "verdict": "refuted",
+                "reasoning": "guarded by the caller",
+            },
+        }
+        return RawResult(outputs[work.phase], usage_recovered=False)
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_plan_bearing_shim_conforms_to_the_headless_panel(monkeypatch) -> None:
+    """Design §5(f): the real JS branch and Python reference return one equivalent panel.
+
+    Lane attribution, completion time, and the WorkItem identity necessarily differ; every
+    runner-owned panel field is compared, including unfolded evidence and per-call rows.
+    """
+    interactive = _run_shim("panel")
+    actual = StageResult.model_validate(interactive["panelResult"])
+
+    work = WorkItem.create(
+        id="wi-headless", run_id="r", task_id="#1", stage=Stage.REVIEW,
+        prompt="ordinary single-reviewer prompt", schema_ref="review",
+        model="claude-opus-5", effort="high",
+        lane_policy=LanePolicy(execution_mode=ExecutionMode.HEADLESS,
+                               provider=Provider.CLAUDE),
+        created_at="T", plan=_panel_plan(),
+    )
+    # Make required-but-unavailable interactive durations exactly comparable.
+    monkeypatch.setattr("adapters.execution.review_panel.time.monotonic", lambda: 1.0)
+    transport = _PanelTransport()
+    expected = run_review_panel(work, transport)
+
+    assert actual.status == expected.status
+    assert actual.structured_output == expected.structured_output is None
+    assert actual.raw_output == expected.raw_output
+    assert actual.error == expected.error
+    assert actual.sub_results == expected.sub_results
+    assert actual.token_usage == expected.token_usage
+    assert actual.schema_retries == expected.schema_retries == 0
+    assert actual.usage_recovered == expected.usage_recovered is False
+    assert [c.model_dump(mode="json") for c in actual.sub_calls or ()] == [
+        c.model_dump(mode="json") for c in expected.sub_calls or ()
+    ]
+    assert [w.phase for w in transport.seen] == ["find:code", "find:spec", "verify:1"]
+
+    calls = interactive["agentCallsDetailed"]
+    assert all("$schema" not in keys for keys in interactive["schemaKeys"])
+    assert [c["agentType"] for c in calls] == ["code-reviewer", "spec-reviewer", None]
+    assert all(c["prompt"] != "ordinary single-reviewer prompt" for c in calls)
+    assert "- line: 7" in calls[-1]["prompt"]  # fold-order representative, not duplicate
+    assert calls[-1]["prompt"].endswith("AT a.py:7")  # mechanical diff-hint slot
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_plan_bearing_shim_fails_on_a_missing_finder_and_not_an_inconclusive_verifier() -> None:
+    finder_failure = StageResult.model_validate(_run_shim("panel-finder-error")["panelResult"])
+    assert finder_failure.status.value == "failure"
+    assert finder_failure.sub_results is None
+    assert [c.phase for c in finder_failure.sub_calls or ()] == ["find:code", "find:spec"]
+    assert "find:spec" in (finder_failure.error or "")
+
+    verifier_failure = StageResult.model_validate(
+        _run_shim("panel-verifier-error")["panelResult"]
+    )
+    assert verifier_failure.status.value == "success"
+    assert verifier_failure.sub_results["verdicts"] == []
+    assert verifier_failure.sub_results["notices"][0]["notice"] == "verifier_inconclusive"
+    folded = synthesize(verifier_failure.sub_results)
+    assert folded.review["approved"] is False and len(folded.review["issues"]) == 1
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not on PATH")
+def test_plan_bearing_shim_caps_verifiers_without_dropping_findings() -> None:
+    result = StageResult.model_validate(_run_shim("panel-cap")["panelResult"])
+    assert len([c for c in result.sub_calls or () if c.phase.startswith("verify:")]) == 8
+    cap = next(n for n in result.sub_results["notices"] if n["notice"] == "verifier_cap")
+    assert cap["count"] == 4
+    # Capped and inconclusive findings receive no refutation, so all remain blocking.
+    assert len(synthesize(result.sub_results).review["issues"]) == 12

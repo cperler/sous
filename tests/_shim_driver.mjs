@@ -5,6 +5,8 @@
 //      it reaches agent() (whose validator rejects the meta-schema URI as a $ref).
 //   3) (#311, mode `badhash`) a WorkItem whose content_hash is not a 64-char sha256
 //      hexdigest aborts the batch before any agent() call is made.
+//   4) (#262, `panel*` modes) a ReviewPlan takes the finder/verifier branch and returns
+//      its unfolded panel contract rather than the ordinary single-reviewer result.
 //
 // Usage: node _shim_driver.mjs <shim path> [badhash]
 //
@@ -19,12 +21,44 @@ const src = readFileSync(shimPath, 'utf8').replace(/^export\s+const\s+meta/m, 'c
 
 const capturedSchemas = []
 const capturedEffort = {} // prompt -> the `effort` opt agent() received (#96)
+const capturedCalls = []
 const phase = () => {}
 const log = () => {}
 const parallel = async (thunks) => Promise.all(thunks.map((t) => t()))
 const agent = async (prompt, opts) => {
   capturedSchemas.push(opts.schema)
   capturedEffort[prompt] = 'effort' in opts ? opts.effort : '<absent>'
+  capturedCalls.push({ prompt, agentType: opts.agentType || null, label: opts.label })
+  if (mode.startsWith('panel')) {
+    if (prompt === 'finder-code') {
+      if (mode === 'panel-cap') {
+        return { findings: Array.from({ length: 12 }, (_, i) => ({
+          severity: 'critical', file: 'cap.py', line: i + 1,
+          description: `bug number ${String(i).padStart(2, '0')}`,
+        })) }
+      }
+      return { findings: [{ severity: 'critical', file: 'a.py', line: 7,
+        description: 'Null deref in the guard' }] }
+    }
+    if (prompt === 'finder-spec') {
+      if (mode === 'panel-finder-error') throw new Error('finder exploded')
+      if (mode === 'panel-cap') return { findings: [] }
+      return { findings: [
+        { severity: 'critical', file: 'a.py', line: 99,
+          description: 'null   DEREF in the guard' },
+        { severity: 'suggestion', file: 'b.py', line: 2, description: 'rename this' },
+      ] }
+    }
+    if (prompt.startsWith('VERIFY ')) {
+      if (mode === 'panel-verifier-error') throw new Error('verifier exploded')
+      return {
+        fingerprint: 'a.py:null deref in the guard',
+        verdict: 'refuted',
+        reasoning: 'guarded by the caller',
+      }
+    }
+    throw new Error(`unexpected panel prompt: ${prompt}`)
+  }
   return { ok: true }
 }
 
@@ -38,6 +72,16 @@ const argsObj = {
       type: 'object',
       properties: { committed: { type: 'boolean' } },
     },
+    review_findings: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: { findings: { type: 'array' } },
+    },
+    review_verdict: {
+      $schema: 'https://json-schema.org/draft/2020-12/schema',
+      type: 'object',
+      properties: { fingerprint: { type: 'string' } },
+    },
   },
   workItems: [
     // wi-1 carries a #96 effort; wi-2 is effort-less (pre-#96 shape) — the shim must
@@ -50,6 +94,26 @@ const argsObj = {
     { id: 'wi-1', schema_version: '77', content_hash: 'a'.repeat(64), run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p1', effort: 'high' },
     { id: 'wi-2', content_hash: 'b'.repeat(64), run_id: 'r', task_id: '#1', stage: 'implement', attempt: 0, model: 'claude-opus-5', schema_ref: 'implement', prompt: 'p2' },
   ],
+}
+
+if (mode.startsWith('panel')) {
+  argsObj.dispatchLimit = 1
+  argsObj.workItems = [{
+    id: 'wi-panel', schema_version: '3', content_hash: 'c'.repeat(64), run_id: 'r',
+    task_id: '#1', stage: 'review', attempt: 0, model: 'claude-opus-5',
+    schema_ref: 'review', prompt: 'ordinary single-reviewer prompt', effort: 'high',
+    plan: {
+      finders: [
+        { lens: 'find:code', prompt: 'finder-code', agent: 'code-reviewer',
+          schema_ref: 'review_findings' },
+        { lens: 'find:spec', prompt: 'finder-spec', agent: 'spec-reviewer',
+          schema_ref: 'review_findings' },
+      ],
+      verify_template: 'VERIFY {finding}\nAT {diff_hint}',
+      verify_schema_ref: 'review_verdict',
+      dedupe_rule: 'fingerprint-v1',
+    },
+  }]
 }
 
 // #311: the exact live failure — a 16-char log preview pasted over the full digest.
@@ -76,7 +140,7 @@ try {
   process.exit(0)
 }
 
-console.log(JSON.stringify({
+const output = {
   resultCount: results.length,
   statuses: results.map((r) => r.status),
   completedAt: results.map((r) => r.completed_at),
@@ -85,4 +149,9 @@ console.log(JSON.stringify({
   resultEffort: Object.fromEntries(results.map((r) => [r.work_item_id, r.effort])),
   // #275: wi-1 carries schema_version '77' (echoed), wi-2 carries none (fallback literal).
   resultSchemaVersion: Object.fromEntries(results.map((r) => [r.work_item_id, r.schema_version])),
-}))
+}
+if (mode.startsWith('panel')) {
+  output.panelResult = results[0]
+  output.agentCallsDetailed = capturedCalls
+}
+console.log(JSON.stringify(output))
