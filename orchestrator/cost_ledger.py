@@ -598,7 +598,12 @@ class CostLedger:
         Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once.
         Tolerant of malformed rows (``.get`` defaults) and of models absent from the
         price table — those still count toward spend but are excluded from the
-        counterfactual (and named in ``unpriced_models``)."""
+        counterfactual (and named in ``unpriced_models``).
+
+        ``unmetered_calls``/``total_invocations`` (#319, mirroring ``summary()``): a row
+        whose usage was never recoverable still contributes its ``cost_usd: 0.0`` to
+        ``total_cost_usd`` like any other row, so a caller (``render_cost_report``) needs
+        the unmetered count to say the total is a floor, not a complete figure."""
         rows = self.rows() if rows is None else rows
 
         def _bump(d: dict, key: str, cost: float, ci: int, co: int, cr: int, cw: int) -> None:

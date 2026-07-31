@@ -3169,8 +3169,10 @@ class Engine:
         synthetic lease-matching ``StageResult`` and feeding it to ``record`` — this is that
         escape, sanctioned and guarded.
 
-        It synthesizes the abandonment INTERNALLY (an honest $0 cost-ledger row, raw output
-        naming the reason, outcome ``dispatch_abandoned``) WITHOUT routing through
+        It synthesizes the abandonment INTERNALLY (a $0 cost-ledger row explicitly flagged
+        unmetered rather than a confident measurement — #319, since the provider process may
+        have burned real spend before being orphaned — raw output naming the reason, outcome
+        ``dispatch_abandoned``) WITHOUT routing through
         ``record``'s retry/fallback machinery, clears the lease, bumps the stage counter, and
         transitions the task DIRECTLY to a terminal state — FAILED (``disposition='failed'``)
         or CLOSED_INFEASIBLE (``disposition='rejected'``, writing the same durable rejection

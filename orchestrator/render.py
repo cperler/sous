@@ -130,7 +130,13 @@ def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) 
 
 
 def render_cost_report(run_id: str, analysis: dict) -> str:
-    """Render `ledger.analysis()` into cost-report.md (per-stage/-task + reuse win)."""
+    """Render `ledger.analysis()` into cost-report.md (per-stage/-task + reuse win).
+
+    The headline total (#319) is qualified when any row is unmetered — an unrecoverable-
+    usage row still sums into ``analysis["total_cost_usd"]`` at its ``cost_usd: 0.0``, so a
+    bare total would understate spend while looking exact. Same honesty rule as
+    ``render_cost_summary``, applied to this artifact too (the acceptance criteria name it
+    explicitly)."""
     reuse = analysis.get("session_reuse", {})
     total = analysis.get("total_cost_usd") or 0.0
     uncached = reuse.get("uncached_cost_usd") or 0.0
@@ -665,8 +671,11 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
     Derived purely from the task's recorded stages, so it is reconstructible on replay:
     a stage table over the task's own pipeline (done ✅ / running ▶️ / next … / failed ❌),
     per-stage attempt counts, the review-cycle / salvage / infra-reset budgets when non-zero,
-    elapsed wall time, and metered cost-to-date summed across the recorded stages.
-    ``now`` (ISO) overrides the elapsed clock for deterministic tests."""
+    elapsed wall time, and metered cost-to-date summed across the recorded stages. A stage
+    whose usage was never recoverable (#319) is excluded from that sum and counted
+    separately, so "Cost to date" reads as a floor rather than a false total when the
+    run's costliest attempt happens to be the one that failed. ``now`` (ISO) overrides the
+    elapsed clock for deterministic tests."""
     state = task.state.value.replace("_", " ")
     lines = [
         f"## Run progress — {task.task_id}",
