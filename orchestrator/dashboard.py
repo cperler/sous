@@ -475,6 +475,7 @@ def _state_icon(state: str) -> str:
         "paused": "!",
         "completed": "+",
         "completed_with_rejections": "~",
+        "superseded": "=",  # #257: retired by a human, not run to a conclusion
         "failed": "x",
         "pending": "-",
         "<unreadable>": "?",
@@ -483,7 +484,14 @@ def _state_icon(state: str) -> str:
 
 def _progress_str(progress: dict) -> str:
     total = progress.get("total", 0)
-    done = progress.get("completed", 0) + progress.get("closed_infeasible", 0)
+    # "done" = every terminal, non-pending-on-a-human outcome: shipped, deliberately
+    # closed (#67), or retired as superseded (#257). A terminal task left out here reads
+    # as still-outstanding work on the board it will never leave.
+    done = (
+        progress.get("completed", 0)
+        + progress.get("closed_infeasible", 0)
+        + progress.get("superseded", 0)
+    )
     return f"{done}/{total}"
 
 
@@ -528,7 +536,11 @@ def render_dashboard(snapshot: dict) -> str:
     # --- header ---
     counts = header["counts"]
     if header["all_quiet"]:
-        done = counts.get("completed", 0) + counts.get("completed_with_rejections", 0)
+        done = (
+            counts.get("completed", 0)
+            + counts.get("completed_with_rejections", 0)
+            + counts.get("superseded", 0)  # #257
+        )
         lines.append(f"ALL QUIET — {header['running']} running, {done} done")
     else:
         lines.append(f"ATTENTION — {header['attention_count']} item(s) need you")

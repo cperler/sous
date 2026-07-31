@@ -39,6 +39,13 @@ FAILS the task (`--min-idle-s` / `--force` govern its own liveness guard). There
 `watch --activity` distinguishes the two shapes of a frozen stream: `STREAM STALLED` (the
 model went quiet) vs `NO LIVE DRIVER` (the claiming process is gone — re-invoke the driver).
 
+When you are not rescuing the run but RETIRING it — the issue was amended and the batch
+rebuilt as a successor — use `orchestrator retire --run RUN --reason "..." --by <who>
+[--superseded-by <successor-run>] [--force]` (#257). It is run-level, needs no lease, drives
+every non-terminal task to `superseded`, finalizes the run, and publishes NOTHING to the
+issues (they are live in the successor run). Do NOT reach for `reject` / `abandon
+--disposition rejected` here: both post a "closed infeasible" note to a live issue.
+
 ### Dating the death: `runs/<run>/driver.jsonl` (#323)
 
 The driver's own log — the record that did not exist when `batch-headless-2`'s driver died

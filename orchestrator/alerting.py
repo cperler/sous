@@ -20,6 +20,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
+from .schemas.enums import TERMINAL_RUN_STATES
+
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an engine<-alerting import cycle
     from .engine import Engine
 
@@ -30,15 +32,20 @@ NOTIFY_TASK_FAILED = "task_failed"
 NOTIFY_TASK_BLOCKED = "task_blocked"
 NOTIFY_RUN_PAUSED = "run_paused"
 NOTIFY_RUN_FINALIZED = "run_finalized"
+# #257: the human retired the run as superseded. Distinct from run_finalized so an
+# operator can tell a run that was stopped from one that ran to its own conclusion.
+NOTIFY_RUN_SUPERSEDED = "run_superseded"
 # #313: the scheduler loop stopped with work left that it may not touch — every
 # non-terminal task holds a dispatch lease it could not reclaim. Distinct from
 # run_paused (a deliberate gate) and task_stale (the task may still be progressing).
 NOTIFY_RUN_BLOCKED = "run_blocked"
 
-# Run states that end a watch (mirror RunState terminal values without importing the
-# enum — this module works off the JSON status snapshot, not engine objects).
-# Includes completed_with_rejections (#67) so a rejection-only run's watch terminates.
-_TERMINAL_RUN_STATES = frozenset({"completed", "completed_with_rejections", "failed"})
+# Run states that end a watch. Derived from the enum's own terminal set rather than
+# re-spelled here (#257): this module works off the JSON status snapshot, so it compares
+# STRING values — but a hand-maintained copy silently omits each new terminal state, and
+# an omitted one means `watch` polls a finished run forever. Includes
+# completed_with_rejections (#67) and superseded (#257) by construction.
+_TERMINAL_RUN_STATES = frozenset(s.value for s in TERMINAL_RUN_STATES)
 
 
 def stale_notifications(

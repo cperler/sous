@@ -331,6 +331,7 @@ class Progress(_StatusModel):
     failed: int = 0
     blocked_on_human: int = 0
     closed_infeasible: int = 0
+    superseded: int = 0
 
 
 class RunDriver(_StatusModel):
@@ -435,6 +436,19 @@ class Run(_StatusModel):
     # create_run setting: it is per-invocation ownership, not run configuration. Additive
     # field: pre-#313 run docs load with the default, no SCHEMA_VERSION bump.
     driver: RunDriver | None = None
+    # Why this run was retired as superseded (#257), written once by ``Engine.retire``.
+    # Persisted on the doc rather than left to events alone so every later subcommand —
+    # which rebuilds the Engine from constructor defaults and re-reads this doc — can
+    # explain a SUPERSEDED run without replaying events.jsonl (#206). ``superseded_by`` is
+    # the successor run id when there is one (None when the work was simply dropped) and is
+    # deliberately NOT validated against the store: the successor is often created AFTER
+    # the predecessor is retired. NOT create_run settings — they are recorded at retire
+    # time. Additive fields: pre-#257 run docs load with the defaults, no SCHEMA_VERSION
+    # bump.
+    superseded_at: str | None = None
+    superseded_by: str | None = None
+    superseded_reason: str | None = None
+    retired_by: str | None = None
 
     def progress(self) -> Progress:
         """Aggregate counters derived from task_refs (single source of truth)."""
@@ -450,6 +464,7 @@ class Run(_StatusModel):
             TaskState.FAILED: "failed",
             TaskState.BLOCKED_ON_HUMAN: "blocked_on_human",
             TaskState.CLOSED_INFEASIBLE: "closed_infeasible",
+            TaskState.SUPERSEDED: "superseded",
         }
         for ref in self.task_refs:
             field = bucket[ref.state]

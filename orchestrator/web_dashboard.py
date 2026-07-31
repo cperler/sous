@@ -383,7 +383,7 @@ INDEX_HTML = """<!doctype html>
       head.appendChild(h("span", "run-id", row.run_id));
       head.appendChild(h("span", "badge " + (row.state || ""), row.state));
       var prog = row.progress || {};
-      var done = (prog.completed || 0) + (prog.closed_infeasible || 0);
+      var done = (prog.completed || 0) + (prog.closed_infeasible || 0) + (prog.superseded || 0);
       head.appendChild(h("span", "muted", done + "/" + (prog.total || 0)));
       // #331: an unmetered call contributes $0 to the run total, so a bare figure would be a
       // confident understatement. Mirror the text board: "≥$X" when some calls are unmetered,
