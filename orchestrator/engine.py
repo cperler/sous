@@ -33,7 +33,13 @@ from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
-from .decomposition import DecompositionError, leaf_ids, parse_subtasks, topological_order
+from .decomposition import (
+    ChildTaskPlan,
+    DecompositionError,
+    leaf_ids,
+    parse_subtasks,
+    topological_order,
+)
 from .driver_log import liveness_from_log
 from .errors import (
     CapacityExhausted,
@@ -89,6 +95,7 @@ from .render import (
     render_retrospective,
     render_stage,
     render_task_index,
+    unfiled_findings,
 )
 from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
@@ -2600,15 +2607,48 @@ class Engine:
     ) -> Task:
         """File/register a validated child DAG and park ``parent`` as its umbrella.
 
-        External issue creation cannot share the status store's filesystem transaction.
-        The durable local-id mapping is therefore advanced after every acknowledged
-        ``create_task`` call; a resumed call skips mapped children and continues with the
-        first unacknowledged one. Registration itself is already crash-idempotent.
+        Validation runs before the lock, so a malformed child graph stays an ordinary
+        retryable SCOPE failure rather than something a lock waiter can observe half-done.
+        The saga itself — every external ``create_task`` and every durable write — runs
+        under the parent's decomposition lock; see :meth:`_file_decomposition_children`.
         """
         tasks = parse_subtasks(output)
         if not tasks:
             return parent
+        # Cheap pre-check on the caller's snapshot; the authoritative one is the in-lock
+        # re-read, which is the only version that can see a concurrent racer's work.
         if parent.decomposition_children:
+            return parent
+        with self.store.with_decomposition_lock(run_id, parent.task_id):
+            return self._file_decomposition_children(run_id, parent.task_id, tasks)
+
+    def _file_decomposition_children(
+        self, run_id: str, parent_id: str, tasks: list[ChildTaskPlan]
+    ) -> Task:
+        """Run the decomposition saga; the CALLER holds the parent's decomposition lock.
+
+        External issue creation cannot share the status store's filesystem transaction.
+        The durable local-id mapping is therefore advanced after every acknowledged
+        ``create_task`` call; a resumed call skips mapped children and continues with the
+        first unacknowledged one. Registration itself is already crash-idempotent.
+
+        That resume is the whole reason the lock exists (#354). The lookup→create window is
+        not atomic, so two reconcilers — ``record`` and any scheduler process calling
+        ``dispatchable`` — could each read a mapping without local id X and each file their
+        own external issue for it. Writing the mapping afterwards only records which one
+        won; the loser's issue is real, assigned to nobody and referenced by nothing. Hence
+        the FRESH re-read below: entering the saga is decided on the parent as it stands
+        inside the lock, never on the snapshot the caller brought in, so a late entrant sees
+        the winner's children and mapping and does nothing.
+        """
+        parent = self.store.load_task(run_id, parent_id)
+        if parent.decomposition_children:
+            return parent
+        # Waiting on the lock can outlast the human gate closing — a losing racer's filing
+        # failure parks the parent via ``_hold_decomposition``. Filing against a parent an
+        # operator has just been asked to look at is the same mistake as filing for an
+        # infeasible SCOPE: the hold wins, and ``approve`` resumes the saga.
+        if parent.state is TaskState.BLOCKED_ON_HUMAN:
             return parent
         source = self.project.task_source
         create = getattr(source, "create_task", None)
@@ -2705,9 +2745,10 @@ class Engine:
         """Find a previously filed child by its deterministic body marker.
 
         Sources without a usable ``list_tasks`` hook return ``None``.  Lookup is
-        deliberately best-effort because creation remains the source's responsibility;
-        durable mappings are the authoritative deduplication mechanism after filing is
-        acknowledged locally.
+        deliberately best-effort because creation remains the source's responsibility; it
+        covers only the CRASH window (the process died between an acknowledged create and
+        the mapping write). Deduplication between LIVE reconcilers is the decomposition
+        lock plus the in-lock mapping re-read, which hold with or without this hook.
 
         The marker must match a WHOLE body line. A substring test made local ids collide by
         prefix — searching ``…/a`` matched a child filed as ``…/ab``, so two valid subtasks
@@ -2732,6 +2773,11 @@ class Engine:
 
         A human-held failure remains quiescent. ``approve`` moves it to PENDING; the next
         scheduler eligibility pass then continues from its persisted mapping.
+
+        The state read here is a pre-filter on a snapshot, not a guarantee: several
+        schedulers may reach the same unfinished saga at once. Each per-parent saga is
+        serialized and re-decided inside its own lock, so concurrent passes converge on one
+        set of children rather than one set each.
         """
         run = self.store.load_run(run_id)
         for ref in list(run.task_refs):
@@ -5253,6 +5299,58 @@ class Engine:
             # requested panel ran at all — so a degraded review is visible from a poll
             # instead of only inside a stage log.
             "review_panel": self.review_panel_audit(run_id, events=events),
+            # #357: a completion note that never reached a human — and the unfiled review
+            # findings it was carrying, which have no other channel — so such a run does not
+            # read as clean from a poll.
+            "completion_notes": self.completion_notes_audit(run_id, events=events),
+        }
+
+    def completion_notes_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
+        """Which completion notes never reached a human, and what they were carrying (#357).
+
+        The completion note is the ONLY channel for the review findings the engine
+        deliberately does not file (``fix_now``/``drop``/over the #188 cap), and publishing
+        it is a best-effort external call. On ``batch-codex-3`` every note failed and three
+        valid ``fix_now`` findings were recoverable only by hand-reading per-stage JSON.
+
+        Derived from the SAME single events read as the other audit blocks (no second source
+        of truth). A task is undelivered when its last ``completion_note_*`` outcome is a
+        failure — a later successful publish (a re-run of finalize) clears it, so the audit
+        reports the current state rather than run-history. ``unfiled_findings`` counts only
+        the findings carried by notes that are STILL undelivered; ``notes`` is every
+        undelivered note's ``{task_id, error, note_file, unfiled}`` so a human polling the
+        run can recover the payload without opening the log tree, and ``persist_failed``
+        flags the worse case where even the durable artifact could not be written."""
+        events = self.store.read_events(run_id) if events is None else events
+        latest: dict[str, dict] = {}
+        persist_failed_by_task: dict[str, int] = {}
+        for ev in events:
+            kind = ev.get("type")
+            task_id = str(ev.get("task_id") or "unknown")
+            if kind in ("completion_note_failed", "completion_note_published"):
+                latest[task_id] = ev
+            elif kind == "completion_note_persist_failed":
+                persist_failed_by_task[task_id] = persist_failed_by_task.get(task_id, 0) + 1
+        notes: list[dict] = [
+            {
+                "task_id": task_id,
+                "error": str(ev.get("error") or ""),
+                "note_file": ev.get("note_file"),
+                # Tolerate a pre-#357 event (no payload) — it reports 0 unfiled, never a
+                # crash, and the note is still flagged as undelivered.
+                "unfiled": ev.get("unfiled") or [],
+            }
+            for task_id, ev in sorted(latest.items())
+            if ev.get("type") == "completion_note_failed"
+        ]
+        return {
+            "undelivered": len(notes),
+            "undelivered_by_task": {n["task_id"]: 1 for n in notes},
+            "unfiled_findings": sum(len(n["unfiled"]) for n in notes),
+            "notes": notes,
+            "persist_failed": sum(persist_failed_by_task.values()),
+            "persist_failed_by_task": dict(sorted(persist_failed_by_task.items())),
+            "clean": not (notes or persist_failed_by_task),
         }
 
     def review_panel_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
@@ -5619,11 +5717,15 @@ class Engine:
         # payload (e.g. a non-string field on the un-validated interactive lane), or a
         # render error must NEVER escape record() and skip the task_completed event /
         # finalize — the task is already COMPLETED and the result can't be replayed.
+        #
+        # Two separately-guarded steps (#357), not one: the completion note is the ONLY
+        # channel for the findings the engine deliberately does not file, so a failure while
+        # marking complete / filing follow-ups must not also cost us the note.
         followups: list[dict] = []
         improvement_ref: str | None = None
         note_md: str | None = None
+        ts = self.project.task_source
         try:
-            ts = self.project.task_source
             if task.pr_url or task.decomposition_children:
                 ts.mark_complete(task.task_id, task.pr_url)
             followups = self._file_review_followups(run_id, task, ts)
@@ -5639,12 +5741,25 @@ class Engine:
                 self._issue_fingerprint(f["title"]) for f in followups if f.get("ref") is not None
             }
             improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
+        except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "evidence_out_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+        try:
             # Rendered ONCE here and handed to both consumers (#359): the task source's
             # completion note and the alerting payload's "what was done" prose. The engine
             # never calls a model, so reusing this already-published artifact is what keeps
             # the alert descriptive without authoring new prose.
+            #
+            # Rendered in THIS block, not the one above (#357): the note is the only channel
+            # for the findings the engine deliberately does not file, so a failure while
+            # marking complete / filing follow-ups must not also cost us the note. Both
+            # inputs default to empty/None, so a block-1 failure still yields a valid — if
+            # thinner — note rather than none at all.
             note_md = render_completion_note(task, followups, improvement_ref)
-            self._publish_completion_note(run_id, task, ts, note_md)
+            self._publish_completion_note(run_id, task, ts, note_md, followups)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
                 run_id,
@@ -6047,14 +6162,39 @@ class Engine:
 
     def _publish_completion_note(
         self, run_id: str, task: Task, task_source: object, body: str,
+        followups: list[dict],
     ) -> None:
-        """Publish the run's completion evidence via the adapter's ``publish_note`` hook
-        (a no-op when absent). Failure is logged, never fatal to finalize.
+        """Persist the run's completion evidence, then publish it via the adapter's
+        ``publish_note`` hook. Failure is logged, never fatal to finalize.
+
+        Persist-then-publish (#357): the note carries the review findings the engine
+        deliberately does NOT file (``fix_now``/``drop``/over the #188 cap), so publishing
+        was a single point of failure for that whole class of output — on ``batch-codex-3``
+        every note failed and three valid findings reached nobody. The rendered note is now
+        written to ``stages/<task>/completion-note.md`` FIRST, and always — including when
+        the adapter exposes no ``publish_note`` hook at all — so the payload is durable
+        independent of delivery. Both outcomes are evented with the unfiled findings inline
+        (``completion_note_published`` / ``completion_note_failed``), so ``events.jsonl``
+        alone answers "what did this run tell me that I never saw?" and a delivered note
+        never reads like one that was never attempted.
 
         Takes the ALREADY-RENDERED note (#359) rather than rendering it here: the caller
         also feeds the same markdown to the ``task_completed`` alert, and rendering it twice
         would risk the note published to the PR and the note mailed to the operator drifting
-        apart."""
+        apart. ``followups`` is still needed to compute the unfiled set for the events."""
+        unfiled = unfiled_findings(
+            (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {},
+            followups,
+        )
+        note_file: str | None = None
+        try:
+            note_file = str(self.store.write_completion_note(task.task_id, body))
+        except Exception as exc:  # noqa: BLE001 - an unwritable log dir must not break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_note_persist_failed", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "error": str(exc)},
+            )
         publish_note = getattr(task_source, "publish_note", None)
         if not callable(publish_note):
             return
@@ -6063,8 +6203,18 @@ class Engine:
         except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
             self.store.append_event(
                 run_id,
-                {"ts": _now(), "type": "completion_note_failed", "run_id": run_id,
-                 "task_id": task.task_id, "error": str(exc)},
+                {"ts": _now(), "type": "completion_note_failed", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "error": str(exc),
+                 # The payload, not just the fact of the failure: an undelivered note's
+                 # unfiled findings have no other channel to a human.
+                 "note_file": note_file, "unfiled": unfiled, "unfiled_count": len(unfiled)},
+            )
+        else:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_note_published", "run_id": run_id,
+                 "task_id": task.task_id, "note_file": note_file,
+                 "unfiled_count": len(unfiled)},
             )
 
     def _maybe_publish_progress(self, run_id: str, task: Task) -> None:

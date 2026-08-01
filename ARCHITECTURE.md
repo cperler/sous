@@ -179,9 +179,14 @@ opaque quality loop.
   existing run DAG. The original task becomes an umbrella that depends on the child leaves:
   independent children can complete even if another branch fails, dependency failures use
   the existing transitive cascade, and the umbrella auto-completes only after every leaf
-  succeeds. A deterministic marker plus the source's `list_tasks` hook closes the external
-  create/record crash window; an unsupported or failed source parks the parent for approval
-  instead of silently falling through to monolithic implementation.
+  succeeds. An unsupported or failed source parks the parent for approval instead of
+  silently falling through to monolithic implementation. Filing is a saga around an
+  external side effect, so it gets two distinct guards: a per-parent decomposition lock in
+  the store (`with_decomposition_lock`) serializes the whole saga across processes and
+  re-reads the parent's mapping inside the lock, so concurrent reconcilers cannot each file
+  their own issue for one subtask (#354); a deterministic body marker plus the source's
+  `list_tasks` hook then closes the remaining create/record CRASH window, best-effort, for
+  sources that support lookup.
 
 ## The three front doors (upstream of any run)
 

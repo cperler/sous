@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import threading
+import time
+
 from adapters.project.base import TaskSpec
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
@@ -22,11 +25,17 @@ class CreatingSource(FakeTaskSource):
         super().__init__()
         self.created: dict[str, TaskSpec] = {}
         self.create_calls = 0
+        # Widens the external-create window so a concurrency test races on the guarantee
+        # rather than on timing (see _race_reconciliation).
+        self.create_delay = 0.0
+        self._guard = threading.Lock()
 
     def create_task(self, title: str, body: str, labels=None) -> str:
-        self.create_calls += 1
-        ref = f"child-{len(self.created) + 1}"
-        self.created[ref] = TaskSpec(task_id=ref, title=title, body=body)
+        time.sleep(self.create_delay)
+        with self._guard:
+            self.create_calls += 1
+            ref = f"child-{len(self.created) + 1}"
+            self.created[ref] = TaskSpec(task_id=ref, title=title, body=body)
         return ref
 
     def resolve(self, task_id: str) -> TaskSpec:
@@ -288,6 +297,154 @@ def test_infeasible_scope_holds_instead_of_filing_children(tmp_path, project) ->
     eng.dispatchable("r1")
     assert source.create_calls == 3
     assert eng.store.load_task("r1", "parent").decomposition_children
+
+
+class NoLookupCreatingSource(CreatingSource):
+    """A creating source with NO usable ``list_tasks`` hook.
+
+    ``_find_decomposition_child`` needs one to spot an already-filed child, so this source
+    has nothing but the durable mapping standing between two reconcilers and a duplicate
+    issue — the weakest configuration the engine has to be correct in.
+    """
+
+    list_tasks = None  # type: ignore[assignment]
+
+
+def _stage_unapplied_scope(tmp_path, project, source: CreatingSource, output: dict) -> None:
+    """Durably record a SCOPE result carrying ``output`` while suppressing the saga.
+
+    Leaves exactly the on-disk shape #354 lives in — a COMPLETED scope stage with a
+    ``subtasks`` payload, no filed children, no mapping — which is what every scheduler
+    process that touches the run then tries to reconcile.
+    """
+    project._task_source = source
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "parent", pipeline=[Stage.SCOPE, Stage.IMPLEMENT])
+    scope = eng.next_work("r1", "parent")
+    original = eng._apply_scope_decomposition
+    eng._apply_scope_decomposition = lambda *_args, **_kwargs: eng.store.load_task(
+        "r1", "parent"
+    )
+    try:
+        eng.record("r1", make_result(scope, structured_output=output))
+    finally:
+        eng._apply_scope_decomposition = original
+    assert eng.store.load_task("r1", "parent").decomposition_mapping == {}
+
+
+def _race_reconciliation(tmp_path, project, output: dict, workers: int = 2) -> Engine:
+    """Reconcile one parent's decomposition from ``workers`` independent engines at once.
+
+    Each engine gets its own ``StatusStore`` over the same run directory: the cross-process
+    shape of #354 without the fork, since the only thing that can serialize them is a lock
+    on disk. Every worker loads the parent BEFORE the barrier, so they all enter holding the
+    same pre-saga snapshot, and ``create_delay`` keeps whichever one wins inside its
+    lookup→create window while the others arrive. Returns one engine for assertions.
+    """
+    engines = [_engine(tmp_path, project) for _ in range(workers)]
+    barrier = threading.Barrier(workers)
+    errors: list[BaseException] = []
+    guard = threading.Lock()
+
+    def _reconcile(eng: Engine) -> None:
+        parent = eng.store.load_task("r1", "parent")
+        barrier.wait()
+        try:
+            eng._apply_scope_decomposition("r1", parent, output)
+        except BaseException as exc:  # noqa: BLE001 - any failure here is a real defect
+            with guard:
+                errors.append(exc)
+
+    threads = [threading.Thread(target=_reconcile, args=(eng,)) for eng in engines]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+    if errors:
+        raise errors[0]
+    return engines[0]
+
+
+def _assert_decomposed_once(eng: Engine, source: CreatingSource, local_ids: list[str]) -> None:
+    parent = eng.store.load_task("r1", "parent")
+    assert source.create_calls == len(local_ids), "a child was filed more than once"
+    assert len(source.created) == len(local_ids)
+    assert sorted(parent.decomposition_mapping) == sorted(local_ids)
+    refs = set(parent.decomposition_mapping.values())
+    assert len(refs) == len(local_ids), "two local ids collapsed onto one ref"
+    # Every filed issue is mapped: no orphan real-world side effect left behind.
+    assert refs == set(source.created)
+    assert set(parent.decomposition_children) == refs
+    assert eng.registered_task_ids("r1") == {"parent", *refs}
+    decomposed = [
+        ev for ev in eng.store.read_events("r1")
+        if ev.get("type") == "task_decomposed" and ev.get("task_id") == "parent"
+    ]
+    assert len(decomposed) == 1, "the losing reconciler re-announced the decomposition"
+
+
+def test_concurrent_reconciliation_files_each_child_once(tmp_path, project) -> None:
+    """Two reconcilers, one parent, one issue per subtask (#354).
+
+    Without a per-parent lock spanning lookup→create, both read a mapping that lacks local
+    id X and both file an external issue for it; the mapping records the winner and the
+    loser's issue is real, orphaned and referenced by nothing.
+    """
+    source = CreatingSource()
+    source.create_delay = 0.05
+    output = _scope_output()
+    _stage_unapplied_scope(tmp_path, project, source, output)
+
+    eng = _race_reconciliation(tmp_path, project, output)
+
+    _assert_decomposed_once(eng, source, ["api", "docs", "client"])
+    # The child DAG is the one the plan asked for, not an interleaving of two sagas.
+    mapping = eng.store.load_task("r1", "parent").decomposition_mapping
+    graph = eng.store.load_run("r1").dependency_graph
+    assert graph["parent"] == [mapping["docs"], mapping["client"]]
+    assert graph[mapping["client"]] == [mapping["api"]]
+
+
+def test_concurrent_reconciliation_without_list_tasks_files_each_child_once(
+    tmp_path, project
+) -> None:
+    """The same race on a source that cannot look a filed child up by marker (#354).
+
+    The marker lookup is best-effort — it needs ``list_tasks``, and it only narrows the
+    window even where it exists. With it gone, serialization plus the re-read of the
+    parent's mapping inside the lock is the ONLY thing preventing duplicate filings.
+    """
+    source = NoLookupCreatingSource()
+    source.create_delay = 0.05
+    output = _scope_output()
+    _stage_unapplied_scope(tmp_path, project, source, output)
+
+    eng = _race_reconciliation(tmp_path, project, output, workers=3)
+
+    _assert_decomposed_once(eng, source, ["api", "docs", "client"])
+
+
+def test_reconciliation_does_not_file_for_a_parent_held_while_it_waited(
+    tmp_path, project
+) -> None:
+    """A saga that waited on the lock re-checks the human gate before filing (#354).
+
+    Serializing the saga means a late entrant now runs AFTER the winner finished — possibly
+    after the winner's filing failure parked the parent for an operator. Re-reading the
+    parent under the lock is what makes that observable, so honour it: a parent at the human
+    gate files nothing, exactly as it would have on the ``record``/``dispatchable`` paths.
+    """
+    source = CreatingSource()
+    output = _scope_output()
+    _stage_unapplied_scope(tmp_path, project, source, output)
+    eng = _engine(tmp_path, project)
+    stale = eng.store.load_task("r1", "parent")
+    eng._hold_decomposition("r1", "parent", "the winning reconciler could not file")
+
+    assert eng._apply_scope_decomposition("r1", stale, output).state is TaskState.BLOCKED_ON_HUMAN
+    assert source.create_calls == 0
+    assert eng.store.load_task("r1", "parent").decomposition_children == []
 
 
 def test_marker_lookup_does_not_collide_on_an_id_prefix(tmp_path, project) -> None:

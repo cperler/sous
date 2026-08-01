@@ -317,6 +317,9 @@ def test_engine_writes_markdown_artifacts(tmp_path, project) -> None:
     assert md_files == [
         "01-intake.md", "02-scope.md", "03-implement.md",
         "04-test.md", "05-deliver.md", "06-review.md",
+        # #357: the completion note is persisted alongside the per-stage prose, so the
+        # findings it carries survive a failed publish.
+        "completion-note.md",
     ]
     # the per-stage md carries the embedded structured substance
     assert "pr_url" in (stage_dir / "05-deliver.md").read_text()
