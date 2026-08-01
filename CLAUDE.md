@@ -112,6 +112,13 @@ per stage, so no stage prompt or output passes through the session. Measured on
 `batch-headless-1`: 92–96% cache hits on long stages (provider sessions chain via `--resume`),
 real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
 
+An all-codex batch requires the global `--provider codex` flag: `provider_tag` routes only
+IMPLEMENT/TEST/SIMPLIFY (#351), not the remaining stages. Even then,
+`routing.engine_lane_required` vetoes DELIVER onto deterministic `ENGINE:none`, at `$0` and
+without the model DELIVER's docstring refresh; the warning-grade
+`stage_rerouted_to_engine_lane` records the move. The codex sandbox turns DELIVER's `git push`
+into a keychain prompt that no unattended batch can answer (#364).
+
 Reach for `orchestrate-batch-interactive` only when a human needs to watch each stage live.
 That lane runs every stage through the session context AND records `$0.00`/zero tokens —
 the Workflow shim cannot report usage, so all 15 pre-2026-07-30 interactive runs are
