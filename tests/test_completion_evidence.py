@@ -383,7 +383,7 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
 
 
-@pytest.mark.parametrize("disposition", ["fix_now", "drop", "fixup", "", "maybe"])
+@pytest.mark.parametrize("disposition", ["fix_now", "drop", "", "maybe"])
 def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, disposition) -> None:
     # A recognized non-file, empty, or unrecognized disposition is NOT filed as an
     # enhancement — but it IS surfaced in the completion note (nothing silently dropped).
@@ -405,10 +405,11 @@ def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, dispo
     note = ts.notes[0]["body"]
     assert "Expose a retry-count knob" in note
     reason = {
+        "fix_now": "noted for in-place handling, not filed",
         "drop": "noted, not tracked",
         "": "no disposition given — not filed",
         "maybe": "unrecognized disposition — not filed",
-    }.get(disposition, "applied in place, not filed")
+    }[disposition]
     assert reason in note
 
     events = _events(tmp_path)
@@ -625,6 +626,21 @@ def test_render_note_self_improvement_sections() -> None:
     assert "Improvement idea" not in note2
 
 
+def test_render_note_never_claims_raw_fixup_disposition_was_applied() -> None:
+    """Legacy/hand-built completion evidence has no #227 rework proof."""
+    task = Task(task_id="#9", run_id="r1", created_at="t0", updated_at="t0")
+    task.stages[Stage.REVIEW].output = {
+        "approved": True,
+        "issues": [],
+        "improvement": {"title": "Tighten the guard", "disposition": "fixup"},
+    }
+
+    note = render_completion_note(task, [])
+
+    assert "requested in-place fixup — not applied" in note
+    assert "applied in place" not in note
+
+
 # --- adapter hooks -----------------------------------------------------------------
 
 
@@ -688,6 +704,7 @@ def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
     assert ref == "t2"
     data = json.loads(path.read_text())
     assert data["t2"] == {"title": "New", "body": "body", "labels": ["spec:x"]}
+    assert src.resolve(ref).labels == ["spec:x"]
 
 
 # --- review schema -----------------------------------------------------------------
@@ -741,10 +758,20 @@ def test_review_schema_accepts_non_blocking() -> None:
     validator.validate({
         "approved": True, "issues": [],
         "improvement": {"title": "idea", "detail": "why"},
-        "retrospective": {"title": "lesson", "detail": "what"},
+        "retrospective": {
+            "title": "lesson", "detail": "what",
+            "target": {"kind": "stage-template", "ref": "REVIEW"},
+        },
     })
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({"approved": True, "issues": [], "improvement": {"detail": "no title"}})
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({
+            "approved": True, "issues": [],
+            "retrospective": {
+                "title": "lesson", "target": {"kind": "engine-logic", "ref": "record"}
+            },
+        })
 
     # #223: the improvement's optional disposition enum (file|fixup|fix_now|drop) validates...
     for disp in ("file", "fixup", "fix_now", "drop"):

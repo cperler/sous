@@ -35,6 +35,7 @@ def make_result(
     task_id: str = "task-1",
     work_item_id: str = "wi-1",
     completed_at: str = "2026-06-20T00:00:00Z",
+    session_ref: str | None = None,
 ) -> StageResult:
     """Build a small StageResult fixture."""
     return StageResult(
@@ -58,6 +59,7 @@ def make_result(
             cache_write=cache_write,
         ),
         cost_usd=cost_usd,
+        session_ref=session_ref,
         completed_at=completed_at,
     )
 
@@ -607,9 +609,10 @@ def test_single_sub_call_still_returns_the_aggregate_view(tmp_path: Path) -> Non
 
 
 def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> None:
-    """Regression: a result with no sub_calls writes exactly ONE row, byte-identical to
-    the pre-#73 line — same keys, same order, no `phase`. This literal is the pre-change
-    output; if the sub-call split ever leaks into the plain path, it fails here."""
+    """Regression: a result with no sub_calls writes exactly ONE row — same keys, same
+    order, no `phase`. This literal is the expected output; if the sub-call split ever leaks
+    into the plain path, it fails here. (`session_ref` joined the row in #350, where the
+    ledger began de-cumulating session-total usage reports and needed the session key.)"""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     result = make_result(
         model="claude-sonnet-5",
@@ -631,6 +634,7 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
         "effort": None,
         "provider": "claude",
         "lane": "interactive",
+        "session_ref": None,
         "input_tokens": 10,
         "output_tokens": 20,
         "cache_read_tokens": 30,
@@ -923,3 +927,69 @@ def test_by_effort_self_read_is_memoised_and_stat_invalidated(tmp_path: Path) ->
     # An explicit rows= arg bypasses the cache entirely and leaves the self-read memo intact.
     assert ledger.by_effort(rows=[]) == []
     assert ledger.by_effort() is second
+
+
+def test_codex_session_totals_are_de_cumulated_per_stage(tmp_path: Path) -> None:
+    """A codex turn.completed reports the whole SESSION's totals, not the turn's (#350).
+
+    Stages chain through one resumed session, so each stage re-reports a running total that
+    already contains its predecessors. Summing those rows put `batch-codex-3` 22x over its
+    real spend. Each row must carry only what its own stage added.
+    """
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    common = dict(provider=Provider.CODEX, model="gpt-5.5", session_ref="th-1")
+
+    scope = ledger.record(make_result(**common, work_item_id="wi-scope", input=1_000, output=100))
+    implement = ledger.record(
+        make_result(**common, work_item_id="wi-impl", stage=Stage.IMPLEMENT,
+                    input=9_000, output=500)
+    )
+    deliver = ledger.record(
+        make_result(**common, work_item_id="wi-deliver", stage=Stage.DELIVER,
+                    input=12_000, output=800)
+    )
+
+    assert scope["input_tokens"] == 1_000
+    assert implement["input_tokens"] == 8_000, "the second stage re-billed the first"
+    assert deliver["input_tokens"] == 3_000
+    assert [scope["output_tokens"], implement["output_tokens"], deliver["output_tokens"]] == [
+        100, 400, 300
+    ]
+    # The deltas still sum to the last cumulative figure the provider reported.
+    assert sum(r["input_tokens"] for r in ledger.rows()) == 12_000
+
+    # A different session starts its own accounting rather than differencing against this one.
+    other = ledger.record(
+        make_result(provider=Provider.CODEX, model="gpt-5.5", session_ref="th-2",
+                    work_item_id="wi-other", input=400, output=40)
+    )
+    assert other["input_tokens"] == 400
+
+
+def test_claude_per_call_usage_is_not_de_cumulated(tmp_path: Path) -> None:
+    """Claude reports per-call usage, so two calls on one session are two full rows (#350).
+    De-cumulating them would erase the second call's real spend."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    common = dict(provider=Provider.CLAUDE, model="claude-opus-5", session_ref="sess-1")
+
+    first = ledger.record(make_result(**common, work_item_id="wi-1", input=1_000, output=100))
+    second = ledger.record(make_result(**common, work_item_id="wi-2", input=1_000, output=100))
+
+    assert first["input_tokens"] == second["input_tokens"] == 1_000
+    assert sum(r["input_tokens"] for r in ledger.rows()) == 2_000
+
+
+def test_a_shrinking_cumulative_report_never_prices_as_a_credit(tmp_path: Path) -> None:
+    """A cumulative counter should only grow; if one resets, the row floors at zero rather
+    than going negative and refunding the session's real spend (#350)."""
+    ledger = CostLedger(tmp_path / "stage-costs.jsonl")
+    common = dict(provider=Provider.CODEX, model="gpt-5.5", session_ref="th-reset")
+
+    ledger.record(make_result(**common, work_item_id="wi-a", input=5_000, output=500))
+    after_reset = ledger.record(
+        make_result(**common, work_item_id="wi-b", stage=Stage.TEST, input=200, output=20)
+    )
+
+    assert after_reset["input_tokens"] == 0
+    assert after_reset["output_tokens"] == 0
+    assert after_reset["cost_usd"] == 0.0

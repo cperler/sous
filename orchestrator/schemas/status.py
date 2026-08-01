@@ -128,6 +128,22 @@ class ResumeCursor(_StatusModel):
     hint: str = ""
 
 
+class ReviewFixup(_StatusModel):
+    """One review-emitted improvement the engine sent through an in-place rework pass.
+
+    REVIEW's working ``StageRecord`` is replaced when the engine re-opens
+    IMPLEMENT→…→REVIEW, so the original improvement would otherwise survive only in
+    the stage log and disappear from completion evidence.  This small durable record is
+    also the loop key: seeing the same fingerprint again means the attempted fixup did not
+    satisfy review and must be held for a human rather than silently cycled forever.
+    """
+
+    title: str
+    detail: str = ""
+    fingerprint: str
+    applied: bool = False
+
+
 def _new_stage_map() -> dict[Stage, StageRecord]:
     # Keyed by the FULL vocabulary (not the task's pipeline): off-pipeline stages sit at
     # SKIPPED, keeping the doc shape uniform across tasks (2026-07-01 design pass §1).
@@ -206,6 +222,14 @@ class Task(_StatusModel):
     # fills it from the lane preset (#68 — micro/lite default to deterministic TEST/DELIVER,
     # FULL keeps model TEST/DELIVER), so a hand-built/loaded doc keeps exactly its stored set.
     deterministic_stages: tuple[Stage, ...] = ()
+    # Optional pre-stage human checkpoint (#71). The task is parked before this stage
+    # until that exact gate identity is approved. Additive for backward compatibility.
+    hold_before: Stage | None = None
+    # Identity of the currently pending checkpoint; approval consumes and clears it.
+    pending_approval_what: str | None = None
+    # Checkpoint identities released for this task. Dispatch additionally requires the
+    # matching durable approval artifact, so an earlier approval cannot release a new gate.
+    approved_holds: list[str] = Field(default_factory=list)
     pr_number: int | None = None
     pr_url: str | None = None
     # Engine-owned task context plane: well-known fields folded out of each stage's
@@ -219,14 +243,19 @@ class Task(_StatusModel):
     resume_cursor: ResumeCursor | None = None
     error_signatures: list[str] = Field(default_factory=list)
     learnings: list[str] = Field(default_factory=list)  # appended per failed attempt
-    # Count of review-rejection fix cycles taken (review gate): each rejection that
-    # re-opens implement→…→review increments this; at the engine's max_review_cycles
-    # the task parks BLOCKED_ON_HUMAN instead of looping forever.
+    # Count of review-driven rework cycles taken (review gate): each blocking rejection or
+    # improvement fixup that re-opens implement→…→review increments this; at the engine's
+    # max_review_cycles the task parks BLOCKED_ON_HUMAN instead of looping forever.
     review_cycles: int = 0
     # Fingerprints (file:description, normalized) of the LAST rejection's blocking
     # issues — the convergence key (#15): a re-review whose issues are a subset of
     # these (no net-new findings, none critical) has converged and auto-approves.
     last_review_rejection: list[str] = Field(default_factory=list)
+    # Review ``improvement.disposition=fixup`` entries already sent through the bounded
+    # IMPLEMENT→…→REVIEW loop (#227).  Kept outside the REVIEW StageRecord because that
+    # record is reset for the rework pass.  Additive: older task docs load with an empty
+    # list, so no schema-version bump is needed.
+    review_fixups: list[ReviewFixup] = Field(default_factory=list)
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None

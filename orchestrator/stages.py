@@ -204,6 +204,8 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "surfaced in the completion note, not filed. Omit the improvement entirely if "
             "none clears the bar. And (b) retrospective — one lesson this task teaches "
             "about the ORCHESTRATION PROCESS itself (prompts, stages, tooling, lanes). "
+            "When the lesson names a concrete harness artifact, include target "
+            "{kind: stage-template|agent|skill|stage-schema|kit, ref: artifact name}; "
             "Omit either if nothing genuine stands out — do not pad.\n"
             "Return: approved, issues (blocking; empty when approved — each an object "
             "{severity: critical|important|suggestion, file, line, description, "
@@ -211,7 +213,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "learnings, so make them concrete and actionable; suggestion-only rejections "
             "auto-approve), non_blocking (list of {title, detail, disposition: "
             "file|fix_now|drop}; empty if none), improvement ({title, detail, disposition: "
-            "file|fixup|fix_now|drop} or omitted), retrospective ({title, detail} or "
+            "file|fixup|fix_now|drop} or omitted), retrospective ({title, detail, target?} or "
             "omitted)."
         ),
     ),
@@ -656,7 +658,8 @@ _FINDER_RETURN = (
     "Return: findings (list of {severity: critical|important|suggestion, file, line, "
     "description, suggested_fix} — empty when you find nothing, which is a valid and "
     "useful answer), improvement ({title, detail} or omitted), retrospective "
-    "({title, detail} or omitted)."
+    "({title, detail, target?} or omitted). For a retrospective about a concrete harness "
+    "artifact, target is {kind: stage-template|agent|skill|stage-schema|kit, ref: name}."
 )
 # The blindness contract, stated to every finder identically.
 _FINDER_PREAMBLE = (

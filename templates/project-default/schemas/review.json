@@ -74,7 +74,17 @@
       "required": ["title"],
       "properties": {
         "title": {"type": "string", "description": "one-line process lesson"},
-        "detail": {"type": "string", "description": "what we learned / what to change"}
+        "detail": {"type": "string", "description": "what we learned / what to change"},
+        "target": {
+          "type": "object",
+          "description": "optional concrete harness artifact this lesson concerns",
+          "required": ["kind", "ref"],
+          "properties": {
+            "kind": {"type": "string", "enum": ["stage-template", "agent", "skill", "stage-schema", "kit"]},
+            "ref": {"type": "string", "minLength": 1}
+          },
+          "additionalProperties": false
+        }
       },
       "additionalProperties": true
     }

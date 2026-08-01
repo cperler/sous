@@ -190,7 +190,10 @@ conversation:
   `max_review_cycles`). Convergence auto-approval (`_review_verdict`): a re-review whose
   blocking issues are a subset of the prior rejection's — no net-new findings — ends the
   loop. Deterministic project policy findings merge in via the `review_findings` hook (#65)
-  and force `approved=false`.
+  and force `approved=false`. An improvement dispositioned `fixup` uses the same bounded
+  tail reset after REVIEW, carrying the request into IMPLEMENT and re-running delivery on
+  the existing PR. The task retains the request outside the reset REVIEW record; only a
+  later approving review marks it applied, while a repeated/unapplicable fixup parks.
 - **Failure taxonomy → recovery.** `orchestrator/retry.py` does retry-with-learnings
   (learnings appended, newest last) behind a *structured* circuit breaker (a hash over the
   normalized failure set — timestamps/paths/numbers scrubbed — so the breaker actually trips).
@@ -273,7 +276,16 @@ conversation:
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
   entries into the `prior_learnings` context key — read-only advisory text, folded once per
   task, rendered (hedged) into every stage prompt. `orchestrator kb capture|apply|show|gc`
-  is the manual surface.
+  is the manual surface. REVIEW process retrospectives use a detector-only `process` kind:
+  they never enter task prompts. `orchestrator/meta_authoring.py` groups those observations
+  by their optional stage-template/agent/skill/schema/kit target and, after the same target
+  appears in two distinct runs, files one evidence-backed `meta-authoring` task through the
+  adapter's `file_followup` seam. `<runs-root>/meta-proposals.jsonl` prevents refiling.
+- **Meta-authoring delivery gate.** Tasks sourced from issues labeled `meta-authoring`
+  persist `hold_before=deliver`. They may scope, implement, test, and review normally, but
+  `next_work` parks them `BLOCKED_ON_HUMAN` before DELIVER. Approval is keyed to the exact
+  `before:deliver` hold, so an earlier scope/review approval cannot authorize delivery; the
+  eventual PR merge remains the independent apply gate.
 - **Batch scheduler.** `orchestrator/scheduler.py` is a thin hub-and-spoke loop over the DAG
   (`orchestrator/dag.py` — transitive cascade-blocking). Each tick dispatches the
   dependency-satisfied, non-terminal tasks within the capacity limit; a batch-wide circuit
@@ -299,6 +311,7 @@ cross-run `learnings-kb.jsonl` share one parent:
                                                    a heartbeat per tick + per sleep
                                                    slice, and an exit record
     stage-costs.jsonl                              per-call cost ledger rows
+    approval-<run>-<task>.json                     human gate decision
     cost-summary.md, cost-report.md                rendered rollups
     stages/<task>/NN-<stage>.{json,md}             per-stage record + prose
     stages/<task>/<stage>-attempt<N>.stream.jsonl  full raw provider stream (retained

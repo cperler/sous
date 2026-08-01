@@ -42,11 +42,22 @@ from .learnings_kb import (
 )
 from .learnings_kb import (
     harvest_from_task,
+    harvest_process_retrospective,
     relevant_learnings,
     resolve_kb_path,
 )
 from .learnings_kb import (
+    read_entries as read_kb_entries,
+)
+from .learnings_kb import (
     tokenize as _kb_tokenize,
+)
+from .meta_authoring import (
+    append_filing,
+    proposal_body,
+    proposal_filing_guard,
+    proposal_title,
+    recurring_proposals,
 )
 from .model_table import (
     DEFAULT_MODEL_TABLE,
@@ -98,7 +109,7 @@ from .schemas.enums import (
     effort_below,
     resolve_effort,
 )
-from .schemas.status import Run, RunDriver, Task, TaskRef
+from .schemas.status import ReviewFixup, Run, RunDriver, Task, TaskRef
 from .schemas.work import (
     LanePolicy,
     LaneUsed,
@@ -117,6 +128,7 @@ from .state_machine import (
     is_done,
     next_stage,
     no_model_test_surface,
+    pr_not_opened,
     reset_for_fix_cycle,
     resume_point,
     unjudged_tests_notice,
@@ -519,6 +531,7 @@ class Engine:
         model: str | None = None,
         effort: str | None = None,
         max_filed_followups: int | None = None,
+        hold_before: Stage | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -536,7 +549,9 @@ class Engine:
         ``max_filed_followups`` (#191) caps how many non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
-        engine default, a negative value is rejected. Validation (non-empty, duplicate-free)
+        engine default, a negative value is rejected. ``hold_before`` parks the task at a
+        human gate before that stage; source tasks carrying the ``meta-authoring`` label
+        default to a pre-DELIVER hold. Validation (non-empty, duplicate-free)
         is the Task model's.
 
         Cost-aware lane routing (#34): when the run enables ``route_by_cost`` AND no
@@ -566,6 +581,10 @@ class Engine:
         something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
         audited way to move the snapshot mid-run."""
         spec = self.project.task_source.resolve(task_id)
+        if hold_before is None and any(
+            str(label).strip().casefold() == "meta-authoring" for label in spec.labels
+        ):
+            hold_before = Stage.DELIVER
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
         # Per-task model pin (#84): resolve the alias/id, then validate it against the task's
@@ -702,6 +721,7 @@ class Engine:
                 execution_lane=effective_lane,
                 pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
                 deterministic_stages=tuple(deterministic_stages or ()),
+                hold_before=hold_before,
                 max_attempts=self.max_attempts,
                 max_filed_followups=max_filed_followups,
             )
@@ -851,7 +871,9 @@ class Engine:
         smaller, less-eager DOWNGRADE band (the ledger read is confined to the band-edge
         util region and gated on a minimum sample). Emitting stamps the dispatch lease
         (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
-        supervisor crash instead.
+        supervisor crash instead. When the resolved stage matches ``Task.hold_before``,
+        dispatch parks until both the matching approval identity and durable artifact are
+        present.
 
         For an interactive, fresh model dispatch, supplying ``supervisor_context`` adds a
         final pre-lease gate after the exact prompt has been rendered. It reserves
@@ -924,6 +946,23 @@ class Engine:
         stage = next_stage(task)
         if stage is None:
             return None
+        if task.hold_before is stage:
+            gate = f"before:{stage.value}"
+            approval = self.store.load_approval(run_id, task_id)
+            gate_is_approved = (
+                gate in task.approved_holds
+                and isinstance(approval, dict)
+                and approval.get("what") == gate
+            )
+            if not gate_is_approved:
+                self.hold_for_approval(run_id, task_id, what=gate)
+                self.emit_notification(
+                    run_id, "task_blocked",
+                    {"run_id": run_id, "task_id": task_id, "kind": "task_blocked",
+                     "summary": f"task {task_id} is held before {stage.value}",
+                     "stage": stage.value, "reason": gate},
+                )
+                return None
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
@@ -1911,6 +1950,11 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
+        # #227: capture the fixup request from the canonical review output (including a
+        # synthesized panel output) before entering the locked transition.  The helper is
+        # pure; whether this is a fresh request, a repeated failed fixup, or a request that
+        # can piggyback on a blocking-review cycle depends on the fresh task under the lock.
+        review_fixup = self._review_fixup(effective)
         # A rate-limit with a cheaper model still available is transient — re-queue the
         # SAME stage+attempt on that model rather than burning a retry or tripping the
         # breaker. Gated on the lane's allow_fallback (so the flag is honored, not dead).
@@ -1939,6 +1983,8 @@ class Engine:
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
         test_validation: dict[str, object] | None = None
+        review_fixup_action: dict[str, object] | None = None
+        fixups_applied: list[ReviewFixup] = []
         cooldown_until: str | None = None
         provider_out_reason: str | None = None
         # #311: what the under-lock re-validation rejected (fresh doc + mismatch), captured
@@ -1949,7 +1995,8 @@ class Engine:
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
-            nonlocal test_validation, cooldown_until, provider_out_reason, lease_rejection
+            nonlocal test_validation, review_fixup_action, fixups_applied
+            nonlocal cooldown_until, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
             # validate→transition sequence is one read-modify-write on the fresh doc,
             # so of two concurrent duplicate records exactly one clears the lease —
@@ -2094,12 +2141,51 @@ class Engine:
                         outcome = "scope_not_feasible_held"
                     elif review_verdict is not None and review_verdict["kind"] == "rejected":
                         outcome = self._apply_review_rejection(t, review_verdict)
-                    elif is_done(t):
-                        t.state = TaskState.COMPLETED
-                        outcome = "task_completed"
+                        if review_fixup is not None:
+                            if outcome == "review_rejected_fix_cycle":
+                                reason = self._review_fixup_tail_ineligibility(t)
+                                if reason is not None:
+                                    review_fixup_action = {
+                                        "disposition": "held",
+                                        "reason": reason,
+                                    }
+                                else:
+                                    fresh = self._remember_review_fixup(t, review_fixup)
+                                    review_fixup_action = {
+                                        "disposition": "scheduled",
+                                        "reason": "combined with blocking-review fix cycle",
+                                        "already_scheduled": not fresh,
+                                    }
+                            else:
+                                review_fixup_action = {
+                                    "disposition": "held",
+                                    "reason": "blocking review exhausted the rework budget",
+                                }
+                    elif review_fixup is not None:
+                        outcome, reason = self._apply_review_fixup(t, review_fixup)
+                        review_fixup_action = {
+                            "disposition": (
+                                "scheduled" if outcome == "review_fixup_cycle" else "held"
+                            ),
+                            "reason": reason,
+                        }
                     else:
-                        t.state = TaskState.RUNNING
-                        outcome = "stage_completed"
+                        # A later REVIEW that reaches completion without asking for the
+                        # fixup again is the engine-observable proof that the re-implement,
+                        # re-test and re-deliver pass satisfied it.  Mark the durable records
+                        # in the approving review's transaction (even when a bespoke
+                        # pipeline has later stages) so disposition text can never get ahead
+                        # of evidence.
+                        if effective.stage is Stage.REVIEW:
+                            fixups_applied = [f for f in t.review_fixups if not f.applied]
+                            for fixup in fixups_applied:
+                                fixup.applied = True
+                        if is_done(t):
+                            t.state = TaskState.COMPLETED
+                            outcome = "task_completed"
+                        else:
+                            t.state = TaskState.RUNNING
+                            outcome = "stage_completed"
                 else:
                     # Session fate on a failure is decided inside _handle_failure (it has the
                     # infra classification + the salvage decision the warm-retry policy needs).
@@ -2196,6 +2282,29 @@ class Engine:
                      "disposition": review_verdict.get("disposition"),
                      "issues": review_verdict["issues_text"],
                      "review_cycles": t.review_cycles}
+                )
+            # #227: the in-place improvement loop has its own evidence rather than
+            # masquerading as a filed/not-filed decision.  These events share the review
+            # result's atomic commit boundary, so a record replay cannot schedule or apply
+            # the same fixup twice.
+            if review_fixup is not None and review_fixup_action is not None:
+                disposition = str(review_fixup_action["disposition"])
+                events.append(
+                    {"ts": _now(), "type": f"review_fixup_{disposition}",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value, "title": review_fixup.title,
+                     "fingerprint": review_fixup.fingerprint,
+                     "reason": review_fixup_action["reason"],
+                     **(
+                         {"already_scheduled": review_fixup_action["already_scheduled"]}
+                         if "already_scheduled" in review_fixup_action else {}
+                     )}
+                )
+            for fixup in fixups_applied:
+                events.append(
+                    {"ts": _now(), "type": "review_fixup_applied", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "title": fixup.title, "fingerprint": fixup.fingerprint}
                 )
             # #261: nobody judged whether the tests are meaningful (or the reviewer's verdict
             # was suppressed by the no-model-test-surface exemption). Warning-grade, so a run
@@ -2349,6 +2458,7 @@ class Engine:
                 # a later run doesn't re-pay to learn the same lesson. Skips a clean task
                 # (empty learnings); best-effort — never breaks the terminal transition.
                 self._harvest_task_learnings(run_id, task)
+                self._harvest_process_retrospective(run_id, task)
             self._maybe_finalize_run(run_id)
         return {
             "recorded": True,
@@ -2383,6 +2493,8 @@ class Engine:
         REVIEW rejection carries its blocking ``issues``. The veto string below is
         load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
         failure streak → ``task.last_error``): enrich the learning, not this reason."""
+        if result.stage is Stage.DELIVER:
+            return pr_not_opened(result.structured_output)
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
@@ -2571,6 +2683,116 @@ class Engine:
         else:
             kind = "rejected"
         return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints}
+
+    @staticmethod
+    def _review_fixup(result: StageResult) -> ReviewFixup | None:
+        """Return a bounded in-place improvement request from a successful REVIEW.
+
+        The interactive lane is intentionally tolerated at this seam, so model fields are
+        coerced and bounded just like evidence-out fields instead of assuming schema-perfect
+        strings.  Only the explicit ``fixup`` disposition acts; every other improvement
+        keeps the existing filing/completion-note behavior.
+        """
+        if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+            return None
+        output = result.structured_output or {}
+        improvement = output.get("improvement")
+        if not isinstance(improvement, dict):
+            return None
+        disposition = str(improvement.get("disposition") or "").strip().casefold()
+        title = str(improvement.get("title") or "").strip()
+        if disposition != "fixup" or not title:
+            return None
+        title = title[:200]
+        detail = str(improvement.get("detail") or "").strip()[:2000]
+        return ReviewFixup(
+            title=title,
+            detail=detail,
+            fingerprint=issue_fingerprint(title),
+        )
+
+    @staticmethod
+    def _fixup_learning(fixup: ReviewFixup, *, repeated: bool = False) -> str:
+        prefix = "review improvement fixup still requested" if repeated else "review improvement fixup"
+        detail = f" — {fixup.detail}" if fixup.detail else ""
+        return f"{prefix}: {fixup.title}{detail}"
+
+    def _remember_review_fixup(self, task: Task, fixup: ReviewFixup) -> bool:
+        """Put a fixup into the durable task/history plane and IMPLEMENT learnings.
+
+        Returns True for a newly-recorded request.  A blocking rejection may revisit an
+        already-scheduled fixup while independently earning another normal review cycle;
+        carry that reminder into IMPLEMENT but do not duplicate the durable record.
+        """
+        existing = next(
+            (saved for saved in task.review_fixups if saved.fingerprint == fixup.fingerprint),
+            None,
+        )
+        task.learnings.append(self._fixup_learning(fixup, repeated=existing is not None))
+        if existing is not None:
+            return False
+        task.review_fixups.append(fixup.model_copy(deep=True))
+        return True
+
+    def _apply_review_fixup(self, task: Task, fixup: ReviewFixup) -> tuple[str, str]:
+        """Schedule one approved-review fixup or hold an unsafe/repeated request.
+
+        Reuses the existing bounded review-cycle budget and tail reset.  The standard
+        pipelines all contain an IMPLEMENT→DELIVER→REVIEW tail; a bespoke pipeline
+        without that order cannot honestly update and re-check the PR, so it parks instead
+        of publishing the old false "applied" completion note.  A repeated fingerprint
+        likewise parks immediately: the first pass already had this exact instruction and
+        another blind loop would be lossy.
+        """
+        if any(saved.fingerprint == fixup.fingerprint for saved in task.review_fixups):
+            reason = "same fixup was requested again after its re-implement pass"
+            return self._hold_review_fixup(task, fixup, reason), reason
+        ineligible = self._review_fixup_tail_ineligibility(task)
+        if ineligible is not None:
+            return self._hold_review_fixup(task, fixup, ineligible), ineligible
+        if task.review_cycles >= self.max_review_cycles:
+            reason = f"review rework budget exhausted ({task.review_cycles} cycles)"
+            return self._hold_review_fixup(task, fixup, reason), reason
+
+        # Same session boundary as a rejecting review: an implementer must act from the
+        # durable instruction, not continue inside the reviewer context that proposed it.
+        task.session_ref = None
+        task.session_provider = None
+        reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
+        if not reset:  # defensive counterpart to the pipeline membership guard above
+            reason = "could not reset the pipeline from IMPLEMENT"
+            return self._hold_review_fixup(task, fixup, reason), reason
+        self._remember_review_fixup(task, fixup)
+        task.review_cycles += 1
+        task.state = TaskState.RETRYING
+        return "review_fixup_cycle", "re-running implement through review in place"
+
+    @staticmethod
+    def _review_fixup_tail_ineligibility(task: Task) -> str | None:
+        """Return a hold reason unless a fixup can be reimplemented and re-delivered.
+
+        A fixup becomes durable application evidence only after the pipeline can run
+        IMPLEMENT, DELIVER, and REVIEW in that order.  Both standalone and combined
+        rejection/fixup paths use this result so bespoke pipelines surface an audit hold
+        instead of later claiming an un-delivered change was applied.
+        """
+        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
+        if not all(stage in task.pipeline for stage in required_tail):
+            return "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
+        positions = tuple(task.pipeline.index(stage) for stage in required_tail)
+        if positions != tuple(sorted(positions)):
+            return "task pipeline does not order IMPLEMENT→DELIVER→REVIEW for a fixup"
+        return None
+
+    @staticmethod
+    def _hold_review_fixup(task: Task, fixup: ReviewFixup, reason: str) -> str:
+        """Park a fixup the engine cannot safely auto-apply, leaving REVIEW resumable."""
+        rec = task.stages[Stage.REVIEW]
+        rec.status = StageStatus.FAILED
+        rec.error = f"review fixup held: {fixup.title} — {reason}"[:500]
+        task.last_error = rec.error
+        task.state = TaskState.BLOCKED_ON_HUMAN
+        return "review_fixup_held"
 
     def _apply_review_rejection(self, task: Task, verdict: dict) -> str:
         """Dispose of a rejected review: a bounded fix cycle (re-open implement→…→review
@@ -3027,7 +3249,8 @@ class Engine:
         """Park a task at the human gate. Refuses while a dispatch is outstanding
         (record the in-flight result first — a held task must be quiescent). If the
         result can never arrive because the run was killed mid-dispatch, use
-        ``abandon()`` to release the lease and drive the task terminal instead."""
+        ``abandon()`` to release the lease and drive the task terminal instead. ``what``
+        is persisted on the task so approval releases the exact pending checkpoint."""
 
         def _hold(t: Task) -> None:
             if t.state in TERMINAL_TASK_STATES:
@@ -3038,6 +3261,7 @@ class Engine:
                     f"record its result before holding"
                 )
             t.state = TaskState.BLOCKED_ON_HUMAN
+            t.pending_approval_what = what
 
         # #199: commit the task mutation + its transition event atomically (event
         # appended first, task doc last) so a crash can never leave a held task with no
@@ -3052,27 +3276,41 @@ class Engine:
 
     def approve(self, run_id: str, task_id: str, *, approved_by: str, what: str = "") -> Task:
         """Release a held task. The durable ``approval-<run>-<task>.json`` artifact IS
-        the gate record (who/when/what) — prose norms stay documentation."""
+        the gate record (who/when/what) — prose norms stay documentation. A pending hold's
+        identity takes precedence over the optional caller note and is recorded in both
+        the task's approved-hold set and the artifact, preventing approval reuse across
+        different checkpoints."""
+
+        approved_what = what
 
         def _release(t: Task) -> None:
+            nonlocal approved_what
             if t.state is not TaskState.BLOCKED_ON_HUMAN:
                 raise ContractError(
                     f"task {task_id} is not held for approval (state {t.state.value})"
                 )
+            approved_what = t.pending_approval_what or what
+            if t.pending_approval_what and t.pending_approval_what not in t.approved_holds:
+                t.approved_holds.append(t.pending_approval_what)
+            t.pending_approval_what = None
             t.state = TaskState.PENDING
+
+        def _approval_events(_t: Task) -> list[dict]:
+            return [
+                {"ts": _now(), "type": "approved", "run_id": run_id,
+                 "task_id": task_id, "approved_by": approved_by, "what": approved_what}
+            ]
 
         # #199: commit the release + its `approved` event atomically (event first, task
         # doc last), so a durable PENDING transition always has its event on disk. The
         # mutator's state guard runs inside the commit, so a rejected release still raises
         # BEFORE any approval artifact is written (no spurious gate record on the error path).
         task = self.store.commit_task_events(
-            run_id, task_id, _release,
-            [{"ts": _now(), "type": "approved", "run_id": run_id, "task_id": task_id,
-              "approved_by": approved_by, "what": what}],
+            run_id, task_id, _release, _approval_events,
         )
         self.store.write_approval(
             run_id, task_id,
-            {"approved_by": approved_by, "at": _now(), "what": what, "run_id": run_id,
+            {"approved_by": approved_by, "at": _now(), "what": approved_what, "run_id": run_id,
              "task_id": task_id},
         )
         self._set_ref_state(run_id, task_id, TaskState.PENDING)
@@ -3610,6 +3848,7 @@ class Engine:
         self._cascade_from(run_id, task.task_id)
         self._release_ports(run_id, task)
         self._harvest_task_learnings(run_id, task)
+        self._harvest_process_retrospective(run_id, task)
         if disposition == "failed":
             # Same alerting record()'s terminal-failure path fires (#55/#107): a task that
             # died is exactly the unattended-run event the old monitor alerted on. Always
@@ -4066,6 +4305,7 @@ class Engine:
         self._set_ref_state(run_id, task_id, TaskState.SUPERSEDED)
         self._release_ports(run_id, task)
         self._harvest_task_learnings(run_id, task)
+        self._harvest_process_retrospective(run_id, task)
         return task
     # --- task spec snapshot refresh (#271) -------------------------------------
     def refresh_spec(
@@ -4973,7 +5213,8 @@ class Engine:
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
-             "followups_filed": len(followups), "improvement_filed": improvement_ref is not None},
+             "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
+             "review_fixups_applied": sum(fixup.applied for fixup in task.review_fixups)},
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
@@ -5059,7 +5300,8 @@ class Engine:
         * (#223/#228) The improvement does not carry an explicit ``file`` disposition —
           the reviewer did not opt it into a standing issue.  An
           ``improvement_not_filed`` event is emitted so the decision is auditable.
-          ``fixup`` means the change should be applied in place in the current PR; the
+          ``fixup`` is normally consumed by #227's pre-finalize rework loop; this remains
+          a defensive no-file gate for legacy/hand-built completed task documents.  The
           other non-file dispositions are noted in the completion note.
         * (#188) The idea fingerprint-matches an already-filed follow-up
           (``skip_fingerprints``) — one observation must not be filed twice as both a
@@ -5074,8 +5316,8 @@ class Engine:
         title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
             return None
-        # #223/#228 disposition gate: filing is opt-in. `fixup` is applied in place in this
-        # PR; every other non-file disposition is noted in the completion note.
+        # #223/#228 disposition gate: filing is opt-in.  A live `fixup` is handled before
+        # finalize by #227; every non-file disposition is suppressed here.
         disposition = str(improvement.get("disposition") or "").strip().casefold()
         if disposition != "file":
             event_disposition = disposition if "disposition" in improvement else None
@@ -5476,6 +5718,86 @@ class Engine:
                  "task_id": task.task_id, "count": len(written)},
             )
 
+    def _harvest_process_retrospective(self, run_id: str, task: Task) -> None:
+        """Persist REVIEW's process lesson for deterministic cross-run recurrence checks."""
+        if not self._learnings_kb_enabled():
+            return
+        try:
+            written = harvest_process_retrospective(self._learnings_kb_path(), task, run_id)
+        except Exception as exc:  # noqa: BLE001 - evidence harvest must never break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "process_harvest_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+            return
+        if written:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "process_harvested", "run_id": run_id,
+                 "task_id": task.task_id, "count": len(written)},
+            )
+
+    def _meta_proposals_path(self) -> Path:
+        """Return the filing ledger beside the resolved cross-run learnings KB."""
+        return self._learnings_kb_path().with_name("meta-proposals.jsonl")
+
+    def _file_meta_proposals(self, run_id: str) -> None:
+        """File newly recurring process complaints through the current task source.
+
+        Detection and filing are best-effort run-finalize effects. A successful tracker
+        reference is ledgered; a missing/raising hook is non-fatal and leaves the cluster
+        eligible for a later run to retry. Each cluster's ledger recheck, external filing,
+        and ledger append share one guard so concurrent finalizers cannot file duplicates.
+        """
+        if not self._learnings_kb_enabled():
+            return
+        file_followup = getattr(self.project.task_source, "file_followup", None)
+        if not callable(file_followup):
+            return
+        try:
+            proposals = recurring_proposals(read_kb_entries(self._learnings_kb_path()))
+            ledger_path = self._meta_proposals_path()
+        except Exception as exc:  # noqa: BLE001 - detection is best-effort evidence-out
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "meta_proposal_failed", "run_id": run_id,
+                 "error": str(exc)},
+            )
+            return
+        for proposal in proposals:
+            title = proposal_title(proposal)
+            try:
+                with proposal_filing_guard(ledger_path, proposal["key"]) as should_file:
+                    if not should_file:
+                        continue
+                    ref = file_followup(
+                        title=title,
+                        body=proposal_body(proposal),
+                        labels=["meta-authoring", "enhancement"],
+                    )
+                    if not ref:
+                        raise RuntimeError("file_followup returned no reference")
+                    appended = append_filing(
+                        ledger_path,
+                        {"key": proposal["key"], "ref": str(ref), "filed_at": _now(),
+                         "run_id": run_id},
+                    )
+                    if not appended:
+                        raise RuntimeError("proposal filing claim was not recorded")
+            except Exception as exc:  # noqa: BLE001 - filing must never break finalize
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "meta_proposal_failed", "run_id": run_id,
+                     "key": proposal["key"], "title": title, "error": str(exc)},
+                )
+                continue
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "meta_proposal_filed", "run_id": run_id,
+                 "key": proposal["key"], "title": title, "ref": str(ref)},
+            )
+
     def _harvest_retrospective(self, run_id: str, retro: dict) -> None:
         """Harvest the failure retrospective's DISTILLED cross-task patterns into the KB
         (#72 tie-in). The per-task learnings were already harvested at task finalize; this
@@ -5612,6 +5934,9 @@ class Engine:
             # #72: harvest the retrospective's distilled cross-task patterns into the KB
             # too (the per-task learnings were harvested at each task's finalize).
             self._harvest_retrospective(run_id, retro)
+        # Process observations from every terminal task are now durable. Detect recurrence
+        # only at the run boundary, and ledger successful filings so replay is idempotent.
+        self._file_meta_proposals(run_id)
         # Every task is terminal → no more writers → sweep the now-idle lock sentinels
         # (done LAST, after the final artifact writes that recreate their own locks).
         self.store.sweep_locks()

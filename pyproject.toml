@@ -125,6 +125,7 @@ module = [
     "orchestrator.gitcmd",
     "orchestrator.lane_loader",
     "orchestrator.learnings_kb",
+    "orchestrator.meta_authoring",
     "orchestrator.model_table",
     "orchestrator.panel_report",
     "orchestrator.port_registry",

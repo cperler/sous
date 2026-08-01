@@ -596,13 +596,31 @@ def to_stage_result(
 
 
 def _usage_from(d: dict) -> TokenUsage:
+    """Normalize a provider usage block to the engine's DISJOINT convention: ``input`` is
+    fresh input only, with cache reads/writes counted separately (that is what
+    ``ModelTable.cost_usd`` prices, charging reads at ``cache_read_mult``).
+
+    The two providers report opposite things under similar names (#350):
+
+    - claude's ``cache_read_input_tokens`` is DISJOINT from ``input_tokens`` — pass through.
+    - codex's ``cached_input_tokens`` is a SUBSET of ``input_tokens`` — subtract it, or the
+      cached tokens get billed at the full input rate AND again at the cache-read rate. At
+      the ~95% hit rates the headless codex lane actually gets, that inflated a row ~7x.
+    """
     u = d.get("usage") or {}
+    reported_input = u.get("input_tokens", 0) or 0
+    claude_cache_read = u.get("cache_read_input_tokens") or 0
+    codex_cache_read = u.get("cached_input_tokens") or 0
+    if claude_cache_read:
+        cache_read, fresh_input = claude_cache_read, reported_input
+    else:
+        # max(): a provider that ever reports cached > input must not yield negative fresh
+        # input, which would price as a credit.
+        cache_read, fresh_input = codex_cache_read, max(0, reported_input - codex_cache_read)
     return TokenUsage(
-        input=u.get("input_tokens", 0) or 0,
+        input=fresh_input,
         output=u.get("output_tokens", 0) or 0,
-        # claude reports cache_read_input_tokens; codex turn.completed reports
-        # cached_input_tokens — map both so codex cache reads aren't dropped.
-        cache_read=(u.get("cache_read_input_tokens") or u.get("cached_input_tokens") or 0),
+        cache_read=cache_read,
         cache_write=u.get("cache_creation_input_tokens", 0) or 0,
     )
 

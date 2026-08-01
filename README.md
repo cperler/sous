@@ -289,6 +289,13 @@ $ORCH supervisor-context # fresh Claude Code context-window snapshot (interactiv
 $ORCH resume-supervisor  # release a lease-free context park from a fresh session
 ```
 
+REVIEW can also identify a process lesson's concrete harness target (a stage template,
+agent, skill, stage schema, or scaffold-kit asset). Those lessons are retained across runs
+but excluded from product-task prompts. When the same target is criticized in two distinct
+runs, the engine files one `meta-authoring` enhancement containing both evidence trails.
+That issue runs through the ordinary pipeline, but is automatically held before DELIVER
+until a human approves it; merging the resulting PR is the apply step.
+
 `panel-report` reads the newest run stores directly, comparing panel and plain review
 costs while breaking panel yield down by finder lens, verifier verdict, and cap hits. It is
 observational: the panel replaces the single-reviewer path, so the report explicitly does
