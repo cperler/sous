@@ -24,7 +24,7 @@ front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). 
 CI gate (pytest + ruff + mypy) is green. Live-proven end to end: real GitHub issues driven
 to merged PRs on a real product repo, with clean lane-attribution audits, and self-hosted on
 this repo's own tracker. Anything cut or thinned is tracked as a GitHub issue (label
-`deferred-scope`); see `DEFERRED.md` for the discipline.
+`deferred-scope`); `CLAUDE.md` documents the discipline.
 
 ## What it does
 
@@ -92,7 +92,6 @@ adapters/                implementations of the ports above (nothing imports bac
 run_targets/             the Workflow shim (JS) + the adapter-bootstrap skill
 tests/                   pytest suite (one test_<subsystem>.py per module)
 docs/                    the frozen build record — design notes, plan, review passes
-DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
 
 ## The front doors: idea → issues → a run
@@ -396,9 +395,10 @@ issue (and re-dispositioned at each gate) — nothing is silently dropped.
 - **`ARCHITECTURE.md`** — the contributor's map of the system as built. Start here if you're
   changing the engine.
 - **`CLAUDE.md`** — the working norms any change to this repo must respect.
-- **`DEFERRED.md`** — the scope-ledger discipline; the live ledger is
+- **Scope ledger** — the live ledger is
   [GitHub issues](https://github.com/cperler/orchestration-template/issues) (label
-  `deferred-scope`), and the pre-migration ledger is frozen at `docs/deferred-history.md`.
+  `deferred-scope`); the discipline and the label taxonomy live in `CLAUDE.md`, and the
+  pre-migration ledger is frozen at `docs/deferred-history.md`.
 - **`docs/`** — the frozen build record (original design notes, the phased plan, and the
   design-pass reviews). Historical by construction; `docs/README.md` indexes it and says
   what was deleted and why. Nothing there describes the current code.

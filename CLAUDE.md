@@ -20,10 +20,24 @@ tracker or fix-forward.
   errors. Add a regression test with each fix.
 - **GitHub issues are the scope ledger** (`gh issue list -R cperler/orchestration-template`).
   Nothing is silently dropped: anything cut, thinned, or found-missing gets an issue labeled
-  `deferred-scope` (with source / why / trigger-to-revisit), re-dispositioned at each gate
-  (promote / keep-with-comment / close-with-reason). File or close issues as you build or
-  defer. `DEFERRED.md` documents the discipline; the pre-2026-07-01 ledger is frozen at
-  `docs/deferred-history.md`.
+  `deferred-scope` carrying the same three fields the old ledger rows did — **source**, **why
+  deferred**, and a **trigger to revisit**. File or close issues as you build or defer; the
+  engine files them too (`Engine._file_review_followups` and `_file_trunk_gate_fix`). A **gate
+  review** sweeps every open `deferred-scope` issue and re-dispositions each one: *promote*
+  (pick it up), *keep* (comment why), or *close with a written reason* — never delete.
+  Labels: `deferred-scope` (cut/thinned scope) · `roadmap` (candidate ideas — promote an item
+  to its own issue when picked up) · `bug` · `friction` (harness pain hit during real use,
+  often filed from another project) · `dx` · `meta-authoring` (harness self-improvement, held
+  before DELIVER). Build narrative lives in commits, PRs, and issue comments — not in a ledger
+  file. The pre-2026-07-01 ledger is frozen at `docs/deferred-history.md`.
+- **When the agent keeps violating a rule, the rule is not the fix.** A directive the model
+  ignores wants structural enforcement — a check the harness runs, a tool it cannot skip, a
+  posture it cannot hold — or deletion. It does not want a louder restatement, which costs
+  tokens in every prompt and buys nothing. #317→#322 is the shape: the no-attribution
+  directive is prose, so a post-hoc audit (`commit_attribution.py`) verifies it and events
+  the misses. This cuts the other way too — harness prose accretes a clause per incident and
+  nothing removes them, so REVIEW's retrospective ask invites SUBTRACTIVE lessons (a rule
+  that never fires, changes nothing, or contradicts another) as explicitly as additive ones.
 - **Run-level settings must persist on the Run/Task doc, not engine memory.** Every CLI
   subcommand rebuilds the Engine from constructor DEFAULTS (`cli._engine` passes only
   store/ledger/project/router/registry), so a setting chosen at run-create time is lost by

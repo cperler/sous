@@ -7,7 +7,7 @@
 | A contributor's map of the system as it is | `../ARCHITECTURE.md` |
 | How to install it, run it, and point it at a project | `../README.md` |
 | Working norms for changing it | `../CLAUDE.md` |
-| Open/deferred scope | [GitHub issues](https://github.com/cperler/orchestration-template/issues) (`../DEFERRED.md` for the discipline) |
+| Open/deferred scope | [GitHub issues](https://github.com/cperler/orchestration-template/issues) (`../CLAUDE.md` for the discipline) |
 
 What's kept here is the historical record of *how the system came to be* — the design
 decisions, the phased plan, and the review passes that shaped it. It is retained because
