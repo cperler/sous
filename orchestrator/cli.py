@@ -42,6 +42,7 @@ from .driver_log import DEFAULT_HEARTBEAT_INTERVAL_S
 from .engine import DEFAULT_ABANDON_MIN_IDLE_S, Engine
 from .lane_loader import build_registry
 from .ports.project import ADAPTER_CONTRACT_VERSION
+from .project_init import DEFAULT_STACK
 from .project_loader import load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider
@@ -543,6 +544,34 @@ def main(argv: list[str] | None = None) -> int:
                     help="newest runs to include (default 20)")
     sub.add_parser("retrospective", help="failure retrospective (patterns + what the retries learned)")
     sub.add_parser("validate", help="check a project adapter against the engine's contract (no run needed)")
+    ip = sub.add_parser("init-project",
+                        help="phase 0 (#367): create a NEW project's repo skeleton — src "
+                             "layout, one passing test, lint/type config — then verify it "
+                             "passes its own commands. Feeds orchestrator-scaffold")
+    ip.add_argument("name", help="project name (kebab-case; 'My Thing' is normalized)")
+    ip.add_argument("--into", default=".",
+                    help="parent dir the project dir is created inside (default: cwd), so "
+                         "the project lands at <into>/<name>")
+    ip.add_argument("--stack", default=DEFAULT_STACK,
+                    help=f"skeleton stack (default: {DEFAULT_STACK})")
+    ip.add_argument("--description", default="",
+                    help="one-line description, written into pyproject + README")
+    ip.add_argument("--package", default=None,
+                    help="import package name (default: the name with hyphens as underscores)")
+    ip.add_argument("--dry-run", action="store_true",
+                    help="print the resolved plan and write nothing")
+    ip.add_argument("--force", action="store_true",
+                    help="allow writing into a non-empty dir (never overwrites a skeleton file)")
+    ip.add_argument("--no-git", action="store_true", help="skip git init + the initial commit")
+    ip.add_argument("--no-verify", action="store_true",
+                    help="skip the skeleton's own verification commands (NOT recommended: "
+                         "they are the commands phase 1 records on the adapter)")
+    ip.add_argument("--create-repo", action="store_true",
+                    help="also create the GitHub repo and push (outward-facing: opt-in, and "
+                         "only attempted after the local skeleton verifies green)")
+    ip.add_argument("--visibility", default="private",
+                    choices=["private", "public", "internal"],
+                    help="--create-repo visibility (default: private)")
     sp = sub.add_parser("spec", help="front door (#18): idea → validated spec → dependency-ordered issues")
     spsub = sp.add_subparsers(dest="spec_cmd", required=True)
     spv = spsub.add_parser("validate", help="schema + DAG check a spec file (no writes)")
@@ -864,6 +893,27 @@ def main(argv: list[str] | None = None) -> int:
         if line:
             print(line)
         return 0
+
+    if args.cmd == "init-project":
+        # Phase 0 (#367): the skeleton `orchestrator-scaffold --detect` needs something to
+        # detect. Pure of the engine — no run, no store, no project adapter (none exists
+        # yet). Non-zero exit whenever a step it was asked to perform failed, so a wrapper
+        # can gate phase 1 on it.
+        from .project_init import ProjectInitError, init_project
+
+        try:
+            report = init_project(
+                args.name, Path(args.into),
+                stack=args.stack, description=args.description, package=args.package,
+                dry_run=args.dry_run, force=args.force,
+                git=not args.no_git, verify=not args.no_verify,
+                create_repo=args.create_repo, visibility=args.visibility,
+            )
+        except ProjectInitError as exc:
+            _emit({"ok": False, "error": str(exc)})
+            return 1
+        _emit(report)
+        return 0 if report.get("ok") else 1
 
     if args.cmd == "validate":
         # Loading an external dir already enforces CONTRACT_VERSION + the full surface;

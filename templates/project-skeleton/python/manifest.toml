@@ -1,0 +1,28 @@
+# The Python phase-0 skeleton (#367).
+#
+# What `orchestrator init-project --stack python` writes into a NEW repo so the harness
+# can be pointed at it: a src layout, one passing test, and ruff + mypy configured. It is
+# deliberately NOT product scaffolding — no business logic, no clients, no data model.
+# The harness builds the product; this only makes the ground it stands on.
+#
+# `verify` is the contract with phase 1: these are the commands the skeleton guarantees
+# green, and the ones `orchestrator-scaffold --detect` will read back off the repo.
+
+[skeleton]
+description = "Minimal Python skeleton: src layout, one passing test, ruff + mypy configured."
+verify = [
+    ["uv", "sync"],
+    ["uv", "run", "pytest"],
+    ["uv", "run", "ruff", "check", "."],
+    ["uv", "run", "mypy"],
+]
+
+# template file -> destination path, relative to the new repo root.
+# `{{PACKAGE}}` in a destination is substituted with the import package name.
+[files]
+"pyproject.toml.tmpl" = "pyproject.toml"
+"gitignore.tmpl" = ".gitignore"
+"README.md.tmpl" = "README.md"
+"package__init__.py.tmpl" = "src/{{PACKAGE}}/__init__.py"
+"package_version.py.tmpl" = "src/{{PACKAGE}}/version.py"
+"test_version.py.tmpl" = "tests/test_version.py"

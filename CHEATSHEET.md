@@ -18,6 +18,7 @@ omitting it on a fresh `runs/` is a real footgun. Include it always.
 
 | Skill | Use it for | Produces |
 |---|---|---|
+| `/new-project` | A project that doesn't exist yet | Repo + adapter, handed off to spec-intake |
 | `/brainstorm` | A fuzzy area, no specific idea yet | Ranked scored ideas → issues or a spec |
 | `/spec-intake` | A known idea → decompose and file | Dependency-linked issues + a spec archive |
 | `/batch-plan` | Issues that already exist, edges unknown | A validated plan applied to a run |
@@ -31,17 +32,27 @@ Producer rule: `/spec-intake` for a **new idea** (it authors the edges as it fil
 
 ---
 
-## Phase 0 — repo skeleton (once, by hand)
-
-Done when these three exit clean in the new repo:
+## Phase 0 — repo skeleton (once)
 
 ```bash
-uv run pytest
-uv run ruff check .
-uv run mypy
+uv run orchestrator init-project "$NAME" --into "$PARENT" \
+    --description "..." --create-repo --visibility private
 ```
 
-Needs: a GitHub remote, a detectable stack, one passing test.
+`--dry-run` previews and writes nothing. `--stack python` is the only stack. `--force`
+writes into a non-empty dir (never overwrites its own files). `--no-verify` / `--no-git`
+skip steps you should almost never skip.
+
+Order: write → `git init` + commit → run the verify commands → **only on green** create the
+GitHub repo and push. Done when the report says `ok: true` **and** `verified: true`, meaning
+these really ran and passed:
+
+```bash
+uv sync && uv run pytest && uv run ruff check . && uv run mypy
+```
+
+Needs: a GitHub remote, a detectable stack, one passing test — which is what the command
+produces.
 
 ## Phase 1 — adapter bootstrap (once, re-tuned later)
 
@@ -54,6 +65,9 @@ uv run orchestrator --project "$REPO/.orchestration" validate
 Then finish by hand: `task_source.py` (swap in GitHub Issues — copy
 `adapters/project/selfhost/task_source.py`) and `classifier.py` (map your test output to
 unit/e2e/shell failures).
+
+**Detect only after the GitHub repo exists** — the `task_source` guess reads the remote, so
+a remote-less repo silently drafts `local-file`.
 
 Never hand-edit `config.py` — it is a generated view of `profile.toml`.
 

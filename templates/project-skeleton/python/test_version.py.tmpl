@@ -1,0 +1,15 @@
+"""One passing test.
+
+Its job is to make `pytest` exit 0 rather than "no tests collected" — an ambiguous
+initial state makes the first real orchestrated run's failure hard to read.
+"""
+
+from __future__ import annotations
+
+from {{PACKAGE}} import __version__
+from {{PACKAGE}}.version import version
+
+
+def test_version_is_reported() -> None:
+    assert version() == __version__
+    assert __version__.count(".") == 2

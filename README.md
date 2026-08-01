@@ -349,6 +349,13 @@ not available, the engine emits no WorkItem and takes no lease: it marks the run
 records `supervisor_parked` with a fresh-session resume command, and excludes the parked
 tasks from stale alarms. Run `resume-supervisor` once from the fresh session.
 
+A project that **doesn't exist yet** starts one step earlier: `orchestrator init-project
+<name> --into <parent> --create-repo` writes the phase-0 skeleton (src layout, one passing
+test, ruff + mypy configured), commits it, runs the skeleton's own verification commands,
+and creates the GitHub repo only once they pass — because those exact commands become the
+adapter's contract below. The `/new-project` skill runs it and the adapter bootstrap as one
+guided interview.
+
 Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
 --detect <repo>` reads the repo's stack and prints a draft `profile.toml`;
 `run_targets/adapter_bootstrap_skill.md` walks the detect → confirm → generate → verify
