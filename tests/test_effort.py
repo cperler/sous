@@ -316,16 +316,20 @@ def test_codex_transport_adds_reasoning_effort_config(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", _stub_run(calls))
     codex_cli_transport()(_work(effort="low", model="gpt-5.5"))
     argv = calls[0]
-    i = argv.index("-c")
-    assert argv[i + 1] == 'model_reasoning_effort="low"'
+    # Located by VALUE, not by "the first -c": #351 put the sandbox network grant on the
+    # fresh call too, so the argv now carries more than one config override.
+    i = argv.index('model_reasoning_effort="low"')
+    assert argv[i - 1] == "-c"
 
 
 def test_codex_transport_unset_effort_omits_the_config(monkeypatch) -> None:
     calls: list = []
     monkeypatch.setattr(subprocess, "run", _stub_run(calls))
     codex_cli_transport()(_work(model="gpt-5.5"))
+    # No EFFORT override. The argv is no longer override-free — #351's network grant is
+    # unconditional on the workspace-write path — so this asserts the absence of this
+    # feature's config, not the absence of every `-c`.
     assert not any(str(a).startswith("model_reasoning_effort") for a in calls[0])
-    assert "-c" not in calls[0]  # fresh call without effort has no -c overrides at all
 
 
 def test_interactive_lane_echoes_effort() -> None:

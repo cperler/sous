@@ -910,6 +910,34 @@ def _claude_permission_flags(work: WorkItem) -> list[str]:
     return ["--allowedTools", ",".join(granted)]
 
 
+# #351: codex's workspace-write sandbox denies network EGRESS by default, and that is the
+# whole reason `batch-codex-3` delivered nothing. DELIVER's `gh pr view`/`gh pr create` came
+# back "error connecting to api.github.com" on every task while the same `gh`, the same auth
+# and the same repo work from an ordinary shell. Reproduced on codex-cli 0.146.0: inside the
+# default `codex exec` sandbox `gh api user`, `curl https://api.github.com` and
+# `git ls-remote https://github.com/…` all fail (DNS never resolves); adding this one config
+# override flips the banner to `sandbox: workspace-write [...] (network access enabled)` and
+# all three succeed, `gh` included — the keychain-stored token IS readable in-sandbox, so the
+# blockage was purely egress, not auth.
+#
+# It is NOT the API host specifically (the issue's first hypothesis): git and curl are denied
+# the same way, so nothing about `api.github.com` is special. The run's own evidence looked
+# host-specific only because #227's `git push` did somehow get through moments before
+# `gh pr view` did not — that one success is still unexplained, and the point of declaring the
+# grant is precisely that a stage's network no longer depends on whatever produced it.
+#
+# One in-sandbox limit survives this and is worth knowing before leaning on it: `gh` works
+# (it can read its token from a config file), but git over HTTPS HANGS on the macOS keychain
+# credential helper until the dispatch timeout. DELIVER opens its PR with `gh`, so its blocking
+# path is clear; a stage that must PUSH over an https remote on this lane is not proven.
+#
+# Only the workspace-write paths get it: the key is namespaced under `sandbox_workspace_write`
+# and would be inert on `--sandbox read-only`, where codex offers no network knob at all. That
+# is a real remaining limit — a read-only REVIEW on this lane still cannot reach `gh` — but it
+# is the posture asking for containment, not the bug this constant fixes.
+_CODEX_NETWORK_CFG = ["-c", "sandbox_workspace_write.network_access=true"]
+
+
 def _codex_permission_read_only(work: WorkItem) -> bool:
     """Does this dispatch get codex's read-only sandbox (#272, routed through #304's posture)?
 
@@ -1533,7 +1561,8 @@ def codex_cli_transport(
                                  "-c", 'approval_policy="never"']
                 else:
                     write_cfg = ["-c", 'sandbox_mode="workspace-write"',
-                                 "-c", 'approval_policy="never"']
+                                 "-c", 'approval_policy="never"',
+                                 *_CODEX_NETWORK_CFG]
                     if grant:
                         write_cfg += [
                             "-c", f"sandbox_workspace_write.writable_roots=[{json.dumps(grant)}]"
@@ -1550,7 +1579,7 @@ def codex_cli_transport(
                 invocation = f"codex exec --sandbox read-only --json (model {work.model})"
             else:
                 add_dir = ["--add-dir", grant] if grant else []
-                argv = ["codex", "exec", "--full-auto", *add_dir, *tail]
+                argv = ["codex", "exec", "--full-auto", *add_dir, *_CODEX_NETWORK_CFG, *tail]
                 invocation = f"codex exec --json (model {work.model})"
             stream_files: dict | None = None
             try:
