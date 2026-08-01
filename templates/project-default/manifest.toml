@@ -16,6 +16,9 @@ description = "Default orchestration starter kit: agents, skills, hooks, schemas
 [agents.generic-implementer]
 roles = ["implement"]
 tags = []                       # fallback implementer when no stack agent fits
+[agents.code-simplifier]
+roles = ["simplify"]
+tags = []
 [agents.code-reviewer]
 roles = ["review"]
 tags = []

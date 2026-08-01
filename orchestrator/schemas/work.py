@@ -11,7 +11,7 @@ Every model here is ``frozen=True, extra="forbid"``. Frozen because these two ar
 immutable once emitted; extra-forbidding (#275) because this is a CROSS-LANGUAGE seam — the
 JS interactive shim and the headless/codex transports all hand-assemble result JSON, so a
 misspelled or invented key is a real and recurring failure mode (``run_targets/workflow_shim.js``
-shipped ``schema_version: '1'`` against an engine speaking "3"). Pydantic's default would
+shipped ``schema_version: '1'`` against an engine speaking "4"). Pydantic's default would
 ignore such a key, and the engine would then act on a result whose author believed it had
 said something the engine never read. Forbidding makes the mismatch fail loudly at the seam
 instead. The version half of the same policy is enforced in ``Engine._lease_mismatch``:

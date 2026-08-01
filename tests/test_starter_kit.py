@@ -16,7 +16,7 @@ from orchestrator.scaffold import _skill_slug
 from orchestrator.schemas.stage_schemas import load_stage_schema
 
 KIT = Path(__file__).resolve().parent.parent / "templates" / "project-default"
-STAGE_REFS = ("intake", "scope", "implement", "test", "deliver", "review")
+STAGE_REFS = ("intake", "scope", "implement", "simplify", "test", "deliver", "review")
 # Sub-call schemas for the multi-agent REVIEW workflow (#73) — not stage refs in
 # STAGE_SPECS, but mirrored into the kit like the stage schemas so codex validation and
 # any project override resolve identically.

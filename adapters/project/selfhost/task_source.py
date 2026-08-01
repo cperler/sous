@@ -10,6 +10,7 @@ source with zero engine changes.
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 from orchestrator.errors import OrchestratorError
@@ -46,6 +47,34 @@ class LocalFileTaskSource:
             # verdict compares content fingerprints, so nothing depends on it being present.
             updated_at=t.get("updated_at"),
         )
+
+    def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
+        """Return at most ``limit`` local tasks, optionally matching an exact label.
+
+        The source order is preserved.  A missing task file is treated as an empty
+        source so decomposition recovery can probe safely before the first local task
+        is created.
+        """
+        data = self._load() if self.tasks_path.exists() else {}
+        tasks: list[TaskSpec] = []
+        for task_id, raw in data.items():
+            labels = list(raw.get("labels", []))
+            if label is not None and label not in labels:
+                continue
+            tasks.append(
+                TaskSpec(
+                    task_id=task_id,
+                    title=raw.get("title", ""),
+                    body=raw.get("body", ""),
+                    depends_on=list(raw.get("depends_on", [])),
+                    labels=labels,
+                    provider_tag=raw.get("provider_tag"),
+                    updated_at=raw.get("updated_at"),
+                )
+            )
+            if len(tasks) >= limit:
+                break
+        return tasks
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         log = self.tasks_path.with_name("completed.log")
@@ -106,12 +135,22 @@ class LocalFileTaskSource:
     def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
         """Create a new task in the tasks file and return its id (the offline mirror of the
         GitHub source's spec-filing hook, #18). Assigns the next free ``t<N>`` id so the
-        spec front door's Depends-on translation works against the local lane too."""
+        spec front door's Depends-on translation works against the local lane too. The
+        first case-insensitive ``Depends-on:`` body line is stored as structured dependency
+        metadata so a decomposed child resolves with the same DAG edges after restart."""
         data = self._load() if self.tasks_path.exists() else {}
         n = len(data) + 1
         while f"t{n}" in data:
             n += 1
         task_id = f"t{n}"
-        data[task_id] = {"title": title, "body": body, "labels": list(labels or [])}
+        entry = {"title": title, "body": body, "labels": list(labels or [])}
+        for line in body.splitlines():
+            match = re.match(r"\s*depends[- ]on\s*:\s*(.+)", line, re.IGNORECASE)
+            if match:
+                deps = [part.strip() for part in match.group(1).split(",") if part.strip()]
+                if deps:
+                    entry["depends_on"] = deps
+                break
+        data[task_id] = entry
         self.tasks_path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         return task_id

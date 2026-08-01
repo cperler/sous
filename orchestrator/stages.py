@@ -50,7 +50,7 @@ class StageSpec:
     tool_policy: ToolPolicy | None = None
 
 
-# The 6 collapsed stages. Templates are deliberately terse, goal-plus-constraints
+# The collapsed stages. Templates are deliberately terse, goal-plus-constraints
 # (newer models do better with that than enumerated micro-steps — design-doc §2).
 STAGE_SPECS: dict[Stage, StageSpec] = {
     Stage.INTAKE: StageSpec(
@@ -85,8 +85,12 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         tool_policy=ToolPolicy(allow_file_writes=False),
         template=(
             "Understand the change, decide feasibility, and produce a minimal task "
-            "plan. If genuinely blocked, say so.\n"
-            "Return: feasible, blocked_reason, plan (list of subtasks)."
+            "plan. If genuinely blocked, say so. For a task too large to survive as one "
+            "all-or-nothing change, also emit a child-task DAG; do not decompose routine "
+            "work. Child ids are local to this plan and dependencies must be acyclic.\n"
+            "Return: feasible, blocked_reason, plan (list of prose subtasks), and optional "
+            "subtasks (list of {id, description, agent, quality_tier: full|light|none, "
+            "implementation_budget: standard|short, depends_on: [local ids]})."
         ),
     ),
     Stage.IMPLEMENT: StageSpec(
@@ -107,6 +111,22 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "bounded: if a fix would grow the diff into a new subsystem or add real risk, "
             "it is NOT a boy-scout fix — leave it for the reviewer to record as a "
             "legitimate follow-up.\n"
+            "Return: files_changed, summary, committed."
+        ),
+    ),
+    Stage.SIMPLIFY: StageSpec(
+        stage=Stage.SIMPLIFY,
+        model_role=Role.REVIEW,
+        schema_ref="simplify",
+        agent_role="simplify",
+        timeout_s=900,
+        checkpoint=True,
+        effort=Effort.MEDIUM,
+        template=(
+            "Make one bounded simplification pass over the implementation already in the "
+            "working tree. Remove needless indirection, duplication, and accidental "
+            "complexity without changing behavior or expanding scope. Run focused checks "
+            "when useful and commit any simplification; a clean no-op is valid.\n"
             "Return: files_changed, summary, committed."
         ),
     ),

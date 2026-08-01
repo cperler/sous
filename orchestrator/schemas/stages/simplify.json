@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "simplify",
+  "description": "Stage output contract: one behavior-preserving simplification pass.",
+  "type": "object",
+  "required": ["files_changed", "summary", "committed"],
+  "properties": {
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"},
+    "committed": {"type": "boolean"}
+  },
+  "additionalProperties": true
+}

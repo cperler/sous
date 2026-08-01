@@ -8,8 +8,8 @@ followed, and each has a test below:
   newer engine had stored while faithfully preserving the misleading version number;
 * Pydantic's default ``extra="ignore"`` meant an unknown persisted key was silently
   dropped at load on both the status and work planes;
-* ``run_targets/workflow_shim.js`` emitted StageResult ``schema_version: '1'`` against an
-  engine speaking ``"3"``, and nothing noticed because ``record()`` never read the field.
+* ``run_targets/workflow_shim.js`` emitted StageResult ``schema_version: '1'`` against a
+  newer engine, and nothing noticed because ``record()`` never read the field.
 
 The policy is asymmetric by plane and that asymmetry is the point: STATUS docs are an
 archive, so old versions migrate forward and only the future is refused; the WORK plane is
@@ -131,6 +131,19 @@ def test_migration_is_durable_on_the_next_write(tmp_path) -> None:
 
     persisted = json.loads((tmp_path / "status-r1-t1.json").read_text())
     assert persisted["schema_version"] == SCHEMA_VERSION
+
+
+def test_v3_task_gains_the_simplify_stage_record_on_load(tmp_path) -> None:
+    """v4 extends the stage vocabulary; a real v3 map lacks the new key."""
+    store = StatusStore(tmp_path)
+    doc = _task_doc()
+    doc["schema_version"] = "3"
+    doc["stages"].pop("simplify")
+    _write(tmp_path / "status-r1-t1.json", doc)
+
+    loaded = store.load_task("r1", "t1")
+    assert loaded.stages[Stage.SIMPLIFY].status is StageStatus.PENDING
+    assert Stage.SIMPLIFY not in loaded.pipeline  # old runs keep their exact sequence
 
 
 def test_the_ladder_covers_every_version_this_engine_accepts(tmp_path) -> None:

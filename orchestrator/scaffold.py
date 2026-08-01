@@ -53,6 +53,7 @@ _COMMAND_METHODS: list[tuple[str, str, bool]] = [
 # The generic roster used when no stack-specific agents are selected (no-profile default).
 _DEFAULT_ROSTER: dict[str, str] = {
     "implement": "generic-implementer",
+    "simplify": "code-simplifier",
     "test": "test-validator",
     "review": "code-reviewer",
     "review:spec": "spec-reviewer",
