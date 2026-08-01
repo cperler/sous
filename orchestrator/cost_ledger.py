@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .model_table import DEFAULT_MODEL_TABLE, ModelTable
@@ -61,6 +62,50 @@ _STAGE_RANK: dict[str, int] = {stage.value: i for i, stage in enumerate(STAGE_OR
 # while the ledger flattens them (``provider``/``lane``), so they are a deliberate
 # representational difference, not a literal-key parity field.
 _ATTRIBUTION_FIELDS: frozenset[str] = frozenset({"model", "effort", "cost_usd"})
+
+# The accounting REGIME a row was priced under. Bumped whenever a correction changes what
+# the same provider report would cost, which makes older rows non-comparable rather than
+# merely imprecise:
+#
+#   1 — pre-#350 (before 2026-08-01). Codex usage was read as per-call when it is actually
+#       SESSION-cumulative, so every stage re-charged its predecessors, and cached input was
+#       double-billed (``cached_input_tokens`` is a subset of ``input_tokens``). Real runs on
+#       disk: batch-codex-3 totals $1155.35 and batch-codex-2 $234.03, both roughly 20x their
+#       true spend. Claude-lane rows of this vintage are unaffected in practice, but the
+#       regime is per-FILE-FORMAT, not per-provider — a v1 row is one written by code that
+#       had the bug, whether or not that particular row tripped it.
+#   2 — current: ``_stage_usage`` de-cumulates session-reporting providers and cached tokens
+#       are netted out of fresh input.
+#
+# Nothing rewrites history — the ledgers on disk keep their original numbers, and readers
+# disclose the mix instead (see ``accounting``).
+ACCOUNTING_VERSION = 2
+
+# When the v2 regime began: the commit that fixed #350 (9c4c513, 2026-08-01T08:19:24-05:00).
+# An UNSTAMPED row is classified by its own timestamp against this instant, not defaulted to
+# v1 — the stamp shipped after the fix, so a flat "absent means v1" would libel every row
+# written in the window between them as ~20x overstated. That window holds real runs
+# (batch-357-354, first row 14:00 UTC, is correctly priced), and a warning that cries wolf on
+# good data is worse than no warning. A row with no usable ``ts`` stays v1: unknown vintage
+# resolves toward disclosure rather than a silent claim of correctness.
+ACCOUNTING_V2_SINCE = datetime(2026, 8, 1, 13, 19, 24, tzinfo=UTC)
+
+
+def row_accounting_version(row: dict) -> int:
+    """The accounting regime of one ledger row (see ``ACCOUNTING_VERSION``).
+
+    An explicit stamp is authoritative. An unstamped row is dated against
+    ``ACCOUNTING_V2_SINCE``; an unparseable or missing timestamp reads as v1."""
+    raw = row.get("accounting_version")
+    if isinstance(raw, int) and raw > 0:
+        return raw
+    try:
+        ts = datetime.fromisoformat(str(row.get("ts")))
+    except (TypeError, ValueError):
+        return 1
+    if ts.tzinfo is None:  # naive timestamps are recorded in UTC
+        ts = ts.replace(tzinfo=UTC)
+    return ACCOUNTING_VERSION if ts >= ACCOUNTING_V2_SINCE else 1
 
 
 class CostLedger:
@@ -354,6 +399,10 @@ class CostLedger:
             "cost_usd": cost,
             "priced": priced,
             "metered": metered,
+            # The pricing regime this row was computed under (see ACCOUNTING_VERSION). Without
+            # it, a pre-#350 row and a post-fix row are byte-compatible and sum silently — two
+            # incompatible accountings presented as one number.
+            "accounting_version": ACCOUNTING_VERSION,
             "duration_s": round(duration_s, 3) if duration_s is not None else None,
             "status": result.status.value,
             "work_item_id": result.work_item_id,
@@ -463,6 +512,7 @@ class CostLedger:
 
         Accepts pre-read ``rows`` so a caller (engine.status) reads the JSONL once
         and shares it. Tolerant of a malformed/partial row via ``.get`` defaults."""
+        rows = self.rows() if rows is None else rows
         by_model: dict[str, dict] = {}
         by_effort_spend: dict[str, dict] = {}
         engine_lane = {"invocations": 0, "cost_usd": 0.0}
@@ -470,7 +520,7 @@ class CostLedger:
         total_invocations = 0
         unmetered_calls = 0
         total_wall_s = 0.0
-        for row in (self.rows() if rows is None else rows):
+        for row in rows:
             total_invocations += 1
             cost = row.get("cost_usd") or 0.0
             total_cost += cost
@@ -514,6 +564,61 @@ class CostLedger:
             "by_model": by_model,
             "by_effort_spend": by_effort_spend,
             "engine_lane": engine_lane,
+            # Travels WITH the total it qualifies (#350 follow-on): a caller that reads
+            # total_cost_usd gets the regime disclosure in the same dict, so mixing two
+            # accountings cannot be an unnoticed omission at the call site.
+            "accounting": self.accounting(rows),
+        }
+
+    def accounting(self, rows: list[dict] | None = None) -> dict:
+        """Which pricing regime(s) the summed rows came from — the disclosure that keeps a
+        mixed total from reading as one measurement.
+
+        Returns ``{versions, mixed, legacy_rows, legacy_cost_usd, legacy_affected_rows,
+        legacy_affected_cost_usd, current}``. ``mixed`` is the flag every renderer and
+        cross-run aggregator checks: when true, ``total_cost_usd`` spans an accounting change
+        and is NOT a like-for-like figure. ``legacy_cost_usd`` isolates how much of the total
+        came from v1 rows, so a reader can see the size of the older part rather than only
+        being told it exists.
+
+        The ``legacy_affected_*`` pair is the sharper number, and the one worth warning on:
+        the #350 defect was specific to providers that report SESSION-cumulative usage
+        (codex), so a v1 CLAUDE row is old but perfectly accurate. Counting every pre-stamp
+        row as suspect would fire a 20x-overstatement warning on ~20 claude runs that have
+        nothing wrong with them — and a warning that mostly cries wolf is one people learn to
+        scroll past. Only rows that are both v1 and from an affected provider are counted
+        here.
+
+        Deliberately a disclosure rather than a restatement. Restating v1 rows would mean
+        re-deriving per-call usage from session-cumulative totals that were never recorded
+        per call — the information is not on disk, so any "corrected" figure would be a
+        guess wearing a precise number's clothes. Saying which part is unreliable is the
+        honest option, and it is the same "never silent" shape the fold layer uses: report
+        what was dropped rather than quietly dropping it.
+
+        Accepts pre-read ``rows`` so a caller reads the JSONL once."""
+        counts: dict[int, int] = {}
+        legacy_cost = 0.0
+        affected_rows = 0
+        affected_cost = 0.0
+        for row in (self.rows() if rows is None else rows):
+            v = row_accounting_version(row)
+            counts[v] = counts.get(v, 0) + 1
+            if v < ACCOUNTING_VERSION:
+                cost = row.get("cost_usd") or 0.0
+                legacy_cost += cost
+                if row.get("provider") in self._CUMULATIVE_USAGE_PROVIDERS:
+                    affected_rows += 1
+                    affected_cost += cost
+        versions = sorted(counts)
+        return {
+            "versions": versions,
+            "mixed": len(versions) > 1,
+            "legacy_rows": sum(n for v, n in counts.items() if v < ACCOUNTING_VERSION),
+            "legacy_cost_usd": round(legacy_cost, 6),
+            "legacy_affected_rows": affected_rows,
+            "legacy_affected_cost_usd": round(affected_cost, 6),
+            "current": ACCOUNTING_VERSION,
         }
 
     def total_attributed(self) -> float:
@@ -725,6 +830,7 @@ class CostLedger:
             "total_cost_usd": round(total_cost, 6),
             "total_invocations": total_invocations,
             "unmetered_calls": unmetered_calls,
+            "accounting": self.accounting(rows),
             "by_stage": by_stage,
             "by_task": by_task,
             "session_reuse": {

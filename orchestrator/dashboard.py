@@ -348,6 +348,13 @@ def _run_row(
         # dollar amount for a run whose spend is partly or wholly unknown.
         "unmetered_calls": int(cost.get("unmetered_calls") or 0),
         "total_invocations": int(cost.get("total_invocations") or 0),
+        # The same qualification for the OTHER way this figure can mislead: a run priced
+        # under the pre-#350 regime is ~20x overstated and byte-compatible with a current
+        # one. The board sums across runs, so it is exactly where two regimes would blend
+        # into one meaningless total unless the row carries its own provenance.
+        "legacy_accounting_rows": int(
+            (cost.get("accounting") or {}).get("legacy_affected_rows") or 0
+        ),
         "budget": budget,
         "last_event_age_s": _last_event_age_s(events, now_epoch=now_epoch),
         "flags": flags,
@@ -468,12 +475,17 @@ def dashboard_snapshot(
     total_spend = 0.0
     unmetered_calls = 0
     total_invocations = 0
+    legacy_accounting_rows = 0
+    legacy_accounting_runs = 0
     for row in shown:
         counts[row["state"]] = counts.get(row["state"], 0) + 1
         if isinstance(row.get("cost_usd"), (int, float)):
             total_spend += row["cost_usd"]
         unmetered_calls += row.get("unmetered_calls") or 0
         total_invocations += row.get("total_invocations") or 0
+        if row.get("legacy_accounting_rows"):
+            legacy_accounting_rows += row["legacy_accounting_rows"]
+            legacy_accounting_runs += 1
 
     header = {
         "generated_at": datetime.fromtimestamp(now_epoch, tz=UTC).isoformat(),
@@ -481,6 +493,10 @@ def dashboard_snapshot(
         "total_spend_usd": round(total_spend, 4),
         "unmetered_calls": unmetered_calls,
         "total_invocations": total_invocations,
+        # A board-wide total spanning two pricing regimes is not a number anyone should act
+        # on. Count the runs it came from so the skin can say so rather than print it flat.
+        "legacy_accounting_rows": legacy_accounting_rows,
+        "legacy_accounting_runs": legacy_accounting_runs,
         "counts": counts,
         "shown": len(shown),
         "total_discovered": total_discovered,
@@ -601,6 +617,15 @@ def render_dashboard(snapshot: dict) -> str:
     else:
         spend_str = f"${header['total_spend_usd']:.4f}"
     lines.append(f"spend: {spend_str} across {header['shown']} run(s)  |  {state_bits}")
+    # The board is the one place two pricing regimes get added together. Say it in the
+    # header rather than letting a ~20x-overstated legacy run inflate a total silently.
+    legacy_runs = header.get("legacy_accounting_runs") or 0
+    if legacy_runs:
+        lines.append(
+            f"  ⚠️ {legacy_runs} run(s) priced under the pre-#350 regime "
+            f"({header.get('legacy_accounting_rows') or 0} row(s)) — overstated ~20x, "
+            f"not comparable with the rest; the total above is inflated by them"
+        )
 
     # --- attention band ---
     if attention:

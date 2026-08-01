@@ -65,6 +65,33 @@ def _effort_cell(rec: StageRecord) -> str:
     return rec.effort.value if rec.effort is not None else "—"
 
 
+def _accounting_caveat(accounting: dict) -> list[str]:
+    """Disclosure line(s) when the summed rows are not all from the current pricing regime.
+
+    Gated on the rows the #350 defect could actually have mispriced (``legacy_affected_*``),
+    not merely on old ones: pre-fix CLAUDE rows are old and correct, and warning about them
+    would put a 20x-overstatement notice on runs with nothing wrong. Silent otherwise, so the
+    artifact gains nothing in the normal path.
+
+    Says which part is unreliable and in which direction it errs — the pre-#350 regime
+    OVERSTATED codex spend, so the true number is lower, not merely unknown."""
+    affected = accounting.get("legacy_affected_rows") or 0
+    if not affected:
+        return []
+    affected_cost = accounting.get("legacy_affected_cost_usd") or 0.0
+    total_legacy = accounting.get("legacy_rows") or affected
+    scope = (
+        "every codex row" if affected == total_legacy and not accounting.get("mixed")
+        else f"{affected} codex row(s)"
+    )
+    return [
+        f"- ⚠️ Accounting regime: {scope} in this ledger predate the #350 pricing fix "
+        f"(v{accounting.get('current', 2) - 1}), which OVERSTATED codex spend by roughly 20x "
+        f"— ${affected_cost:.4f} of the total comes from them. Not comparable with runs "
+        f"priced under v{accounting.get('current', 2)}; the true figure is lower.",
+    ]
+
+
 def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) -> str:
     """Render `ledger.summary()` into cost-summary.md.
 
@@ -97,6 +124,7 @@ def render_cost_summary(run_id: str, summary: dict, budget: dict | None = None) 
         f"- Invocations: **{invocations}**",
         cost_line,
     ]
+    lines += _accounting_caveat(summary.get("accounting") or {})
     if budget:
         b = budget.get("budget_usd") or 0.0
         spent = budget.get("spent_usd") or 0.0
@@ -178,6 +206,7 @@ def render_cost_report(run_id: str, analysis: dict) -> str:
         f"# Cost report — {run_id}",
         "",
         total_line,
+        *_accounting_caveat(analysis.get("accounting") or {}),
         "",
         "## Session-reuse win",
         "",
@@ -272,10 +301,20 @@ def _cost_breakdown_table(heading: str, col: str, buckets: dict) -> list[str]:
 
 
 def render_retrospective(retro: dict) -> str:
-    """Render `build_retrospective()` into retrospective.md."""
+    """Render `build_retrospective()` into retrospective.md.
+
+    The heading follows the content: every finalized run now gets a retrospective, so a
+    green run's document must not announce itself as a "Failure retrospective" — a title
+    that contradicts its own totals line is how a reader learns to stop trusting it."""
     t = retro.get("totals", {})
+    troubled = bool(
+        retro.get("failed_tasks")
+        or retro.get("cascade_blocked_tasks")
+        or retro.get("patterns")
+    )
+    kind = "Failure retrospective" if troubled else "Run retrospective"
     lines = [
-        f"# Failure retrospective — {retro.get('run_id', '?')}",
+        f"# {kind} — {retro.get('run_id', '?')}",
         "",
         f"Run state: **{retro.get('run_state', '?')}** — "
         f"{t.get('completed', 0)} completed · {t.get('failed', 0)} failed · "

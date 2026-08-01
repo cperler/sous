@@ -31,11 +31,14 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
     assert types.count("stage_dispatched") == 6
     assert types.count("stage_recorded") == 6
     assert "task_completed" in types
-    # run_finalized is immediately followed by its alerting `notification` row (#55),
-    # so it's the penultimate event and the finalize notification is the last.
-    assert types[-2] == "run_finalized"
-    assert types[-1] == "notification"
-    assert events[-1]["kind"] == "run_finalized"
+    # run_finalized is immediately followed by its alerting `notification` row (#55).
+    # Anchored on the finalize index rather than the tail: every finalized run now also
+    # emits its retrospective receipt afterwards, so "last event" is no longer the assertion
+    # this cares about — adjacency is.
+    fin = types.index("run_finalized")
+    assert types[fin + 1] == "notification"
+    assert events[fin + 1]["kind"] == "run_finalized"
+    assert "retrospective_emitted" in types
     # dispatched precedes recorded for each stage
     assert types.index("stage_dispatched") < types.index("stage_recorded")
 

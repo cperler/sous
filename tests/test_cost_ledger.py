@@ -12,8 +12,13 @@ from pathlib import Path
 
 import pytest
 
-from orchestrator.cost_ledger import CostLedger
+from orchestrator.cost_ledger import (
+    ACCOUNTING_VERSION,
+    CostLedger,
+    row_accounting_version,
+)
 from orchestrator.model_table import DEFAULT_MODEL_TABLE
+from orchestrator.render import render_cost_report, render_cost_summary
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LaneUsed, StageResult, SubCall, TokenUsage
 
@@ -612,7 +617,9 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
     """Regression: a result with no sub_calls writes exactly ONE row — same keys, same
     order, no `phase`. This literal is the expected output; if the sub-call split ever leaks
     into the plain path, it fails here. (`session_ref` joined the row in #350, where the
-    ledger began de-cumulating session-total usage reports and needed the session key.)"""
+    ledger began de-cumulating session-total usage reports and needed the session key;
+    `accounting_version` joined it in the #350 follow-on, which stamps the pricing regime so
+    pre-fix and post-fix rows cannot be summed as if they were the same measurement.)"""
     ledger = CostLedger(tmp_path / "stage-costs.jsonl")
     result = make_result(
         model="claude-sonnet-5",
@@ -642,6 +649,7 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
         "cost_usd": DEFAULT_MODEL_TABLE.cost_usd("claude-sonnet-5", result.token_usage),
         "priced": True,
         "metered": True,
+        "accounting_version": ACCOUNTING_VERSION,
         "duration_s": 1.234,
         "status": "success",
         "work_item_id": "wi-X",
@@ -993,3 +1001,117 @@ def test_a_shrinking_cumulative_report_never_prices_as_a_credit(tmp_path: Path) 
     assert after_reset["input_tokens"] == 0
     assert after_reset["output_tokens"] == 0
     assert after_reset["cost_usd"] == 0.0
+
+
+# --- accounting regime stamping (#350 follow-on) -----------------------------------------
+
+
+def test_row_carries_the_current_accounting_version(tmp_path) -> None:
+    ledger = CostLedger(tmp_path / "c.jsonl")
+    row = ledger.record(make_result(input=1000, output=100))
+    assert row["accounting_version"] == ACCOUNTING_VERSION
+
+
+def test_unstamped_row_is_dated_not_blanket_condemned() -> None:
+    """An unstamped row is classified by its own ts, because the stamp shipped AFTER the
+    #350 fix: rows written in the window between them are correctly priced, and calling
+    them 20x-overstated would be a false alarm on good data (batch-357-354 is exactly that
+    case). No ts at all resolves to v1 — unknown vintage gets disclosed, not vouched for."""
+    assert row_accounting_version({"accounting_version": 2}) == 2  # explicit stamp wins
+    assert row_accounting_version({"ts": "2026-07-31T21:20:34.729578+00:00"}) == 1
+    assert row_accounting_version({"ts": "2026-08-01T14:00:20.920460+00:00"}) == 2
+    # Naive timestamps are UTC; garbage and absence both fall back to v1.
+    assert row_accounting_version({"ts": "2026-08-01T14:00:20"}) == 2
+    assert row_accounting_version({}) == 1
+    assert row_accounting_version({"ts": "not-a-date"}) == 1
+    assert row_accounting_version({"accounting_version": None, "ts": None}) == 1
+
+
+def test_accounting_discloses_a_mixed_ledger(tmp_path) -> None:
+    """The defect this closes: a pre-fix row and a current row are byte-compatible, so a
+    total spanning both looked like one measurement."""
+    path = tmp_path / "c.jsonl"
+    # A legacy row, exactly as batch-codex-3 left it: no accounting_version key at all.
+    path.write_text(
+        json.dumps({"ts": "2026-07-31T21:20:34.729578+00:00", "stage": "deliver",
+                    "provider": "codex", "model": "gpt-5-codex", "cost_usd": 900.0,
+                    "input_tokens": 0, "output_tokens": 0, "attempt": 0,
+                    "status": "success", "work_item_id": "wi-old"}) + "\n",
+        encoding="utf-8",
+    )
+    ledger = CostLedger(path)
+    ledger.record(make_result(input=1000, output=100, work_item_id="wi-new"))
+
+    acct = ledger.accounting()
+    assert acct["mixed"] is True
+    assert acct["versions"] == [1, ACCOUNTING_VERSION]
+    assert acct["legacy_rows"] == 1
+    assert acct["legacy_cost_usd"] == 900.0
+    # The legacy row is a codex one, so it is also an AFFECTED row (the sharper count).
+    assert acct["legacy_affected_rows"] == 1
+    assert acct["legacy_affected_cost_usd"] == 900.0
+    # And it travels with the total it qualifies, on both aggregations.
+    assert ledger.summary()["accounting"]["mixed"] is True
+    assert ledger.analysis()["accounting"]["legacy_rows"] == 1
+
+
+def test_accounting_is_quiet_on_a_wholly_current_ledger(tmp_path) -> None:
+    ledger = CostLedger(tmp_path / "c.jsonl")
+    ledger.record(make_result(input=1000, output=100))
+    acct = ledger.accounting()
+    assert acct["mixed"] is False and acct["legacy_rows"] == 0
+    assert acct["versions"] == [ACCOUNTING_VERSION]
+
+
+def test_cost_artifacts_disclose_a_legacy_accounting_total() -> None:
+    """The disclosure has to reach a human — a flag only the JSON carries is not a fix."""
+    summary = {"total_cost_usd": 1155.35, "total_invocations": 40, "unmetered_calls": 0,
+               "by_model": {}, "accounting": {"versions": [1], "mixed": False,
+                                              "legacy_rows": 40, "legacy_cost_usd": 1155.35,
+                                              "legacy_affected_rows": 40,
+                                              "legacy_affected_cost_usd": 1155.35,
+                                              "current": 2}}
+    md = render_cost_summary("batch-codex-3", summary)
+    assert "Accounting regime" in md and "every codex row" in md
+    assert "$1155.3500" in md and "20x" in md
+
+    analysis = {"total_cost_usd": 60.0, "total_invocations": 10, "unmetered_calls": 0,
+                "by_stage": {}, "by_task": {}, "session_reuse": {},
+                "accounting": {"versions": [1, 2], "mixed": True, "legacy_rows": 3,
+                               "legacy_cost_usd": 55.0, "legacy_affected_rows": 3,
+                               "legacy_affected_cost_usd": 55.0, "current": 2}}
+    report = render_cost_report("mixed-run", analysis)
+    assert "3 codex row(s)" in report and "$55.0000" in report
+
+
+def test_cost_artifacts_stay_silent_when_every_row_is_current() -> None:
+    """No noise in the normal path — the caveat appears only when it is true."""
+    summary = {"total_cost_usd": 2.5, "total_invocations": 4, "unmetered_calls": 0,
+               "by_model": {}, "accounting": {"versions": [2], "mixed": False,
+                                              "legacy_rows": 0, "legacy_cost_usd": 0.0,
+                                              "legacy_affected_rows": 0,
+                                              "legacy_affected_cost_usd": 0.0,
+                                              "current": 2}}
+    assert "Accounting regime" not in render_cost_summary("r1", summary)
+    # And a caller that passes no accounting block at all must not crash or invent a warning.
+    assert "Accounting regime" not in render_cost_summary("r1", {"total_cost_usd": 1.0})
+
+
+def test_old_claude_only_ledger_gets_no_overstatement_warning(tmp_path) -> None:
+    """The #350 defect was specific to session-cumulative providers (codex). A pre-fix
+    CLAUDE row is old but ACCURATE, and telling ~20 claude runs their spend is 20x
+    overstated would be a false alarm that teaches people to ignore the warning."""
+    path = tmp_path / "c.jsonl"
+    path.write_text(
+        json.dumps({"ts": "2026-07-30T12:00:00+00:00", "stage": "implement",
+                    "provider": "claude", "model": "claude-opus-5", "cost_usd": 12.0,
+                    "input_tokens": 0, "output_tokens": 0, "attempt": 0,
+                    "status": "success", "work_item_id": "wi-claude"}) + "\n",
+        encoding="utf-8",
+    )
+    acct = CostLedger(path).accounting()
+    assert acct["legacy_rows"] == 1            # it IS pre-stamp vintage...
+    assert acct["legacy_affected_rows"] == 0   # ...but nothing could have mispriced it
+    assert render_cost_summary("r", {"total_cost_usd": 12.0, "accounting": acct}) .count(
+        "Accounting regime"
+    ) == 0

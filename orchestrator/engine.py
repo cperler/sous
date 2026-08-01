@@ -5127,7 +5127,9 @@ class Engine:
         return out
 
     def retrospective(self, run_id: str) -> dict:
-        """Structured failure retrospective over the run's durable artifacts."""
+        """Structured retrospective over the run's durable artifacts. Emitted for every
+        finalized run (see ``_emit_retrospective``), so this is reached by clean and
+        rejection-only runs too — not just failures."""
         run = self.store.load_run(run_id)
         tasks = [self.store.load_task(run_id, ref.task_id) for ref in run.task_refs]
         events = self.store.read_events(run_id)
@@ -5135,8 +5137,8 @@ class Engine:
         # #67: annotate any deliberately-closed (CLOSED_INFEASIBLE) tasks with the reason
         # read BACK from the durable rejection artifact, so a mixed failure+rejection run's
         # retrospective separates human closes from execution failures instead of ignoring
-        # them. Rejection-only runs never reach here (they finalize COMPLETED_WITH_REJECTIONS,
-        # which does not emit a retrospective) — this only enriches genuinely-failed runs.
+        # them. A rejection-only run (COMPLETED_WITH_REJECTIONS) now reaches here too, and
+        # this is the section that keeps its retrospective from reading "no failures".
         rejections = {}
         for t in tasks:
             if t.state is TaskState.CLOSED_INFEASIBLE:
@@ -6414,6 +6416,54 @@ class Engine:
                  "key": proposal["key"], "title": title, "ref": str(ref)},
             )
 
+    def _emit_retrospective(self, run_id: str) -> None:
+        """Write ``retrospective.md`` and harvest its distilled patterns — for EVERY
+        finalized run, not only a FAILED one.
+
+        This used to be gated on ``RunState.FAILED`` ("nothing to retrospect on a clean
+        run"). That premise was wrong, and measurably so: across 26 finalized runs only 2
+        emitted a retrospective, while the learnings KB accumulated 18 review-rejection
+        entries — every one of them from a run that finished GREEN. A run that burned three
+        review cycles, retried a stage, and shipped is exactly the run worth retrospecting;
+        "did it end green" is not the same question as "did it go smoothly", and only the
+        first one was being asked. The KB's cross-run recall is fed from here, so the gate
+        was starving the loop that makes each run teach the next.
+
+        Deterministic (a fold over the run's own durable artifacts — no model call), so a
+        clean run pays nothing but the write. On a genuinely uneventful run the document
+        honestly says ``_No failures recorded._`` and ``_harvest_retrospective`` finds no
+        distilled pattern to persist — a thin artifact, not a misleading one.
+
+        Best-effort in the same sense as ``_harvest_task_learnings``: a raising retrospective
+        must never break finalize, since the run's real work is already done and its state
+        already written. The emission event is deduped on a prior one so a repeat
+        ``_maybe_finalize_run`` (an out-of-band ``reject()`` after every task went terminal)
+        rewrites the artifact idempotently without appending a second receipt."""
+        try:
+            retro = self.retrospective(run_id)
+            self.store.write_run_artifact("retrospective.md", render_retrospective(retro))
+        except Exception as exc:  # noqa: BLE001 - a retrospective must never break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "retrospective_failed", "run_id": run_id,
+                 "error": str(exc)},
+            )
+            return
+        already = any(
+            ev.get("type") == "retrospective_emitted"
+            for ev in self.store.read_events(run_id)
+        )
+        if not already:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "retrospective_emitted", "run_id": run_id,
+                 "run_state": retro.get("run_state")},
+            )
+        # #72: harvest the retrospective's distilled cross-task patterns into the KB too
+        # (the per-task learnings were harvested at each task's finalize). Idempotent on its
+        # own — ``append_kb_learnings`` dedupes — so it is safe on a repeat finalize.
+        self._harvest_retrospective(run_id, retro)
+
     def _harvest_retrospective(self, run_id: str, retro: dict) -> None:
         """Harvest the failure retrospective's DISTILLED cross-task patterns into the KB
         (#72 tie-in). The per-task learnings were already harvested at task finalize; this
@@ -6561,20 +6611,7 @@ class Engine:
                  "tasks": self._finalize_roster(run)},
             )
         self._write_final_cost_artifacts(run_id, run)
-        # Auto-generate the failure retrospective only when the run actually failed —
-        # there is nothing to retrospect on a clean run.
-        if new_state is RunState.FAILED:
-            retro = self.retrospective(run_id)
-            self.store.write_run_artifact(
-                "retrospective.md", render_retrospective(retro)
-            )
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "retrospective_emitted", "run_id": run_id},
-            )
-            # #72: harvest the retrospective's distilled cross-task patterns into the KB
-            # too (the per-task learnings were harvested at each task's finalize).
-            self._harvest_retrospective(run_id, retro)
+        self._emit_retrospective(run_id)
         # Process observations from every terminal task are now durable. Detect recurrence
         # only at the run boundary, and ledger successful filings so replay is idempotent.
         self._file_meta_proposals(run_id)

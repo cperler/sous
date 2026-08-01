@@ -85,15 +85,62 @@ def test_cascade_blocked_appears_in_retrospective(tmp_path, project) -> None:
     assert retro["failed_tasks"][0]["blocked_dependents"] == ["B"]
 
 
-def test_clean_run_writes_no_retrospective(tmp_path, project) -> None:
+def test_clean_run_writes_an_honest_retrospective(tmp_path, project) -> None:
+    """Every finalized run retrospects — a clean one included.
+
+    The old gate ("nothing to retrospect on a clean run") is why 24 of 26 real runs had no
+    retrospective at all while the KB filled with review-rejection learnings harvested from
+    runs that ended GREEN. A clean run's document is thin and says so; it does not claim a
+    failure it didn't have."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     while (w := eng.next_work("r1", "t1")) is not None:
         eng.record("r1", make_result(w))
-    assert not (tmp_path / "retrospective.md").exists()  # nothing to retrospect
+
+    md = (tmp_path / "retrospective.md").read_text()
+    assert md.startswith("# Run retrospective — r1")  # not "Failure retrospective"
+    assert "_No failures recorded._" in md
+    events = eng.store.read_events("r1")
+    assert [e["run_state"] for e in events if e["type"] == "retrospective_emitted"] == [
+        "completed"
+    ]
     retro = eng.retrospective("r1")
     assert retro["failed_tasks"] == [] and retro["patterns"] == []
+
+
+def test_retrospective_emit_receipt_is_not_duplicated(tmp_path, project) -> None:
+    """A repeat finalize rewrites the artifact but appends no second receipt."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    while (w := eng.next_work("r1", "t1")) is not None:
+        eng.record("r1", make_result(w))
+    eng._maybe_finalize_run("r1")
+    eng._maybe_finalize_run("r1")
+
+    events = eng.store.read_events("r1")
+    assert len([e for e in events if e["type"] == "retrospective_emitted"]) == 1
+    assert (tmp_path / "retrospective.md").exists()
+
+
+def test_retrospective_failure_never_breaks_finalize(tmp_path, project, monkeypatch) -> None:
+    """The run's work is already done when this runs — a raising retrospective is evented,
+    not propagated."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    monkeypatch.setattr(
+        type(eng), "retrospective",
+        lambda self, run_id: (_ for _ in ()).throw(RuntimeError("boom")),
+    )
+    while (w := eng.next_work("r1", "t1")) is not None:
+        eng.record("r1", make_result(w))
+
+    assert eng.store.load_run("r1").state.value == "completed"
+    events = eng.store.read_events("r1")
+    assert [e["error"] for e in events if e["type"] == "retrospective_failed"] == ["boom"]
+    assert not (tmp_path / "retrospective.md").exists()
 
 
 def test_detect_failure_patterns_cross_task() -> None:

@@ -83,15 +83,25 @@ def test_failed_run_retrospective_annotates_rejections(tmp_path, project) -> Non
     assert "depends on a deprecated third-party API" in md
 
 
-def test_rejection_only_run_emits_no_retrospective(tmp_path, project) -> None:
+def test_rejection_only_run_emits_a_retrospective(tmp_path, project) -> None:
+    """A rejection-only run finalizes COMPLETED_WITH_REJECTIONS and still retrospects.
+
+    This used to assert the opposite — the retrospective was gated on RunState.FAILED, so
+    the one run shape whose whole story is "a human closed this as infeasible" produced no
+    document at all. The reason it is safe to emit now is the #67 rejected_tasks section:
+    the artifact names the closed task and its reason rather than reading "No failures
+    recorded", which was the original objection to emitting here."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     _reject(eng, "t1", "genuinely infeasible")
 
-    # The run finalized COMPLETED_WITH_REJECTIONS, so the FAILED-only retrospective path
-    # never fired: no confusing "No failures recorded" artifact, no emit event.
     assert eng.store.load_run("r1").state is RunState.COMPLETED_WITH_REJECTIONS
-    assert not (eng.store.root / "retrospective.md").exists()
+    md = (eng.store.root / "retrospective.md").read_text()
+    assert "Closed as infeasible" in md and "genuinely infeasible" in md
+    # Not a failure — the heading must not claim one.
+    assert md.startswith("# Run retrospective — r1")
     events = eng.store.read_events("r1")
-    assert [e for e in events if e["type"] == "retrospective_emitted"] == []
+    assert [e["run_state"] for e in events if e["type"] == "retrospective_emitted"] == [
+        "completed_with_rejections"
+    ]
