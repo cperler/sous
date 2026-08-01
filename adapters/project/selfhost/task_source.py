@@ -27,6 +27,10 @@ class LocalFileTaskSource:
         return json.loads(self.tasks_path.read_text())
 
     def resolve(self, task_id: str) -> TaskSpec:
+        """Resolve a local task snapshot, including labels that drive engine policies.
+
+        Raises ``OrchestratorError`` when the task file or requested task is absent.
+        """
         data = self._load()
         if task_id not in data:
             raise OrchestratorError(f"unknown task {task_id!r} in {self.tasks_path}")
@@ -36,6 +40,7 @@ class LocalFileTaskSource:
             title=t.get("title", ""),
             body=t.get("body", ""),
             depends_on=list(t.get("depends_on", [])),
+            labels=list(t.get("labels", [])),
             provider_tag=t.get("provider_tag"),
             # #271: optional per-task last-modified stamp, mirroring the GitHub source's
             # ``updatedAt``. Absent from the file → None ("unknown"); the engine's staleness

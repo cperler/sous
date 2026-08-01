@@ -403,7 +403,9 @@ def test_codex_failed_call_keeps_usage_and_session(monkeypatch) -> None:
     raw = codex_cli_transport()(_codex_wi())
 
     assert raw.exit_code == 1
-    assert raw.usage.input == 900 and raw.usage.output == 400 and raw.usage.cache_read == 300
+    # codex's input_tokens INCLUDES cached_input_tokens, so the engine's disjoint
+    # convention is 900 - 300 fresh (#350); the old pass-through billed the 300 twice.
+    assert raw.usage.input == 600 and raw.usage.output == 400 and raw.usage.cache_read == 300
     assert raw.session_ref == "th-77"
     assert raw.usage_recovered is True
 

@@ -387,6 +387,7 @@ class LocalTaskSource:
         self.tasks_path = Path(tasks_path)
 
     def resolve(self, task_id: str) -> TaskSpec:
+        """Resolve a local task snapshot, including labels used by engine policies."""
         if not self.tasks_path.exists():
             raise OrchestratorError(f"tasks file not found: {{self.tasks_path}}")
         data = json.loads(self.tasks_path.read_text())
@@ -394,7 +395,8 @@ class LocalTaskSource:
             raise OrchestratorError(f"unknown task {{task_id!r}}")
         t = data[task_id]
         return TaskSpec(task_id=task_id, title=t.get("title", ""), body=t.get("body", ""),
-                        depends_on=list(t.get("depends_on", [])))
+                        depends_on=list(t.get("depends_on", [])),
+                        labels=list(t.get("labels", [])))
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         with open(self.tasks_path.with_name("completed.log"), "a", encoding="utf-8") as fh:

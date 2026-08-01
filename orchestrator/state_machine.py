@@ -9,6 +9,7 @@ schema makes the crash marker unambiguous.
 from __future__ import annotations
 
 import json
+import re
 from typing import NamedTuple
 
 from pydantic import ValidationError
@@ -405,6 +406,45 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
         truncations.extend(cap_notices)
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(pr_fields=dropped, truncations=truncations, evictions=evictions)
+
+
+_PR_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)/?$")
+
+
+def pr_not_opened(structured_output: dict | None) -> str | None:
+    """Veto reason when a SUCCESS DELIVER did not actually open a PR — else ``None`` (#351).
+
+    ``pr_url`` is free text, so before this check a *compare* link
+    (``…/pull/new/task/259``) and a prose sentence beginning ``"blocked: GitHub API
+    unreachable…"`` both passed as a delivered PR, with ``pr_number: 0`` sitting right
+    beside them. Every DELIVER stage of ``batch-codex-3`` reported success that way and the
+    run finished green having opened nothing; the only trace was the string itself, in a
+    per-stage JSON no one reads on a passing run.
+
+    A real delivery is a positive ``pr_number`` AND a ``pr_url`` ending in ``/pull/<n>``
+    that AGREES with it — the pair has to be coherent, since either alone can be stale from
+    a prior fix cycle. Pure: the engine call site turns the reason into the veto and the
+    event.
+    """
+    out = structured_output or {}
+    number = out.get("pr_number")
+    url = out.get("pr_url")
+    detail = f"pr_number={number!r} pr_url={_bound_dropped_value(url)}"
+    if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
+        return (
+            "deliver gate: no pull request was opened — a delivered stage must report a "
+            f"positive pr_number ({detail}). The branch may already be pushed; open the PR "
+            "for it (or re-run once the GitHub API is reachable) rather than reporting a "
+            "compare link or an error message as the PR."
+        )
+    if not isinstance(url, str) or (m := _PR_URL_RE.match(url.strip())) is None:
+        return (
+            "deliver gate: pr_url is not a pull-request URL — it must end in /pull/<number>, "
+            f"not a compare link or a message ({detail})."
+        )
+    if int(m.group(1)) != number:
+        return f"deliver gate: pr_url and pr_number disagree ({detail})."
+    return None
 
 
 def no_model_test_surface(task: Task) -> bool:
