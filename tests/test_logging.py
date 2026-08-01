@@ -6,7 +6,7 @@ import json
 
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import Stage
+from orchestrator.schemas.enums import Stage, StageStatus
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
@@ -40,10 +40,13 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
     assert types.index("stage_dispatched") < types.index("stage_recorded")
 
 
-def test_pr_field_dropped_event_on_malformed_pr_value(tmp_path, project) -> None:
-    """#201: a malformed model pr_number dropped at the fold emits a warning-grade
-    pr_field_dropped audit event, so the drop is no longer silent. The valid pr_url
-    sibling still folds and contributes no event."""
+def test_malformed_pr_number_now_fails_the_deliver_stage(tmp_path, project) -> None:
+    """#351 supersedes #201's warning for this case: a DELIVER that cannot name a real PR
+    is vetoed to a FAILURE, which is strictly louder than a warning event on a green stage.
+
+    #201's pr_field_dropped remains as defense in depth, for a value that passes the gate
+    but still fails assignment — exercised directly at the fold in test_state_machine.
+    """
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
@@ -53,21 +56,16 @@ def test_pr_field_dropped_event_on_malformed_pr_value(tmp_path, project) -> None
                 w,
                 structured_output={"pr_number": "", "pr_url": "https://example.test/pr/9"},
             ))
-        else:
-            eng.record("r1", make_result(w))
+            break
+        eng.record("r1", make_result(w))
+
+    task = eng.store.load_task("r1", "t1")
+    assert task.stages[Stage.DELIVER].status is StageStatus.FAILED
+    assert "no pull request was opened" in (task.last_error or "")
+    assert task.pr_url is None, "a vetoed deliver must not fold its outputs"
 
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
-    dropped = [e for e in events if e["type"] == "pr_field_dropped"]
-    assert len(dropped) == 1, "exactly one drop event for the malformed pr_number"
-    ev = dropped[0]
-    assert ev["run_id"] == "r1"
-    assert ev["task_id"] == "t1"
-    assert ev["stage"] == Stage.DELIVER.value
-    assert ev["field"] == "pr_number"
-    assert ev["value"] == "''"  # bounded repr keeps the empty-string type visible
-    assert ev["reason"]  # a non-empty reason string
-    # The valid sibling folded onto the task (no event for it).
-    assert eng.store.load_task("r1", "t1").pr_url == "https://example.test/pr/9"
+    assert not [e for e in events if e["type"] == "task_completed"]
 
 
 def test_context_value_truncated_event_on_oversized_scope_plan(tmp_path, project) -> None:

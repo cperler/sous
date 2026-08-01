@@ -14,6 +14,7 @@ from orchestrator.cli import _engine
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import ContractError
+from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.render import render_cost_summary
 from orchestrator.scheduler import Scheduler
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
@@ -99,13 +100,30 @@ def test_codex_usage_parser() -> None:
 
 
 # codex turn.completed reports cached_input_tokens (not cache_read_input_tokens):
-# both spellings must land in cache_read so codex cache reads aren't dropped
+# both spellings must land in cache_read so codex cache reads aren't dropped.
+# #350: and the two conventions are OPPOSITE — codex's cached count is a SUBSET of its
+# input_tokens, claude's is disjoint from them. The engine normalizes to disjoint, so a
+# cached token is priced once (at the cache-read rate) rather than twice.
 def test_codex_usage_maps_cached_input_tokens() -> None:
     stdout = '{"msg":{"usage":{"input_tokens":100,"output_tokens":10,"cached_input_tokens":80}}}\n'
     u = _codex_usage(stdout)
     assert u.cache_read == 80
+    assert u.input == 20, "codex cached tokens must be subtracted out of fresh input"
     claude = '{"msg":{"usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":7}}}\n'
     assert _codex_usage(claude).cache_read == 7
+    assert _codex_usage(claude).input == 1, "claude input is already disjoint from its reads"
+
+
+def test_cached_tokens_are_priced_once_at_the_cache_rate() -> None:
+    """The arithmetic #350 was found by: a 95%-cached codex review stage read $46.54 when it
+    should read $6.54, because the cached tokens were billed at the full input rate inside
+    input_tokens AND again at cache_read_mult."""
+    stdout = (
+        '{"msg":{"usage":{"input_tokens":20930480,"output_tokens":56784,'
+        '"cached_input_tokens":20002304}}}\n'
+    )
+    cost = DEFAULT_MODEL_TABLE.cost_usd("gpt-5.6-terra", _codex_usage(stdout))
+    assert 6.5 < cost < 6.6, cost
 
 
 # #7 render_cost_summary tolerates None totals + partial by_model bucket

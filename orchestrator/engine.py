@@ -127,6 +127,7 @@ from .state_machine import (
     is_done,
     next_stage,
     no_model_test_surface,
+    pr_not_opened,
     reset_for_fix_cycle,
     resume_point,
     unjudged_tests_notice,
@@ -2404,6 +2405,8 @@ class Engine:
         REVIEW rejection carries its blocking ``issues``. The veto string below is
         load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
         failure streak → ``task.last_error``): enrich the learning, not this reason."""
+        if result.stage is Stage.DELIVER:
+            return pr_not_opened(result.structured_output)
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}

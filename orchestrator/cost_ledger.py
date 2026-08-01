@@ -144,7 +144,7 @@ class CostLedger:
                 self._row(
                     result,
                     model=sub.model,
-                    usage=sub.usage,
+                    usage=self._stage_usage(result, sub.usage),
                     duration_s=sub.duration_s,
                     schema_retries=sub.schema_retries,
                     phase=sub.phase,
@@ -157,7 +157,7 @@ class CostLedger:
                 self._row(
                     result,
                     model=result.model,
-                    usage=result.token_usage,
+                    usage=self._stage_usage(result, result.token_usage),
                     duration_s=duration_s,
                     schema_retries=result.schema_retries,
                     phase=None,
@@ -191,6 +191,51 @@ class CostLedger:
                     for row in to_append:
                         fh.write(json.dumps(row) + "\n")
         return rows
+
+    # Providers whose usage report is SESSION-cumulative rather than per-call (#350).
+    _CUMULATIVE_USAGE_PROVIDERS = frozenset({"codex"})
+
+    def _stage_usage(self, result: StageResult, usage: TokenUsage) -> TokenUsage:
+        """This CALL's usage, de-cumulated when the provider reports session totals (#350).
+
+        A codex ``turn.completed`` reports the totals for the whole resumed session, not for
+        the turn. Because a task's stages chain through one session (#314 continuity), every
+        stage re-reports a running total that already contains its predecessors — and the
+        ledger sums rows. On ``batch-codex-3`` that read a 148-second DELIVER stage as having
+        consumed 19.8M input tokens, and put the run's total 22x over its real spend.
+
+        The delta is taken against what this session has ALREADY been charged, which is the
+        sum of its prior rows: those rows are themselves deltas, so they sum to the last
+        cumulative figure the provider reported. That makes the correction self-healing — a
+        row the ledger never got (a killed stage) is absorbed into the next stage's delta
+        instead of being lost, and the session total stays right.
+
+        No lock is needed for the read: a session is per-task and its stages are sequential,
+        so two dispatches never de-cumulate against the same session concurrently. Claude
+        reports per-call usage and is passed through untouched.
+        """
+        session = result.session_ref
+        if not session or result.lane_used.provider.value not in self._CUMULATIVE_USAGE_PROVIDERS:
+            return usage
+        prior = TokenUsage()
+        for row in self.rows():
+            if row.get("session_ref") != session:
+                continue
+            prior = TokenUsage(
+                input=prior.input + (row.get("input_tokens") or 0),
+                output=prior.output + (row.get("output_tokens") or 0),
+                cache_read=prior.cache_read + (row.get("cache_read_tokens") or 0),
+                cache_write=prior.cache_write + (row.get("cache_write_tokens") or 0),
+            )
+        # max(): a cumulative counter should only ever grow, but a provider that resets or
+        # re-reports low must not produce a negative row (which would price as a credit and
+        # silently refund the session's real spend).
+        return TokenUsage(
+            input=max(0, usage.input - prior.input),
+            output=max(0, usage.output - prior.output),
+            cache_read=max(0, usage.cache_read - prior.cache_read),
+            cache_write=max(0, usage.cache_write - prior.cache_write),
+        )
 
     def _tail_missing_newline(self) -> bool:
         """True when the ledger exists, is non-empty, and its last byte is not ``\\n``.
@@ -298,6 +343,10 @@ class CostLedger:
             "effort": result.effort,
             "provider": result.lane_used.provider.value,
             "lane": result.lane_used.execution_mode.value,
+            # #350: the provider session this call billed to. Needed to de-cumulate a
+            # provider that reports session totals, and independently useful — it is what
+            # lets a report tie spend to a continuity chain rather than to a lone stage.
+            "session_ref": result.session_ref,
             "input_tokens": usage.input,
             "output_tokens": usage.output,
             "cache_read_tokens": usage.cache_read,
