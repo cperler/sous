@@ -91,7 +91,7 @@ def test_stageresult_ok_property() -> None:
     assert not sr.model_copy(update={"status": ResultStatus.TIMEOUT}).ok
 
 
-def test_task_initializes_all_six_stages_with_started_at() -> None:
+def test_task_initializes_every_stage_with_started_at() -> None:
     t = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
     assert list(t.stages.keys()) == list(Stage)
     # started_at ALWAYS present (null until running) — fixes the as-built omission.

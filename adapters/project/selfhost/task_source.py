@@ -1,6 +1,8 @@
 """Local-file task source (target.md §5 — a second TaskSource impl, not GitHub).
 
-Tasks live in a JSON file: {"<id>": {"title", "body", "depends_on": [...]}}.
+Tasks live in a JSON file: {"<id>": {"title", "body", "depends_on": [...], "labels": [...]}}.
+``labels`` is not decoration — engine policies read it (e.g. the #71 meta-authoring
+delivery gate), so a task file that omits it silently opts out of those policies.
 ``mark_complete`` appends to a sibling ``completed.log``; the optional evidence-out
 hooks append to ``notes.log`` / ``followups.log``. This proves the task-source
 provider is genuinely pluggable — a project with no GitHub workflow uses a different

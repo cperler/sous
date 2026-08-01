@@ -76,8 +76,8 @@ def test_stage_spec_effort_defaults() -> None:
     expect = {
         Stage.INTAKE: None,
         Stage.SCOPE: Effort.HIGH,
-            Stage.IMPLEMENT: Effort.HIGH,
-            Stage.SIMPLIFY: Effort.MEDIUM,
+        Stage.IMPLEMENT: Effort.HIGH,
+        Stage.SIMPLIFY: Effort.MEDIUM,
         Stage.TEST: Effort.MEDIUM,
         Stage.DELIVER: Effort.LOW,
         Stage.REVIEW: Effort.MEDIUM,

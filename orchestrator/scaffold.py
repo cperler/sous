@@ -381,7 +381,10 @@ from orchestrator.errors import OrchestratorError
 
 
 class LocalTaskSource:
-    """Tasks from a JSON file: {{"<id>": {{"title", "body", "depends_on"}}}}."""
+    """Tasks from a JSON file: {{"<id>": {{"title", "body", "depends_on", "labels"}}}}.
+
+    ``labels`` is read by engine policies (e.g. the meta-authoring delivery gate), so
+    omitting it silently opts a task out of them."""
 
     def __init__(self, tasks_path: str | Path) -> None:
         self.tasks_path = Path(tasks_path)
