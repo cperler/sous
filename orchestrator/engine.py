@@ -258,6 +258,11 @@ SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RAT
 # retry does execute the panel).
 _PLAN_UNRUN_STATUSES = frozenset({ResultStatus.RATE_LIMITED, ResultStatus.PROVIDER_UNAVAILABLE})
 
+# The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
+# from this set, so the two types must be listed together: a park that only looked for a
+# prior park would treat a settled park→resume pair as an interrupted episode.
+_SUPERVISOR_LIFECYCLE_EVENTS = frozenset({"supervisor_parked", "supervisor_resumed"})
+
 # Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
 # rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
 # is too noisy to act on, so the band falls back to the flat downgrade_threshold (today's
@@ -3182,6 +3187,34 @@ class Engine:
                 context=context,
             )
 
+    def _orphaned_supervisor_event(self, run_id: str, expected_type: str) -> dict | None:
+        """The park/resume event this same transition already wrote, if its run-document
+        commit was interrupted — otherwise ``None``.
+
+        Both transitions commit events-first, so a crash between the event append and the
+        document write leaves an event on disk that nothing reflects; the retry must reuse
+        it rather than append a second one. Identity is the ORDER of the supervisor
+        lifecycle events, NOT ``Run.updated_at``: an unrelated run mutation between the
+        failed write and the retry bumps ``updated_at``, so a timestamp-derived key stops
+        matching its own episode and the "idempotent lifecycle event" promise breaks.
+
+        The trailing lifecycle event being the transition we are about to make is enough to
+        identify it, because both callers have already established that the document is not
+        in that state (``park`` returns early when already ``PARKED``; ``resume`` raises
+        unless still ``PARKED``). A settled park/resume pair therefore never looks orphaned.
+        """
+        last = next(
+            (
+                event
+                for event in reversed(self.store.read_events(run_id))
+                if event.get("type") in _SUPERVISOR_LIFECYCLE_EVENTS
+            ),
+            None,
+        )
+        if last is not None and last.get("type") == expected_type:
+            return last
+        return None
+
     def _park_supervisor_locked(
         self,
         run_id: str,
@@ -3224,16 +3257,7 @@ class Engine:
             # lock. Revalidate the freshly locked run document so none of those can be
             # overwritten by the older snapshot validated above.
             _ensure_parkable(r)
-            transition_key = f"supervisor_parked:{r.updated_at}"
-            prior = next(
-                (
-                    event
-                    for event in reversed(self.store.read_events(run_id))
-                    if event.get("type") == "supervisor_parked"
-                    and event.get("transition_key") == transition_key
-                ),
-                None,
-            )
+            prior = self._orphaned_supervisor_event(run_id, "supervisor_parked")
             if prior is None:
                 parked_at = _now()
                 park_event = {
@@ -3243,7 +3267,6 @@ class Engine:
                     "reason": reason,
                     "resume_command": resume_command,
                     "context": context,
-                    "transition_key": transition_key,
                 }
             else:
                 # The event-first transaction was interrupted before its run-doc commit.
@@ -3298,16 +3321,7 @@ class Engine:
                     f"run {run_id} was parked by supervisor session {previous_session}; "
                     "resume it from a fresh Claude Code session"
                 )
-            transition_key = f"supervisor_resumed:{r.updated_at}"
-            prior = next(
-                (
-                    event
-                    for event in reversed(self.store.read_events(run_id))
-                    if event.get("type") == "supervisor_resumed"
-                    and event.get("transition_key") == transition_key
-                ),
-                None,
-            )
+            prior = self._orphaned_supervisor_event(run_id, "supervisor_resumed")
             if prior is None:
                 resume_event = {
                     "ts": _now(),
@@ -3315,7 +3329,6 @@ class Engine:
                     "run_id": run_id,
                     "previous_session_id": previous_session,
                     "session_id": supervisor_session_id,
-                    "transition_key": transition_key,
                 }
             else:
                 append_resume_event = False

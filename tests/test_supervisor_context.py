@@ -475,3 +475,79 @@ def test_park_and_resume_recover_event_first_crash_without_duplicate(
         for event in engine.store.read_events("r1")
         if event["type"] == "supervisor_resumed"
     ]) == 1
+
+
+def test_park_recovery_survives_unrelated_run_mutation_after_the_crash(
+    tmp_path, monkeypatch
+) -> None:
+    """An unrelated run-document write between the failed park commit and its retry must
+    not cost the retry its own episode. Recovery keyed on ``Run.updated_at`` did: the
+    mutation bumped the timestamp, the retry computed a fresh key, matched nothing, and
+    appended a SECOND ``supervisor_parked`` for one park (#259 review)."""
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    engine.add_task("r1", "t1")
+
+    original_write = engine.store._write_run
+    crashed = False
+
+    def crash_once(run):
+        nonlocal crashed
+        if run.state is RunState.PARKED and not crashed:
+            crashed = True
+            raise RuntimeError("simulated crash before run commit")
+        return original_write(run)
+
+    monkeypatch.setattr(engine.store, "_write_run", crash_once)
+    park = {"reason": "context exhausted", "resume_command": "resume r1"}
+
+    with pytest.raises(RuntimeError, match="before run commit"):
+        engine.park_supervisor("r1", **park)
+    first = [e for e in engine.store.read_events("r1") if e["type"] == "supervisor_parked"]
+    assert len(first) == 1
+
+    # The unrelated mutation: anything at all that rewrites the RUNNING document.
+    engine.store.update_run("r1", lambda r: setattr(r, "metadata", {"touched": True}))
+    assert engine.store.load_run("r1").state is RunState.RUNNING
+
+    parked = engine.park_supervisor("r1", **park)
+    assert parked.state is RunState.PARKED
+    parked_events = [
+        e for e in engine.store.read_events("r1") if e["type"] == "supervisor_parked"
+    ]
+    assert len(parked_events) == 1, "the retry appended a duplicate lifecycle event"
+    assert parked.supervisor_parked_at == first[0]["ts"]
+
+
+def test_future_dated_observation_fails_closed(tmp_path) -> None:
+    """A negative age must not satisfy an upper-bound-only freshness test (#259 review)."""
+    project = tmp_path / "project"
+    capture_statusline_context(
+        {
+            "session_id": "s1",
+            "cwd": str(project),
+            "context_window": {"context_window_size": 200_000, "remaining_percentage": 90},
+        },
+        cache_root=tmp_path / "cache",
+        now=1_000.0,
+    )
+
+    future = read_supervisor_context(project, cache_root=tmp_path / "cache", now=900.0)
+    assert future.available is False
+    assert future.reason == "supervisor context observation is dated in the future"
+
+    # And the guarded path must park rather than lease work off it.
+    engine = _engine(tmp_path)
+    engine.create_run("r1")
+    engine.add_task("r1", "t1")
+    _through_intake(engine, "r1", "t1")
+    work = engine.next_work(
+        "r1",
+        "t1",
+        supervisor_context=future,
+        supervisor_resume_command="fresh-session /orchestrate-task-interactive r1 t1",
+    )
+    assert work is None
+    run = engine.store.load_run("r1")
+    assert run.state is RunState.PARKED
+    assert engine.store.load_task("r1", "t1").pending_work_item_id is None

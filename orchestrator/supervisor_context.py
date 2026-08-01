@@ -240,6 +240,12 @@ def read_supervisor_context(
     produces an unavailable snapshot with a reason instead of raising. Cached counters
     must have finite numeric values and valid ranges before they can authorize a dispatch,
     allowing callers to fail closed at a stage boundary.
+
+    Freshness is an AGE, and the age must be a real non-negative number. A future-dated
+    ``observed_at`` (clock skew, a corrupt row, a hand-edited cache) would otherwise make
+    ``current - observed_at`` negative and sail through an upper-bound-only comparison,
+    authorizing dispatch off an observation that never happened — the exact fail-OPEN this
+    sensor exists to prevent. A non-finite bound is rejected for the same reason.
     """
     target = _cache_root(cache_root) / f"{_cwd_key(cwd)}.json"
     try:
@@ -250,7 +256,15 @@ def read_supervisor_context(
     if snapshot is None:
         return SupervisorContext(available=False, reason="supervisor context sensor unavailable")
     current = now if now is not None else time.time()
-    if snapshot.observed_at is None or current - snapshot.observed_at > max_age_s:
+    age = None if snapshot.observed_at is None else current - snapshot.observed_at
+    if (
+        age is None
+        or not math.isfinite(age)
+        or age < 0
+        or not math.isfinite(max_age_s)
+        or max_age_s < 0
+        or age > max_age_s
+    ):
         return SupervisorContext(
             available=False,
             observed_at=snapshot.observed_at,
@@ -259,6 +273,10 @@ def read_supervisor_context(
             context_window_size=snapshot.context_window_size,
             used_percentage=snapshot.used_percentage,
             remaining_percentage=snapshot.remaining_percentage,
-            reason="supervisor context sensor is stale",
+            reason=(
+                "supervisor context observation is dated in the future"
+                if age is not None and math.isfinite(age) and age < 0
+                else "supervisor context sensor is stale"
+            ),
         )
     return snapshot
