@@ -100,7 +100,7 @@ from .render import (
 from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
 from .review_workflow import issue_fingerprint, synthesize
-from .routing import DEFAULT_ROUTER, Router
+from .routing import DEFAULT_ROUTER, Router, engine_lane_required
 from .schemas.enums import (
     LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
@@ -1073,6 +1073,17 @@ class Engine:
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
         # sources — never a second selection mechanism.
         deterministic = spec.deterministic or stage in task.deterministic_stages
+        # ...plus a VETO, which is a different kind of thing and so is not a third source of
+        # the choice above: the model lane this stage would otherwise take cannot perform it
+        # (#364 — codex's sandbox turns DELIVER's `git push` into an unanswerable GUI keychain
+        # prompt). The caller cannot opt out of a capability it does not have, so the veto
+        # overrides an explicitly model-pinned stage; it is evented rather than applied
+        # silently, because a run that quietly stopped using the lane it was told to use is
+        # exactly the kind of drift `lane_audit` exists to catch.
+        reroute_reason: str | None = None
+        if not deterministic:
+            reroute_reason = engine_lane_required(stage, self.router.lane_for(stage, task))
+            deterministic = reroute_reason is not None
         # Resolved to an Effort (from the task pin or stage spec) or downshifted via
         # effort_below below — always an Effort member or None (#161/#202 narrowed the
         # transitional ``str | Effort | None``). StrEnum, so it flows identically into the
@@ -1086,6 +1097,14 @@ class Engine:
                 execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False
             )
             model = ENGINE_MODEL
+            if reroute_reason is not None:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "stage_rerouted_to_engine_lane", "run_id": run_id,
+                     "task_id": task_id, "stage": stage.value, "level": "warning",
+                     "reason": reroute_reason,
+                     "from": self.router.lane_for(stage, task).provider.value},
+                )
         else:
             lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
             # Model resolution precedence for a model-lane stage (highest first):
