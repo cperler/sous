@@ -688,6 +688,7 @@ def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
     assert ref == "t2"
     data = json.loads(path.read_text())
     assert data["t2"] == {"title": "New", "body": "body", "labels": ["spec:x"]}
+    assert src.resolve(ref).labels == ["spec:x"]
 
 
 # --- review schema -----------------------------------------------------------------
@@ -741,10 +742,20 @@ def test_review_schema_accepts_non_blocking() -> None:
     validator.validate({
         "approved": True, "issues": [],
         "improvement": {"title": "idea", "detail": "why"},
-        "retrospective": {"title": "lesson", "detail": "what"},
+        "retrospective": {
+            "title": "lesson", "detail": "what",
+            "target": {"kind": "stage-template", "ref": "REVIEW"},
+        },
     })
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({"approved": True, "issues": [], "improvement": {"detail": "no title"}})
+    with pytest.raises(jsonschema.ValidationError):
+        validator.validate({
+            "approved": True, "issues": [],
+            "retrospective": {
+                "title": "lesson", "target": {"kind": "engine-logic", "ref": "record"}
+            },
+        })
 
     # #223: the improvement's optional disposition enum (file|fixup|fix_now|drop) validates...
     for disp in ("file", "fixup", "fix_now", "drop"):

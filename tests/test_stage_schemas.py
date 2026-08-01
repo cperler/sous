@@ -37,6 +37,10 @@ def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
     assert "omitting `disposition` means noted, not filed" in prompt
     assert "Filing requires an explicit `file`" in prompt
     assert "an explicit `file` files it as an enhancement issue" in prompt
+    # #71: capture only works if the single-reviewer prompt asks for the same target
+    # vocabulary the schema validates and the recurrence detector consumes.
+    assert "kind: stage-template|agent|skill|stage-schema|kit" in prompt
+    assert "retrospective ({title, detail, target?}" in prompt
 
 
 def test_local_override_wins(tmp_path) -> None:
