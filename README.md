@@ -23,8 +23,8 @@ checkpoints, approval gate), and the 2026-07-04 burn-down (deterministic test/de
 front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). The full
 CI gate (pytest + ruff + mypy) is green. Live-proven end to end: real GitHub issues driven
 to merged PRs on a real product repo, with clean lane-attribution audits, and self-hosted on
-this repo's own tracker. Anything cut or thinned is tracked as a GitHub issue (label
-`deferred-scope`); `CLAUDE.md` documents the discipline.
+this repo's own tracker. Anything cut or thinned is tracked as a GitHub issue carrying a
+`Source:` line; `CLAUDE.md` documents the discipline.
 
 ## What it does
 
@@ -383,8 +383,8 @@ in sync with CI (and that these docs don't re-acquire a hardcoded test total).
 
 The engine stays project-agnostic: new projects plug in via a project-owned
 `.orchestration/` adapter (or `adapters/project/` for in-repo reference adapters), never
-by editing the engine. Anything cut from scope is filed as a `deferred-scope` GitHub
-issue (and re-dispositioned at each gate) — nothing is silently dropped.
+by editing the engine. Anything cut from scope is filed as an ordinary GitHub issue naming
+the task that cut it — nothing is silently dropped.
 
 ## Docs
 
@@ -396,9 +396,9 @@ issue (and re-dispositioned at each gate) — nothing is silently dropped.
   changing the engine.
 - **`CLAUDE.md`** — the working norms any change to this repo must respect.
 - **Scope ledger** — the live ledger is
-  [GitHub issues](https://github.com/cperler/orchestration-template/issues) (label
-  `deferred-scope`); the discipline and the label taxonomy live in `CLAUDE.md`, and the
-  pre-migration ledger is frozen at `docs/deferred-history.md`.
+  [GitHub issues](https://github.com/cperler/orchestration-template/issues); the discipline
+  and the label taxonomy live in `CLAUDE.md`, and the pre-migration ledger is frozen at
+  `docs/deferred-history.md`.
 - **`docs/`** — the frozen build record (original design notes, the phased plan, and the
   design-pass reviews). Historical by construction; `docs/README.md` indexes it and says
   what was deleted and why. Nothing there describes the current code.

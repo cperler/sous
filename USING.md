@@ -21,7 +21,7 @@ flags mispricings.
 
 ---
 
-## Phase 0 — the repo skeleton (not orchestrated)
+## Phase 0 — the repo skeleton
 
 The harness drives *increments* into a repo. Every run ends with: make a change, run the
 project's tests, run its linter, open a PR against an issue. That sentence presumes three
@@ -34,15 +34,27 @@ things a run cannot produce, because a run needs them to start:
    real commands and read exit codes. An unconfigured type-checker is a gate that silently
    passes forever.
 
-So phase 0 is done by hand, in an ordinary session. It is *not* building the product — no
-business logic. It is a skeleton:
+This phase is *not* building the product — no business logic. It is a skeleton, and
+`orchestrator init-project` writes it:
+
+```bash
+uv run orchestrator init-project prediction-markets \
+    --into ~/Development \
+    --description "Ingest prediction-market data and flag mispricings." \
+    --create-repo --visibility private
+```
+
+Add `--dry-run` to see the resolved plan without writing anything. Python is the only
+stack today.
+
+What lands:
 
 ```
 prediction-markets/
-├── .gitignore
-├── README.md              two honest paragraphs: what this is meant to become
-├── pyproject.toml         deps + ruff and mypy config
-├── src/predmarket/
+├── .gitignore             includes runs/ — the audit trail is local-only
+├── README.md              a stub that tells you to replace it with two honest paragraphs
+├── pyproject.toml         deps + ruff and mypy configured
+├── src/prediction_markets/
 │   ├── __init__.py
 │   └── version.py
 └── tests/
@@ -50,20 +62,40 @@ prediction-markets/
 ```
 
 The one trivial test exists so the test command exits 0 rather than "no tests collected" —
-an ambiguous initial state makes the first real run's failure hard to read. The README
-matters more than it looks: a run's `scope` stage reads the repo for context, and two
-honest paragraphs measurably improve early runs.
+an ambiguous initial state makes the first real run's failure hard to read. The README stub
+matters more than it looks: a run's `scope` stage reads the repo for context, so replacing
+it with two honest paragraphs measurably improves early runs.
 
-**Phase 0 is done when three commands exit clean** in that folder:
+### It verifies itself, in this order
 
-```bash
-uv run pytest
-uv run ruff check .
-uv run mypy
-```
+1. Writes the skeleton (refusing a non-empty dir unless `--force`, and never overwriting a
+   file it owns).
+2. `git init` and an initial commit.
+3. **Runs the skeleton's own verification commands** — `uv sync`, `uv run pytest`,
+   `uv run ruff check .`, `uv run mypy`.
+4. **Only on green**, creates the GitHub repo and pushes.
 
-Those exact commands become the adapter's verification commands in phase 1. That is
-phase 0's real product.
+Step 3 is the point of the whole command. Writing a `pyproject.toml` that *configures* mypy
+is not the same as a repo where `uv run mypy` exits 0, and those exact commands become the
+adapter's contract in phase 1 — a skeleton that can't pass them hands the harness gates it
+can never satisfy. `verified: true` in the report means they really ran.
+
+On red, the report names the failing command and carries its output, and **no GitHub repo is
+created**. Fix the repo rather than dropping the command from the profile in phase 1.
+
+**Phase 0 is done when the report says `ok: true` and `verified: true`.** Those three
+commands are its real product.
+
+### Doing it by hand
+
+Nothing stops you writing the skeleton yourself — the harness only cares that the three
+commands are green and the repo has a remote. The command exists because the failure mode
+is quiet: an unconfigured type-checker or a missing `[tool.mypy] files` entry produces a
+gate that passes forever without checking anything.
+
+> **The `/new-project` skill** runs this phase and phase 1 together as a guided interview,
+> then hands off to `/spec-intake`. Use it when you want the conversation; use the CLI
+> directly when you don't.
 
 ---
 
@@ -88,6 +120,11 @@ Writes nothing. Prints a draft `profile.toml`: languages (from `pyproject.toml` 
 an agent roster, and a task-source guess (`github-issues` if there's a GitHub remote, else
 `local-file`). Detect-then-confirm — you correct a filled-in draft rather than answering
 cold.
+
+> **Create the GitHub repo before you detect.** The task-source guess reads the remote, so
+> detecting a remote-less repo writes `task_source = "local-file"` — the wrong answer for an
+> issue-driven project, and easy to skim past in the draft. `init-project --create-repo`
+> gets the ordering right for you.
 
 ### Confirm
 
@@ -400,7 +437,7 @@ changes can still produce a red trunk once merged together.
 
 The gate shells out to your adapter's declared verification commands — only adapter argv,
 never a hardcoded pytest/ruff/mypy, so the engine stays project-agnostic — over an
-**already-merged trunk checkout**. On red it best-effort files one `deferred-scope`
+**already-merged trunk checkout**. On red it best-effort files one `trunk-gate`
 remediation task, deduped against a prior filing, and exits non-zero so it wraps cleanly into
 CI.
 
@@ -438,9 +475,9 @@ rule as phase 2.
 ```
 
 A run files issues as it goes — non-blocking review findings, improvement ideas from the
-evidence-out seam, and the implement stage's `deferred-scope` items (things it consciously
-chose not to do). That auto-filing has no human gate by design, so without triage the
-tracker fills with machine-generated noise.
+evidence-out seam, and cut-scope issues a task filed for things it consciously chose not to
+do (matched by their `Source:` line). That auto-filing has no human gate by design, so
+without triage the tracker fills with machine-generated noise.
 
 This is that gate. Walk them **one at a time**, each explained from its source finding and
 the code it points at, and decide: keep / close / promote / edit. Re-runnable later.

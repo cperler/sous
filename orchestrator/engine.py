@@ -5817,7 +5817,7 @@ class Engine:
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
-        """File non-blocking review findings as deferred-scope follow-up issues — but only
+        """File non-blocking review findings as ``review-followup`` issues — but only
         the ones that clear the #188 filing threshold, so task completion doesn't become a
         hydra. A finding is filed only when its ``disposition`` is explicitly ``file`` AND
         the filing cap (``Task.max_filed_followups``, falling
@@ -5868,7 +5868,7 @@ class Engine:
                 f"({task.pr_url or 'PR'}) as a non-blocking follow-up._"
             )
             try:
-                ref = file_followup(title=title, body=body, labels=["deferred-scope"])
+                ref = file_followup(title=title, body=body, labels=["review-followup"])
             except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
                 self.store.append_event(
                     run_id,
@@ -6116,7 +6116,7 @@ class Engine:
         title = f"Post-merge trunk gate red: {', '.join(failing) or 'unknown'} (run {run_id})"
         body = self._render_trunk_gate_fix_body(run_id, commands, failing)
         try:
-            ref = file_followup(title=title, body=body, labels=["deferred-scope"])
+            ref = file_followup(title=title, body=body, labels=["trunk-gate"])
         except Exception as exc:  # noqa: BLE001 - the gate must survive a flaky task source
             self.store.append_event(
                 run_id,

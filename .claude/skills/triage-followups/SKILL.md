@@ -1,14 +1,14 @@
 ---
 name: triage-followups
-description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas from the evidence-out seam, AND the implement stage's scope-ledger deferred-scope issues) ONE AT A TIME with the human — explaining each from its source finding/rationale and the code it points at — and decide keep / close / promote / edit. The human triage gate the auto-filing seams deliberately do not have. Runs after any completed run (batch or single-task); re-runnable later.
+description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas from the evidence-out seam, AND any issue a task filed for work it deliberately cut) ONE AT A TIME with the human — explaining each from its source finding/rationale and the code it points at — and decide keep / close / promote / edit. The human triage gate the auto-filing seams deliberately do not have. Runs after any completed run (batch or single-task); re-runnable later.
 ---
 
 # Triage follow-ups — human gate on a run's auto-filed issues
 
 You are the **triage supervisor**. When a run finishes it auto-files GitHub issues with
 **no human judgment**, from two sources: (1) the evidence-out seam files the review stage's
-`non_blocking` findings (as `deferred-scope`) and the `improvement` idea (as `enhancement`);
-(2) the implement stage files `deferred-scope` issues for work a task deliberately cut/thinned
+`non_blocking` findings (as `review-followup`) and the `improvement` idea (as `enhancement`);
+(2) a task files an issue for work it deliberately cut/thinned, carrying a `Source:` line
 (the CLAUDE.md "nothing is silently dropped" discipline). Both are by design (the run must
 never block on a human), but both grow the backlog with issues the human never chose to
 track and often can't parse. This skill is that missing gate: walk each auto-filed issue
@@ -34,12 +34,13 @@ each with its own stable footer keyed to a run task id. Gate **both** — they a
 auto-filed without a human gate and both grow the backlog:
 
 - **Review-seam issues** — the evidence-out seam files the review stage's `non_blocking`
-  findings (as `deferred-scope`) and the `improvement` idea (as `enhancement`). Footer:
+  findings (as `review-followup`) and the `improvement` idea (as `enhancement`). Footer:
   `Filed automatically from the <task_id> review`.
-- **Scope-ledger deferrals** — the implement stage files a `deferred-scope` issue whenever
-  a task deliberately cuts/thins/finds-missing work (the CLAUDE.md "nothing is silently
-  dropped" discipline). These do NOT carry the review marker; they carry a `Source:` line
-  naming the task id (e.g. `**Source:** #216 …`, `Source: #224/#223 implementation`).
+- **Cut-scope issues** — a task that deliberately cuts/thins/finds-missing work files an
+  ordinary issue for it (the CLAUDE.md "nothing is silently dropped" discipline). These do
+  NOT carry the review marker; they carry a `Source:` line naming the task id (e.g.
+  `**Source:** #216 …`, `Source: #224/#223 implementation`). Match on that line, not on a
+  label — they are filed under whatever ordinary label fits (`enhancement`, `bug`, `dx`).
 
 So:
 
@@ -52,10 +53,10 @@ So:
    ```
    Keep an issue when EITHER holds for **any** task id in the run:
    - **(a) review-seam:** its body contains `Filed automatically from the <task_id> review`
-     (covers both the `deferred-scope` findings and the `enhancement` improvement); OR
-   - **(b) scope-ledger:** it is labeled `deferred-scope` AND its body has a `Source:` line
-     naming that task id (e.g. `Source:` … `#216`). Match the task id both with and without
-     the leading `#`.
+     (covers both the `review-followup` findings and the `enhancement` improvement); OR
+   - **(b) cut scope:** its body has a `Source:` line naming that task id (e.g. `Source:` …
+     `#216`). Match the task id both with and without the leading `#`. This branch is
+     label-agnostic on purpose — the `Source:` line is the marker, not a label.
 
    Union the two sets and dedupe by issue number. That union — and only it — is what this
    run filed and what you triage. **Open only**, so a re-run skips already-triaged issues.
@@ -96,7 +97,7 @@ Then write, in plain language (assume the human did not follow the review):
 - **Recommendation** — your default disposition (see below), stated as a recommendation.
 
 Then ask the human to pick a disposition (offer these; "keep" is the safe default):
-- **keep** — worth tracking. Leave open. Optionally relabel (e.g. `deferred-scope` →
+- **keep** — worth tracking. Leave open. Optionally relabel (e.g. `review-followup` →
   `enhancement`) or drop a one-line clarifying comment so a future reader (or `batch-plan`)
   understands it. Nothing else to do.
 - **close** — not worth the effort to track. `gh issue close <n> -R "$REPO" --reason

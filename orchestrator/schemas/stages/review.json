@@ -37,7 +37,7 @@
     },
     "non_blocking": {
       "type": "array",
-      "description": "findings that do NOT block approval; each may carry a `disposition` that gates what the engine does with it at finalize. Only an explicit `file`, chosen deliberately with justification, becomes a deferred-scope issue — and only up to a small per-task cap. An absent disposition and `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
+      "description": "findings that do NOT block approval; each may carry a `disposition` that gates what the engine does with it at finalize. Only an explicit `file`, chosen deliberately with justification, becomes a `review-followup` issue — and only up to a small per-task cap. An absent disposition and `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
       "items": {
         "type": "object",
         "required": ["title"],

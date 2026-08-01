@@ -18,18 +18,20 @@ tracker or fix-forward.
   `.github/workflows/ci.yml`). `tests/` is intentionally outside the mypy gate via
   `[tool.mypy] files` in `pyproject.toml`; explicit paths surface pre-existing, out-of-gate
   errors. Add a regression test with each fix.
-- **GitHub issues are the scope ledger** (`gh issue list -R cperler/orchestration-template`).
-  Nothing is silently dropped: anything cut, thinned, or found-missing gets an issue labeled
-  `deferred-scope` carrying the same three fields the old ledger rows did — **source**, **why
-  deferred**, and a **trigger to revisit**. File or close issues as you build or defer; the
-  engine files them too (`Engine._file_review_followups` and `_file_trunk_gate_fix`). A **gate
-  review** sweeps every open `deferred-scope` issue and re-dispositions each one: *promote*
-  (pick it up), *keep* (comment why), or *close with a written reason* — never delete.
-  Labels: `deferred-scope` (cut/thinned scope) · `roadmap` (candidate ideas — promote an item
-  to its own issue when picked up) · `bug` · `friction` (harness pain hit during real use,
-  often filed from another project) · `dx` · `meta-authoring` (harness self-improvement, held
-  before DELIVER). Build narrative lives in commits, PRs, and issue comments — not in a ledger
-  file. The pre-2026-07-01 ledger is frozen at `docs/deferred-history.md`.
+- **Nothing is silently dropped** (`gh issue list -R cperler/orchestration-template`).
+  Anything cut, thinned, or found-missing while building gets an ordinary issue with a
+  `**Source:** #N` line naming the task that cut it — that line, not a label, is what
+  `triage-followups` matches on. Use whatever label fits the work (`enhancement`, `bug`,
+  `dx`, `friction` for harness pain hit during real use, `roadmap` for a candidate idea,
+  `meta-authoring` for harness self-improvement, which is held before DELIVER). The engine
+  files two kinds itself: `review-followup` (`_file_review_followups`, a review's
+  non-blocking findings) and `trunk-gate` (`_file_trunk_gate_fix`, a red post-merge gate —
+  an incident, not a backlog item). Build narrative lives in commits, PRs, and issue
+  comments, never in a ledger file. There is deliberately no `deferred-scope` label and no
+  gate-review ritual: both were rebuild-phase machinery for proving nothing was lost against
+  a reference system that no longer exists, and half the label's population were review
+  findings that never carried a deferral rationale at all. The frozen pre-2026-07-01 ledger
+  is at `docs/deferred-history.md`.
 - **When the agent keeps violating a rule, the rule is not the fix.** A directive the model
   ignores wants structural enforcement — a check the harness runs, a tool it cannot skip, a
   posture it cannot hold — or deletion. It does not want a louder restatement, which costs
@@ -104,7 +106,7 @@ tracker or fix-forward.
   Option 2 half (b)). `Engine.trunk_gate(run_id, *, cwd, file_fix=True)` shells the project
   adapter's declared verification commands over an already-merged trunk checkout (only
   adapter argv — never a hardcoded pytest/ruff/mypy — so the engine stays project-agnostic
-  and model-free) and, on red, best-effort files ONE `deferred-scope` remediation task,
+  and model-free) and, on red, best-effort files ONE `trunk-gate` remediation task,
   deduped on a prior `trunk_gate_fix_filed` event. The `trunk-gate` CLI subcommand exits
   non-zero on red for a CI/human wrapper. **Caller contract:** the invoker (human or CI
   wrapper) must ensure the merged-trunk checkout at `cwd` exists — the gate reports a

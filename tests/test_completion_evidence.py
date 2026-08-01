@@ -1,7 +1,7 @@
 """Evidence-out at task finalize (the 'publish the reasoning' half of the seam).
 
 When a task completes the engine files explicitly opted-in non-blocking review findings
-as deferred-scope follow-ups and posts a completion note — both via OPTIONAL duck-typed
+as review-followup issues and posts a completion note — both via OPTIONAL duck-typed
 task-source hooks, so an adapter without them is a graceful no-op and a flaky hook can
 never un-complete a finished task.
 """
@@ -72,12 +72,12 @@ def test_finalize_files_followups_and_publishes_note(tmp_path, project) -> None:
     assert outcomes[-1]["outcome"] == "task_completed"
 
     ts = project.task_source
-    # one follow-up per non-blocking finding, all labeled deferred-scope
+    # one follow-up per non-blocking finding, all labeled review-followup
     assert [f["title"] for f in ts.followups] == [
         "Handle a nonexistent --repo path",
         "Guard negative --keep-latest",
     ]
-    assert all(f["labels"] == ["deferred-scope"] for f in ts.followups)
+    assert all(f["labels"] == ["review-followup"] for f in ts.followups)
     assert "#10" not in ts.followups[0]["body"]  # (uses the real task id t1, not a literal)
     assert "t1" in ts.followups[0]["body"]  # provenance back-reference
 
@@ -114,7 +114,7 @@ def test_finalize_files_improvement_and_renders_self_improvement(tmp_path, proje
     _drive(eng, review_output=_REVIEW_WITH_SELF_IMPROVEMENT)
 
     ts = project.task_source
-    # the improvement idea is filed as an ENHANCEMENT issue (not deferred-scope)
+    # the improvement idea is filed as an ENHANCEMENT issue (not review-followup)
     enh = [f for f in ts.followups if f["labels"] == ["enhancement"]]
     assert len(enh) == 1
     assert enh[0]["title"] == "Add a schema-validate-retry loop to the transport"
@@ -354,9 +354,9 @@ def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
     })
 
     ts = project.task_source
-    # filed exactly once (as the deferred-scope follow-up), not also as an enhancement
+    # filed exactly once (as the review-followup), not also as an enhancement
     assert len(ts.followups) == 1
-    assert ts.followups[0]["labels"] == ["deferred-scope"]
+    assert ts.followups[0]["labels"] == ["review-followup"]
     assert not any(f["labels"] == ["enhancement"] for f in ts.followups)
 
     events = _events(tmp_path)
@@ -380,7 +380,7 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     })
 
     ts = project.task_source
-    assert [f["labels"] for f in ts.followups] == [["deferred-scope"], ["enhancement"]]
+    assert [f["labels"] for f in ts.followups] == [["review-followup"], ["enhancement"]]
 
 
 @pytest.mark.parametrize("disposition", ["fix_now", "drop", "", "maybe"])
@@ -660,9 +660,9 @@ def test_github_source_publish_note_and_file_followup() -> None:
     src.publish_note("#10", "hi")  # no PR -> comment on the issue
     assert calls[-1] == ["gh", "issue", "comment", "10", "--repo", "o/r", "--body", "hi"]
 
-    ref = src.file_followup("Title", "Body", labels=["deferred-scope", "dx"])
+    ref = src.file_followup("Title", "Body", labels=["review-followup", "dx"])
     assert calls[-1] == ["gh", "issue", "create", "--repo", "o/r", "--title", "Title",
-                         "--body", "Body", "--label", "deferred-scope", "--label", "dx"]
+                         "--body", "Body", "--label", "review-followup", "--label", "dx"]
     assert ref == "https://github.com/o/r/issues/99"
 
 
@@ -687,10 +687,10 @@ def test_localfile_source_publish_note_and_file_followup(tmp_path) -> None:
     src.publish_note("id-1", "the note body", pr_url=None)
     assert "the note body" in (tmp_path / "notes.log").read_text()
 
-    ref = src.file_followup("A title", "A body", labels=["deferred-scope"])
+    ref = src.file_followup("A title", "A body", labels=["review-followup"])
     assert ref == "local:A title"
     log = (tmp_path / "followups.log").read_text()
-    assert "deferred-scope" in log and "A title" in log
+    assert "review-followup" in log and "A title" in log
 
 
 def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:
