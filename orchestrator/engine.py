@@ -2337,10 +2337,17 @@ class Engine:
         # durably recorded. Filing is deliberately outside the task-result transaction: it
         # is an external side effect, while the mapping persisted after each child makes a
         # retry/reconciliation resume from the last acknowledged ref.
+        # A parent the transaction just parked at the human gate files NOTHING. A SCOPE
+        # result carrying both feasible=false and subtasks otherwise reached this branch and
+        # turned the feasibility hold into a decomposition umbrella — filing external issues
+        # before the human ever saw the "not feasible" verdict they were being held for. The
+        # hold wins; ``_resume_pending_decompositions`` picks the saga up from the persisted
+        # SCOPE output once ``approve`` releases the task.
         if (
             result.stage is Stage.SCOPE
             and effective.status is ResultStatus.SUCCESS
             and (effective.structured_output or {}).get("subtasks") is not None
+            and task.state is not TaskState.BLOCKED_ON_HUMAN
         ):
             task = self._apply_scope_decomposition(run_id, task, effective.structured_output)
             outcome = (
@@ -2490,13 +2497,15 @@ class Engine:
                             f"task source returned no ref for child {local_id!r}"
                         )
                     mapping[local_id] = str(ref)
-                    self.store.update_task(
-                        run_id,
-                        parent.task_id,
-                        lambda task, saved=dict(mapping): setattr(
-                            task, "decomposition_mapping", saved
-                        ),
-                    )
+
+                    # Snapshot per child: the mapping keeps growing, but what this
+                    # acknowledgement persists is the refs confirmed so far.
+                    saved = dict(mapping)
+
+                    def _save_mapping(task: Task, saved: dict[str, str] = saved) -> None:
+                        task.decomposition_mapping = saved
+
+                    self.store.update_task(run_id, parent.task_id, _save_mapping)
 
             registered = self.registered_task_ids(run_id)
             for local_id in topological_order(tasks):
@@ -2550,6 +2559,12 @@ class Engine:
         deliberately best-effort because creation remains the source's responsibility;
         durable mappings are the authoritative deduplication mechanism after filing is
         acknowledged locally.
+
+        The marker must match a WHOLE body line. A substring test made local ids collide by
+        prefix — searching ``…/a`` matched a child filed as ``…/ab``, so two valid subtasks
+        collapsed onto one ref and the umbrella could finish having executed only one of
+        them. ``ChildTaskPlan.id`` is also constrained to single-line, non-space characters,
+        which keeps the marker itself one line and this comparison meaningful.
         """
         list_tasks = getattr(source, "list_tasks", None)
         if not callable(list_tasks):
@@ -2559,7 +2574,7 @@ class Engine:
         except Exception:  # noqa: BLE001 - absence/failure falls back to create_task
             return None
         for task in tasks or []:
-            if marker in str(getattr(task, "body", "")):
+            if marker in str(getattr(task, "body", "")).splitlines():
                 return str(task.task_id)
         return None
 
@@ -2920,9 +2935,9 @@ class Engine:
         if any(saved.fingerprint == fixup.fingerprint for saved in task.review_fixups):
             reason = "same fixup was requested again after its re-implement pass"
             return self._hold_review_fixup(task, fixup, reason), reason
-        reason = self._review_fixup_tail_ineligibility(task)
-        if reason is not None:
-            return self._hold_review_fixup(task, fixup, reason), reason
+        ineligible = self._review_fixup_tail_ineligibility(task)
+        if ineligible is not None:
+            return self._hold_review_fixup(task, fixup, ineligible), ineligible
         if task.review_cycles >= self.max_review_cycles:
             reason = f"review rework budget exhausted ({task.review_cycles} cycles)"
             return self._hold_review_fixup(task, fixup, reason), reason

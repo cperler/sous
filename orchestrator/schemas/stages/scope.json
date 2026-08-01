@@ -20,7 +20,7 @@
         "type": "object",
         "required": ["id", "description"],
         "properties": {
-          "id": {"type": "string", "minLength": 1, "maxLength": 80},
+          "id": {"type": "string", "minLength": 1, "maxLength": 80, "pattern": "^\\S+$"},
           "description": {"type": "string", "minLength": 1},
           "agent": {"type": ["string", "null"]},
           "quality_tier": {"type": "string", "enum": ["full", "light", "none"], "default": "full"},

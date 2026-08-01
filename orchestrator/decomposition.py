@@ -27,7 +27,10 @@ class ChildTaskPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    id: str = Field(min_length=1, max_length=80)
+    # Single-line, no whitespace: the id goes into the ``Decomposition-key: <parent>/<id>``
+    # body marker that crash recovery matches as a whole line. A newline in the id would
+    # split the marker across lines and make every lookup miss, filing a duplicate child.
+    id: str = Field(min_length=1, max_length=80, pattern=r"^\S+$")
     description: str = Field(min_length=1)
     agent: str | None = None
     quality_tier: QualityTier = QualityTier.FULL

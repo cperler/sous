@@ -256,3 +256,66 @@ def test_direct_next_resumes_approved_partial_decomposition(tmp_path, project) -
     assert parent.state is TaskState.BLOCKED
     assert parent.decomposition_children == ["child-1", "child-2", "child-3"]
     assert eng.registered_task_ids("r1") == {"parent", "child-1", "child-2", "child-3"}
+
+
+def test_infeasible_scope_holds_instead_of_filing_children(tmp_path, project) -> None:
+    """feasible=false wins over a subtasks payload in the same SCOPE result (#60 review).
+
+    Decomposition files real external issues. Doing that for a parent the same transaction
+    just parked at the human gate spends side effects on a verdict the human has not seen.
+    """
+    source = CreatingSource()
+    project._task_source = source
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "parent", pipeline=[Stage.SCOPE, Stage.IMPLEMENT])
+    scope = eng.next_work("r1", "parent")
+
+    output = {**_scope_output(), "feasible": False, "blocked_reason": "needs a decision"}
+    result = eng.record("r1", make_result(scope, structured_output=output))
+
+    assert result["outcome"] == "scope_not_feasible_held"
+    parent = eng.store.load_task("r1", "parent")
+    assert parent.state is TaskState.BLOCKED_ON_HUMAN
+    assert parent.decomposition_children == []
+    assert parent.decomposition_mapping == {}
+    assert source.create_calls == 0, "filed children before the human released the hold"
+
+    # The hold stays quiescent through an eligibility pass, then decomposes on approval.
+    eng.dispatchable("r1")
+    assert source.create_calls == 0
+    eng.approve("r1", "parent", approved_by="tester")
+    eng.dispatchable("r1")
+    assert source.create_calls == 3
+    assert eng.store.load_task("r1", "parent").decomposition_children
+
+
+def test_marker_lookup_does_not_collide_on_an_id_prefix(tmp_path, project) -> None:
+    """The body marker matches a WHOLE line, so local id ``a`` never reuses ``ab``'s
+    child (#60 review). A substring test collapsed both subtasks onto one ref and let the
+    umbrella finish having executed only one of them."""
+    source = CreatingSource()
+    source.created["child-ab"] = TaskSpec(
+        task_id="child-ab",
+        title="existing ab",
+        body="Decomposition-key: parent/ab\nfiled before the mapping was saved",
+    )
+    project._task_source = source
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "parent", pipeline=[Stage.SCOPE, Stage.IMPLEMENT])
+    scope = eng.next_work("r1", "parent")
+    output = {
+        "feasible": True,
+        "plan": ["split"],
+        "subtasks": [
+            {"id": "ab", "description": "AB"},
+            {"id": "a", "description": "A"},
+        ],
+    }
+    eng.record("r1", make_result(scope, structured_output=output))
+
+    parent = eng.store.load_task("r1", "parent")
+    assert parent.decomposition_mapping["ab"] == "child-ab"
+    assert parent.decomposition_mapping["a"] != "child-ab"
+    assert len(set(parent.decomposition_mapping.values())) == 2
