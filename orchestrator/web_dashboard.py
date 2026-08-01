@@ -250,7 +250,7 @@ INDEX_HTML = """<!doctype html>
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 20px; border: 1px solid var(--line);
     color: var(--muted); }
   .badge.running { color: var(--run); border-color: var(--run); }
-  .badge.paused, .badge.failed { color: var(--attn); border-color: var(--attn); }
+  .badge.paused, .badge.parked, .badge.failed { color: var(--attn); border-color: var(--attn); }
   .badge.completed { color: var(--ok); border-color: var(--ok); }
   .grow { flex: 1; }
   .muted { color: var(--muted); }
@@ -312,6 +312,10 @@ INDEX_HTML = """<!doctype html>
       return "! [" + run + "] " + it.task_id + " BLOCKED_ON_HUMAN — " + (it.reason || "");
     if (it.kind === "paused")
       return "! [" + run + "] PAUSED — " + (it.reason || "");
+    if (it.kind === "parked")
+      return "! [" + run + "] PARKED — needs a fresh supervisor ("
+        + (it.reason || "supervisor context exhausted") + "); resume: "
+        + (it.resume_command || "start a new interactive session");
     if (it.kind === "budget_exhausted") {
       var f = it.fraction;
       var pct = (typeof f === "number") ? Math.round(f * 100) + "%" : "?";

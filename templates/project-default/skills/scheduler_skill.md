@@ -22,6 +22,11 @@ directly and never run `claude -p`.
    each task's `depends_on`; the engine builds the DAG).
 
 ## The loop (repeat until `status.run_state` is terminal)
+Configure `orchestrator statusline` as Claude Code's `statusLine` command and confirm
+`orchestrator supervisor-context` returns a fresh snapshot. Guard every `next`; if it
+returns `drain_required`, dispatch/record already-leased WorkItems and stop collecting new
+ones before retrying. A run may only park after all leases have drained.
+
 1. **dispatchable**: `D=$(… dispatchable --util auto --max-concurrent 3)`.
    - `D.dispatch_now` is the engine-bounded set to run THIS round (DAG-ready ∩
      remaining headroom = `limit - in_flight_count`, so in-flight leases are already
@@ -29,7 +34,11 @@ directly and never run `claude -p`.
      `dispatch_now`, even if the Workflow cap could allow more.
    - If `dispatch_now` is empty but tasks remain non-terminal, you're capacity-
      stalled (`limit==0`) — wait for the usage window, then retry.
-2. **next** (per task in `dispatch_now`): `… next --task "$T"` → one WorkItem each.
+2. **next** (per task in `dispatch_now`): `… next --task "$T"
+   --guard-supervisor-context --supervisor-resume-command "start a fresh Claude Code
+   session and invoke /orchestrate-batch-interactive for $RUN"` → one WorkItem each.
+   A `null` result requires a status check: if the run is `parked`, surface its reason and
+   resume command and stop. A fresh session runs `… resume-supervisor` before restarting.
    Collect them into a single batch.
 3. **dispatch ONE Workflow batch**: invoke `run_targets/workflow_shim.js` with
    `{ workItems: [...all collected...], dispatchLimit: <engine limit>, now: <ISO>, schemas: {...} }`.

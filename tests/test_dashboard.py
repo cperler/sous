@@ -149,6 +149,28 @@ def test_paused_run_surfaces_reason(tmp_path) -> None:
     assert "circuit breaker" in paused[0]["reason"]
 
 
+def test_supervisor_park_is_distinct_attention_not_stale(tmp_path) -> None:
+    rr = tmp_path / "r1"
+    eng = _engine(rr)
+    _drive_intake(eng, "r1")
+    eng.park_supervisor(
+        "r1",
+        reason="remaining supervisor context is below threshold",
+        resume_command="fresh-session /orchestrate-task-interactive r1 t1",
+        context={"remaining_percentage": 18.0},
+    )
+
+    snap = _snapshot(tmp_path, stale_after_s=-1)
+    row = snap["runs"][0]
+    assert row["state"] == "parked"
+    assert row["flags"] == ["parked:needs-fresh-supervisor"]
+    assert [item["kind"] for item in snap["attention"]] == ["parked"]
+    assert not [item for item in snap["attention"] if item["kind"] == "stale"]
+    out = render_dashboard(snap)
+    assert "PARKED — needs a fresh supervisor" in out
+    assert "fresh-session /orchestrate-task-interactive" in out
+
+
 def test_blocked_on_human_surfaced_in_attention(tmp_path) -> None:
     rr = tmp_path / "r1"
     eng = _engine(rr)

@@ -261,6 +261,26 @@ def test_watch_polls_dedupes_and_exits_on_terminal() -> None:
     assert slept == [5, 5]  # slept between the three polls, not after the terminal one
 
 
+def test_watch_returns_immediately_and_renders_supervisor_park() -> None:
+    parked = _status("r1", {"A": {"stale": False}}, "parked")
+    parked["supervisor_parked"] = {
+        "reason": "context low",
+        "resume_command": "fresh-session /orchestrate-batch-interactive r1",
+    }
+    eng = _ScriptedEngine([parked])
+    slept: list[int] = []
+    lines: list[str] = []
+
+    final = watch(eng, "r1", interval=5, sleeper=slept.append, emit=lines.append)
+
+    assert final["run_state"] == "parked"
+    assert slept == []
+    assert lines == [
+        "run PARKED — needs a fresh supervisor; resume: "
+        "fresh-session /orchestrate-batch-interactive r1"
+    ]
+
+
 def _stalled_snapshot(driver: dict) -> dict:
     return {
         "driver": driver,

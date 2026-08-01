@@ -246,6 +246,11 @@ class RunState(StrEnum):
     COMPLETED_WITH_REJECTIONS = "completed_with_rejections"
     FAILED = "failed"
     PAUSED = "paused"
+    # #259: a clean interactive-lane handoff boundary. No task is awaiting a human
+    # decision and no dispatch lease is held; a fresh supervisor may resume the run.
+    # Non-terminal by design — the work remains live, merely without enough context in
+    # the session that was driving it.
+    PARKED = "parked"
     # #257: the human retired the run as superseded (Engine.retire()). Declared, not
     # derived: unlike the three rollups above — which _maybe_finalize_run computes from the
     # task states — this one is asserted by the operator, so it does NOT follow the

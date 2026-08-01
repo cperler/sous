@@ -10,7 +10,8 @@ each run lives in its own ``runs/<run_id>/`` StatusStore root (``status-<run_id>
 ``events.jsonl`` + ``stage-costs.jsonl`` + ``stages/``), and ``Engine.status`` already
 computes per-task state / staleness / in-flight activity + the cost + budget blocks. This
 module discovers the run dirs, folds each run's ``status()`` into a compact row, lifts the
-"needs a human" items (blocked-on-human, paused, stale, budget-exhausted, unreadable) into a
+"needs a human" items (blocked-on-human, supervisor-parked, paused, stale,
+budget-exhausted, unreadable) into a
 top ATTENTION band, and renders it.
 
 The engine is never touched for model work: the dashboard only *reads*. The ``Engine`` used
@@ -45,10 +46,11 @@ _TERMINAL = {s.value for s in TERMINAL_RUN_STATES}
 # (approve/reject, unpause) rank above the softer stall/unreadable signals.
 _ATTENTION_RANK = {
     "blocked_on_human": 0,
-    "paused": 1,
-    "budget_exhausted": 2,
-    "unreadable": 3,
-    "stale": 4,
+    "parked": 1,
+    "paused": 2,
+    "budget_exhausted": 3,
+    "unreadable": 4,
+    "stale": 5,
 }
 
 
@@ -302,6 +304,18 @@ def _run_row(
         reason = pause_reason or "paused"
         flags.append("paused")
         attention_items.append({"kind": "paused", "run_id": loc.run_id, "reason": reason})
+    if state == "parked":
+        parked = status.get("supervisor_parked") or {}
+        reason = parked.get("reason") or "needs a fresh supervisor"
+        flags.append("parked:needs-fresh-supervisor")
+        attention_items.append(
+            {
+                "kind": "parked",
+                "run_id": loc.run_id,
+                "reason": reason,
+                "resume_command": parked.get("resume_command"),
+            }
+        )
     if budget and budget.get("exhausted"):
         flags.append("budget-exhausted")
         attention_items.append(
@@ -485,6 +499,7 @@ def _state_icon(state: str) -> str:
     return {
         "running": "*",
         "paused": "!",
+        "parked": "!",
         "completed": "+",
         "completed_with_rejections": "~",
         "superseded": "=",  # #257: retired by a human, not run to a conclusion
@@ -524,6 +539,10 @@ def _render_attention_item(item: dict) -> str:
         return f"  ! [{run}] {item['task_id']} BLOCKED_ON_HUMAN — {item.get('reason')}"
     if kind == "paused":
         return f"  ! [{run}] PAUSED — {item.get('reason')}"
+    if kind == "parked":
+        command = item.get("resume_command") or "start a fresh interactive supervisor"
+        reason = item.get("reason") or "supervisor context exhausted"
+        return f"  ! [{run}] PARKED — needs a fresh supervisor ({reason}); resume: {command}"
     if kind == "budget_exhausted":
         frac = item.get("fraction")
         pct = f"{frac * 100:.0f}%" if isinstance(frac, (int, float)) else "?"

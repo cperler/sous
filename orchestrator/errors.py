@@ -50,6 +50,24 @@ class CapacityExhausted(OrchestratorError):
     """No capacity-safe dispatch slot is available right now."""
 
 
+class SupervisorParkDeferred(OrchestratorError):
+    """Signal that a low-context park must wait for existing leases to drain.
+
+    ``in_flight`` identifies the leases that keep the run away from a safe stage
+    boundary; ``projection`` preserves the failed context calculation for reporting.
+    The interactive driver should stop refilling work, record those results, then retry
+    the guarded dispatch so it can park without stranding a lease.
+    """
+
+    def __init__(self, in_flight: list[str], projection: dict) -> None:
+        self.in_flight = in_flight
+        self.projection = projection
+        super().__init__(
+            "supervisor context is below the dispatch threshold; stop refilling and "
+            f"record the in-flight task(s) before parking: {in_flight}"
+        )
+
+
 class NoRunnerError(OrchestratorError):
     """No execution runner is registered for a required (mode, provider) cell."""
 

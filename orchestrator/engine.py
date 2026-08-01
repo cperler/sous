@@ -35,6 +35,7 @@ from .errors import (
     NoRunnerError,
     RunExistsError,
     StatusNotFoundError,
+    SupervisorParkDeferred,
 )
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
@@ -134,6 +135,7 @@ from .state_machine import (
 )
 from .status_store import StatusStore
 from .stream_probe import probe_current_stream, prompt_filename, prompt_relpath
+from .supervisor_context import DEFAULT_MIN_REMAINING_PCT, SupervisorContext
 
 
 def _now() -> str:
@@ -267,6 +269,11 @@ SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RAT
 # ``review_plan_not_executed`` marker is withheld for them (no crying wolf on a run whose
 # retry does execute the panel).
 _PLAN_UNRUN_STATUSES = frozenset({ResultStatus.RATE_LIMITED, ResultStatus.PROVIDER_UNAVAILABLE})
+
+# The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
+# from this set, so the two types must be listed together: a park that only looked for a
+# prior park would treat a settled park→resume pair as an interrupted episode.
+_SUPERVISOR_LIFECYCLE_EVENTS = frozenset({"supervisor_parked", "supervisor_resumed"})
 
 # Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
 # rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
@@ -788,6 +795,8 @@ class Engine:
         re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
         """
         run = self.store.load_run(run_id)
+        if run.state in (RunState.PAUSED, RunState.PARKED):
+            return []
         states = {ref.task_id: ref.state for ref in run.task_refs}
         dag = Dag(run.dependency_graph)
         out: list[str] = []
@@ -837,7 +846,15 @@ class Engine:
 
     # --- dispatch / record ----------------------------------------------------
     def next_work(
-        self, run_id: str, task_id: str, *, util_pct: float = 0.0, resume: bool = False
+        self,
+        run_id: str,
+        task_id: str,
+        *,
+        util_pct: float = 0.0,
+        resume: bool = False,
+        supervisor_context: SupervisorContext | None = None,
+        supervisor_min_remaining_pct: float = DEFAULT_MIN_REMAINING_PCT,
+        supervisor_resume_command: str | None = None,
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, budget pause, or pipeline exhausted).
@@ -856,8 +873,22 @@ class Engine:
         (``pending_work_item_id``); ``resume=True`` re-emits an outstanding lease after a
         supervisor crash instead. When the resolved stage matches ``Task.hold_before``,
         dispatch parks until both the matching approval identity and durable artifact are
-        present. Raises ``CapacityExhausted`` at the per-call gate or during a rate-limit
-        cooldown, ``ContractError`` on a lease conflict.
+        present.
+
+        For an interactive, fresh model dispatch, supplying ``supervisor_context`` adds a
+        final pre-lease gate after the exact prompt has been rendered. It reserves
+        ``supervisor_min_remaining_pct`` of the window plus a conservative prompt cost.
+        Insufficient or unavailable context parks the run with
+        ``supervisor_resume_command`` before any prompt artifact, event, or lease is
+        written. This decision and each fresh lease commit are serialized per run, so a
+        parked run cannot gain a concurrent lease. If other task leases are still live, it
+        instead raises
+        ``SupervisorParkDeferred`` so the caller can drain them to a safe boundary.
+        ``resume=True`` never applies this gate because it recovers an existing lease.
+
+        Raises ``CapacityExhausted`` at the per-call gate or during a rate-limit cooldown,
+        ``ContractError`` on a lease conflict, and ``SupervisorParkDeferred`` when a
+        requested park must wait for in-flight work.
         """
         # Budget backpressure (#34): consult the run's metered spend against its budget at
         # this dispatch point. Once spend >= budget, do NOT dispatch new work — PAUSE the
@@ -866,6 +897,9 @@ class Engine:
         # resume (that recovers an ALREADY-dispatched, already-charged lease). Placed HERE,
         # at the single dispatch point, so it catches BOTH the scheduler loop AND the
         # single-task engine-lane drain (mirrors the alerting seam's one-layer rationale).
+        run = self.store.load_run(run_id)
+        if not resume and run.state in (RunState.PAUSED, RunState.PARKED):
+            return None
         if not resume and self._budget_hard_stop(run_id):
             return None
         # Capacity backpressure: at the per-call gate, no new dispatch (the caller waits).
@@ -932,7 +966,7 @@ class Engine:
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]
-        run = self.store.load_run(run_id)  # for route_by_capacity (#12); cheap single read
+        run = self.store.load_run(run_id)  # refresh after the budget gate may mutate it
         # Deterministic routing: a stage is run by the in-process ENGINE-lane shell runner
         # (no model call, $0) when it is globally deterministic (intake) OR the task/pipeline
         # opted it in via `deterministic_stages` (#33: TEST/DELIVER). ONE decision, two
@@ -1192,9 +1226,7 @@ class Engine:
         # not the possibly-capped file, so cross-stage prefix-drift comparison — the whole
         # point of recording it — is unaffected by any truncation.
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        _, prompt_dropped = self.store.write_stage_prompt(
-            task_id, prompt_filename(stage.value, attempt), prompt
-        )
+        prompt_dropped: int | None = None
         prompt_file = prompt_relpath(task_id, stage.value, attempt)
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
@@ -1333,7 +1365,63 @@ class Engine:
                 )
             return evs
 
-        self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
+        def _locked_dispatch() -> bool:
+            """Guard and commit one dispatch while excluding run-level parking."""
+            nonlocal prompt_dropped
+
+            # A caller may have rendered this prompt before another caller parked the run.
+            # Re-check under the same run-level lock used by park_supervisor so no fresh
+            # lease can commit after PARKED becomes durable.
+            locked_run = self.store.load_run(run_id)
+            if not resume and locked_run.state in (RunState.PAUSED, RunState.PARKED):
+                return False
+
+            # Interactive supervisor context gate (#259). The exact engine-rendered prompt
+            # is already in memory, but no prompt artifact/event/WorkItem has crossed the
+            # process boundary and no dispatch lease exists yet. The guard and possible
+            # PARKED transition share this critical section with every fresh lease commit,
+            # making this stage-boundary decision atomic across concurrent next_work calls.
+            # Deterministic/headless dispatches do not traverse supervisor context, and a
+            # crash resume already owns a lease, so neither is context-gated.
+            if (
+                supervisor_context is not None
+                and not resume
+                and lane.execution_mode is ExecutionMode.INTERACTIVE
+            ):
+                projection = supervisor_context.projected(
+                    prompt, min_remaining_pct=supervisor_min_remaining_pct
+                )
+                if projection["should_park"]:
+                    in_flight = self.in_flight(run_id)
+                    if in_flight:
+                        raise SupervisorParkDeferred(in_flight, projection)
+                    reason = (
+                        "supervisor context sensor unavailable"
+                        if not projection["available"]
+                        else "remaining supervisor context cannot safely carry the next "
+                        "engine-rendered prompt"
+                    )
+                    self._park_supervisor_locked(
+                        run_id,
+                        reason=reason,
+                        resume_command=(
+                            supervisor_resume_command
+                            or f"orchestrator --run {run_id} resume-supervisor"
+                        ),
+                        context=projection,
+                    )
+                    return False
+
+            _, prompt_dropped = self.store.write_stage_prompt(
+                task_id, prompt_filename(stage.value, attempt), prompt
+            )
+            self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
+            return True
+
+        with self.store.with_dispatch_lock(run_id):
+            committed = _locked_dispatch()
+        if not committed:
+            return None
         self._set_ref_state(run_id, task_id, TaskState.RUNNING)
         return work
 
@@ -3306,6 +3394,199 @@ class Engine:
         )
         return self.store.load_run(run_id)
 
+    # --- interactive supervisor context park (#259) ---------------------------
+    def park_supervisor(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        resume_command: str,
+        context: dict | None = None,
+    ) -> Run:
+        """Park an interactive run only at a lease-free stage boundary.
+
+        Unlike PAUSED (budget/breaker) and BLOCKED_ON_HUMAN (a decision gate), PARKED
+        means the current Claude Code session lacks enough context to safely carry the
+        next prompt. ``reason`` and ``resume_command`` are persisted in the run status
+        and the single ``supervisor_parked`` audit event; ``context`` may retain the
+        failed projection for diagnosis. Repeated calls are idempotent: one park episode
+        has one event. The run state and event commit together with the event first, so a
+        retry after an interrupted write repairs the document without duplicating the
+        event. The park transition is serialized with fresh dispatch commits, and its
+        state is revalidated under the run lock so it cannot overwrite a concurrent pause
+        or finalization. Raises ``ContractError`` for missing handoff details, a paused or
+        terminal run, or any outstanding dispatch lease.
+        """
+        with self.store.with_dispatch_lock(run_id):
+            return self._park_supervisor_locked(
+                run_id,
+                reason=reason,
+                resume_command=resume_command,
+                context=context,
+            )
+
+    def _orphaned_supervisor_event(self, run_id: str, expected_type: str) -> dict | None:
+        """The park/resume event this same transition already wrote, if its run-document
+        commit was interrupted — otherwise ``None``.
+
+        Both transitions commit events-first, so a crash between the event append and the
+        document write leaves an event on disk that nothing reflects; the retry must reuse
+        it rather than append a second one. Identity is the ORDER of the supervisor
+        lifecycle events, NOT ``Run.updated_at``: an unrelated run mutation between the
+        failed write and the retry bumps ``updated_at``, so a timestamp-derived key stops
+        matching its own episode and the "idempotent lifecycle event" promise breaks.
+
+        The trailing lifecycle event being the transition we are about to make is enough to
+        identify it, because both callers have already established that the document is not
+        in that state (``park`` returns early when already ``PARKED``; ``resume`` raises
+        unless still ``PARKED``). A settled park/resume pair therefore never looks orphaned.
+        """
+        last = next(
+            (
+                event
+                for event in reversed(self.store.read_events(run_id))
+                if event.get("type") in _SUPERVISOR_LIFECYCLE_EVENTS
+            ),
+            None,
+        )
+        if last is not None and last.get("type") == expected_type:
+            return last
+        return None
+
+    def _park_supervisor_locked(
+        self,
+        run_id: str,
+        *,
+        reason: str,
+        resume_command: str,
+        context: dict | None = None,
+    ) -> Run:
+        """Implement :meth:`park_supervisor` while the dispatch lock is held."""
+        run = self.store.load_run(run_id)
+        if run.state is RunState.PARKED:
+            return run
+        if not reason.strip() or not resume_command.strip():
+            raise ContractError("supervisor park requires a reason and resume command")
+
+        def _ensure_parkable(r: Run) -> None:
+            if r.state is RunState.PAUSED:
+                raise ContractError(
+                    f"cannot supervisor-park paused run {run_id}; resolve its pause first"
+                )
+            if r.state in TERMINAL_RUN_STATES:
+                raise ContractError(
+                    f"cannot park terminal run {run_id} (state {r.state.value})"
+                )
+
+        _ensure_parkable(run)
+        in_flight = self.in_flight(run_id)
+        if in_flight:
+            raise ContractError(
+                "supervisor park requires a stage boundary with no dispatch leases; "
+                f"still in flight: {in_flight}"
+            )
+
+        park_event: dict | None = None
+        append_park_event = True
+
+        def _park(r: Run) -> None:
+            nonlocal append_park_event, park_event
+            # A record/finalize, pause, or retire transition does not take the dispatch
+            # lock. Revalidate the freshly locked run document so none of those can be
+            # overwritten by the older snapshot validated above.
+            _ensure_parkable(r)
+            prior = self._orphaned_supervisor_event(run_id, "supervisor_parked")
+            if prior is None:
+                parked_at = _now()
+                park_event = {
+                    "ts": parked_at,
+                    "type": "supervisor_parked",
+                    "run_id": run_id,
+                    "reason": reason,
+                    "resume_command": resume_command,
+                    "context": context,
+                }
+            else:
+                # The event-first transaction was interrupted before its run-doc commit.
+                # Reuse that episode's evidence and finish the document without appending
+                # a duplicate event.
+                append_park_event = False
+                park_event = prior
+            assert park_event is not None
+            r.state = RunState.PARKED
+            r.supervisor_parked_at = park_event["ts"]
+            r.supervisor_park_reason = park_event["reason"]
+            r.supervisor_resume_command = park_event["resume_command"]
+            r.supervisor_context = park_event.get("context")
+
+        return self.store.commit_run_events(
+            run_id,
+            _park,
+            lambda _run: [park_event] if append_park_event and park_event is not None else [],
+        )
+
+    def resume_supervisor(
+        self, run_id: str, *, supervisor_session_id: str | None = None
+    ) -> Run:
+        """Release a supervisor-context park after a fresh interactive handoff.
+
+        The method clears the parked metadata, returns the run to ``RUNNING``, and emits
+        ``supervisor_resumed``. The event is committed before the run document and a
+        retry after an interrupted write reuses that event rather than emitting another.
+        If the park recorded a session id, callers must provide a different
+        ``supervisor_session_id``; this prevents the exhausted supervisor from immediately
+        refilling the run. Raises ``ContractError`` unless the run is parked and that
+        freshness check succeeds.
+        """
+        resume_event: dict | None = None
+        append_resume_event = True
+
+        def _resume(r: Run) -> None:
+            nonlocal append_resume_event, resume_event
+            if r.state is not RunState.PARKED:
+                raise ContractError(f"run {run_id} is not parked (state {r.state.value})")
+            previous_session = (
+                r.supervisor_context.get("session_id")
+                if isinstance(r.supervisor_context, dict)
+                else None
+            )
+            if previous_session and not supervisor_session_id:
+                raise ContractError(
+                    "resuming this parked run requires a fresh supervisor context snapshot"
+                )
+            if previous_session and supervisor_session_id == previous_session:
+                raise ContractError(
+                    f"run {run_id} was parked by supervisor session {previous_session}; "
+                    "resume it from a fresh Claude Code session"
+                )
+            prior = self._orphaned_supervisor_event(run_id, "supervisor_resumed")
+            if prior is None:
+                resume_event = {
+                    "ts": _now(),
+                    "type": "supervisor_resumed",
+                    "run_id": run_id,
+                    "previous_session_id": previous_session,
+                    "session_id": supervisor_session_id,
+                }
+            else:
+                append_resume_event = False
+                resume_event = prior
+            r.state = RunState.RUNNING
+            r.supervisor_parked_at = None
+            r.supervisor_park_reason = None
+            r.supervisor_resume_command = None
+            r.supervisor_context = None
+
+        return self.store.commit_run_events(
+            run_id,
+            _resume,
+            lambda _run: (
+                [resume_event]
+                if append_resume_event and resume_event is not None
+                else []
+            ),
+        )
+
     # --- per-run ledger attribution (#281) -------------------------------------
     def run_rows(self, run_id: str) -> list[dict]:
         """Ledger rows attributed to ``run_id`` only. Every row carries ``run_id``
@@ -4434,6 +4715,7 @@ class Engine:
                     and age_s > stale_after_s
                     and task.state not in TERMINAL_TASK_STATES
                     and task.state is not TaskState.BLOCKED_ON_HUMAN
+                    and run.state is not RunState.PARKED
                 ),
             }
             # A human-closed-infeasible task surfaces WHY it was closed — read back from the
@@ -4501,6 +4783,18 @@ class Engine:
             "tasks": tasks,
             "cost": summary,
             "budget": budget,  # #34: metered spend vs. budget (None when no budget set)
+            # #259: a clean interactive handoff is run-level, not a stale task or a
+            # human decision. The block is present only for the active park episode.
+            "supervisor_parked": (
+                {
+                    "at": run.supervisor_parked_at,
+                    "reason": run.supervisor_park_reason,
+                    "resume_command": run.supervisor_resume_command,
+                    "context": run.supervisor_context,
+                }
+                if run.state is RunState.PARKED
+                else None
+            ),
             # #313/#323: who is driving this run's scheduler loop, whether that process is
             # still alive, and what its own log says it was last doing (last heartbeat +
             # age + state) — so "the model went quiet", "the driver is sleeping out a

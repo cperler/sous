@@ -209,6 +209,15 @@ conversation:
   own cap is merely a ceiling. `orchestrator/cost_policy.py` is the USD sibling: remaining
   budget fraction routes new tasks to cheaper lanes / the $0 deterministic runners. Distinct
   levers: rate-limit headroom vs dollars.
+- **Interactive supervisor context.** Claude Code supplies context-window counters to the
+  configured `orchestrator statusline` command, which caches a fresh cwd-keyed snapshot.
+  Guarded interactive `next` evaluates its exact rendered prompt in memory and reserves a
+  conservative prompt estimate plus 20% of the window before it writes the prompt artifact,
+  emits a WorkItem, or commits `pending_work_item_id`. Insufficient/stale sensing parks the
+  run in non-terminal `PARKED` with a `supervisor_parked` event and resume command. Parking
+  is refused while any batch lease remains; the supervisor stops refilling, drains results,
+  and retries at the lease-free boundary. A parked run is neither stale nor waiting on a
+  human decision; `resume-supervisor` releases it in a fresh session.
 - **Cross-provider fallthrough.** A `provider_unavailable` result (codex CLI missing / auth
   expired) can fall through to claude when the run opts in (`cross_provider_fallback`); off, it
   degrades to a normal retry-then-fail.
@@ -316,7 +325,9 @@ cross-run `learnings-kb.jsonl` share one parent:
   stage's stream via `stream_probe.py`), `dashboard` (`dashboard.py` — cross-session board of
   all runs, "what needs a human" lifted to an attention band), `cost-report`, `retrospective`,
   `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
-  utilization for the Claude Code status bar, off the same usage cache).
+  utilization plus context-window capture for the Claude Code status bar),
+  `supervisor-context` (read that fresh payload), and `resume-supervisor` (release a
+  lease-free interactive context park in a fresh session).
 - **Driver telemetry** (`orchestrator/driver_log.py`, #323): `Scheduler.run` — the
   long-lived foreground process that owns a run — writes `driver.jsonl` and mirrors it to
   stderr. A heartbeat precedes each tick's dispatch and repeats every

@@ -285,6 +285,8 @@ $ORCH --root runs panel-report --limit 20  # cross-run panel yield + review cost
 $ORCH retrospective   # failure patterns + what the retries learned (on a failed run)
 $ORCH util            # 5h/7d account utilization (JSON) — the --util sensor
 $ORCH statusline      # the same numbers as one line, for the status bar
+$ORCH supervisor-context # fresh Claude Code context-window snapshot (interactive sensor)
+$ORCH resume-supervisor  # release a lease-free context park from a fresh session
 ```
 
 REVIEW can also identify a process lesson's concrete harness target (a stage template,
@@ -316,6 +318,14 @@ Verified against Claude Code's [status line docs](https://code.claude.com/docs/e
 
 It stays quiet (empty line, exit 0) whenever the probe is unavailable, so the bar
 never shows an error.
+
+The same status-line invocation captures Claude Code's `context_window` counters in a
+small cwd-keyed temp cache. `orchestrator supervisor-context` reports the fresh snapshot;
+interactive skills pass `--guard-supervisor-context` to `next`, which reserves 20% of the
+window plus a conservative estimate of the exact next rendered prompt. If that headroom is
+not available, the engine emits no WorkItem and takes no lease: it marks the run `parked`,
+records `supervisor_parked` with a fresh-session resume command, and excludes the parked
+tasks from stale alarms. Run `resume-supervisor` once from the fresh session.
 
 Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
 --detect <repo>` reads the repo's stack and prints a draft `profile.toml`;

@@ -60,11 +60,24 @@ D=$(uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PR
 Maintain a set of in-flight background dispatches (task id → background invocation +
 its `timeout_s` + start time). Each pass:
 
+Require the Claude Code status-line sensor throughout the loop: configure
+`orchestrator statusline` as `statusLine` and verify `orchestrator supervisor-context`
+returns a fresh snapshot. Every `next` below uses the engine guard, which evaluates the
+exact rendered prompt before returning it or taking a lease. If guarded `next` returns
+`drain_required`, stop launching new work, reap and record every existing background
+dispatch, then retry guarded `next`; only the lease-free retry may emit
+`supervisor_parked`. Never mark a run parked while a sibling invocation is live.
+
 1. **Fill headroom.** Compute `slots = limit - in_flight_count` from a fresh
    `dispatchable`. For up to `slots` tasks from `D.dispatchable`:
-   - `WORK=$(… --shared-root … next --task "$T")` → one WorkItem (the engine drains
+   - `WORK=$(… --shared-root … next --task "$T" --guard-supervisor-context
+     --supervisor-resume-command "start a fresh Claude Code session and invoke
+     /orchestrate-batch-interactive for $RUN")` → one WorkItem (the engine drains
      any leading deterministic stage in-process and returns the first model WorkItem;
      `null` means that task is done — skip it).
+     If it returns `null`, check status first: `run_state=parked` means stop and surface
+     `supervisor_parked.reason` plus `resume_command`, not "task done". A fresh session
+     runs `… resume-supervisor` once before restarting this loop.
    - **Launch ONE Workflow invocation for that task with `run_in_background`**:
      invoke `run_targets/workflow_shim.js` with
      `{ workItems: [WORK], dispatchLimit: <engine limit>, now: <ISO>, schemas: {...} }`.

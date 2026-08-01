@@ -20,7 +20,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
-from .schemas.enums import TERMINAL_RUN_STATES
+from .schemas.enums import TERMINAL_RUN_STATES, RunState
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an engine<-alerting import cycle
     from .engine import Engine
@@ -46,6 +46,7 @@ NOTIFY_RUN_BLOCKED = "run_blocked"
 # an omitted one means `watch` polls a finished run forever. Includes
 # completed_with_rejections (#67) and superseded (#257) by construction.
 _TERMINAL_RUN_STATES = frozenset(s.value for s in TERMINAL_RUN_STATES)
+_WATCH_STOP_STATES = _TERMINAL_RUN_STATES | {RunState.PARKED.value}
 
 
 def stale_notifications(
@@ -188,13 +189,15 @@ def watch(
     activity: bool = False,
     stall_after_s: int = 300,
 ) -> dict:
-    """Poll ``run_id`` to a terminal run state, firing stall notifications with the
-    shared once-per-episode dedupe. Usable for ANY run — including single-task
+    """Poll ``run_id`` until terminal or supervisor-parked, firing stall notifications
+    with the shared once-per-episode dedupe. Usable for ANY run — including single-task
     engine-lane runs that no scheduler loop is watching.
 
     Each pass: read ``status`` (with ``stale_after_s``), emit any newly-due stall
     notifications (project hook + audit row via ``engine.emit_notification``, plus a
-    human line via ``emit``), and return the final status once the run is terminal.
+    human line via ``emit``), and return the final status once the run is terminal. A
+    PARKED run is also a stop condition: it emits the persisted fresh-supervisor resume
+    command but does not classify the clean handoff as stale or human-blocked.
     ``sleeper`` is injected (``time.sleep`` in production, a stub in tests) so the loop
     is drivable without real sleeping.
 
@@ -217,6 +220,13 @@ def watch(
         if activity:
             for line in activity_lines(status, stall_after_s=stall_after_s):
                 emit(line)
-        if str(status.get("run_state")) in _TERMINAL_RUN_STATES:
+        if str(status.get("run_state")) == RunState.PARKED.value:
+            parked = status.get("supervisor_parked") or {}
+            emit(
+                "run PARKED — needs a fresh supervisor; resume: "
+                f"{parked.get('resume_command') or 'resume-supervisor'}"
+            )
+            return status
+        if str(status.get("run_state")) in _WATCH_STOP_STATES:
             return status
         sleeper(interval)

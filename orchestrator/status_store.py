@@ -124,6 +124,9 @@ class StatusStore:
     def _task_path(self, run_id: str, task_id: str) -> Path:
         return self.root / f"status-{run_id}-{task_id}.json"
 
+    def _dispatch_path(self, run_id: str) -> Path:
+        return self.root / f"dispatch-{run_id}"
+
     @property
     def _events_path(self) -> Path:
         return self.root / "events.jsonl"
@@ -180,6 +183,19 @@ class StatusStore:
         (``update_run``). No path ever takes them the other way round, so there is no cycle
         to deadlock on."""
         with self.with_lock(self._task_path(run_id, task_id)):
+            yield
+
+    @contextmanager
+    def with_dispatch_lock(self, run_id: str) -> Iterator[None]:
+        """Serialize fresh lease commits with run-level dispatch-boundary parks.
+
+        This lock is outermost: dispatch commits may take a task lock and parking may
+        take the run lock while it is held, but no task/run transaction may acquire it.
+        Keeping the guard, lease scan, PARKED transition, and fresh lease commit in this
+        critical section prevents a run from becoming PARKED while a concurrent
+        ``next_work`` is between its preflight checks and task-doc commit.
+        """
+        with self.with_lock(self._dispatch_path(run_id)):
             yield
 
     def write_task_locked(self, task: Task) -> None:
@@ -312,6 +328,39 @@ class StatusStore:
             mutator(run)
             run.updated_at = _utc_now_iso()
             self._write_run(run)  # already under the lock
+            return run
+
+    def commit_run_events(
+        self,
+        run_id: str,
+        mutator: Callable[[Run], None],
+        events: list[dict] | Callable[[Run], list[dict]] | None = None,
+    ) -> Run:
+        """Transactionally mutate a run and append its bookkeeping events.
+
+        This is the run-document counterpart to :meth:`commit_task_events`: the
+        events are appended first and the run document is written last as the durable
+        commit point. Consequently, a persisted run transition always has its audit
+        evidence already on disk. The returned run includes the committed mutation;
+        exceptions from the mutator or an append/write leave the run document unchanged.
+        ``events`` may be computed from the freshly mutated run when transition details
+        are only known inside the locked mutation.
+
+        A crash after an event append but before the run write can leave the safe
+        inverse (event present, document unchanged). Callers whose transition must be
+        idempotent should give the event a stable transition key and suppress a matching
+        append when retrying against that unchanged document. The caller supplies events
+        for this method because the store cannot infer an event's semantic identity.
+        """
+        path = self._run_path(run_id)
+        with self.with_lock(path):
+            run = self.load_run(run_id)
+            mutator(run)
+            run.updated_at = _utc_now_iso()
+            evs = events(run) if callable(events) else (events or [])
+            for ev in evs:
+                self.append_event(run_id, ev)
+            self._write_run(run)  # durable commit point — LAST, already under lock
             return run
 
     # ---- task API -------------------------------------------------------

@@ -74,6 +74,17 @@ def _positive_int(raw: str) -> int:
     return value
 
 
+def _percentage(raw: str) -> float:
+    """Argparse type for a finite percentage in the inclusive 0..100 range."""
+    try:
+        value = float(raw)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{raw!r} is not a number") from None
+    if not math.isfinite(value) or not 0 <= value <= 100:
+        raise argparse.ArgumentTypeError(f"must be between 0 and 100, got {raw}")
+    return value
+
+
 def _auto_util_provider() -> Callable[[], float]:
     """A live 5-hour-usage util probe: re-probes each tick so the gate tracks reality
     (0.0 when no usage snapshot is available). Shared by the queue-drive and headless
@@ -152,7 +163,8 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
 # the flag, so passing it there is a no-op worth warning about (mis-positioned flag).
 _ENGINE_COMMANDS = frozenset({
     "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
-    "hold", "approve", "unpause", "reject", "abandon", "retire", "resume", "status", "refresh-spec",
+    "hold", "approve", "unpause", "park-supervisor", "resume-supervisor", "reject",
+    "abandon", "retire", "resume", "status", "refresh-spec",
     "watch", "cost-report", "retrospective", "trunk-gate",
 })
 
@@ -347,6 +359,14 @@ def main(argv: list[str] | None = None) -> int:
                    help="re-emit the pending WorkItem for a task whose supervisor crashed "
                         "holding the dispatch lease (bypasses the lease/cooldown guard so a "
                         "crashed supervisor recovers its item without hand-editing state; #50)")
+    n.add_argument("--guard-supervisor-context", action="store_true",
+                   help="before an interactive model dispatch, compare a fresh Claude Code "
+                        "status-line context snapshot with this exact rendered prompt and "
+                        "park lease-free when there is insufficient headroom (#259)")
+    n.add_argument("--supervisor-min-remaining-pct", type=_percentage, default=20.0,
+                   help="context reserve kept after the projected next prompt (default 20%%)")
+    n.add_argument("--supervisor-resume-command", default=None,
+                   help="operator command/instruction stored on supervisor_parked")
     sub.add_parser("record").add_argument("--result", required=True, help="StageResult JSON file")
     d = sub.add_parser(
         "dispatchable",
@@ -409,6 +429,10 @@ def main(argv: list[str] | None = None) -> int:
     rq.add_argument("--force", action="store_true",
                     help="with --release-claim, override the live-owner refusal")
     sub.add_parser("util", help="probe the account's 5h/7d utilization (feeds --util)")
+    sc = sub.add_parser("supervisor-context",
+                        help="read the fresh Claude Code context snapshot captured by statusline")
+    sc.add_argument("--max-age", type=float, default=30.0,
+                    help="maximum accepted sensor age in seconds (default 30)")
     sl = sub.add_parser("statusline",
                         help="one-line 5h/7d utilization for the Claude Code status bar "
                              "(reads the same usage cache as util; quiet on a probe miss)")
@@ -429,6 +453,10 @@ def main(argv: list[str] | None = None) -> int:
                     help="on a budget-exhausted pause (#34): resume with this NEW budget "
                          "ceiling (re-arms the soft warning), must be > 0. Omit to drop "
                          "the cap entirely")
+    ps = sub.add_parser("park-supervisor", help="park an interactive run at a lease-free boundary")
+    ps.add_argument("--reason", required=True)
+    ps.add_argument("--resume-command", required=True)
+    sub.add_parser("resume-supervisor", help="release a supervisor-context park in a fresh session")
     rj = sub.add_parser("reject", help="confirm-and-close a held infeasible task (writes the rejection artifact)")
     rj.add_argument("--task", required=True)
     rj.add_argument("--by", required=True, help="who is rejecting")
@@ -799,10 +827,20 @@ def main(argv: list[str] | None = None) -> int:
         _emit({"available": usage is not None, **(asdict(usage) if usage else {})})
         return 0
 
+    if args.cmd == "supervisor-context":
+        from .supervisor_context import read_supervisor_context
+
+        snapshot = read_supervisor_context(Path.cwd(), max_age_s=args.max_age)
+        payload = snapshot.__dict__.copy()
+        payload["remaining_tokens"] = snapshot.remaining_tokens
+        _emit(payload)
+        return 0 if snapshot.available else 1
+
     if args.cmd == "statusline":
         # Display-only sibling of `util`: same cache, but a raw line for Claude Code's
         # statusLine (which consumes plain text, not JSON). Quiet on a probe miss so the
         # status bar shows nothing rather than an error. Always exit 0.
+        from .supervisor_context import capture_statusline_context
         from .usage_probe import format_statusline, read_usage, watch_statusline
 
         if args.watch:
@@ -811,6 +849,17 @@ def main(argv: list[str] | None = None) -> int:
             # Ctrl-C ends the loop cleanly — watch_statusline swallows KeyboardInterrupt itself.
             watch_statusline(emit=print, sleeper=time.sleep, interval=args.interval)
             return 0
+        # Claude Code supplies context_window/session_id/cwd as JSON on statusLine stdin.
+        # Capture it before rendering the existing utilization line. A terminal invocation
+        # has no payload; malformed/blocked stdin is a quiet no-op because statusLine must
+        # never become a source of UI errors.
+        try:
+            raw = "" if sys.stdin.isatty() else sys.stdin.read()
+            incoming = json.loads(raw) if raw.strip() else None
+            if isinstance(incoming, dict):
+                capture_statusline_context(incoming)
+        except (OSError, ValueError):
+            pass
         line = format_statusline(read_usage())
         if line:
             print(line)
@@ -1173,11 +1222,48 @@ def main(argv: list[str] | None = None) -> int:
         # --resume applies only to the FIRST call — the one recovering a lease a crashed
         # supervisor left held (#50). Any deterministic stages drained afterward are fresh
         # dispatches with no outstanding lease, so they take the normal path.
-        work = eng.next_work(args.run, args.task, util_pct=util_pct, resume=args.resume)
-        while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
-            stage_result = eng.registry.resolve(work.lane_policy).dispatch(work)
-            eng.record(args.run, stage_result)
-            work = eng.next_work(args.run, args.task, util_pct=util_pct)
+        from .errors import SupervisorParkDeferred
+        from .supervisor_context import SupervisorContext, read_supervisor_context
+
+        def _context() -> SupervisorContext | None:
+            return (
+                read_supervisor_context(Path.cwd())
+                if args.guard_supervisor_context
+                else None
+            )
+
+        try:
+            work = eng.next_work(
+                args.run,
+                args.task,
+                util_pct=util_pct,
+                resume=args.resume,
+                supervisor_context=_context(),
+                supervisor_min_remaining_pct=args.supervisor_min_remaining_pct,
+                supervisor_resume_command=args.supervisor_resume_command,
+            )
+            while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
+                stage_result = eng.registry.resolve(work.lane_policy).dispatch(work)
+                eng.record(args.run, stage_result)
+                work = eng.next_work(
+                    args.run,
+                    args.task,
+                    util_pct=util_pct,
+                    supervisor_context=_context(),
+                    supervisor_min_remaining_pct=args.supervisor_min_remaining_pct,
+                    supervisor_resume_command=args.supervisor_resume_command,
+                )
+        except SupervisorParkDeferred as exc:
+            _emit(
+                {
+                    "ok": False,
+                    "parked": False,
+                    "drain_required": exc.in_flight,
+                    "projection": exc.projection,
+                    "error": str(exc),
+                }
+            )
+            return 2
         _emit(None if work is None else json.loads(work.model_dump_json()))
     elif args.cmd == "record":
         from .errors import ContractError
@@ -1250,6 +1336,24 @@ def main(argv: list[str] | None = None) -> int:
         run = eng.unpause_run(args.run, raise_budget_to=args.raise_budget)
         _emit({"unpaused": run.run_id, "state": run.state.value,
                "budget_usd": run.budget_usd})
+    elif args.cmd == "park-supervisor":
+        run = eng.park_supervisor(
+            args.run,
+            reason=args.reason,
+            resume_command=args.resume_command,
+        )
+        _emit({"parked": run.run_id, "state": run.state.value,
+               "reason": run.supervisor_park_reason,
+               "resume_command": run.supervisor_resume_command})
+    elif args.cmd == "resume-supervisor":
+        from .supervisor_context import read_supervisor_context
+
+        snapshot = read_supervisor_context(Path.cwd())
+        if not snapshot.available:
+            _emit({"ok": False, "resumed": False, "error": snapshot.reason})
+            return 1
+        run = eng.resume_supervisor(args.run, supervisor_session_id=snapshot.session_id)
+        _emit({"resumed": run.run_id, "state": run.state.value})
     elif args.cmd == "reject":
         task = eng.reject(args.run, args.task, rejected_by=args.by, reason=args.reason)
         _emit({"rejected": task.task_id, "state": task.state.value, "by": args.by})

@@ -21,8 +21,16 @@ You never call a model directly and you never run `claude -p`.
 2. `… add-task --task "$TASK"` (resolves the issue via the GitHub task source).
 
 ## The loop (repeat until the task is terminal)
-1. **next**: `WORK=$(… next --task "$TASK" --util auto)`.
+Before every model dispatch, require the Claude Code status-line sensor. Configure
+`orchestrator statusline` as this session's `statusLine` command; it caches Claude Code's
+`context_window` payload. Confirm it with `orchestrator supervisor-context`.
+
+1. **next**: `WORK=$(… next --task "$TASK" --util auto --guard-supervisor-context
+   --supervisor-resume-command "start a fresh Claude Code session and invoke
+   /orchestrate-task-interactive for $RUN $TASK")`.
    - If `WORK` is `null`, the task is done — stop.
+   - First check `… status`: if `run_state` is `parked`, surface its reason/resume command
+     and stop. A fresh session runs `… resume-supervisor` once before restarting the loop.
    - `--util auto` probes the account's REAL 5h utilization (see `orchestrator util`;
      a probe miss falls back to 0.0 and says so) and the engine turns it into the binding
      dispatch limit. **Do not exceed the engine's limit** even though the Workflow
