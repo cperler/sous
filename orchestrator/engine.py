@@ -2617,9 +2617,9 @@ class Engine:
         if any(saved.fingerprint == fixup.fingerprint for saved in task.review_fixups):
             reason = "same fixup was requested again after its re-implement pass"
             return self._hold_review_fixup(task, fixup, reason), reason
-        reason = self._review_fixup_tail_ineligibility(task)
-        if reason is not None:
-            return self._hold_review_fixup(task, fixup, reason), reason
+        ineligible = self._review_fixup_tail_ineligibility(task)
+        if ineligible is not None:
+            return self._hold_review_fixup(task, fixup, ineligible), ineligible
         if task.review_cycles >= self.max_review_cycles:
             reason = f"review rework budget exhausted ({task.review_cycles} cycles)"
             return self._hold_review_fixup(task, fixup, reason), reason
