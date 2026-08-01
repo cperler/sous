@@ -8,9 +8,10 @@ This module is the consumer's shared core: the scheduler's long-running ``run()`
 loop and the ``watch`` CLI both feed it a status snapshot + the set of task ids
 already signalled, so the dedupe lives in ONE pure, sleep-free, unit-testable place.
 
-Point-in-time transitions (task failed / blocked-on-human / run paused / run
-finalized) are emitted where they HAPPEN — in the engine's ``record`` /
-``_maybe_finalize_run`` and the scheduler's breaker — via ``Engine.emit_notification``.
+Point-in-time transitions (task completed / task failed / blocked-on-human / run paused /
+run finalized) are emitted where they HAPPEN — in the engine's ``record`` /
+``_on_task_completed`` / ``_maybe_finalize_run`` and the scheduler's breaker — via
+``Engine.emit_notification``.
 This module owns only the poll-driven stall case, which has no single transition to
 hang an emit on.
 """
@@ -29,6 +30,14 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids an engine<-alerting 
 # row's ``kind``). Kept here so the emit sites and any consumer share one spelling.
 NOTIFY_TASK_STALE = "task_stale"
 NOTIFY_TASK_FAILED = "task_failed"
+# #359: the success half of the per-task pair. Before this, a task that LANDED was only
+# observable at whole-run granularity (``run_finalized``), which on a multi-task batch says
+# nothing about WHICH task shipped or where its PR is — so a detached driver could finish a
+# task and the only way to learn it was to poll ``status``. Emitted from the engine's
+# ``_on_task_completed`` choke point (NOT ``_terminal_effects``, which only runs the
+# failed/rejected dispositions), so it fires exactly once per completed task and covers the
+# decomposition-parent path too.
+NOTIFY_TASK_COMPLETED = "task_completed"
 NOTIFY_TASK_BLOCKED = "task_blocked"
 NOTIFY_RUN_PAUSED = "run_paused"
 NOTIFY_RUN_FINALIZED = "run_finalized"
