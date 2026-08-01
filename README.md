@@ -8,8 +8,14 @@ Workflow on the subscription, and headless by shelling out to `claude -p` / `cod
 It is a deliberate **Python rebuild** of an earlier bash orchestration system, extracted
 to a spec and rebuilt around a clean engine/adapter split.
 
-New here? **`ARCHITECTURE.md`** is a one-page map of the whole system — the engine/adapter
-split, the six-stage pipeline, the front doors, the control loops, and where to start reading.
+New here? Two entry points, depending on what you're doing:
+
+- **`USING.md`** — the operator's guide: standing up your own project and running the loop,
+  phase by phase (repo skeleton → adapter → issues → run → merge → triage).
+- **`ARCHITECTURE.md`** — the contributor's map: the engine/adapter split, the six-stage
+  pipeline, the front doors, the control loops, and where to start reading.
+
+`CHEATSHEET.md` collects the skills, the per-phase commands, and the gotchas on one page.
 
 **Status: built and live-proven.** Phases 1–5 complete plus engine-hardening passes, the
 2026-07-01 review→execute cycle (context plane, per-task pipelines, session continuity,
@@ -350,7 +356,8 @@ Standing up a **new project** is an interview, not boilerplate: `orchestrator-sc
 flow (and is re-callable to tune from run artifacts). The scaffold turns the profile into a
 project-config adapter **and** seeds a stack-appropriate starter kit (agents, skills, hooks,
 schemas from `templates/project-default/`) into the project's `.claude/`. The engine is
-never touched.
+never touched. See **`USING.md`** phase 1 for the full walkthrough, including the two files
+the profile can't infer (`task_source.py`, `classifier.py`).
 
 The adapter is **owned by the project's repo**, not this one (the two-folder layout):
 `orchestrator-scaffold --into <repo>` writes it to `<repo>/.orchestration/` (profile.toml
@@ -382,7 +389,12 @@ issue (and re-dispositioned at each gate) — nothing is silently dropped.
 
 ## Docs
 
-- **`ARCHITECTURE.md`** — the contributor's map of the system as built. Start here.
+- **`USING.md`** — the operator's guide: the six phases of standing up a project and running
+  the loop on it. Start here if you're *using* the harness rather than changing it.
+- **`CHEATSHEET.md`** — skills, per-phase commands, lane selection, recovery, and gotchas on
+  one page.
+- **`ARCHITECTURE.md`** — the contributor's map of the system as built. Start here if you're
+  changing the engine.
 - **`CLAUDE.md`** — the working norms any change to this repo must respect.
 - **`DEFERRED.md`** — the scope-ledger discipline; the live ledger is
   [GitHub issues](https://github.com/cperler/orchestration-template/issues) (label

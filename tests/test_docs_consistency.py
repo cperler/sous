@@ -1,7 +1,8 @@
 """Lightweight consistency check for the current-state docs (#276).
 
-README.md and ARCHITECTURE.md are the advertised contributor map, so the claims that
-drift fastest are pinned here rather than re-audited by hand:
+README.md and ARCHITECTURE.md are the advertised contributor map, and USING.md /
+CHEATSHEET.md the operator's guide, so the claims that drift fastest are pinned here
+rather than re-audited by hand:
 
 * the developer command list stays in sync with the CI gate (`uv run pytest` / `ruff` /
   `mypy`) — the omission that motivated this test was a missing `uv run mypy`;
@@ -23,7 +24,13 @@ import pytest
 
 REPO = Path(__file__).resolve().parent.parent
 CI_WORKFLOW = REPO / ".github" / "workflows" / "ci.yml"
-CURRENT_STATE_DOCS = ("README.md", "ARCHITECTURE.md", "CLAUDE.md")
+CURRENT_STATE_DOCS = (
+    "README.md",
+    "ARCHITECTURE.md",
+    "CLAUDE.md",
+    "USING.md",
+    "CHEATSHEET.md",
+)
 
 # "725 pytest cases", "838 cases", "pytest suite (725)" — any concrete total, which goes
 # stale the moment a test is added. Counts must be generated or absent, never typed in.
