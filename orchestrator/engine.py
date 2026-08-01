@@ -108,7 +108,7 @@ from .schemas.enums import (
     effort_below,
     resolve_effort,
 )
-from .schemas.status import Run, RunDriver, Task, TaskRef
+from .schemas.status import ReviewFixup, Run, RunDriver, Task, TaskRef
 from .schemas.work import (
     LanePolicy,
     LaneUsed,
@@ -1861,6 +1861,11 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
+        # #227: capture the fixup request from the canonical review output (including a
+        # synthesized panel output) before entering the locked transition.  The helper is
+        # pure; whether this is a fresh request, a repeated failed fixup, or a request that
+        # can piggyback on a blocking-review cycle depends on the fresh task under the lock.
+        review_fixup = self._review_fixup(effective)
         # A rate-limit with a cheaper model still available is transient — re-queue the
         # SAME stage+attempt on that model rather than burning a retry or tripping the
         # breaker. Gated on the lane's allow_fallback (so the flag is honored, not dead).
@@ -1889,6 +1894,8 @@ class Engine:
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
         test_validation: dict[str, object] | None = None
+        review_fixup_action: dict[str, object] | None = None
+        fixups_applied: list[ReviewFixup] = []
         cooldown_until: str | None = None
         provider_out_reason: str | None = None
         # #311: what the under-lock re-validation rejected (fresh doc + mismatch), captured
@@ -1899,7 +1906,8 @@ class Engine:
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
-            nonlocal test_validation, cooldown_until, provider_out_reason, lease_rejection
+            nonlocal test_validation, review_fixup_action, fixups_applied
+            nonlocal cooldown_until, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
             # validate→transition sequence is one read-modify-write on the fresh doc,
             # so of two concurrent duplicate records exactly one clears the lease —
@@ -2044,12 +2052,51 @@ class Engine:
                         outcome = "scope_not_feasible_held"
                     elif review_verdict is not None and review_verdict["kind"] == "rejected":
                         outcome = self._apply_review_rejection(t, review_verdict)
-                    elif is_done(t):
-                        t.state = TaskState.COMPLETED
-                        outcome = "task_completed"
+                        if review_fixup is not None:
+                            if outcome == "review_rejected_fix_cycle":
+                                reason = self._review_fixup_tail_ineligibility(t)
+                                if reason is not None:
+                                    review_fixup_action = {
+                                        "disposition": "held",
+                                        "reason": reason,
+                                    }
+                                else:
+                                    fresh = self._remember_review_fixup(t, review_fixup)
+                                    review_fixup_action = {
+                                        "disposition": "scheduled",
+                                        "reason": "combined with blocking-review fix cycle",
+                                        "already_scheduled": not fresh,
+                                    }
+                            else:
+                                review_fixup_action = {
+                                    "disposition": "held",
+                                    "reason": "blocking review exhausted the rework budget",
+                                }
+                    elif review_fixup is not None:
+                        outcome, reason = self._apply_review_fixup(t, review_fixup)
+                        review_fixup_action = {
+                            "disposition": (
+                                "scheduled" if outcome == "review_fixup_cycle" else "held"
+                            ),
+                            "reason": reason,
+                        }
                     else:
-                        t.state = TaskState.RUNNING
-                        outcome = "stage_completed"
+                        # A later REVIEW that reaches completion without asking for the
+                        # fixup again is the engine-observable proof that the re-implement,
+                        # re-test and re-deliver pass satisfied it.  Mark the durable records
+                        # in the approving review's transaction (even when a bespoke
+                        # pipeline has later stages) so disposition text can never get ahead
+                        # of evidence.
+                        if effective.stage is Stage.REVIEW:
+                            fixups_applied = [f for f in t.review_fixups if not f.applied]
+                            for fixup in fixups_applied:
+                                fixup.applied = True
+                        if is_done(t):
+                            t.state = TaskState.COMPLETED
+                            outcome = "task_completed"
+                        else:
+                            t.state = TaskState.RUNNING
+                            outcome = "stage_completed"
                 else:
                     # Session fate on a failure is decided inside _handle_failure (it has the
                     # infra classification + the salvage decision the warm-retry policy needs).
@@ -2146,6 +2193,29 @@ class Engine:
                      "disposition": review_verdict.get("disposition"),
                      "issues": review_verdict["issues_text"],
                      "review_cycles": t.review_cycles}
+                )
+            # #227: the in-place improvement loop has its own evidence rather than
+            # masquerading as a filed/not-filed decision.  These events share the review
+            # result's atomic commit boundary, so a record replay cannot schedule or apply
+            # the same fixup twice.
+            if review_fixup is not None and review_fixup_action is not None:
+                disposition = str(review_fixup_action["disposition"])
+                events.append(
+                    {"ts": _now(), "type": f"review_fixup_{disposition}",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value, "title": review_fixup.title,
+                     "fingerprint": review_fixup.fingerprint,
+                     "reason": review_fixup_action["reason"],
+                     **(
+                         {"already_scheduled": review_fixup_action["already_scheduled"]}
+                         if "already_scheduled" in review_fixup_action else {}
+                     )}
+                )
+            for fixup in fixups_applied:
+                events.append(
+                    {"ts": _now(), "type": "review_fixup_applied", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "title": fixup.title, "fingerprint": fixup.fingerprint}
                 )
             # #261: nobody judged whether the tests are meaningful (or the reviewer's verdict
             # was suppressed by the no-model-test-surface exemption). Warning-grade, so a run
@@ -2522,6 +2592,116 @@ class Engine:
         else:
             kind = "rejected"
         return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints}
+
+    @staticmethod
+    def _review_fixup(result: StageResult) -> ReviewFixup | None:
+        """Return a bounded in-place improvement request from a successful REVIEW.
+
+        The interactive lane is intentionally tolerated at this seam, so model fields are
+        coerced and bounded just like evidence-out fields instead of assuming schema-perfect
+        strings.  Only the explicit ``fixup`` disposition acts; every other improvement
+        keeps the existing filing/completion-note behavior.
+        """
+        if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+            return None
+        output = result.structured_output or {}
+        improvement = output.get("improvement")
+        if not isinstance(improvement, dict):
+            return None
+        disposition = str(improvement.get("disposition") or "").strip().casefold()
+        title = str(improvement.get("title") or "").strip()
+        if disposition != "fixup" or not title:
+            return None
+        title = title[:200]
+        detail = str(improvement.get("detail") or "").strip()[:2000]
+        return ReviewFixup(
+            title=title,
+            detail=detail,
+            fingerprint=issue_fingerprint(title),
+        )
+
+    @staticmethod
+    def _fixup_learning(fixup: ReviewFixup, *, repeated: bool = False) -> str:
+        prefix = "review improvement fixup still requested" if repeated else "review improvement fixup"
+        detail = f" — {fixup.detail}" if fixup.detail else ""
+        return f"{prefix}: {fixup.title}{detail}"
+
+    def _remember_review_fixup(self, task: Task, fixup: ReviewFixup) -> bool:
+        """Put a fixup into the durable task/history plane and IMPLEMENT learnings.
+
+        Returns True for a newly-recorded request.  A blocking rejection may revisit an
+        already-scheduled fixup while independently earning another normal review cycle;
+        carry that reminder into IMPLEMENT but do not duplicate the durable record.
+        """
+        existing = next(
+            (saved for saved in task.review_fixups if saved.fingerprint == fixup.fingerprint),
+            None,
+        )
+        task.learnings.append(self._fixup_learning(fixup, repeated=existing is not None))
+        if existing is not None:
+            return False
+        task.review_fixups.append(fixup.model_copy(deep=True))
+        return True
+
+    def _apply_review_fixup(self, task: Task, fixup: ReviewFixup) -> tuple[str, str]:
+        """Schedule one approved-review fixup or hold an unsafe/repeated request.
+
+        Reuses the existing bounded review-cycle budget and tail reset.  The standard
+        pipelines all contain an IMPLEMENT→DELIVER→REVIEW tail; a bespoke pipeline
+        without that order cannot honestly update and re-check the PR, so it parks instead
+        of publishing the old false "applied" completion note.  A repeated fingerprint
+        likewise parks immediately: the first pass already had this exact instruction and
+        another blind loop would be lossy.
+        """
+        if any(saved.fingerprint == fixup.fingerprint for saved in task.review_fixups):
+            reason = "same fixup was requested again after its re-implement pass"
+            return self._hold_review_fixup(task, fixup, reason), reason
+        ineligible = self._review_fixup_tail_ineligibility(task)
+        if ineligible is not None:
+            return self._hold_review_fixup(task, fixup, ineligible), ineligible
+        if task.review_cycles >= self.max_review_cycles:
+            reason = f"review rework budget exhausted ({task.review_cycles} cycles)"
+            return self._hold_review_fixup(task, fixup, reason), reason
+
+        # Same session boundary as a rejecting review: an implementer must act from the
+        # durable instruction, not continue inside the reviewer context that proposed it.
+        task.session_ref = None
+        task.session_provider = None
+        reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
+        if not reset:  # defensive counterpart to the pipeline membership guard above
+            reason = "could not reset the pipeline from IMPLEMENT"
+            return self._hold_review_fixup(task, fixup, reason), reason
+        self._remember_review_fixup(task, fixup)
+        task.review_cycles += 1
+        task.state = TaskState.RETRYING
+        return "review_fixup_cycle", "re-running implement through review in place"
+
+    @staticmethod
+    def _review_fixup_tail_ineligibility(task: Task) -> str | None:
+        """Return a hold reason unless a fixup can be reimplemented and re-delivered.
+
+        A fixup becomes durable application evidence only after the pipeline can run
+        IMPLEMENT, DELIVER, and REVIEW in that order.  Both standalone and combined
+        rejection/fixup paths use this result so bespoke pipelines surface an audit hold
+        instead of later claiming an un-delivered change was applied.
+        """
+        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
+        if not all(stage in task.pipeline for stage in required_tail):
+            return "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
+        positions = tuple(task.pipeline.index(stage) for stage in required_tail)
+        if positions != tuple(sorted(positions)):
+            return "task pipeline does not order IMPLEMENT→DELIVER→REVIEW for a fixup"
+        return None
+
+    @staticmethod
+    def _hold_review_fixup(task: Task, fixup: ReviewFixup, reason: str) -> str:
+        """Park a fixup the engine cannot safely auto-apply, leaving REVIEW resumable."""
+        rec = task.stages[Stage.REVIEW]
+        rec.status = StageStatus.FAILED
+        rec.error = f"review fixup held: {fixup.title} — {reason}"[:500]
+        task.last_error = rec.error
+        task.state = TaskState.BLOCKED_ON_HUMAN
+        return "review_fixup_held"
 
     def _apply_review_rejection(self, task: Task, verdict: dict) -> str:
         """Dispose of a rejected review: a bounded fix cycle (re-open implement→…→review
@@ -4736,7 +4916,8 @@ class Engine:
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
-             "followups_filed": len(followups), "improvement_filed": improvement_ref is not None},
+             "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
+             "review_fixups_applied": sum(fixup.applied for fixup in task.review_fixups)},
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
@@ -4822,7 +5003,8 @@ class Engine:
         * (#223/#228) The improvement does not carry an explicit ``file`` disposition —
           the reviewer did not opt it into a standing issue.  An
           ``improvement_not_filed`` event is emitted so the decision is auditable.
-          ``fixup`` means the change should be applied in place in the current PR; the
+          ``fixup`` is normally consumed by #227's pre-finalize rework loop; this remains
+          a defensive no-file gate for legacy/hand-built completed task documents.  The
           other non-file dispositions are noted in the completion note.
         * (#188) The idea fingerprint-matches an already-filed follow-up
           (``skip_fingerprints``) — one observation must not be filed twice as both a
@@ -4837,8 +5019,8 @@ class Engine:
         title = str(improvement.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title:
             return None
-        # #223/#228 disposition gate: filing is opt-in. `fixup` is applied in place in this
-        # PR; every other non-file disposition is noted in the completion note.
+        # #223/#228 disposition gate: filing is opt-in.  A live `fixup` is handled before
+        # finalize by #227; every non-file disposition is suppressed here.
         disposition = str(improvement.get("disposition") or "").strip().casefold()
         if disposition != "file":
             event_disposition = disposition if "disposition" in improvement else None

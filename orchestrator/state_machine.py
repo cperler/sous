@@ -508,7 +508,7 @@ def _test_stage_fact(task: Task) -> str:
 
 
 def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
-    """Re-open the tail of the pipeline for a review-rejection fix cycle: every
+    """Re-open the tail of the pipeline for a review-driven fix cycle: every
     pipeline stage at/after ``from_stage`` gets a fresh PENDING record, so
     ``next_stage`` returns ``from_stage`` and the fix re-runs implement→…→review.
 
