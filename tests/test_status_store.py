@@ -5,6 +5,8 @@ from __future__ import annotations
 import glob
 import json
 import os
+import threading
+import time
 from datetime import UTC, datetime
 from unittest import mock
 
@@ -267,3 +269,51 @@ def test_with_lock_is_reentrant_across_distinct_paths(tmp_path):
     # locks released cleanly; a fresh acquire must succeed
     with store.with_lock(p1):
         pass
+
+
+def test_decomposition_lock_excludes_another_store_on_the_same_parent(tmp_path):
+    """Mutual exclusion across StatusStore instances, keyed per parent (#354).
+
+    The decomposition saga's racers are separate processes, so the lock has to live on
+    disk: two stores over one run dir must not both be inside it for the same parent, and
+    must not block each other on different parents (which would serialize an entire batch's
+    filing behind one slow task source).
+    """
+    a, b = StatusStore(tmp_path), StatusStore(tmp_path)
+    entered: list[str] = []
+    contending = threading.Event()
+
+    def _contend() -> None:
+        contending.set()
+        with b.with_decomposition_lock("r1", "parent"):
+            entered.append("b")
+
+    with a.with_decomposition_lock("r1", "parent"):
+        thread = threading.Thread(target=_contend)
+        thread.start()
+        assert contending.wait(timeout=5)
+        # The event fires just BEFORE the acquire, so give the contender room to reach it
+        # and (wrongly) succeed — otherwise this would pass on the contender being slow.
+        time.sleep(0.25)
+        # A different parent is a different lock: it must not wait on this one, or one slow
+        # task source would serialize the filing of every parent in a batch.
+        with b.with_decomposition_lock("r1", "other-parent"):
+            entered.append("other-parent")
+        assert entered == ["other-parent"], "the contender entered while the lock was held"
+    thread.join(timeout=5)
+    assert entered == ["other-parent", "b"]
+
+
+def test_decomposition_lock_sentinel_is_not_the_task_doc(tmp_path):
+    """The lock keys on its own path so the saga can still write the parent's task doc.
+
+    ``file_lock`` is not re-entrant, so a lock keyed on ``status-r1-parent.json`` would
+    deadlock the first ``update_task`` the saga performs.
+    """
+    store = StatusStore(tmp_path)
+    assert store._decomposition_path("r1", "parent") != store._task_path("r1", "parent")
+    # A "/" in a task id must not escape the run dir into a subdirectory.
+    assert store._decomposition_path("r1", "a/b").parent == tmp_path
+    with store.with_decomposition_lock("r1", "parent"):
+        store.save_task(_make_task())
+    assert store.load_task("r1", "t1").task_id == "t1"
