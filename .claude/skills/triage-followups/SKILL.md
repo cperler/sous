@@ -124,10 +124,18 @@ is the human-readable record of the gate — the mirror of the evidence-out seam
 them without a gate in the first place.
 
 ## Notes
-- **Scope: only actually-filed issues.** Findings the reviewer marked `fix_now`/`drop`, and
-  findings over the per-task filing cap, were **noted in the completion note, never filed**
-  (#188) — they are not GitHub issues, so they are out of scope here. Triage gates what was
-  filed, not what was suppressed.
+- **Scope: actually-filed issues — plus any completion note that never reached a human.**
+  Findings the reviewer marked `fix_now`/`drop`, and findings over the per-task filing cap,
+  were **noted in the completion note, never filed** (#188). They are not GitHub issues, so
+  they are out of the issue-by-issue queue above: triage gates what was filed, not what was
+  suppressed. But that reasoning assumes the note actually reached someone, and publishing
+  it is a best-effort external call — on `batch-codex-3` every note failed and three valid
+  `fix_now` findings reached nobody (#357). So **before** the queue, check
+  `orchestrator status --run <RUN>`'s `completion_notes` block: if `clean` is false, read
+  each undelivered note's `unfiled` findings (also inline in the `completion_note_failed`
+  event, and the full note is at `runs/<RUN>/stages/<TASK>/completion-note.md`) and walk
+  those with the human too — they have no other channel. `persist_failed` means even the
+  artifact is missing; fall back to `runs/<RUN>/stages/<TASK>/NN-review.json`.
 - **Never delete `runs/<RUN>/`** while reading it (the durable audit trail). This skill
   only reads it.
 - This is a human-judgment loop — you present and recommend; the human decides. Do not
