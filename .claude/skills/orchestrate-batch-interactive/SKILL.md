@@ -23,7 +23,7 @@ sibling is still mid-stage.
 ## Constants
 - `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
   each run's store under `runs/<run-id>/` so runs never comingle their files flat.
-- `RUN` = run id. `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`).
+- `RUN` = run id. `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`).
 - Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
   - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#102): it
     forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet

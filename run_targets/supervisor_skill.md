@@ -13,7 +13,7 @@ You never call a model directly and you never run `claude -p`.
 ## Constants
 - `ROOT` = the run's status/ledger dir (e.g. `runs/<run-id>`).
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
-- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`, the reference; or your own).
+- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`, the reference; or your own).
 - Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
 
 ## One-time setup
@@ -34,7 +34,7 @@ Before every model dispatch, require the Claude Code status-line sensor. Configu
    - **Deterministic stages are already done for you.** `next` runs any leading
      deterministic stage (e.g. `intake` — worktree/branch/baseline) in-process on the
      `engine:none` lane and returns the first *model* WorkItem. You never create a
-     worktree by hand or dispatch intake to a model (heysoo #227).
+     worktree by hand or dispatch intake to a model.
    - `--util auto` probes the account's REAL 5h utilization (see `orchestrator util`;
      a probe miss falls back to 0.0 and says so) and the engine turns it into the binding
      dispatch limit. **Do not exceed the engine's limit** even though the Workflow

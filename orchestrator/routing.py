@@ -75,8 +75,8 @@ def engine_lane_required(stage: Stage, lane: LanePolicy) -> str | None:
 
     So DELIVER goes to the ENGINE lane, where ``DeterministicDeliverRunner`` pushes and opens
     the PR from the engine's own process — outside any sandbox, where the keychain answers
-    without a dialog — at \\$0 and with no model call. That is the same argument heysoo #227
-    already made for the mechanical stages generally: don't ask a model to run ``gh pr
+    without a dialog — at \\$0 and with no model call. That is the same argument the
+    mechanical stages already make generally: don't ask a model to run ``gh pr
     create``. The cost is the model DELIVER's docstring-refresh pass, which the deterministic
     runner documents itself as not doing.
 

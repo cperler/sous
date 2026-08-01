@@ -1,6 +1,6 @@
-"""Deterministic ENGINE-lane runner — no model call (heysoo #227).
+"""Deterministic ENGINE-lane runner — no model call.
 
-heysoo #227: an LLM asked to run ``git worktree add`` + emit structured JSON does the
+An LLM asked to run ``git worktree add`` + emit structured JSON does the
 agentic work then answers in prose, failing schema validation. So the mechanical stages
 are scripts, not model calls. This runner serves the whole
 ``(ExecutionMode.ENGINE, Provider.NONE)`` cell and dispatches by stage:

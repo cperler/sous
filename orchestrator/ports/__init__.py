@@ -11,7 +11,7 @@ execution adapter implements:
   and the ``default_registry`` cell map.
 
 Concrete implementations stay under ``adapters/``: the reference project adapters
-(``adapters/project/{heysoo,selfhost}``) and the execution lanes
+(``adapters/project/selfhost``) and the execution lanes
 (``adapters/execution/{headless_claude,codex,interactive,...}``). The engine reaches a
 concrete lane bundle only through ``orchestrator.lane_loader`` (an entry point), never
 by importing it.

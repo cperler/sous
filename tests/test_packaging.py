@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
-from adapters.project.heysoo.config import HeysooConfig
+from adapters.project.selfhost.config import SelfHostConfig
 from orchestrator import project_loader
 from orchestrator.project_loader import load_project
 
@@ -44,16 +44,15 @@ class _FakeEntryPoint:
         return self._target
 
 
-def test_reference_adapters_resolve_by_entry_point_name() -> None:
-    # Short names aren't importable modules or dirs, so they exercise the real
-    # `orchestrator.project_adapters` entry points registered by this package itself.
-    assert load_project("heysoo").name == "heysoo"
+def test_reference_adapter_resolves_by_entry_point_name() -> None:
+    # A short name isn't an importable module or a dir, so this exercises the real
+    # `orchestrator.project_adapters` entry point registered by this package itself.
     # selfhost's config intentionally names itself after the repo it self-hosts.
     assert load_project("selfhost").name == "orchestration-template"
 
 
 def test_entry_point_configclass_form(monkeypatch) -> None:
-    class MyConfig(HeysooConfig):
+    class MyConfig(SelfHostConfig):
         # A third-party ConfigClass carries its own class-level contract version.
         CONTRACT_VERSION = ADAPTER_CONTRACT_VERSION
         name = "myproj"
@@ -66,7 +65,7 @@ def test_entry_point_configclass_form(monkeypatch) -> None:
 
 
 def test_entry_point_contract_mismatch_fails_loudly(monkeypatch) -> None:
-    class StaleConfig(HeysooConfig):
+    class StaleConfig(SelfHostConfig):
         CONTRACT_VERSION = ADAPTER_CONTRACT_VERSION + 999
         name = "stale"
 
@@ -85,7 +84,7 @@ def test_unknown_project_adapter_is_a_clear_error(monkeypatch) -> None:
 def test_path_based_loading_unchanged(monkeypatch) -> None:
     # No entry points at all: the dotted-module lane must still resolve in-repo adapters.
     monkeypatch.setattr(project_loader, "_project_adapter_entry_points", lambda: [])
-    assert load_project("adapters.project.heysoo").name == "heysoo"
+    assert load_project("adapters.project.selfhost").name == "orchestration-template"
 
 
 # ---------------------------------------------------------------------------------------
@@ -132,7 +131,7 @@ def test_wheel_builds_installs_and_runs(tmp_path) -> None:
         "assert load_stage_schema('implement'), 'stage schema not found in wheel';"
         "assert (KIT_DIR / 'manifest.toml').is_file(), ('kit missing: %s' % KIT_DIR);"
         "load_kit_manifest();"
-        "assert load_project('heysoo').name == 'heysoo', 'entry-point adapter not discovered';"
+        "assert load_project('selfhost').name, 'entry-point adapter not discovered';"
         "print('SMOKE_OK')"
     )
     r = _run([str(bin_dir / "python"), "-c", check], cwd=str(tmp_path), env=env)

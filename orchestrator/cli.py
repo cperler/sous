@@ -267,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
                         "--root is the top-level runs/ dir")
     p.add_argument("--run", help="run id (not needed for validate)")
     p.add_argument("--project",
-                   help="project-config module (e.g. adapters.project.heysoo) or a "
+                   help="project-config module (e.g. adapters.project.selfhost) or a "
                         "project-owned adapter dir (e.g. ../my-project/.orchestration)")
     p.add_argument("--mode", default="interactive", choices=["interactive", "headless"],
                    help="execution mode (config-only lane selection)")

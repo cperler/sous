@@ -1,7 +1,7 @@
 """Project-config adapter PORT (target.md §5) — engine-owned, adapter-implemented.
 
-What a repo plugs in so the same engine drives any project. The Hey Soo! adapter
-(``adapters/project/heysoo``) is the reference implementation. The engine depends
+What a repo plugs in so the same engine drives any project. The self-host adapter
+(``adapters/project/selfhost``) is the reference implementation. The engine depends
 only on these Protocols, never on a concrete repo.
 
 This module lives INSIDE ``orchestrator/`` on purpose (#273): the dependency arrow
@@ -111,8 +111,8 @@ class TaskSource(Protocol):
     #       raising hook is swallowed + evented (``notify_failed``) and NEVER breaks a
     #       run, and adding it needs no CONTRACT_VERSION bump. Every notification is ALSO
     #       appended to events.jsonl (type ``notification``) so the audit trail shows
-    #       what was signalled even when no hook is installed. HeysooConfig.notify is the
-    #       reference sink (stderr line + macOS desktop notification + optional email).
+    #       what was signalled even when no hook is installed. SelfHostConfig.notify is the
+    #       reference sink (stderr line + optional email).
     #
     #       The two PER-TASK terminal kinds (``task_completed``/``task_failed``) additionally
     #       carry the shared enrichment block from ``Engine._notification_facts`` (#359), so
@@ -157,8 +157,8 @@ class ProjectConfig(Protocol):
     # (orchestrator.port_registry) and exports it into every stage subprocess. Opt IN either
     # way:
     #   port_env(base: int, count: int) -> dict[str, str]
-    #       Translate the block into THIS project's server env vars (e.g. heysoo maps base →
-    #       REACT_PORT + HEYSOO_REACT_URL). Merged OVER the generic vars the engine always
+    #       Translate the block into THIS project's server env vars (e.g. a web app maps
+    #       base → REACT_PORT + APP_URL). Merged OVER the generic vars the engine always
     #       exports (ORCHESTRATOR_PORT_BASE / ORCHESTRATOR_PORT_COUNT / PORT). Its mere
     #       presence is the opt-in.
     #   needs_ports: bool
@@ -180,7 +180,7 @@ class ProjectConfig(Protocol):
     #       same ``['true']``/empty no-op handling the other commands get, so an adapter that
     #       omits it (or returns the sentinel) degrades to skipping it — observably (the gate
     #       records it under ``skipped``), never a crash. Return the no-op sentinel when the
-    #       project has no type checker distinct from ``typecheck_cmd`` (e.g. heysoo, whose
+    #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
 
     # --- commands (shelled by runners / test-support, never by the engine itself) ---

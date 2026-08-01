@@ -32,7 +32,7 @@ class StageSpec:
     # metadata — the transport wrapper does the git I/O, the engine only names tags.
     checkpoint: bool = False
     # Deterministic stage: produced by an in-process shell/engine runner on the
-    # non-model ENGINE lane — NEVER a model call (heysoo #227: don't ask an LLM to run
+    # non-model ENGINE lane — NEVER a model call (don't ask an LLM to run
     # `git worktree add`). Routes to (ExecutionMode.ENGINE, Provider.NONE); $0.
     deterministic: bool = False
     # Default reasoning effort for a model-lane dispatch of this stage (#96): hard
@@ -60,7 +60,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role=None,
         timeout_s=1800,  # worktree prep + a REAL baseline test run (bounded at 900s itself)
         checkpoint=True,  # the baseline anchor: implement's first retry resets here
-        deterministic=True,  # run by the engine's shell runner, not a model (heysoo #227)
+        deterministic=True,  # run by the engine's shell runner, not a model
         template=(
             "Prepare an isolated worktree/branch for this task and capture a test "
             "baseline using the project's test commands. Do not implement anything.\n"
@@ -265,7 +265,7 @@ def _has_frontend_change(files_changed: object) -> bool:
 
 # The design-craft criteria themselves (#62), factored out so the single-reviewer lens below
 # and the #73 ``find:design`` finder body share ONE list — they must not drift. Project-
-# agnostic: the heysoo-specific design-system tokens (visual language, component library,
+# agnostic: a project's own design-system tokens (visual language, component library,
 # theme rules) stay in the adapter's design agent; this block is the reusable craft lens only.
 _DESIGN_CRITERIA = (
     "- Visual hierarchy: size/weight/spacing guide attention; the primary element reads first.\n"
@@ -634,7 +634,7 @@ def render_prompt(
         instruction += _stacked_diff_directive(context)
     # #62: a frontend change (deterministic signal on files_changed folded from IMPLEMENT)
     # gets the design-review criteria block appended to the REVIEW prompt. Project-agnostic
-    # wording; the heysoo-specific design tokens live in the adapter's design agent.
+    # wording; a project's own design tokens live in its adapter's design agent.
     if stage is Stage.REVIEW and _has_frontend_change((context or {}).get("files_changed")):
         instruction += _DESIGN_REVIEW_LENS
     # #317: every stage whose success ends in a commit (implement, test, deliver) is told NOT

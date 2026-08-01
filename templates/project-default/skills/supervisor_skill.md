@@ -13,7 +13,7 @@ You never call a model directly and you never run `claude -p`.
 ## Constants
 - `ROOT` = the run's status/ledger dir (e.g. `runs/<run-id>`).
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
-- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`, the reference; or your own).
+- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`, the reference; or your own).
 - Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
 
 ## One-time setup

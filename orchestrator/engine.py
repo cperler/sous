@@ -1091,7 +1091,7 @@ class Engine:
         effort: Effort | None = None
         if deterministic:
             # No model: route to the in-process ENGINE lane (a shell runner does the work).
-            # heysoo #227 — don't ask an LLM to run `git worktree add` / `gh pr create`.
+            # Don't ask an LLM to run `git worktree add` / `gh pr create`.
             # No model also means no effort — the ENGINE lane has nothing to throttle.
             lane = LanePolicy(
                 execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False
@@ -5890,7 +5890,7 @@ class Engine:
         skip_fingerprints: set[str] | None = None,
     ) -> str | None:
         """File the review's single forward-looking improvement idea as an ``enhancement``
-        issue (the self-improvement loop — heysoo's Innovation Brainstorm). Returns the
+        issue (the self-improvement loop). Returns the
         issue ref, or None when the adapter lacks ``file_followup``, the review had none,
         or the improvement was suppressed.
 

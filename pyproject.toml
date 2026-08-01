@@ -12,11 +12,10 @@ dependencies = [
 orchestrator = "orchestrator.cli:main"
 orchestrator-scaffold = "orchestrator.scaffold:main"
 
-# The in-repo reference project-config adapters, registered so the engine can resolve
-# them by short name (`--project heysoo`) via entry-point discovery — the same seam any
+# The in-repo reference project-config adapter, registered so the engine can resolve it
+# by short name (`--project selfhost`) via entry-point discovery — the same seam any
 # third-party package uses to ship its own adapter. This self-tests the mechanism.
 [project.entry-points."orchestrator.project_adapters"]
-heysoo = "adapters.project.heysoo"
 selfhost = "adapters.project.selfhost"
 
 # The execution-lane bundle (#273). The engine owns the lane CONTRACT
@@ -170,10 +169,6 @@ module = [
     "adapters.project",
     "adapters.project.base",
     "adapters.project.github_issues",
-    "adapters.project.heysoo",
-    "adapters.project.heysoo.classifier",
-    "adapters.project.heysoo.config",
-    "adapters.project.heysoo.task_source",
     "adapters.project.selfhost",
     "adapters.project.selfhost.classifier",
     "adapters.project.selfhost.config",

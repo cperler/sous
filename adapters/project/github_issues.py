@@ -1,7 +1,7 @@
 """Shared GitHub-Issues task source (target.md §5, build-fresh D8).
 
 Repo-agnostic: any project adapter whose tasks are GitHub issues instantiates this
-with its repo slug (heysoo and selfhost both do). ``resolve`` reads an issue via
+with its repo slug (the selfhost adapter does). ``resolve`` reads an issue via
 ``gh``; ``mark_complete`` posts a PR link comment. The subprocess runner is
 injectable so unit tests never hit the network.
 """

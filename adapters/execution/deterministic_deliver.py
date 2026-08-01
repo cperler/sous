@@ -1,6 +1,6 @@
 """Deterministic DELIVER runner — the ENGINE lane (no model call).
 
-heysoo #227 follow-up (#33): pushing the task branch and opening a PR is mechanical
+#33: pushing the task branch and opening a PR is mechanical
 git/gh work. This runner verifies the branch has commits vs its base, pushes it, and
 opens — or, on a review fix cycle, REUSES (leaving an advisory comment that the branch was
 re-pushed, #68) — a pull request, deterministically at $0, mirroring the DELIVER stage

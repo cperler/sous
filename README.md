@@ -15,10 +15,10 @@ split, the six-stage pipeline, the front doors, the control loops, and where to 
 2026-07-01 review→execute cycle (context plane, per-task pipelines, session continuity,
 checkpoints, approval gate), and the 2026-07-04 burn-down (deterministic test/deliver,
 front doors, budgets/routing, salvage/warm-retry, ports, packaging, dashboard). The full
-CI gate (pytest + ruff + mypy) is green. Driven real GitHub issues to merged/draft PRs on
-the reference project (heysoo PRs #556–#560) with clean lane-attribution audits. Remaining/known-thinned
-scope is tracked as GitHub issues (label `deferred-scope`); see `DEFERRED.md` for the
-discipline.
+CI gate (pytest + ruff + mypy) is green. Live-proven end to end: real GitHub issues driven
+to merged PRs on a real product repo, with clean lane-attribution audits, and self-hosted on
+this repo's own tracker. Anything cut or thinned is tracked as a GitHub issue (label
+`deferred-scope`); see `DEFERRED.md` for the discipline.
 
 ## What it does
 
@@ -29,8 +29,8 @@ observability. A batch of tasks runs over a DAG with transitive cascade-blocking
 clean resume-after-kill.
 
 The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test` → `deliver`
-→ `review`. (Collapsed from the reference system's ~12–15 stages; the mapping lives in
-`docs/orchestration-spec/target.md` §6.)
+→ `review`, collapsed from the reference system's ~12–15. `simplify` is an additional
+stage-vocabulary member SCOPE can opt a decomposed child into, not a seventh standing step.
 
 ## The load-bearing idea: engine / adapter split
 
@@ -79,18 +79,34 @@ orchestrator/            the deterministic engine (never calls a model) + CLI
 adapters/                implementations of the ports above (nothing imports back inward)
   execution/             interactive shim, headless_claude, codex, runners (the bundle),
                          transport; base.py is a back-compat re-export of the port
-  project/{heysoo,selfhost}/   reference adapters (a NEW project's adapter lives in the
-                         project's OWN repo — see below); base.py likewise a shim
+  project/selfhost/      the reference adapter — this repo self-hosting (a NEW project's
+                         adapter lives in the project's OWN repo, see below); plus the
+                         shared github_issues.py task source and email_sink.py;
+                         base.py likewise a shim
 run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
 tests/                   pytest suite (one test_<subsystem>.py per module)
-docs/                    design doc, plan, and the as-built/target spec (see below)
+docs/                    the frozen build record — design notes, plan, review passes
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
 ```
 
-## The front door: idea → issues
+## The front doors: idea → issues → a run
 
-A run starts from an already-written issue. The **spec front door** is the missing
-upstream: it turns *an idea* into small, dependency-ordered, independently-shippable
+A run consumes a DAG of tasks. Three front doors produce one, each pairing a deterministic
+module (validate / rank / file — no model call) with a `.claude/skills/` skill that runs the
+conversation:
+
+- **`/brainstorm`** (`orchestrator/brainstorm.py`) — a fuzzy area → scored candidate ideas →
+  a ranked shortlist you pick from. Small picks file as standalone issues; large ones feed
+  spec-intake.
+- **`/spec-intake`** (`orchestrator/spec_intake.py`) — a known idea → a validated,
+  dependency-ordered spec → one filed issue per task, in topological order. Detailed below.
+- **`/batch-plan`** (`orchestrator/batch_plan.py`) — a pile of *already-filed*, independently
+  authored issues → a validated dependency-ordered plan applied straight to a run. Reuses
+  spec-intake's DAG validation.
+
+### spec-intake in detail
+
+It turns *an idea* into small, dependency-ordered, independently-shippable
 issues that feed the batch lane. The model authors a spec file during a conversation
 (the `spec-intake` skill guides it); deterministic code validates and files it. The
 spec shape is a JSON doc validated by `orchestrator/schemas/spec.json` — a `title`,
@@ -128,7 +144,7 @@ full-validation work from an installed copy exactly as from a checkout.
 
 A project plugs its adapter in one of three ways (in resolution order for `--project`):
 a **directory path** (`../my-project/.orchestration` — the zero-packaging option, the
-adapter lives in the project repo), a **dotted module** (`adapters.project.heysoo`), or
+adapter lives in the project repo), a **dotted module** (`adapters.project.selfhost`), or
 an **entry-point name** once a package registers one. To ship an adapter as an installable
 package, register it under the `orchestrator.project_adapters` group — then
 `--project <name>` resolves it:
@@ -140,8 +156,8 @@ myproj = "myproj_orchestration"                    # module: CONTRACT_VERSION + 
 # or: myproj = "myproj_orchestration:MyProjConfig" # a ProjectConfig class (class-level CONTRACT_VERSION)
 ```
 
-The engine's own `heysoo` / `selfhost` reference adapters are registered exactly this way
-(`--project heysoo`), which self-tests the mechanism.
+The engine's own `selfhost` reference adapter is registered exactly this way
+(`--project selfhost`), which self-tests the mechanism.
 
 ## Running it
 
@@ -151,7 +167,7 @@ engine is the same CLI in every case (`orchestrator/cli.py`); what differs is wh
 the model calls. Set these once so the examples stay short:
 
 ```bash
-ROOT=runs/issue-42; RUN=issue-42; PROJECT=adapters.project.heysoo
+ROOT=runs/issue-42; RUN=issue-42; PROJECT=adapters.project.selfhost
 ORCH="uv run orchestrator --root $ROOT --run $RUN --project $PROJECT"
 ```
 
@@ -186,7 +202,7 @@ each derived run in-process to terminal.
 $ORCH enqueue --queue-file runs/queue.json --tasks "#42,#43" --branch batch-a
 
 # the daemon drains the queue, deriving one run per batch (run id from enqueued_at):
-$ORCH --root runs --project adapters.project.heysoo \
+$ORCH --root runs --project adapters.project.selfhost \
       run-queue --queue-file runs/queue.json --owner day-cron \
       --wait --idle-timeout 300
 ```
@@ -343,8 +359,8 @@ process, so the project repo needs no Python packaging. Because an external adap
 updated in lockstep with the engine, its generated `__init__.py` declares the
 `CONTRACT_VERSION` it targets (`orchestrator/ports/project.py`); the loader refuses a mismatch
 loudly, and `orchestrator --project <dir> validate` duck-checks the full ProjectConfig
-surface without needing a run. The in-repo `adapters/project/{heysoo,selfhost}` remain the
-reference implementations, kept in lockstep by this repo's test suite.
+surface without needing a run. The in-repo `adapters/project/selfhost` remains the
+reference implementation, kept in lockstep by this repo's test suite.
 
 ## Developing
 
@@ -365,9 +381,11 @@ issue (and re-dispositioned at each gate) — nothing is silently dropped.
 
 ## Docs
 
-- `docs/orchestration-template.md` — original design notes + the billing-change analysis (2026-06, historical).
-- `docs/orchestration-template-plan.md` — the phased implementation plan (historical record).
-- `docs/orchestration-spec/as-built.md` (+ `sections/`, `fragments/`) — the verified extraction of the **reference** bash system (read-only ground truth; describes heysoo's `.claude/`, not this code).
-- `docs/orchestration-spec/target.md` — the implementation-agnostic target design the rebuild was built from. Deviations are tracked in the issue tracker + git history.
-- `docs/orchestration-spec/retrospective.md` — the Phase 5 dogfood retrospective.
-- `DEFERRED.md` — the scope-ledger discipline; the live ledger is [GitHub issues](https://github.com/cperler/orchestration-template/issues) (label `deferred-scope`), and the pre-migration ledger is frozen at `docs/deferred-history.md`.
+- **`ARCHITECTURE.md`** — the contributor's map of the system as built. Start here.
+- **`CLAUDE.md`** — the working norms any change to this repo must respect.
+- **`DEFERRED.md`** — the scope-ledger discipline; the live ledger is
+  [GitHub issues](https://github.com/cperler/orchestration-template/issues) (label
+  `deferred-scope`), and the pre-migration ledger is frozen at `docs/deferred-history.md`.
+- **`docs/`** — the frozen build record (original design notes, the phased plan, and the
+  design-pass reviews). Historical by construction; `docs/README.md` indexes it and says
+  what was deleted and why. Nothing there describes the current code.

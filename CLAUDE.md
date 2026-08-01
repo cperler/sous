@@ -1,17 +1,16 @@
-# Orchestration Template — Build Workspace
+# Orchestration Template
 
-Deliberate rebuild of an orchestration harness: extracted from an existing bash
-system (Hey Soo!'s `.claude/`) and rebuilt in Python around an engine/adapter split.
-See `README.md` for the project overview and `docs/` for the design doc, the
-implementation plan, and the as-built/target spec.
+A project-agnostic orchestration harness — originally extracted from a bash system and
+rebuilt in Python around an engine/adapter split. `README.md` is the project overview,
+`ARCHITECTURE.md` the map of the system as built, and `docs/` the frozen build record
+(historical only — see `docs/README.md`).
 
 ## Status
-**Built.** Phases 1–5 complete (per-task engine → batch scheduler → second execution
-mode + codex → dogfood/generalize) plus two engine-hardening passes, a workflow
-code-review pass, and the 2026-07-01 review→execute cycle (context plane, per-task
-pipelines schema v2, session continuity, checkpoints, approval gate — see
-`docs/reviews/`). All pytest cases green, ruff clean; live-proven on real heysoo
-issues. Ongoing work is incremental — pick from the issue tracker or fix-forward.
+**In production use.** The rebuild is complete, the backlog is empty, and the harness is
+now used for real work rather than built toward. All pytest cases green, ruff and mypy
+clean; live-proven end to end (real issues → merged PRs, clean lane-attribution audits) and
+self-hosted on this repo's own tracker. Ongoing work is incremental — pick from the issue
+tracker or fix-forward.
 
 ## Working norms
 - **Tests + lint + types, every change:** `uv run pytest`, `uv run ruff check .`, and
@@ -150,19 +149,19 @@ returns `scheduler.exit_reason = blocked_on_orphaned_dispatches` (warning event 
 notification, and `run-headless` exits non-zero), and the escape hatch is still the terminal
 `orchestrator abandon`. `watch --activity` distinguishes a stalled stream from a dead driver.
 
-## Live runs against the product repo (HARD CHECKPOINT)
-A live run writes to the real product repo (heysoo) and opens a PR. **The human picks the
-specific (small, low-risk) issue and approves the run before any write or PR.** Do not
-select the task or open a PR autonomously. heysoo PRs from these runs are for testing.
+## Live runs against an external product repo (HARD CHECKPOINT)
+A live run against a repo other than this one writes to that repo and opens a PR there.
+**The human picks the specific issue and approves the run before any write or PR.** Do not
+select the task or open a PR autonomously. This is the human half of the engine's approval
+gate — the engine parks; humans release.
 
-## Reference system (read-only — read in place, do NOT copy in)
-The system being spec'd lives in another repo: `/Users/craigperler/Development/heysoo/.claude/`
-  - scripts:        `.claude/scripts/*.sh`
-  - shared engine:  `.claude/scripts/lib/orchestrator-common.sh`
-  - schemas:        `.claude/scripts/schemas/*.json`
-  - real run logs:  `/Users/craigperler/Development/heysoo/logs/implement-roadmap-task/`
-This is a rebuild, not a port — do not fork the bash into this repo. The `docs/orchestration-spec/`
-as-built fragments/sections describe THIS reference system (faithful extraction), not our code.
+## Project adapters
+`adapters/project/selfhost` is the only in-repo adapter: this repo driving its own GitHub
+issues, and the reference implementation of `orchestrator/ports/project.py`. An external
+project's adapter belongs in **its own repo** under `<repo>/.orchestration/`
+(`orchestrator-scaffold --into <repo>`), loaded by path and contract-version-checked — not
+added here. The `heysoo` reference adapter and the `docs/orchestration-spec/` extraction of
+that project's bash system were removed on 2026-08-01; `git log` recovers them.
 
 ## Engine language
 Python (uv, pytest, ruff). Reasoning in `docs/orchestration-template-plan.md` §0.

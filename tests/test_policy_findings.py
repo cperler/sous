@@ -5,10 +5,6 @@ become tracked follow-ups, and a raising hook can never break record()."""
 
 from __future__ import annotations
 
-import subprocess
-from pathlib import Path
-
-from adapters.project.heysoo.config import HeysooConfig
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage
@@ -94,72 +90,3 @@ def test_no_hook_and_empty_findings_are_untouched(tmp_path, project) -> None:
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
     assert out["outcome"] == "task_completed"
-
-
-# --- the heysoo reference gates, against a real repo -----------------------------
-
-def _repo(tmp_path) -> Path:
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=tmp_path, check=True)
-    (tmp_path / "README.md").write_text("x")
-    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "init"], cwd=tmp_path, check=True)
-    subprocess.run(["git", "checkout", "-qb", "task/x"], cwd=tmp_path, check=True)
-    return tmp_path
-
-
-def _commit(repo: Path, *paths: str) -> None:
-    for p in paths:
-        f = repo / p
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text("content")
-    subprocess.run(["git", "add", "-A"], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.email=t@t", "-c", "user.name=t",
-                    "commit", "-qm", "change"], cwd=repo, check=True)
-
-
-class _QuietTscHeysoo(HeysooConfig):
-    """Typecheck stubbed green so the e2e-policy gate is isolated (and no npx)."""
-
-    def typecheck_cmd(self) -> list[str]:
-        return ["sh", "-c", "exit 0"]
-
-
-def test_heysoo_e2e_policy_flags_frontend_change_without_spec(tmp_path) -> None:
-    repo = _repo(tmp_path)
-    _commit(repo, "frontend/src/widget.tsx")
-    findings = _QuietTscHeysoo().review_findings(worktree=str(repo))
-    assert len(findings) == 1
-    assert "e2e policy" in findings[0]["description"] and findings[0]["blocking"]
-
-
-def test_heysoo_e2e_policy_satisfied_by_spec_change(tmp_path) -> None:
-    repo = _repo(tmp_path)
-    _commit(repo, "frontend/src/widget.tsx", "tests/e2e/widget.spec.ts")
-    assert _QuietTscHeysoo().review_findings(worktree=str(repo)) == []
-
-
-def test_heysoo_backend_only_change_passes_e2e_policy(tmp_path) -> None:
-    repo = _repo(tmp_path)
-    _commit(repo, "lambda/suggest/handler.py")
-    assert _QuietTscHeysoo().review_findings(worktree=str(repo)) == []
-
-
-def test_heysoo_tsc_gate_flags_failing_typecheck(tmp_path) -> None:
-    repo = _repo(tmp_path)
-    _commit(repo, "lambda/suggest/handler.py")
-
-    class _RedTsc(HeysooConfig):
-        def typecheck_cmd(self) -> list[str]:
-            return ["sh", "-c", "echo 'TS2322: type error'; exit 2"]
-
-    findings = _RedTsc().review_findings(worktree=str(repo))
-    assert len(findings) == 1
-    f = findings[0]
-    assert "TSC gate" in f["description"] and "TS2322" in f["description"]
-    assert f["severity"] == "critical" and f["blocking"]
-
-
-def test_heysoo_no_worktree_is_silent(tmp_path) -> None:
-    assert _QuietTscHeysoo().review_findings(worktree=None) == []
-    assert _QuietTscHeysoo().review_findings(worktree=str(tmp_path / "nope")) == []

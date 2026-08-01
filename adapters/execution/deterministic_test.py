@@ -1,6 +1,6 @@
 """Deterministic TEST runner — the ENGINE lane (no model call).
 
-heysoo #227 follow-up (#33): running the project's test commands and reporting
+#33: running the project's test commands and reporting
 pass/fail is mechanical. A model only adds cost, flakiness, and the risk of MISreporting
 a red suite as green. This runner shells the project's declared test commands in the task
 worktree, bounds their output, classifies failures via the project's ``FailureClassifier``,

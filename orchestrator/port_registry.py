@@ -56,7 +56,7 @@ DEFAULT_BLOCK_SIZE = 10
 DEFAULT_TTL_S = 6 * 3600  # a block older than this with no live owner is reclaimable
 
 # Convenience env var names the engine injects into every stage subprocess (a project's
-# ``port_env`` hook may add/override with its own names — e.g. heysoo's REACT_PORT).
+# ``port_env`` hook may add/override with its own names — e.g. a web app's REACT_PORT).
 ENV_PORT_BASE = "ORCHESTRATOR_PORT_BASE"
 ENV_PORT_COUNT = "ORCHESTRATOR_PORT_COUNT"
 ENV_PORT = "PORT"  # the single most-common convenience var == the block base
@@ -328,7 +328,7 @@ def port_env_for(project: object, base: int, count: int) -> dict[str, str]:
     """The env vars to export into a task's stage subprocess for its port block. Always the
     generic trio (``ORCHESTRATOR_PORT_BASE``/``ORCHESTRATOR_PORT_COUNT``/``PORT``); a project's
     optional ``port_env(base, count) -> dict[str, str]`` hook adds/overrides with its own names
-    (e.g. heysoo's ``REACT_PORT``/``HEYSOO_REACT_URL``). A raising/malformed hook is ignored —
+    (e.g. a web app's ``REACT_PORT``/``APP_URL``). A raising/malformed hook is ignored —
     injection must never break a dispatch."""
     env = {ENV_PORT_BASE: str(base), ENV_PORT_COUNT: str(count), ENV_PORT: str(base)}
     hook = getattr(project, "port_env", None)

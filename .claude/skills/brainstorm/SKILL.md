@@ -15,7 +15,7 @@ own ranking and filing. **Filing is outward-facing: the human selects from the s
 before anything is created.**
 
 ## Constants
-- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.heysoo`).
+- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.selfhost`).
 - Command shape: `uv run orchestrator [--project "$PROJECT"] brainstorm <validate|capture> <file> [flags]`.
 
 ## The flow

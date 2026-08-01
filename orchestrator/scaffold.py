@@ -368,7 +368,7 @@ class {cls}Classifier:
 _TASK_SOURCE = '''"""{name} task source (GENERATED — a local JSON file source by default).
 
 If the project's profile says ``task_source = "github-issues"``, replace this with a
-GitHub-Issues source (see ``adapters/project/heysoo/task_source.py`` for the shape).
+GitHub-Issues source (see ``adapters/project/selfhost/task_source.py`` for the shape).
 """
 
 from __future__ import annotations

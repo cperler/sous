@@ -21,8 +21,8 @@ never a hand-rolled tick loop — so the scenarios catch integration bugs (path/
 assumptions, context-plane gaps between real deterministic and scripted stages,
 worktree issues, serialization) that fake-store unit tests can't.
 
-The human-gated live MODEL batch against the product repo (heysoo) is deliberately
-NOT here — that is Craig's call per the CLAUDE.md hard checkpoint.
+A human-gated live MODEL batch against a real product repo is deliberately NOT here —
+that is Craig's call per the CLAUDE.md hard checkpoint.
 """
 
 from __future__ import annotations

@@ -13,7 +13,7 @@ dependency order, translating local ids to real issue refs. **Filing is outward-
 the human confirms the plan before anything is created.**
 
 ## Constants
-- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.heysoo`).
+- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.selfhost`).
 - Command shape: `uv run orchestrator [--project "$PROJECT"] spec <validate|plan|file> <file>`.
 
 ## The flow

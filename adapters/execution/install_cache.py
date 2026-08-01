@@ -5,8 +5,8 @@ when the project's lockfiles are byte-identical to the last *successful* install
 THIS worktree, skip the (slow) dependency install and record the skip honestly.
 
 CORRECTNESS — the cache is PER-WORKTREE, never global (this is the whole subtlety of
-#63). The reference projects install INTO the worktree: heysoo ``npm install && uv
-sync`` writes ``node_modules`` + ``.venv`` into the CWD; selfhost ``uv sync`` writes
+#63). Projects install INTO the worktree: a JS/Python app's ``npm install && uv
+sync`` writes ``node_modules`` + ``.venv`` into the CWD; selfhost's ``uv sync`` writes
 ``.venv``. Every task gets a FRESH worktree, so a naive ``(repo, lockfile)->hash``
 cache would match on a brand-new worktree and skip the install, leaving it with no
 dependencies — a broken worktree. So the cache marker lives in the worktree's OWN

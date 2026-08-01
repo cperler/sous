@@ -194,9 +194,9 @@ def test_gate_vetoed_checkpoint_is_not_absorbed(tmp_path, project) -> None:
 def test_ids_are_sanitized_into_git_safe_tag_names(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("run 1", ExecutionLane.FULL)
-    eng.add_task("run 1", "heysoo#551")
-    w = eng.next_work("run 1", "heysoo#551")
-    assert w.checkpoint_tag == "task/run-1/heysoo-551/intake/0"
+    eng.add_task("run 1", "proj#551")
+    w = eng.next_work("run 1", "proj#551")
+    assert w.checkpoint_tag == "task/run-1/proj-551/intake/0"
 
 
 def test_checkpoint_fields_do_not_change_the_content_hash() -> None:

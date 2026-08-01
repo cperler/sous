@@ -16,7 +16,7 @@ validation, and applying. You never hand-write `add-task --depends-on` — `appl
 topological order. **Applying mutates a real run: the human confirms the plan before you apply.**
 
 ## Constants
-- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.heysoo`).
+- `PROJECT` = the project-config module/dir supplying the task source (e.g. `adapters.project.selfhost`).
 - Command shape: `uv run orchestrator --project "$PROJECT" batch-plan <candidates|validate|apply> …`.
 
 ## The flow

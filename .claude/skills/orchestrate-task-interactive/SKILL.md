@@ -14,7 +14,7 @@ You never call a model directly and you never run `claude -p`.
 - `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
   each run's store under `runs/<run-id>/` so runs never comingle their files flat.
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
-- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`, the reference; or your own).
+- `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`, the reference; or your own).
 - Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
   - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#91): it
     forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet
@@ -43,7 +43,7 @@ with `orchestrator supervisor-context` (unavailable/stale fails closed).
    - **Deterministic stages are already done for you.** `next` runs any leading
      deterministic stage (e.g. `intake` — worktree/branch/baseline) in-process on the
      `engine:none` lane and returns the first *model* WorkItem. You never create a
-     worktree by hand or dispatch intake to a model (heysoo #227).
+     worktree by hand or dispatch intake to a model.
    - `--util auto` probes the account's REAL 5h utilization (see `orchestrator util`;
      a probe miss falls back to 0.0 and says so) and the engine turns it into the binding
      dispatch limit. **Do not exceed the engine's limit** even though the Workflow

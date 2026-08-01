@@ -96,8 +96,8 @@ class SelfHostConfig:
 
         Always a stderr line; additionally mails the payload when the environment configures
         SMTP (see ``adapters.project.email_sink`` for the env vars). Unconfigured, the email
-        half is a no-op. Deliberately no ``osascript`` here — unlike the heysoo reference
-        adapter this one is not macOS-specific. Swallows ALL errors: the engine already
+        half is a no-op. Deliberately no ``osascript`` here — this adapter is not
+        macOS-specific. Swallows ALL errors: the engine already
         guards this hook, so this is belt-and-suspenders."""
         print(f"[orchestrator:{kind}] {payload.get('summary') or kind}", file=sys.stderr)
         try:

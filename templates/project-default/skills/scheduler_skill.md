@@ -13,7 +13,7 @@ run finalization) lives in the `orchestrator` engine. Your job is the loop:
 directly and never run `claude -p`.
 
 ## Constants
-- `ROOT` = the run's status/ledger dir. `RUN` = run id. `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.heysoo`).
+- `ROOT` = the run's status/ledger dir. `RUN` = run id. `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`).
 - Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
 
 ## One-time setup

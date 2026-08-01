@@ -2,7 +2,7 @@
 
 > **HISTORICAL (June 2026).** The pre-build design doc, kept as the decision record.
 > The system has since been built well past it — see `ARCHITECTURE.md` for the as-built
-> map and `docs/orchestration-spec/target.md` for the spec.
+> map, and `docs/README.md` for what else in this directory is frozen.
 
 > Working document. Captures the assessment of Hey Soo!'s existing `.claude/`
 > orchestration system, the analysis of the June 15 2026 billing change, the

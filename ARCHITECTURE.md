@@ -1,8 +1,8 @@
 # Architecture — a contributor's map
 
 A one-page map of where things live and how they fit. It grounds every claim in the
-code (paths are real — grep them). For the *why* and the historical record see
-`docs/orchestration-spec/` (target + as-built spec) and `docs/reviews/` (design notes).
+code (paths are real — grep them). For the *why* and the historical record see `docs/`
+(the frozen build record — design notes, the phased plan, and the design-pass reviews).
 
 ## The load-bearing idea: engine / adapter split
 
@@ -40,7 +40,7 @@ written.
         │        implement the ports   │                   │  dispatch on a lane
   adapters/execution/            adapters/project/          │
   HOW/WHERE a call runs:         WHAT a repo plugs in:      │
-   interactive (Workflow shim)    heysoo/  selfhost/        │
+   interactive (Workflow shim)    selfhost/                  │
    headless_claude (claude -p)    github_issues.py          │
    codex (codex exec)             external repos plug in    │
    deterministic_* (ENGINE lane,    via <repo>/.orchestration/
@@ -67,8 +67,8 @@ written.
   `deterministic_test.py` / `deterministic_deliver.py`; bundled by `runners.py`, dispatched
   through `transport.py`, with `review_panel.py` fanning a plan-bearing REVIEW out into
   finder/verifier sub-calls below the seam). `adapters/project/` = what a repo supplies
-  (commands, test taxonomy, agent roster, task source): `heysoo/` and `selfhost/` are the
-  in-repo reference adapters, `github_issues.py` a shared task source. A new external
+  (commands, test taxonomy, agent roster, task source): `selfhost/` is the in-repo
+  reference adapter (this repo self-hosting), `github_issues.py` a shared task source. A new external
   project's adapter lives in **its own repo** under
   `<repo>/.orchestration/` (loaded by path, contract-version-checked) or ships as a package
   registering an `orchestrator.project_adapters` entry point.
@@ -154,8 +154,8 @@ opaque quality loop.
 - **Deterministic stage executors** run on the `engine×none` lane — no model, $0. Intake
   (`deterministic_setup.py`) creates the worktree/branch and captures the test baseline;
   `deterministic_test.py` runs the suite and classifies failures; `deterministic_deliver.py`
-  pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (heysoo #227:
-  an LLM asked to run `git worktree add` answers in prose and fails schema validation).
+  pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
+  to run `git worktree add` answers in prose and fails schema validation).
 - **Dispatch/record contract.** `Engine.next_work()` emits an immutable `WorkItem` whose
   `content_hash` (over stage+prompt+schema+model+lane+attempt) is its idempotency key; the
   task holds a **dispatch lease** (`pending_work_item_id`) so an in-flight or crashed-mid-stage
@@ -375,9 +375,8 @@ cross-run `learnings-kb.jsonl` share one parent:
   adapter concern: `adapters/project/email_sink.py` is a stdlib-`smtplib` sink, env-configured
   (`ORCHESTRATOR_SMTP_*` / `ORCHESTRATOR_NOTIFY_EMAIL_TO`, nothing checked in), absent unless
   configured, kind-filterable, and always short-timeout — the engine's `notify_failed` guard
-  covers a raising sink, but only a timeout covers one that HANGS. Wired into both the heysoo
-  and selfhost adapters; before this, selfhost had no `notify` at all, so every dogfood batch
-  was silent.
+  covers a raising sink, but only a timeout covers one that HANGS. Wired into the selfhost
+  adapter; before this it had no `notify` at all, so every dogfood batch was silent.
 - **Retrospective** (`orchestrator/retrospective.py`): on a failed run, folds
   `events.jsonl` + per-stage logs into per-task failure trails, the cascade map, and recurring
   error patterns (same structured signature the breaker uses).
@@ -394,7 +393,7 @@ cross-run `learnings-kb.jsonl` share one parent:
    reading one is the fastest way to see a subsystem's contract exercised. Run the gate the
    way CI does: `uv run pytest`, `uv run ruff check .`, `uv run mypy`.
 
-Then, for depth and history: `docs/orchestration-spec/target.md` (the implementation-agnostic
-target the rebuild was built from), `docs/orchestration-spec/as-built.md` (the read-only
-extraction of the reference bash system), and `docs/reviews/` (the design notes behind the
-context plane, per-task pipelines, session continuity, and the front doors).
+Then, for history: `docs/` (indexed by `docs/README.md`) — the original design notes, the
+phased plan, and the design-pass reviews behind the context plane, per-task pipelines,
+session continuity, meta-authoring, and the review workflow. It is a frozen record: where it
+disagrees with the code, the code is right.

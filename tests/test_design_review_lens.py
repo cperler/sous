@@ -1,7 +1,7 @@
 """#62: the design-review lens — a deterministic, project-agnostic criteria block the
 REVIEW prompt grows when the change touches frontend files (files_changed folded from
 IMPLEMENT). Sibling of the #41 docs-only directive: engine-template-side, no model trust
-needed (it only ADDS scrutiny). The heysoo-specific design tokens stay in the adapter agent.
+needed (it only ADDS scrutiny). Project-specific design tokens stay in the adapter agent.
 """
 
 from __future__ import annotations

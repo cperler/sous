@@ -58,7 +58,7 @@ the engine checks it at load and refuses a stale adapter loudly.
   and changed-file → impacted-tests. The generated default matches `^FAILED <name>`.
 - **`task_source.py`** (Replace, only if `task_source = github-issues`) — swap the generated
   `LocalTaskSource` for a GitHub-Issues source; copy the shape from
-  `adapters/project/heysoo/task_source.py`.
+  `adapters/project/selfhost/task_source.py`.
 - **Hooks** (Modify) — the seeded `$REPO/.claude/hooks/*.json` are examples; merge them into
   the project's `.claude/settings.json` and adjust to its Claude Code version.
 

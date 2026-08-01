@@ -52,11 +52,10 @@ def test_local_override_wins(tmp_path) -> None:
 
 
 def test_adapters_expose_schema_for() -> None:
-    from adapters.project.heysoo import get_config as heysoo
     from adapters.project.selfhost import get_config as selfhost
-    for cfg in (heysoo(), selfhost()):
-        assert cfg.schema_for("review")["title"] == "review"
-        assert cfg.schema_for("unknown") is None
+    cfg = selfhost()
+    assert cfg.schema_for("review")["title"] == "review"
+    assert cfg.schema_for("unknown") is None
 
 
 # The payoff: codex full-validation now runs against the REAL canonical schema.

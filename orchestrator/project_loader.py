@@ -2,7 +2,7 @@
 
 Three ways a project plugs its adapter in:
 
-- **module path** (``adapters.project.heysoo``) — the in-repo reference adapters,
+- **module path** (``adapters.project.selfhost``) — the in-repo reference adapter,
   imported off ``sys.path`` and kept honest by this repo's test suite;
 - **directory path** (``../my-project/.orchestration``) — the adapter lives in the
   *project's* repo and the engine loads it by path. The adapter executes inside the
@@ -11,7 +11,7 @@ Three ways a project plugs its adapter in:
   still resolves through that module's re-export shim) resolve against the engine — the
   project repo needs no Python packaging. This is the zero-packaging option and stays
   first-class;
-- **entry-point name** (``heysoo``) — when the engine is ``pip``/``uv tool`` installed as
+- **entry-point name** (``selfhost``) — when the engine is ``pip``/``uv tool`` installed as
   a library, a project (or third-party) package registers its adapter under the
   ``orchestrator.project_adapters`` group. ``--project <name>`` then resolves by that name
   once a path/importable-module lookup misses. The entry-point value is either a package
@@ -162,7 +162,7 @@ def load_project(spec: str) -> ProjectConfig:
             raise SystemExit(f"project adapter directory not found: {spec}")
         return _config_from_module(spec, _import_adapter_dir(path), external=True)
 
-    # A dotted, importable in-repo module (``adapters.project.heysoo``) — kept honest by
+    # A dotted, importable in-repo module (``adapters.project.selfhost``) — kept honest by
     # this repo's suite, so it isn't re-validated as external.
     try:
         module = importlib.import_module(spec)

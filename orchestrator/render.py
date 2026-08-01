@@ -736,7 +736,7 @@ def render_completion_note(
         lines += ["", "### Noted, not filed"]
         lines += [f"- {n['title']} — {n['reason']}" for n in noted]
 
-    # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
+    # Self-improvement loop: the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
     applied_fixups = [fixup for fixup in task.review_fixups if fixup.applied]

@@ -1,4 +1,4 @@
-"""The deterministic ENGINE-lane intake runner (heysoo #227): worktree/baseline in
+"""The deterministic ENGINE-lane intake runner: worktree/baseline in
 shell, no model call. Real-git-in-tmp coverage (mirrors tests/test_checkpoint.py)."""
 
 from __future__ import annotations
