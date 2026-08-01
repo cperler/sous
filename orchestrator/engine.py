@@ -84,6 +84,7 @@ from .render import (
     render_retrospective,
     render_stage,
     render_task_index,
+    unfiled_findings,
 )
 from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
@@ -5149,6 +5150,58 @@ class Engine:
             # requested panel ran at all — so a degraded review is visible from a poll
             # instead of only inside a stage log.
             "review_panel": self.review_panel_audit(run_id, events=events),
+            # #357: a completion note that never reached a human — and the unfiled review
+            # findings it was carrying, which have no other channel — so such a run does not
+            # read as clean from a poll.
+            "completion_notes": self.completion_notes_audit(run_id, events=events),
+        }
+
+    def completion_notes_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
+        """Which completion notes never reached a human, and what they were carrying (#357).
+
+        The completion note is the ONLY channel for the review findings the engine
+        deliberately does not file (``fix_now``/``drop``/over the #188 cap), and publishing
+        it is a best-effort external call. On ``batch-codex-3`` every note failed and three
+        valid ``fix_now`` findings were recoverable only by hand-reading per-stage JSON.
+
+        Derived from the SAME single events read as the other audit blocks (no second source
+        of truth). A task is undelivered when its last ``completion_note_*`` outcome is a
+        failure — a later successful publish (a re-run of finalize) clears it, so the audit
+        reports the current state rather than run-history. ``unfiled_findings`` counts only
+        the findings carried by notes that are STILL undelivered; ``notes`` is every
+        undelivered note's ``{task_id, error, note_file, unfiled}`` so a human polling the
+        run can recover the payload without opening the log tree, and ``persist_failed``
+        flags the worse case where even the durable artifact could not be written."""
+        events = self.store.read_events(run_id) if events is None else events
+        latest: dict[str, dict] = {}
+        persist_failed_by_task: dict[str, int] = {}
+        for ev in events:
+            kind = ev.get("type")
+            task_id = str(ev.get("task_id") or "unknown")
+            if kind in ("completion_note_failed", "completion_note_published"):
+                latest[task_id] = ev
+            elif kind == "completion_note_persist_failed":
+                persist_failed_by_task[task_id] = persist_failed_by_task.get(task_id, 0) + 1
+        notes: list[dict] = [
+            {
+                "task_id": task_id,
+                "error": str(ev.get("error") or ""),
+                "note_file": ev.get("note_file"),
+                # Tolerate a pre-#357 event (no payload) — it reports 0 unfiled, never a
+                # crash, and the note is still flagged as undelivered.
+                "unfiled": ev.get("unfiled") or [],
+            }
+            for task_id, ev in sorted(latest.items())
+            if ev.get("type") == "completion_note_failed"
+        ]
+        return {
+            "undelivered": len(notes),
+            "undelivered_by_task": {n["task_id"]: 1 for n in notes},
+            "unfiled_findings": sum(len(n["unfiled"]) for n in notes),
+            "notes": notes,
+            "persist_failed": sum(persist_failed_by_task.values()),
+            "persist_failed_by_task": dict(sorted(persist_failed_by_task.items())),
+            "clean": not (notes or persist_failed_by_task),
         }
 
     def review_panel_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
@@ -5515,10 +5568,14 @@ class Engine:
         # payload (e.g. a non-string field on the un-validated interactive lane), or a
         # render error must NEVER escape record() and skip the task_completed event /
         # finalize — the task is already COMPLETED and the result can't be replayed.
+        #
+        # Two separately-guarded steps (#357), not one: the completion note is the ONLY
+        # channel for the findings the engine deliberately does not file, so a failure while
+        # marking complete / filing follow-ups must not also cost us the note.
         followups: list[dict] = []
         improvement_ref: str | None = None
+        ts = self.project.task_source
         try:
-            ts = self.project.task_source
             if task.pr_url or task.decomposition_children:
                 ts.mark_complete(task.task_id, task.pr_url)
             followups = self._file_review_followups(run_id, task, ts)
@@ -5534,6 +5591,13 @@ class Engine:
                 self._issue_fingerprint(f["title"]) for f in followups if f.get("ref") is not None
             }
             improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
+        except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "evidence_out_failed", "run_id": run_id,
+                 "task_id": task.task_id, "error": str(exc)},
+            )
+        try:
             self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
@@ -5918,19 +5982,53 @@ class Engine:
         self, run_id: str, task: Task, task_source: object, followups: list[dict],
         improvement_ref: str | None = None,
     ) -> None:
-        """Publish the run's completion evidence via the adapter's ``publish_note`` hook
-        (a no-op when absent). Failure is logged, never fatal to finalize."""
+        """Persist the run's completion evidence, then publish it via the adapter's
+        ``publish_note`` hook. Failure is logged, never fatal to finalize.
+
+        Persist-then-publish (#357): the note carries the review findings the engine
+        deliberately does NOT file (``fix_now``/``drop``/over the #188 cap), so publishing
+        was a single point of failure for that whole class of output — on ``batch-codex-3``
+        every note failed and three valid findings reached nobody. The rendered note is now
+        written to ``stages/<task>/completion-note.md`` FIRST, and always — including when
+        the adapter exposes no ``publish_note`` hook at all — so the payload is durable
+        independent of delivery. Both outcomes are evented with the unfiled findings inline
+        (``completion_note_published`` / ``completion_note_failed``), so ``events.jsonl``
+        alone answers "what did this run tell me that I never saw?" and a delivered note
+        never reads like one that was never attempted."""
+        body = render_completion_note(task, followups, improvement_ref)
+        unfiled = unfiled_findings(
+            (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {},
+            followups,
+        )
+        note_file: str | None = None
+        try:
+            note_file = str(self.store.write_completion_note(task.task_id, body))
+        except Exception as exc:  # noqa: BLE001 - an unwritable log dir must not break finalize
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_note_persist_failed", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "error": str(exc)},
+            )
         publish_note = getattr(task_source, "publish_note", None)
         if not callable(publish_note):
             return
-        body = render_completion_note(task, followups, improvement_ref)
         try:
             publish_note(task.task_id, body, pr_url=task.pr_url)
         except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
             self.store.append_event(
                 run_id,
-                {"ts": _now(), "type": "completion_note_failed", "run_id": run_id,
-                 "task_id": task.task_id, "error": str(exc)},
+                {"ts": _now(), "type": "completion_note_failed", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "error": str(exc),
+                 # The payload, not just the fact of the failure: an undelivered note's
+                 # unfiled findings have no other channel to a human.
+                 "note_file": note_file, "unfiled": unfiled, "unfiled_count": len(unfiled)},
+            )
+        else:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_note_published", "run_id": run_id,
+                 "task_id": task.task_id, "note_file": note_file,
+                 "unfiled_count": len(unfiled)},
             )
 
     def _maybe_publish_progress(self, run_id: str, task: Task) -> None:

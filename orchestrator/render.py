@@ -583,6 +583,53 @@ def render_task_index(task: Task, rejection_reason: str | None = None) -> str:
     return "\n".join(lines)
 
 
+# Why a non-blocking finding was NOT filed as an issue, keyed by its disposition. The
+# completion note renders these as prose; `unfiled_findings` returns them as data.
+_UNFILED_REASON = {
+    "fix_now": "fixed in place (boy-scout)",
+    "drop": "noted, not tracked",
+}
+
+
+def unfiled_findings(
+    review: dict | None, followups: list[dict] | None = None
+) -> list[dict]:
+    """The review's non-blocking findings the engine did NOT file, as structured data (#357).
+
+    ``fix_now``/``drop`` findings, findings with an absent/unrecognized disposition, and
+    ``file`` findings past the per-task cap (#188) are deliberately not filed as issues, so
+    the completion note is their ONLY channel to a human — and publishing that note is a
+    best-effort external call. Returning the drop-list as data lets the engine put the
+    payload in ``completion_note_failed`` and in the ``status`` audit, so a note that never
+    reached anyone is a delivery problem with a recoverable payload rather than data loss.
+
+    Pure (the fold/state-machine convention): computes and returns what was dropped; the
+    engine call site is what emits events. ``render_completion_note`` consumes this same
+    helper, so the Markdown section and the machine-readable list can never disagree.
+
+    Each item is ``{"title", "disposition", "reason"}``; ``followups`` is the engine's
+    ``[{"title", "ref"}]`` list of findings it DID file (those are excluded)."""
+    filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
+    out: list[dict] = []
+    for finding in (review or {}).get("non_blocking") or []:
+        if not isinstance(finding, dict):
+            continue
+        title = str(finding.get("title") or "").strip()  # coerce: a model may emit non-strings
+        if not title or title in filed_titles:
+            continue
+        disposition = str(finding.get("disposition") or "").strip().casefold()
+        if disposition == "file":
+            reason = "over per-task cap"
+        elif disposition in _UNFILED_REASON:
+            reason = _UNFILED_REASON[disposition]
+        elif disposition:
+            reason = "unrecognized disposition — not filed"
+        else:
+            reason = "no disposition given — not filed"
+        out.append({"title": title, "disposition": disposition, "reason": reason})
+    return out
+
+
 def render_completion_note(
     task: Task, followups: list[dict] | None = None, improvement_ref: str | None = None
 ) -> str:
@@ -643,28 +690,12 @@ def render_completion_note(
     # #188: the "noted, moving on" destination. A non-blocking finding the engine did NOT
     # file — absent/unrecognized, dispositioned `fix_now`/`drop`, or an explicit `file`
     # finding past the per-task cap — is surfaced here so the drop bucket is durable in
-    # the PR/issue note. Derived from the review's findings minus the filed titles.
-    filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
-    _noted_reason = {"fix_now": "fixed in place (boy-scout)", "drop": "noted, not tracked"}
-    noted: list[str] = []
-    for finding in review.get("non_blocking") or []:
-        if not isinstance(finding, dict):
-            continue
-        title = str(finding.get("title") or "").strip()
-        if not title or title in filed_titles:
-            continue
-        disposition = str(finding.get("disposition") or "").strip().casefold()
-        if disposition == "file":
-            reason = "over per-task cap"
-        elif disposition in _noted_reason:
-            reason = _noted_reason[disposition]
-        elif disposition:
-            reason = "unrecognized disposition — not filed"
-        else:
-            reason = "no disposition given — not filed"
-        noted.append(f"- {title} — {reason}")
+    # the PR/issue note. Computed by `unfiled_findings` (#357), the same helper the engine
+    # reads for the failure event and the status audit, so note and data cannot disagree.
+    noted = unfiled_findings(review, followups)
     if noted:
-        lines += ["", "### Noted, not filed"] + noted
+        lines += ["", "### Noted, not filed"]
+        lines += [f"- {n['title']} — {n['reason']}" for n in noted]
 
     # Self-improvement loop (heysoo parity): the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.

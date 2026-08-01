@@ -521,6 +521,20 @@ class StatusStore:
         self._atomic_write(path, text)
         return path
 
+    def write_completion_note(self, task_id: str, text: str) -> Path:
+        """Persist a task's rendered completion note to stages/<task>/completion-note.md (#357).
+
+        The note is the ONLY channel for the review findings the engine deliberately does not
+        file (``fix_now``/``drop``/over-cap), and publishing it is a best-effort external
+        call. Writing it here BEFORE the publish attempt makes the payload durable
+        independent of delivery: a failed publish leaves a recoverable artifact instead of
+        losing the findings."""
+        d = self._stages_dir(task_id)
+        d.mkdir(parents=True, exist_ok=True)
+        path = d / "completion-note.md"
+        self._atomic_write(path, text)
+        return path
+
     def write_task_index(self, task_id: str, text: str) -> Path:
         d = self._stages_dir(task_id)
         d.mkdir(parents=True, exist_ok=True)

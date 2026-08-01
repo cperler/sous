@@ -18,7 +18,7 @@ from adapters.project.github_issues import GitHubIssuesSource
 from adapters.project.selfhost.task_source import LocalFileTaskSource
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.render import render_completion_note
+from orchestrator.render import render_completion_note, unfiled_findings
 from orchestrator.schemas.enums import ExecutionLane, Stage, StageStatus
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 from orchestrator.schemas.status import Task
@@ -795,3 +795,237 @@ def test_review_schema_accepts_non_blocking() -> None:
             "approved": True, "issues": [],
             "improvement": {"title": "idea", "disposition": "maybe"},
         })
+
+
+# --- #357: the note's payload is durable independent of delivery -------------------
+#
+# `fix_now`/`drop`/over-cap findings are deliberately NOT filed as issues, so the
+# completion note is their ONLY channel to a human — and publishing it is a best-effort
+# external call. On batch-codex-3 every note failed and three valid fix_now findings
+# reached nobody. These lock in: the note is persisted BEFORE publishing, the failure
+# event carries the payload, and `status` stops reading clean.
+
+_REVIEW_WITH_UNFILED = {
+    "approved": True,
+    "issues": [],
+    "non_blocking": [
+        {"title": "Two dict entries over-indented", "detail": "cosmetic",
+         "disposition": "fix_now"},
+        {"title": "all_six_stages iterates seven", "detail": "naming", "disposition": "drop"},
+        {"title": "Filed one", "detail": "real", "disposition": "file"},
+    ],
+}
+
+
+class _NotePublishFailsSource:
+    """publish_note raises — the batch-codex-3 failure mode (a non-PR pr_url, a rate
+    limit, an auth blip). Everything else works."""
+
+    def __init__(self) -> None:
+        self.followups: list = []
+
+    def resolve(self, task_id: str) -> TaskSpec:
+        return TaskSpec(task_id=task_id, title="x", body="y", issue_number=1)
+
+    def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
+        pass
+
+    def file_followup(self, title: str, body: str, labels=None) -> str:
+        self.followups.append({"title": title, "body": body, "labels": labels})
+        return f"https://example.test/issues/{len(self.followups)}"
+
+    def publish_note(self, task_id: str, body: str, *, pr_url=None) -> None:
+        raise RuntimeError("gh: GitHub API unreachable")
+
+
+class _MarkCompleteRaisesSource(_NotePublishFailsSource):
+    """The earlier half of evidence-out explodes; the note must still be produced."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.notes: list = []
+
+    def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
+        raise RuntimeError("gh issue close exploded")
+
+    def publish_note(self, task_id: str, body: str, *, pr_url=None) -> None:
+        self.notes.append(body)
+
+
+def test_unfiled_findings_matches_the_rendered_noted_section() -> None:
+    # The helper and the Markdown section are the same computation — a title/reason that
+    # appears in one must appear in the other, or the event payload could lie.
+    task = Task(task_id="#10", run_id="r1", created_at="t0", updated_at="t0")
+    review = {
+        "approved": True,
+        "non_blocking": [
+            {"title": "fixed inline", "disposition": "fix_now"},
+            {"title": "dropped", "disposition": "drop"},
+            {"title": "capped", "disposition": "file"},   # filed list omits it -> over cap
+            {"title": "no disp"},
+            {"title": "weird", "disposition": "maybe"},
+            {"title": "was filed", "disposition": "file"},
+            "not a dict",                                  # tolerated, skipped
+            {"title": "   "},                              # blank title, skipped
+        ],
+    }
+    task.stages[Stage.REVIEW].output = review
+    followups = [{"title": "was filed", "ref": "url-1"}]
+
+    unfiled = unfiled_findings(review, followups)
+
+    assert [(u["title"], u["reason"]) for u in unfiled] == [
+        ("fixed inline", "fixed in place (boy-scout)"),
+        ("dropped", "noted, not tracked"),
+        ("capped", "over per-task cap"),
+        ("no disp", "no disposition given — not filed"),
+        ("weird", "unrecognized disposition — not filed"),
+    ]
+    note = render_completion_note(task, followups)
+    for item in unfiled:
+        assert f"- {item['title']} — {item['reason']}" in note
+    assert "was filed" not in note.split("### Noted, not filed")[1]
+    # pure: no events, no I/O, and the input is untouched
+    assert len(review["non_blocking"]) == 8
+
+    # tolerant of an absent/blank review
+    assert unfiled_findings(None) == [] and unfiled_findings({}) == []
+
+
+def test_failed_note_is_persisted_and_its_findings_land_in_the_event(tmp_path, project) -> None:
+    project._task_source = _NotePublishFailsSource()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    outcomes = _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+    assert outcomes[-1]["outcome"] == "task_completed"  # a failed note never un-completes
+
+    # 1. the payload survives the failed delivery as an artifact
+    note_path = tmp_path / "stages" / "t1" / "completion-note.md"
+    body = note_path.read_text()
+    assert "Two dict entries over-indented" in body
+    assert "all_six_stages iterates seven" in body
+
+    # 2. ...and inside the failure event itself, so events.jsonl alone answers
+    #    "what did this run tell me that I never saw?"
+    events = _events(tmp_path)
+    failed = [e for e in events if e["type"] == "completion_note_failed"]
+    assert len(failed) == 1
+    assert failed[0]["level"] == "warning"
+    assert failed[0]["note_file"] == str(note_path)
+    assert failed[0]["unfiled_count"] == 2
+    assert [(u["title"], u["disposition"]) for u in failed[0]["unfiled"]] == [
+        ("Two dict entries over-indented", "fix_now"),
+        ("all_six_stages iterates seven", "drop"),
+    ]
+    assert not any(e["type"] == "completion_note_published" for e in events)
+
+    # 3. ...and the run stops reading clean from a poll
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False
+    assert audit["undelivered"] == 1 and audit["undelivered_by_task"] == {"t1": 1}
+    assert audit["unfiled_findings"] == 2
+    assert audit["notes"][0]["task_id"] == "t1"
+    assert "GitHub API unreachable" in audit["notes"][0]["error"]
+    assert audit["notes"][0]["note_file"] == str(note_path)
+
+
+def test_published_note_is_persisted_and_receipted(tmp_path, project) -> None:
+    # Clean-and-never-looked must not read alike (#322): a delivered note leaves a receipt.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+
+    note_path = tmp_path / "stages" / "t1" / "completion-note.md"
+    assert note_path.exists()
+    events = _events(tmp_path)
+    published = [e for e in events if e["type"] == "completion_note_published"]
+    assert len(published) == 1
+    assert published[0]["note_file"] == str(note_path)
+    assert published[0]["unfiled_count"] == 2
+    assert not any(e["type"] == "completion_note_failed" for e in events)
+    assert eng.status("r1")["completion_notes"] == {
+        "undelivered": 0, "undelivered_by_task": {}, "unfiled_findings": 0, "notes": [],
+        "persist_failed": 0, "persist_failed_by_task": {}, "clean": True,
+    }
+
+
+def test_note_is_persisted_even_when_the_adapter_cannot_publish(tmp_path, project) -> None:
+    # A v1-era source with no publish_note hook used to render nothing at all — the
+    # findings existed only inside the stage JSON.
+    project._task_source = _BareSource()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    outcomes = _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+
+    assert outcomes[-1]["outcome"] == "task_completed"
+    body = (tmp_path / "stages" / "t1" / "completion-note.md").read_text()
+    assert "Two dict entries over-indented" in body
+    # no hook -> nothing was delivered and nothing failed; the run still reads clean
+    events = _events(tmp_path)
+    assert not any(e["type"].startswith("completion_note_") for e in events)
+    assert eng.status("r1")["completion_notes"]["clean"] is True
+
+
+def test_note_survives_a_failure_in_the_filing_half(tmp_path, project) -> None:
+    # The two evidence-out halves are guarded separately: mark_complete blowing up used to
+    # skip the note entirely, taking the unfiled findings with it.
+    project._task_source = _MarkCompleteRaisesSource()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    outcomes = _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+
+    assert outcomes[-1]["outcome"] == "task_completed"
+    events = _events(tmp_path)
+    assert sum(e["type"] == "evidence_out_failed" for e in events) == 1
+    assert (tmp_path / "stages" / "t1" / "completion-note.md").exists()
+    assert project.task_source.notes  # and delivery was still attempted
+    assert "Two dict entries over-indented" in project.task_source.notes[0]
+
+
+def test_completion_notes_audit_tolerates_a_pre_357_event(tmp_path, project) -> None:
+    # A run logged before this change has a bare completion_note_failed (no payload): it
+    # must still be flagged as undelivered, reporting zero unfiled rather than crashing.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.store.append_event(
+        "r1", {"ts": "t0", "type": "completion_note_failed", "run_id": "r1",
+               "task_id": "t9", "error": "old"},
+    )
+
+    audit = eng.completion_notes_audit("r1")
+
+    assert audit["undelivered"] == 1 and audit["unfiled_findings"] == 0
+    assert audit["notes"][0] == {"task_id": "t9", "error": "old", "note_file": None,
+                                 "unfiled": []}
+    assert audit["clean"] is False
+
+
+def test_completion_notes_audit_clears_on_a_later_successful_publish(tmp_path, project) -> None:
+    # Current state, not run-history: a re-run that finally delivers the note clears it.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    for ev in (
+        {"ts": "t0", "type": "completion_note_failed", "run_id": "r1", "task_id": "t1",
+         "error": "boom", "unfiled": [{"title": "a", "disposition": "drop", "reason": "r"}]},
+        {"ts": "t1", "type": "completion_note_published", "run_id": "r1", "task_id": "t1",
+         "note_file": "/x/completion-note.md", "unfiled_count": 1},
+    ):
+        eng.store.append_event("r1", ev)
+
+    assert eng.completion_notes_audit("r1")["clean"] is True
+
+    # ...but a persist failure is never cleared: without the artifact there is no recovery.
+    eng.store.append_event(
+        "r1", {"ts": "t2", "type": "completion_note_persist_failed", "run_id": "r1",
+               "task_id": "t1", "error": "read-only fs"},
+    )
+    audit = eng.completion_notes_audit("r1")
+    assert audit["clean"] is False and audit["persist_failed_by_task"] == {"t1": 1}
