@@ -1,6 +1,6 @@
 # Project starter-kit menu.
 #
-# The bootstrap skill (run_targets/project_bootstrap_skill.md) and the profile-driven
+# The bootstrap skill (run_targets/adapter_bootstrap_skill.md) and the profile-driven
 # scaffold read this to decide WHICH assets to roll into a new project, based on the
 # project's stack profile (languages + layers). Agents/hooks carry stack `tags`; an
 # empty `tags` list means "generic, always available". Stage schemas are universal.

@@ -344,7 +344,8 @@ cross-run `learnings-kb.jsonl` share one parent:
 - **CLIs** (`orchestrator/cli.py`): `status` (progress + cost + lane-attribution audit),
   `watch` (poll one run to terminal, alerting on stalls), `tail` (live tail of a running
   stage's stream via `stream_probe.py`), `dashboard` (`dashboard.py` — cross-session board of
-  all runs, "what needs a human" lifted to an attention band), `cost-report`, `retrospective`,
+  all runs, "what needs a human" lifted to an attention band; `--watch` polls in the
+  terminal and `--serve` binds `web_dashboard.py` as a local HTTP server), `cost-report`, `retrospective`,
   `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
   utilization plus context-window capture for the Claude Code status bar),
   `supervisor-context` (read that fresh payload), and `resume-supervisor` (release a

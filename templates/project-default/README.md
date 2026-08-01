@@ -1,7 +1,7 @@
 # Project starter kit (the default orchestration template)
 
 The customizable source of "stuff" a new project starts from when you bootstrap it for
-orchestration. The bootstrap skill (`run_targets/project_bootstrap_skill.md`) and the
+orchestration. The bootstrap skill (`run_targets/adapter_bootstrap_skill.md`) and the
 profile-driven scaffold (`orchestrator-scaffold`) read `manifest.toml` to roll a
 **stack-appropriate subset** of these assets into a new project — plus the generated
 project-config adapter.
