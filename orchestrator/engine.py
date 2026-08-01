@@ -28,7 +28,13 @@ from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
-from .decomposition import DecompositionError, leaf_ids, parse_subtasks, topological_order
+from .decomposition import (
+    ChildTaskPlan,
+    DecompositionError,
+    leaf_ids,
+    parse_subtasks,
+    topological_order,
+)
 from .driver_log import liveness_from_log
 from .errors import (
     CapacityExhausted,
@@ -2580,15 +2586,48 @@ class Engine:
     ) -> Task:
         """File/register a validated child DAG and park ``parent`` as its umbrella.
 
-        External issue creation cannot share the status store's filesystem transaction.
-        The durable local-id mapping is therefore advanced after every acknowledged
-        ``create_task`` call; a resumed call skips mapped children and continues with the
-        first unacknowledged one. Registration itself is already crash-idempotent.
+        Validation runs before the lock, so a malformed child graph stays an ordinary
+        retryable SCOPE failure rather than something a lock waiter can observe half-done.
+        The saga itself — every external ``create_task`` and every durable write — runs
+        under the parent's decomposition lock; see :meth:`_file_decomposition_children`.
         """
         tasks = parse_subtasks(output)
         if not tasks:
             return parent
+        # Cheap pre-check on the caller's snapshot; the authoritative one is the in-lock
+        # re-read, which is the only version that can see a concurrent racer's work.
         if parent.decomposition_children:
+            return parent
+        with self.store.with_decomposition_lock(run_id, parent.task_id):
+            return self._file_decomposition_children(run_id, parent.task_id, tasks)
+
+    def _file_decomposition_children(
+        self, run_id: str, parent_id: str, tasks: list[ChildTaskPlan]
+    ) -> Task:
+        """Run the decomposition saga; the CALLER holds the parent's decomposition lock.
+
+        External issue creation cannot share the status store's filesystem transaction.
+        The durable local-id mapping is therefore advanced after every acknowledged
+        ``create_task`` call; a resumed call skips mapped children and continues with the
+        first unacknowledged one. Registration itself is already crash-idempotent.
+
+        That resume is the whole reason the lock exists (#354). The lookup→create window is
+        not atomic, so two reconcilers — ``record`` and any scheduler process calling
+        ``dispatchable`` — could each read a mapping without local id X and each file their
+        own external issue for it. Writing the mapping afterwards only records which one
+        won; the loser's issue is real, assigned to nobody and referenced by nothing. Hence
+        the FRESH re-read below: entering the saga is decided on the parent as it stands
+        inside the lock, never on the snapshot the caller brought in, so a late entrant sees
+        the winner's children and mapping and does nothing.
+        """
+        parent = self.store.load_task(run_id, parent_id)
+        if parent.decomposition_children:
+            return parent
+        # Waiting on the lock can outlast the human gate closing — a losing racer's filing
+        # failure parks the parent via ``_hold_decomposition``. Filing against a parent an
+        # operator has just been asked to look at is the same mistake as filing for an
+        # infeasible SCOPE: the hold wins, and ``approve`` resumes the saga.
+        if parent.state is TaskState.BLOCKED_ON_HUMAN:
             return parent
         source = self.project.task_source
         create = getattr(source, "create_task", None)
@@ -2685,9 +2724,10 @@ class Engine:
         """Find a previously filed child by its deterministic body marker.
 
         Sources without a usable ``list_tasks`` hook return ``None``.  Lookup is
-        deliberately best-effort because creation remains the source's responsibility;
-        durable mappings are the authoritative deduplication mechanism after filing is
-        acknowledged locally.
+        deliberately best-effort because creation remains the source's responsibility; it
+        covers only the CRASH window (the process died between an acknowledged create and
+        the mapping write). Deduplication between LIVE reconcilers is the decomposition
+        lock plus the in-lock mapping re-read, which hold with or without this hook.
 
         The marker must match a WHOLE body line. A substring test made local ids collide by
         prefix — searching ``…/a`` matched a child filed as ``…/ab``, so two valid subtasks
@@ -2712,6 +2752,11 @@ class Engine:
 
         A human-held failure remains quiescent. ``approve`` moves it to PENDING; the next
         scheduler eligibility pass then continues from its persisted mapping.
+
+        The state read here is a pre-filter on a snapshot, not a guarantee: several
+        schedulers may reach the same unfinished saga at once. Each per-parent saga is
+        serialized and re-decided inside its own lock, so concurrent passes converge on one
+        set of children rather than one set each.
         """
         run = self.store.load_run(run_id)
         for ref in list(run.task_refs):

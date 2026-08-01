@@ -127,6 +127,12 @@ class StatusStore:
     def _dispatch_path(self, run_id: str) -> Path:
         return self.root / f"dispatch-{run_id}"
 
+    def _decomposition_path(self, run_id: str, task_id: str) -> Path:
+        # Sanitized like the per-stage log dir, not raw like the task doc: this name is only
+        # ever a lock key, so two task ids that sanitize alike sharing one lock costs a
+        # little concurrency, while a task id containing "/" would cost correctness.
+        return self.root / f"decomposition-{run_id}-{safe_task_dirname(task_id)}"
+
     @property
     def _events_path(self) -> Path:
         return self.root / "events.jsonl"
@@ -196,6 +202,26 @@ class StatusStore:
         ``next_work`` is between its preflight checks and task-doc commit.
         """
         with self.with_lock(self._dispatch_path(run_id)):
+            yield
+
+    @contextmanager
+    def with_decomposition_lock(self, run_id: str, task_id: str) -> Iterator[None]:
+        """Serialize one parent's whole SCOPE decomposition saga across processes (#354).
+
+        The saga's lookup→create→record-the-mapping cycle spans an EXTERNAL side effect
+        (filing a child in the task source), so no single-document transaction can cover it:
+        the durable mapping is written after the create and can only record which racer won,
+        never un-file the loser's issue. This lock keys on the parent, is held for the whole
+        saga, and is what makes the fresh in-lock re-read of the parent's mapping meaningful.
+
+        Keyed on its own sentinel path rather than the parent's task doc because the locks
+        are not re-entrant and the saga writes that doc (``update_task``) repeatedly.
+
+        Lock order: OUTER to the task and run locks, INNER to the dispatch lock. No path
+        takes the dispatch lock across a decomposition (``next_work`` reconciles before its
+        dispatch critical section), so there is no cycle to deadlock on.
+        """
+        with self.with_lock(self._decomposition_path(run_id, task_id)):
             yield
 
     def write_task_locked(self, task: Task) -> None:
