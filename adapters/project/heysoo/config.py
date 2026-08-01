@@ -13,6 +13,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from adapters.project.email_sink import email_sink_from_env
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
@@ -131,11 +132,23 @@ class HeysooConfig:
     def notify(self, kind: str, payload: dict) -> None:
         """Reference implementation of the alerting seam the old monitor's email +
         desktop-notify plugged into. Deliberately dead simple: always log a line to
-        stderr, and best-effort fire a macOS desktop notification via ``osascript``
-        (short timeout). Swallows ALL errors — the engine already guards this hook, so
-        this is belt-and-suspenders. No email: SMTP config doesn't belong in this pass."""
+        stderr, best-effort fire a macOS desktop notification via ``osascript`` (short
+        timeout), and — when the environment configures SMTP (#359) — mail the payload.
+        Swallows ALL errors — the engine already guards this hook, so this is
+        belt-and-suspenders.
+
+        Email closes the gap a DETACHED driver opens: a desktop notification only reaches
+        someone sitting at this machine, so a backgrounded batch that finishes out of session
+        was previously only discoverable by polling ``status``. See
+        ``adapters.project.email_sink`` for the env vars; unconfigured, it is a no-op and
+        this hook behaves exactly as it did before."""
         summary = str(payload.get("summary") or kind)
         print(f"[orchestrator:{kind}] {summary}", file=sys.stderr)
+        try:
+            if sink := email_sink_from_env():
+                sink(kind, payload)  # swallows its own errors; short socket timeout
+        except Exception:  # noqa: BLE001 - an alert sink must never break the run
+            pass
         try:
             # json.dumps yields valid AppleScript double-quoted string literals (no shell
             # involved — argv, not a shell string — so no injection surface).

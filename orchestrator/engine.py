@@ -23,6 +23,11 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
 
+from .alerting import (
+    NOTIFY_RUN_FINALIZED,
+    NOTIFY_TASK_COMPLETED,
+    NOTIFY_TASK_FAILED,
+)
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .commit_attribution import scan_commits
 from .cost_ledger import CostLedger
@@ -199,6 +204,22 @@ def _hash_preview(value: str | None) -> str | None:
     if value is None:
         return None
     return f"{value[:12]}...(len {len(value)})"
+
+
+# Cap on the completion-note prose folded into a ``task_completed`` alert payload (#359).
+# The payload is appended verbatim to events.jsonl and handed to a sink that may put it in an
+# email body, so an unbounded note would bloat both. Generous enough that a normal note (a
+# few hundred lines of markdown at most) passes through whole.
+NOTIFY_NOTE_MAX_CHARS = 8000
+
+
+def _bounded(text: str | None, limit: int) -> str | None:
+    """Truncate ``text`` to ``limit`` characters, SAYING SO in the text itself when it cuts
+    (the "never silent" convention — a reader must never mistake a truncated note for the
+    whole one). ``None`` stays ``None``."""
+    if text is None or len(text) <= limit:
+        return text
+    return text[:limit] + f"\n\n… [truncated at {limit} chars — full note in the run log]"
 
 
 def _in_future(iso: str | None) -> bool:
@@ -3660,6 +3681,83 @@ class Engine:
                  "kind": kind, "error": str(exc)},
             )
 
+    def _task_cost_facts(self, run_id: str, task_id: str) -> dict:
+        """This task's metered spend, rolled up from the run's ledger rows (#359).
+
+        #319-aware on purpose: an unmetered row contributes its ``cost_usd: 0.0`` to the
+        total like any other, so the count of unmetered calls travels WITH the figure —
+        without it an alert would render a confident ``$0.0000`` for a task whose usage was
+        never recoverable, which reads as "free" when the truth is "unknown"."""
+        rows = [r for r in self.run_rows(run_id) if r.get("task_id") == task_id]
+        return {
+            "usd": round(sum(r.get("cost_usd") or 0.0 for r in rows), 6),
+            "invocations": len(rows),
+            "unmetered_calls": sum(1 for r in rows if r.get("metered") is False),
+        }
+
+    def _notification_facts(self, run_id: str, task: Task) -> dict:
+        """The shared, deterministic enrichment every per-task notification carries (#359):
+        enough for a sink to render an ACTIONABLE alert — what landed, where the PR is, what
+        it cost, and where the full trail lives — without the recipient re-opening `status`.
+
+        Derived purely from durable state (the task doc + the cost ledger), so it is
+        model-free and reproducible on replay. Load-bearing beyond email: the same richer
+        payload improves the desktop sink and the ``notification`` audit row.
+
+        TOTAL by construction — this runs INSIDE a terminal transition that has already
+        mutated durable state and cannot be replayed, so an enrichment failure must never
+        escape. The flat fields are plain attribute reads that cannot raise; the two derived
+        blocks (stage roll-up, ledger scan — the latter does file I/O) are wrapped
+        individually so one failing still yields the other, and a degraded payload is EVENTED
+        rather than silently thinned (the "never silent" convention)."""
+        facts: dict = {
+            "task_id": task.task_id,
+            "title": task.title or None,
+            "issue_number": task.issue_number,
+            "pr_url": task.pr_url,
+            "pr_number": task.pr_number,
+            "task_state": task.state.value,
+            "attempt": task.attempt,
+            "review_cycles": task.review_cycles,
+            # Where the full trail lives — status/events.jsonl/stage-costs.jsonl/stages/.
+            # Run logs are retained until the human prunes them, so this stays resolvable
+            # long after the worktree and task branch are cleaned up.
+            "run_dir": str(self.store.root),
+        }
+        try:
+            facts["stages"] = [
+                {
+                    "stage": stage.value,
+                    "status": rec.status.value,
+                    "attempt": rec.attempt,
+                    "model": rec.model,
+                    "error": rec.error,
+                }
+                for stage, rec in task.stages.items()
+                if rec.status is not StageStatus.PENDING
+            ]
+            review = task.stages.get(Stage.REVIEW)
+            facts["review_approved"] = (review.output or {}).get("approved") if review else None
+        except Exception as exc:  # noqa: BLE001 - enrichment must never break the transition
+            self._event_facts_degraded(run_id, task, "stages", exc)
+        try:
+            facts["cost"] = self._task_cost_facts(run_id, task.task_id)
+        except Exception as exc:  # noqa: BLE001 - a ledger read must never break the transition
+            self._event_facts_degraded(run_id, task, "cost", exc)
+        return facts
+
+    def _event_facts_degraded(self, run_id: str, task: Task, part: str, exc: Exception) -> None:
+        """Record that a notification payload went out MISSING one of its derived blocks —
+        so a thin alert is explained by the trail instead of looking like there was nothing
+        to report. Best-effort: even the event write is guarded, because this is the last
+        line of defense inside an unreplayable terminal transition."""
+        with contextlib.suppress(Exception):
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "notification_facts_degraded", "run_id": run_id,
+                 "task_id": task.task_id, "part": part, "error": str(exc)},
+            )
+
     # --- run pause (batch-wide circuit breaker, #58) ----------------------------
     def pause_run(self, run_id: str, reason: str) -> None:
         """Pause a run (no further scheduler dispatch until unpaused). Used by the
@@ -4177,10 +4275,16 @@ class Engine:
             # each attempt start, but the caller's reason is still the correct source here).
             # Each caller passes the reason for THIS transition (record: effective.error or
             # outcome; abandon: the abandon reason; reject: the human's reason).
+            # #359: enriched with the SAME shared facts the success half carries, so a sink
+            # can render an actionable failure alert (which stages ran, what they cost, where
+            # the trail is) instead of a bare one-liner. The four original keys are spelled
+            # AFTER the spread so they win: summary/stage/reason stay byte-compatible for
+            # every existing consumer.
             stage = task.current_stage
             self.emit_notification(
-                run_id, "task_failed",
-                {"run_id": run_id, "task_id": task.task_id, "kind": "task_failed",
+                run_id, NOTIFY_TASK_FAILED,
+                {**self._notification_facts(run_id, task),
+                 "run_id": run_id, "task_id": task.task_id, "kind": NOTIFY_TASK_FAILED,
                  "summary": f"task {task.task_id} FAILED"
                             + (f" at {stage.value}" if stage else "")
                             + f": {reason}",
@@ -5517,6 +5621,7 @@ class Engine:
         # finalize — the task is already COMPLETED and the result can't be replayed.
         followups: list[dict] = []
         improvement_ref: str | None = None
+        note_md: str | None = None
         try:
             ts = self.project.task_source
             if task.pr_url or task.decomposition_children:
@@ -5534,7 +5639,12 @@ class Engine:
                 self._issue_fingerprint(f["title"]) for f in followups if f.get("ref") is not None
             }
             improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
-            self._publish_completion_note(run_id, task, ts, followups, improvement_ref)
+            # Rendered ONCE here and handed to both consumers (#359): the task source's
+            # completion note and the alerting payload's "what was done" prose. The engine
+            # never calls a model, so reusing this already-published artifact is what keeps
+            # the alert descriptive without authoring new prose.
+            note_md = render_completion_note(task, followups, improvement_ref)
+            self._publish_completion_note(run_id, task, ts, note_md)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
                 run_id,
@@ -5547,6 +5657,27 @@ class Engine:
              "task_id": task.task_id, "pr_url": task.pr_url,
              "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
              "review_fixups_applied": sum(fixup.applied for fixup in task.review_fixups)},
+        )
+        # Alerting (#359): the success half of the per-task pair, symmetric with the
+        # ``task_failed`` that ``_terminal_effects`` fires. Emitted from THIS choke point
+        # (not ``_terminal_effects``, which only runs the failed/rejected dispositions)
+        # because it is the one place every completed task passes through exactly once —
+        # ``record``'s success path AND ``_complete_ready_umbrellas``' decomposition parents.
+        # Deliberately per-task and immediate rather than coalesced into a ``run_finalized``
+        # digest: the whole point is proactive notice BEFORE the batch ends.
+        summary = f"task {task.task_id} COMPLETED"
+        if task.title:
+            summary += f" — {task.title}"
+        if task.pr_url:
+            summary += f" ({task.pr_url})"
+        self.emit_notification(
+            run_id, NOTIFY_TASK_COMPLETED,
+            {**self._notification_facts(run_id, task),
+             "run_id": run_id, "task_id": task.task_id, "kind": NOTIFY_TASK_COMPLETED,
+             "summary": summary,
+             "followups_filed": len(followups),
+             "improvement_ref": improvement_ref,
+             "note_md": _bounded(note_md, NOTIFY_NOTE_MAX_CHARS)},
         )
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
@@ -5915,15 +6046,18 @@ class Engine:
         return out
 
     def _publish_completion_note(
-        self, run_id: str, task: Task, task_source: object, followups: list[dict],
-        improvement_ref: str | None = None,
+        self, run_id: str, task: Task, task_source: object, body: str,
     ) -> None:
         """Publish the run's completion evidence via the adapter's ``publish_note`` hook
-        (a no-op when absent). Failure is logged, never fatal to finalize."""
+        (a no-op when absent). Failure is logged, never fatal to finalize.
+
+        Takes the ALREADY-RENDERED note (#359) rather than rendering it here: the caller
+        also feeds the same markdown to the ``task_completed`` alert, and rendering it twice
+        would risk the note published to the PR and the note mailed to the operator drifting
+        apart."""
         publish_note = getattr(task_source, "publish_note", None)
         if not callable(publish_note):
             return
-        body = render_completion_note(task, followups, improvement_ref)
         try:
             publish_note(task.task_id, body, pr_url=task.pr_url)
         except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
@@ -6205,6 +6339,26 @@ class Engine:
             "cost-report.md", render_cost_report(run_id, self.ledger.analysis(rows=rows))
         )
 
+    def _finalize_roster(self, run: Run) -> list[dict]:
+        """Per-task roster for the ``run_finalized`` alert (#359): ``{task_id, state, title,
+        pr_url}`` per task, in run order.
+
+        ``TaskRef`` carries only the state cache, so the PR url and title come from the task
+        DOCS — N reads, taken once at the single finalize transition (the same path already
+        scans the whole ledger for the cost artifacts). Best-effort per task AND overall: a
+        finalize must never be broken by an unreadable task doc, so an unloadable task
+        degrades to its ref-level facts rather than losing the whole roster."""
+        roster: list[dict] = []
+        for ref in run.task_refs:
+            entry = {"task_id": ref.task_id, "state": ref.state.value,
+                     "title": None, "pr_url": None}
+            with contextlib.suppress(Exception):
+                task = self.store.load_task(run.run_id, ref.task_id)
+                entry["title"] = task.title or None
+                entry["pr_url"] = task.pr_url
+            roster.append(entry)
+        return roster
+
     def _maybe_finalize_run(self, run_id: str) -> None:
         """Finalize the run once every task is terminal (multi-task aware)."""
         run = self.store.load_run(run_id)
@@ -6246,10 +6400,15 @@ class Engine:
             # (scheduler, engine-lane record, and the out-of-band reject()).
             progress = run.progress()
             self.emit_notification(
-                run_id, "run_finalized",
-                {"run_id": run_id, "kind": "run_finalized", "state": new_state.value,
+                run_id, NOTIFY_RUN_FINALIZED,
+                {"run_id": run_id, "kind": NOTIFY_RUN_FINALIZED, "state": new_state.value,
                  "summary": f"run {run_id} finalized {new_state.value} — "
-                            f"{progress.completed}/{progress.total} tasks completed"},
+                            f"{progress.completed}/{progress.total} tasks completed",
+                 # #359: the per-task roster, so a sink can render a batch DIGEST — which
+                 # task landed where — instead of only a completed/total count that says
+                 # nothing about which of N tasks shipped.
+                 "run_dir": str(self.store.root),
+                 "tasks": self._finalize_roster(run)},
             )
         self._write_final_cost_artifacts(run_id, run)
         # Auto-generate the failure retrospective only when the run actually failed —

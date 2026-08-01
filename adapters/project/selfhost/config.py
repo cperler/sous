@@ -12,7 +12,9 @@ local/offline mode instead.
 from __future__ import annotations
 
 import os
+import sys
 
+from adapters.project.email_sink import email_sink_from_env
 from adapters.project.github_issues import GitHubIssuesSource
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
@@ -84,6 +86,25 @@ class SelfHostConfig:
 
     def schema_for(self, ref: str) -> dict | None:
         return resolve_stage_schema(ref)
+
+    # --- alerting sink (#55/#359) -----------------------------------------------
+    def notify(self, kind: str, payload: dict) -> None:
+        """Alerting sink for runs against THIS repo. Before #359 this adapter had no
+        ``notify`` at all, so every dogfood batch was entirely silent no matter what the
+        seam supported — the gap that made a detached driver's completion undiscoverable
+        except by polling ``status``.
+
+        Always a stderr line; additionally mails the payload when the environment configures
+        SMTP (see ``adapters.project.email_sink`` for the env vars). Unconfigured, the email
+        half is a no-op. Deliberately no ``osascript`` here — unlike the heysoo reference
+        adapter this one is not macOS-specific. Swallows ALL errors: the engine already
+        guards this hook, so this is belt-and-suspenders."""
+        print(f"[orchestrator:{kind}] {payload.get('summary') or kind}", file=sys.stderr)
+        try:
+            if sink := email_sink_from_env():
+                sink(kind, payload)  # swallows its own errors; short socket timeout
+        except Exception:  # noqa: BLE001 - an alert sink must never break the run
+            pass
 
 
 def get_config() -> SelfHostConfig:

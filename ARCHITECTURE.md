@@ -357,6 +357,22 @@ cross-run `learnings-kb.jsonl` share one parent:
   `emit_notification` for stall + transition alerts (`alerting.py`), `publish_progress` /
   `publish_note` to post progress to the task source, `file_followup` to file follow-up
   issues. A raising or missing hook never breaks a run.
+- **Alerting payloads + email** (#359): the per-task pair is symmetric — `task_failed` from
+  `_terminal_effects`, and `task_completed` from `_on_task_completed` (the choke point BOTH
+  `record`'s success path and the decomposition-parent path pass through, so it fires exactly
+  once). Both carry `Engine._notification_facts`: pr_url/pr_number, title, per-stage outcomes,
+  the task's metered cost (with #319's unmetered count alongside, never a confident $0), and
+  a pointer to the retained `runs/<run>/`; `task_completed` adds the `render_completion_note`
+  markdown already published to the PR (reused, not re-authored — the engine never calls a
+  model), and `run_finalized` adds a per-task roster so a batch digest is renderable. The
+  derived blocks are best-effort and a thinned payload is evented
+  (`notification_facts_degraded`), so a sink treats them as optional. DELIVERY stays an
+  adapter concern: `adapters/project/email_sink.py` is a stdlib-`smtplib` sink, env-configured
+  (`ORCHESTRATOR_SMTP_*` / `ORCHESTRATOR_NOTIFY_EMAIL_TO`, nothing checked in), absent unless
+  configured, kind-filterable, and always short-timeout — the engine's `notify_failed` guard
+  covers a raising sink, but only a timeout covers one that HANGS. Wired into both the heysoo
+  and selfhost adapters; before this, selfhost had no `notify` at all, so every dogfood batch
+  was silent.
 - **Retrospective** (`orchestrator/retrospective.py`): on a failed run, folds
   `events.jsonl` + per-stage logs into per-task failure trails, the cascade map, and recurring
   error patterns (same structured signature the breaker uses).

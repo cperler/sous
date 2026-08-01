@@ -102,17 +102,33 @@ class TaskSource(Protocol):
     #   notify(kind: str, payload: dict) -> None
     #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify
     #       plugged into). The engine calls it via ``Engine.emit_notification`` at the
-    #       events it matters for: a task terminally failed, a task parked
-    #       BLOCKED_ON_HUMAN autonomously, the batch circuit breaker paused the run, the
-    #       run finalized, and (poll-driven, from the scheduler loop / the ``watch`` CLI)
-    #       a task went stale. ``kind`` is one of alerting.NOTIFY_* ; ``payload`` carries
-    #       {run_id, task_id?, kind, summary, and specifics like stage/reason}. Same
-    #       duck-typed, best-effort contract as the hooks above: getattr-called, so a
+    #       events it matters for: a task COMPLETED (#359) or terminally failed, a task
+    #       parked BLOCKED_ON_HUMAN autonomously, the batch circuit breaker paused the run,
+    #       the run finalized, and (poll-driven, from the scheduler loop / the ``watch``
+    #       CLI) a task went stale. ``kind`` is one of alerting.NOTIFY_* ; ``payload``
+    #       carries {run_id, task_id?, kind, summary, and specifics like stage/reason}.
+    #       Same duck-typed, best-effort contract as the hooks above: getattr-called, so a
     #       raising hook is swallowed + evented (``notify_failed``) and NEVER breaks a
     #       run, and adding it needs no CONTRACT_VERSION bump. Every notification is ALSO
     #       appended to events.jsonl (type ``notification``) so the audit trail shows
     #       what was signalled even when no hook is installed. HeysooConfig.notify is the
-    #       reference sink (stderr line + best-effort macOS desktop notification).
+    #       reference sink (stderr line + macOS desktop notification + optional email).
+    #
+    #       The two PER-TASK terminal kinds (``task_completed``/``task_failed``) additionally
+    #       carry the shared enrichment block from ``Engine._notification_facts`` (#359), so
+    #       a sink can render an ACTIONABLE alert without the recipient re-opening `status`:
+    #         task_id, title, issue_number, pr_url, pr_number, task_state, attempt,
+    #         review_cycles, review_approved, run_dir (pointer to the retained runs/<run>/),
+    #         stages ([{stage, status, attempt, model, error}] for every stage that RAN),
+    #         cost ({usd, invocations, unmetered_calls} — the unmetered count travels WITH
+    #         the figure per #319, so a sink never renders a confident $0 for unknown usage).
+    #       ``task_completed`` also carries ``note_md`` (the render_completion_note markdown
+    #       already published to the PR, bounded — reused rather than re-authored, since the
+    #       engine never calls a model), plus followups_filed/improvement_ref.
+    #       ``run_finalized`` carries a per-task ``tasks`` roster ({task_id, state, title,
+    #       pr_url}) so a batch digest is renderable. The derived blocks are best-effort: a
+    #       payload missing ``stages``/``cost`` is evented (``notification_facts_degraded``)
+    #       rather than silently thinned, so a sink should treat both as optional.
 
 
 @runtime_checkable
