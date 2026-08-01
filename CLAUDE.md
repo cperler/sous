@@ -113,7 +113,7 @@ per stage, so no stage prompt or output passes through the session. Measured on
 real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
 
 An all-codex batch requires the global `--provider codex` flag: `provider_tag` routes only
-IMPLEMENT/TEST/SIMPLIFY (#351), not the remaining stages. Even then,
+`routing.DEFAULT_CODEX_ELIGIBLE` (IMPLEMENT/TEST/SIMPLIFY), not the remaining stages. Even then,
 `routing.engine_lane_required` vetoes DELIVER onto deterministic `ENGINE:none`, at `$0` and
 without the model DELIVER's docstring refresh; the warning-grade
 `stage_rerouted_to_engine_lane` records the move. The codex sandbox turns DELIVER's `git push`
