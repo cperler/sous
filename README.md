@@ -5,8 +5,8 @@ dependency-aware coding tasks through Claude (and Codex) — runnable as an in-s
 Workflow on the subscription, and headless by shelling out to `claude -p` / `codex exec`
 (both behind an injectable transport seam, so another headless client can be dropped in).
 
-It is a deliberate **Python rebuild** of a bash orchestration system (Hey Soo!'s
-`.claude/`), extracted to a spec and rebuilt around a clean engine/adapter split.
+It is a deliberate **Python rebuild** of an earlier bash orchestration system, extracted
+to a spec and rebuilt around a clean engine/adapter split.
 
 New here? **`ARCHITECTURE.md`** is a one-page map of the whole system — the engine/adapter
 split, the six-stage pipeline, the front doors, the control loops, and where to start reading.
@@ -83,7 +83,7 @@ adapters/                implementations of the ports above (nothing imports bac
                          adapter lives in the project's OWN repo, see below); plus the
                          shared github_issues.py task source and email_sink.py;
                          base.py likewise a shim
-run_targets/             thin run targets: the Workflow shim (JS) + supervisor skills
+run_targets/             the Workflow shim (JS) + the adapter-bootstrap skill
 tests/                   pytest suite (one test_<subsystem>.py per module)
 docs/                    the frozen build record — design notes, plan, review passes
 DEFERRED.md              scope-ledger discipline (the ledger itself = GitHub issues)
@@ -251,8 +251,9 @@ shim, which a plain terminal doesn't have.
 - **batch** → `/orchestrate-batch-interactive`
 
 These are real, registered skills — they live at `.claude/skills/<name>/SKILL.md` (the
-layout Claude Code discovers), sourced from `run_targets/supervisor_skill.md` /
-`scheduler_skill.md`. The skill runs the loop: `init-run` → `add-task` → `next` → dispatch
+layout Claude Code discovers), and `templates/project-default/skills/` holds byte-identical
+copies that `orchestrator-scaffold` seeds into a new project (kept identical by
+`tests/test_kit_skills_in_sync.py`). The skill runs the loop: `init-run` → `add-task` → `next` → dispatch
 via `run_targets/workflow_shim.js` → `record`, repeating until the task is terminal. It
 never calls a model directly or drives `next`/`record` by hand out of order — the engine
 sequences the state; the supervisor just follows it. (The same engine commands exist

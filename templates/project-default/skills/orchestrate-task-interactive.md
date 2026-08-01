@@ -11,10 +11,16 @@ status, capacity) lives in the `orchestrator` engine CLI. Your only job is the l
 You never call a model directly and you never run `claude -p`.
 
 ## Constants
-- `ROOT` = the run's status/ledger dir (e.g. `runs/<run-id>`).
+- `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
+  each run's store under `runs/<run-id>/` so runs never comingle their files flat.
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
 - `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`, the reference; or your own).
-- Engine call shape: `uv run orchestrator --root "$ROOT" --run "$RUN" --project "$PROJECT" <cmd> ...`
+- Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
+  - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#91): it
+    forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet
+    recognize (no KB / sibling stores exist on day one). It's a no-op once nesting is
+    established, so it's safe to pass on every call. Omit it only if you point `ROOT`
+    directly at a pre-existing per-run dir (`runs/<run-id>`).
 
 ## One-time setup
 1. `… init-run --lane full` (or `lite`/`micro`).
@@ -22,15 +28,18 @@ You never call a model directly and you never run `claude -p`.
 
 ## The loop (repeat until the task is terminal)
 Before every model dispatch, require the Claude Code status-line sensor. Configure
-`orchestrator statusline` as this session's `statusLine` command; it caches Claude Code's
-`context_window` payload. Confirm it with `orchestrator supervisor-context`.
+`orchestrator statusline` as this session's `statusLine` command; it retains the existing
+5h/7d display and caches Claude Code's `context_window` payload for the guard. Confirm it
+with `orchestrator supervisor-context` (unavailable/stale fails closed).
 
 1. **next**: `WORK=$(… next --task "$TASK" --util auto --guard-supervisor-context
    --supervisor-resume-command "start a fresh Claude Code session and invoke
    /orchestrate-task-interactive for $RUN $TASK")`.
    - If `WORK` is `null`, the task is done — stop.
-   - First check `… status`: if `run_state` is `parked`, surface its reason/resume command
-     and stop. A fresh session runs `… resume-supervisor` once before restarting the loop.
+   - First check `… status`: if `run_state` is `parked`, report
+     `supervisor_parked.reason` and its `resume_command`, then stop. The engine evaluated
+     the exact rendered prompt before emitting it or taking a lease, so there is nothing
+     to replay. A fresh session runs `… resume-supervisor` once, then restarts this loop.
    - **Deterministic stages are already done for you.** `next` runs any leading
      deterministic stage (e.g. `intake` — worktree/branch/baseline) in-process on the
      `engine:none` lane and returns the first *model* WorkItem. You never create a
@@ -43,13 +52,22 @@ Before every model dispatch, require the Claude Code status-line sensor. Configu
 2. **dispatch**: invoke the **Workflow shim** (`run_targets/workflow_shim.js`) with
    `{ workItems: [WORK], dispatchLimit: <engine limit>, now: <ISO timestamp>, schemas: {...} }`.
    The shim CANNOT enforce `timeout_s` (no clock in the Workflow sandbox) — YOU own it: if a dispatch visibly exceeds the WorkItem's `timeout_s`, stop waiting, hand-craft that item's `StageResult` with `status: "timeout"` and a one-line `error`, and record it — the engine classifies TIMEOUT and retries from the checkpoint. Never leave a hung dispatch un-recorded.
-   **Pass the WorkItem through VERBATIM** — copy the whole JSON object `next` printed;
-   never retype or abbreviate a field. `content_hash` is a 64-char digest whose only job
-   is tying the returned result back to this dispatch, so a truncated log preview (or a
-   hash copied from another in-flight item) breaks that tie: `record` refuses it and the
-   shim aborts the batch before spending anything if the shape is wrong (#311).
    The shim calls `agent()` in-session and **returns** an array of `StageResult`
    objects (it cannot write to disk). It does the actual work in the task's worktree.
+   - **Pass the WorkItem through VERBATIM** (#311): copy the whole JSON object `next`
+     printed — never retype or abbreviate a field. `content_hash` is a 64-char digest
+     whose only job is tying the returned result back to *this* dispatch, so a truncated
+     log preview (the live `batch-next5b` failure) or a hash copied from another in-flight
+     item breaks that tie. `record` refuses such a result and the shim aborts the batch
+     before spending anything when the shape is wrong.
+   - **Honor the WorkItem's `effort`** (#96/#140): each WorkItem carries a per-stage
+     reasoning `effort` (`low`/`medium`/`high`, or absent). The shim forwards it as
+     `agent({ effort: wi.effort })` so the dispatched sub-agent runs at that reasoning
+     level — pass the WorkItem through **unmodified** and never strip or override
+     `effort` (an absent `effort` is itself valid — it means "use the provider default,"
+     which the shim expresses as `wi.effort || undefined`; do not substitute a value of
+     your own). It rides back on the `StageResult` (echoed for the ledger/audit row), so
+     dropping it both mis-sets the sub-agent's effort and corrupts the cost attribution.
 3. **persist + record**: write each returned `StageResult` to a temp file and run
    `… record --result <file>`. Read the JSON outcome:
    - `task_completed` → the PR is open; stop (success).
@@ -86,9 +104,24 @@ Because the shim only returns results **on Workflow completion**, a session deat
 mid-dispatch loses only the in-flight **batch**. The crash leaves the dispatch lease
 held, so a plain `… next` refuses (it guards the in-flight result) — recover with
 `… next --resume`, which re-emits the un-recorded stage at the same attempt. Keep
-batches small.
+batches small. **Use `--resume` ONLY to recover a genuine crash, never as a routine
+re-preview** — always capture `next` into `WORK` in the single call above so you never
+call `next` then `next --resume` for the same live stage. A resume that supersedes a
+still-outstanding lease is self-describing in the timeline (#142): the re-dispatch's
+`stage_dispatched` carries `resume: true` / `supersedes: <old work_item_id>` and the
+retired lease gets its own `lease_superseded` event, so no orphan dispatch is left.
 
 ## Audit (every gate)
 Run `… status` and check `lane_audit.clean == true`: every recorded model call must
 be `interactive:claude` with zero `unattributed`/`off_lane`. A hidden `claude -p`
 would show up here — there should be none.
+
+## Post-run follow-up triage (opt-in: `--triage-followups`)
+A completed task's evidence-out seam files its review's `non_blocking` findings and
+`improvement` idea as GitHub issues automatically, with no human gate. If the invocation
+args include **`--triage-followups`** (or the human asks to triage), then after the task
+is terminal and the audit is clean, invoke the **`triage-followups`** skill on this `RUN`:
+it walks the issues this run filed one at a time — explaining each from its source review
+finding and the code it points at — and takes the human's keep / close / promote / edit
+call. Read-only on the run, re-runnable, so triage can also be done later instead of
+inline. Without the flag, the run finalizes and its auto-filed issues stay untriaged.

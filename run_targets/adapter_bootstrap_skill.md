@@ -66,7 +66,7 @@ the engine checks it at load and refuses a stale adapter loudly.
 - Satisfies the contract (version + full ProjectConfig surface, no run needed):
   `uv run orchestrator --project "$REPO/.orchestration" validate`
 - A stage resolves (and the roster/agent names resolve in `$REPO/.claude/agents/`): run the
-  interactive supervisor loop (`run_targets/supervisor_skill.md`) or
+  interactive supervisor loop (`/orchestrate-task-interactive`) or
   `--project "$REPO/.orchestration" run-headless` on a throwaway task, and confirm
   `status` shows `lane_audit.clean == true`.
 

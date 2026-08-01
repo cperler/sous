@@ -56,9 +56,17 @@ description = "Run ruff format on edited Python files."
 tags = ["typescript"]
 description = "Run prettier on edited TS/JS files."
 
-# ── Skills: the run-target supervisor skills (always copied) ──
+# ── Skills: the run-lane supervisor skills + the post-run triage gate (always copied) ──
+# These files are byte-identical copies of this repo's own `.claude/skills/<name>/SKILL.md`
+# and `tests/test_kit_skills_in_sync.py` fails if they drift: a scaffolded project must not
+# receive an older generation of a skill than the one this repo runs.
 [skills]
-always = ["supervisor_skill", "scheduler_skill"]
+always = [
+    "orchestrate-task-interactive",
+    "orchestrate-batch-interactive",
+    "orchestrate-batch-headless",
+    "triage-followups",
+]
 
 # ── Stack -> default adapter commands (the interview maps answers to these) ──
 [commands.python]

@@ -50,9 +50,11 @@ written.
      (orchestrator.execution_lanes entry point)             │
         │                                                   │
         └──▶ model conversations live in .claude/skills/ ───┘
-             (front-door + supervisor skills; run_targets/ holds their
-              sources + the Workflow shim JS; templates/project-default/
-              is the scaffold kit seeded into a new project's .claude/)
+             (front-door + supervisor skills; run_targets/ holds the
+              Workflow shim JS + the adapter-bootstrap skill;
+              templates/project-default/ is the scaffold kit seeded into a
+              new project's .claude/ — its skill copies are byte-identical
+              to .claude/skills/, pinned by a test)
 ```
 
 - **Two orthogonal axes:** `execution_mode × provider`. `ExecutionMode ∈ {interactive,

@@ -47,9 +47,15 @@ def test_manifest_hooks_and_skills_resolve() -> None:
         assert src.exists(), f"missing skills/{skill}.md"
         # Every kit skill must carry a frontmatter name — that name becomes the
         # .claude/skills/<name>/SKILL.md dir the bootstrap seeds (the invocable slash
-        # command), so a missing/blank name would seed an undiscoverable skill.
-        slug = _skill_slug(src)
-        assert slug and slug != src.stem, f"{skill}.md has no frontmatter name:"
+        # command), so a missing/blank name would seed an undiscoverable skill. Assert on
+        # the frontmatter itself, not on `slug != src.stem`: kit filenames now match their
+        # slugs (they are byte-identical copies of `.claude/skills/<name>/SKILL.md`, see
+        # tests/test_kit_skills_in_sync.py), so that inequality no longer distinguishes a
+        # real name from `_skill_slug`'s file-stem fallback.
+        assert src.read_text(encoding="utf-8").lstrip().startswith("---"), (
+            f"{skill}.md does not open with a frontmatter block"
+        )
+        assert _skill_slug(src) == skill, f"{skill}.md frontmatter name: does not match"
 
 
 def test_kit_schemas_match_canonical() -> None:
