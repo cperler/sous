@@ -160,8 +160,7 @@ gate — the engine parks; humans release.
 issues, and the reference implementation of `orchestrator/ports/project.py`. An external
 project's adapter belongs in **its own repo** under `<repo>/.orchestration/`
 (`orchestrator-scaffold --into <repo>`), loaded by path and contract-version-checked — not
-added here. The `heysoo` reference adapter and the `docs/orchestration-spec/` extraction of
-that project's bash system were removed on 2026-08-01; `git log` recovers them.
+added here.
 
 ## Engine language
 Python (uv, pytest, ruff). Reasoning in `docs/orchestration-template-plan.md` §0.
