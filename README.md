@@ -1,6 +1,6 @@
 # sous
 
-**What this is, in one breath:** you point it at a pile of GitHub issues, and it drives
+**What this is:** you point it at a pile of GitHub issues, and it drives
 each one through a staged pipeline — scope → implement → test → deliver → review — in an
 isolated git worktree, with Claude (or Codex) doing the model work and a deterministic
 Python engine doing everything else: sequencing, retries-with-learnings, dependency
