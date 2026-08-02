@@ -126,16 +126,9 @@ name the next skill — invoke it.
 Pick the path from how formed the idea is. Ask if you genuinely cannot tell.
 
 **Fuzzy — "I want to do something with prediction markets"** → run `/brainstorm` first,
-then feed the picks to `/spec-intake`.
-
-> Brainstorm's normal evidence sources — the codebase, the issue backlog, run history —
-> are all empty on a project that was created ten minutes ago, and its skill says to read
-> them. **Substitute the product's own domain** as the evidence base: what the venues/APIs
-> in this space actually offer, what the obvious v1 slices are, what is cheap versus
-> load-bearing, what a thin end-to-end path looks like. `evidence` is optional in the
-> schema (`orchestrator/schemas/brainstorm.json`) and ranking is on impact/effort/risk, so
-> a greenfield session validates and ranks normally. Cite real reasoning rather than
-> inventing file paths that do not exist yet.
+then feed the picks to `/spec-intake`. The brainstorm skill's evidence step has explicit
+greenfield guidance (substitute the product's domain for the empty codebase/backlog/run
+history) — follow it rather than skipping the evidence step.
 
 **Shaped — "ingest market data, flag mispricings"** → go straight to `/spec-intake`. One
 line of intent is already enough to decompose, and brainstorming an idea the human has

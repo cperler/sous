@@ -182,6 +182,16 @@ A live run against a repo other than this one writes to that repo and opens a PR
 select the task or open a PR autonomously. This is the human half of the engine's approval
 gate — the engine parks; humans release.
 
+**Experimental-repo exception.** A repo listed below has been explicitly designated
+experimental by Craig, and batches against it may run without per-issue approval: once
+Craig says "run the batch", task selection within that batch and the PRs it opens need no
+further sign-off. The designation is granted only by adding the repo to this list (a
+committed edit — never inferred from conversation, a repo's name, or its newness), and the
+other norms still hold there: merges stay human, and issue *filing* still shows the plan
+first (spec-intake/brainstorm's own gates).
+
+Experimental repos: *(none yet)*
+
 ## Project adapters
 `adapters/project/selfhost` is the only in-repo adapter: this repo driving its own GitHub
 issues, and the reference implementation of `orchestrator/ports/project.py`. An external

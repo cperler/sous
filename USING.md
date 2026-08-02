@@ -16,8 +16,8 @@ tune), and phases 2–5 as a repeating loop.
 | 4. Run the batch | PRs + a full audit trail | Every cycle |
 | 5. After the batch | Merged trunk, triaged follow-ups | Every cycle |
 
-A running example: a hypothetical `prediction-markets` tool that ingests market data and
-flags mispricings.
+A running example: a hypothetical `sample-project` tool that ingests data from an external
+API and computes signals over it.
 
 ---
 
@@ -38,9 +38,9 @@ This phase is *not* building the product — no business logic. It is a skeleton
 `orchestrator init-project` writes it:
 
 ```bash
-uv run orchestrator init-project prediction-markets \
+uv run orchestrator init-project sample-project \
     --into ~/Development \
-    --description "Ingest prediction-market data and flag mispricings." \
+    --description "Ingest data from an external API and compute signals over it." \
     --create-repo --visibility private
 ```
 
@@ -50,11 +50,11 @@ stack today.
 What lands:
 
 ```
-prediction-markets/
+sample-project/
 ├── .gitignore             includes runs/ — the audit trail is local-only
 ├── README.md              a stub that tells you to replace it with two honest paragraphs
 ├── pyproject.toml         deps + ruff and mypy configured
-├── src/prediction_markets/
+├── src/sample_project/
 │   ├── __init__.py
 │   └── version.py
 └── tests/
@@ -114,7 +114,7 @@ The interview is **detect → confirm → generate → verify**
 ### Detect
 
 ```bash
-uv run orchestrator-scaffold --detect ~/Development/prediction-markets --name prediction-markets
+uv run orchestrator-scaffold --detect ~/Development/sample-project --name sample-project
 ```
 
 Writes nothing. Prints a draft `profile.toml`: languages (from `pyproject.toml` /
@@ -137,9 +137,9 @@ really how this repo installs, tests, and type-checks? GitHub Issues or a local
 ### Generate
 
 ```bash
-uv run orchestrator-scaffold --name prediction-markets \
-    --profile /tmp/prediction-markets-profile.toml \
-    --into ~/Development/prediction-markets
+uv run orchestrator-scaffold --name sample-project \
+    --profile /tmp/sample-project-profile.toml \
+    --into ~/Development/sample-project
 ```
 
 Two things land in your repo:
@@ -171,7 +171,7 @@ project's `.claude/settings.json`.
 ### Verify
 
 ```bash
-uv run orchestrator --project ~/Development/prediction-markets/.orchestration validate
+uv run orchestrator --project ~/Development/sample-project/.orchestration validate
 ```
 
 Duck-checks the entire `ProjectConfig` surface and the contract version without needing a
@@ -183,7 +183,25 @@ run. A half-finished adapter fails here rather than twenty minutes into a batch.
 > scaffold.
 
 **From here on, every `orchestrator` command carries
-`--project ~/Development/prediction-markets/.orchestration`.**
+`--project ~/Development/sample-project/.orchestration`.**
+
+### Where you run all of this from: the cockpit model
+
+**This repo (`orchestration-template`) is the cockpit; project repos are the workpieces.**
+Sessions and commands start *here* and reach outward via `--project`:
+
+- The front-door skills — `/new-project`, `/brainstorm`, `/spec-intake`, `/batch-plan`,
+  the orchestrate-* runners, `/triage-followups` — live in **this repo's** `.claude/skills/`.
+  A session started inside `~/Development/sample-project` does not have them: typing
+  `/spec-intake` there hits nothing. Start the session in `orchestration-template`.
+- The scaffolded project's own `.claude/` gets only the four **run-lane supervisor skills**
+  (plus agents, schemas, hooks) — the pieces a *stage dispatch* needs when the engine runs
+  work inside that repo's worktree. It is deliberately not a second cockpit.
+- Run state follows the cockpit too: `runs/<run>/` lives under whatever `--root` you pass,
+  conventionally this repo's `runs/`, regardless of which project the run drives.
+
+One engine, one place to sit, any number of projects reached by `--project` — that's the
+same engine/adapter split the rest of the system is built on, applied to your terminal.
 
 ---
 
@@ -210,20 +228,20 @@ orders, and files.** Issues are never opened by hand.
 ### What spec-intake does
 
 **Interrogates briefly** — the two or three questions that most change the decomposition,
-not an interview. For the example: which venue first? Batch report or live monitor? CLI or
-UI in v1?
+not an interview. For the example: which data source first? Batch report or live monitor?
+CLI or UI in v1?
 
 **Decomposes** into small, independently-shippable tasks — one PR's worth of work each with
 a clear "done" test. Prefer more, smaller tasks. Dependencies must be *real* (t2 consumes
 t1's output), never incidental ordering.
 
 ```
-t1  Polymarket HTTP client + config, recorded fixtures
-t2  market/outcome model + parsing            (needs t1)
-t3  append-only local snapshot store          (needs t2)
-t4  implied-probability + spread computation  (needs t2)
-t5  CLI: fetch, store, print current markets  (needs t3, t4)
-t6  mispricing flag rule + threshold config   (needs t4)
+t1  HTTP client for the external API + config, recorded fixtures
+t2  domain data model + response parsing       (needs t1)
+t3  append-only local snapshot store           (needs t2)
+t4  the core signal computation over a snapshot (needs t2)
+t5  CLI: fetch, store, print a summary table   (needs t3, t4)
+t6  alert/threshold rule + its config          (needs t4)
 ```
 
 **Writes a spec JSON** (`orchestrator/schemas/spec.json`). Each task body uses `## Scope`,
@@ -367,6 +385,12 @@ manual.
 > **Hard checkpoint.** A live run against a repo other than this one writes to that repo and
 > opens PRs there. **The human picks the specific issues and approves before any write or
 > PR** — never selected autonomously. Mode (b) is the sanctioned shape.
+>
+> The exception: a repo explicitly designated **experimental** in `CLAUDE.md`'s list may
+> batch without per-issue approval once you say go. The designation is a committed edit to
+> that list, never something inferred — see the checkpoint section there for exactly what
+> it relaxes (task selection and PR-opening) and what it doesn't (merges, issue-filing
+> confirmation).
 
 ### Monitoring
 

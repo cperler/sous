@@ -28,6 +28,16 @@ before anything is created.**
    - **The codebase:** read structure, TODOs, rough edges near the area. Cite real paths.
    - **Run history (if present):** retrospectives / learnings under `runs/<run>/` — recurring
      failure patterns and the self-improvement loop's filed ideas are rich seams. Read only.
+
+   **On a brand-new project all three are empty — substitute the product's own domain.**
+   A repo created an hour ago has no backlog to cluster, no rough edges to read, and no run
+   history; going through the motions on empty sources produces generic ideas dressed as
+   grounded ones. The evidence base is the domain instead: what the external APIs/venues in
+   this space actually offer, what the obvious v1 slices are, what is cheap versus
+   load-bearing, what the thinnest end-to-end path looks like. That satisfies the schema —
+   `evidence` is optional and ranking is on impact/effort/risk — but cite real reasoning
+   ("Polymarket's public API paginates markets, so a client + fixtures is a small first
+   slice"), never file paths or issue refs that do not exist yet.
 3. **Diverge — the model work.** Generate **N candidate ideas** (aim wide, ~5–10; quantity
    before judgment). Each idea needs: a concrete **problem** (the gap/pain), a **proposal**
    sketch (how you'd address it), and honest **impact** (high/medium/low), **effort**
