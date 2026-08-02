@@ -89,7 +89,7 @@ with `orchestrator supervisor-context` (unavailable/stale fails closed).
 When the task completes, the engine publishes the run's evidence through the project
 adapter — no supervisor action needed:
 - files each **non-blocking** review finding (`review.non_blocking[*]`) as a
-  `review-followup` issue (a reviewer's nits are never dropped);
+  follow-up issue, unlabeled for triage (a reviewer's nits are never dropped);
 - **self-improvement loop:** files the review's `improvement` idea as an `enhancement`
   issue and renders both it and the `retrospective` (process lesson) into the note — so a
   completed run also grows the roadmap, not just ships a fix;

@@ -21,13 +21,18 @@ tracker or fix-forward.
 - **Nothing is silently dropped** (`gh issue list -R cperler/orchestration-template`).
   Anything cut, thinned, or found-missing while building gets an ordinary issue with a
   `**Source:** #N` line naming the task that cut it — that line, not a label, is what
-  `triage-followups` matches on. Use whatever label fits the work (`enhancement`, `bug`,
-  `dx`, `friction` for harness pain hit during real use, `roadmap` for a candidate idea,
-  `meta-authoring` for harness self-improvement, which is held before DELIVER). The engine
-  files two kinds itself: `review-followup` (`_file_review_followups`, a review's
-  non-blocking findings) and `trunk-gate` (`_file_trunk_gate_fix`, a red post-merge gate —
-  an incident, not a backlog item). Build narrative lives in commits, PRs, and issue
-  comments, never in a ledger file. There is deliberately no `deferred-scope` label and no
+  `triage-followups` matches on. **The label set is deliberately small and standard** —
+  `bug`, `enhancement`, `docs`, `ux`, `chore`, `duplicate` — and every one of them means
+  what it means anywhere else on GitHub. Do not invent a label for a workflow state; a
+  label nobody can read without a glossary is the failure mode that retired
+  `deferred-scope`. The single exception is FUNCTIONAL, not descriptive:
+  **`meta-authoring`** is read by `Engine` (a task sourced from an issue carrying it
+  persists `hold_before=deliver`), so it changes behavior rather than describing work.
+  The engine itself labels sparingly: an `improvement` files as `enhancement`, a red
+  post-merge trunk gate files as `bug`, and a review's non-blocking findings file
+  **unlabeled** — the engine cannot tell whether a nit is a bug, a docs gap, or an
+  enhancement, so it declines to guess and triage assigns one. Build narrative lives in
+  commits, PRs, and issue comments, never in a ledger file. There is no `deferred-scope` and no
   gate-review ritual: both were rebuild-phase machinery for proving nothing was lost against
   a reference system that no longer exists, and half the label's population were review
   findings that never carried a deferral rationale at all. The frozen pre-2026-07-01 ledger
@@ -106,7 +111,7 @@ tracker or fix-forward.
   Option 2 half (b)). `Engine.trunk_gate(run_id, *, cwd, file_fix=True)` shells the project
   adapter's declared verification commands over an already-merged trunk checkout (only
   adapter argv — never a hardcoded pytest/ruff/mypy — so the engine stays project-agnostic
-  and model-free) and, on red, best-effort files ONE `trunk-gate` remediation task,
+  and model-free) and, on red, best-effort files ONE `bug`-labeled remediation task,
   deduped on a prior `trunk_gate_fix_filed` event. The `trunk-gate` CLI subcommand exits
   non-zero on red for a CI/human wrapper. **Caller contract:** the invoker (human or CI
   wrapper) must ensure the merged-trunk checkout at `cwd` exists — the gate reports a

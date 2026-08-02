@@ -93,9 +93,11 @@ commands are green and the repo has a remote. The command exists because the fai
 is quiet: an unconfigured type-checker or a missing `[tool.mypy] files` entry produces a
 gate that passes forever without checking anything.
 
-> **The `/new-project` skill** runs this phase and phase 1 together as a guided interview,
-> then hands off to `/spec-intake`. Use it when you want the conversation; use the CLI
-> directly when you don't.
+> **The `/new-project` skill** runs phases 0, 1, and 2 as one guided session — skeleton,
+> adapter, then the idea carried through `/brainstorm` (if it's still fuzzy) and
+> `/spec-intake` into filed, dependency-ordered issues. It leaves you at the start of
+> phase 3 with work queued. Use it when you want the conversation; use the CLI directly
+> when you don't.
 
 ---
 
@@ -196,9 +198,12 @@ orders, and files.** Issues are never opened by hand.
 - **`/spec-intake`** — a known idea → a validated spec → one filed issue per task. The right
   door for a new project.
 - **`/brainstorm`** — a fuzzy area → scored, ranked candidate ideas → your picks (small ones
-  filed directly, large ones fed to spec-intake). It reasons over the codebase, backlog, and
-  run history, so it's thin on day one and becomes the natural door once the question shifts
-  from "build the thing" to "what next."
+  filed directly, large ones fed to spec-intake). Its usual evidence base is the codebase,
+  the backlog, and run history, so on an established project it's the natural door for
+  "what next." On a brand-new one those are empty and the product's own domain is the
+  evidence base instead — that works (`evidence` is optional and ranking is on
+  impact/effort/risk), it's just a different kind of input. Skip it whenever the idea is
+  already shaped enough to decompose.
 - **`/batch-plan`** — for issues that *already exist*, filed independently with no encoded
   edges. See phase 3.
 
@@ -437,7 +442,7 @@ changes can still produce a red trunk once merged together.
 
 The gate shells out to your adapter's declared verification commands — only adapter argv,
 never a hardcoded pytest/ruff/mypy, so the engine stays project-agnostic — over an
-**already-merged trunk checkout**. On red it best-effort files one `trunk-gate`
+**already-merged trunk checkout**. On red it best-effort files one `bug`-labeled
 remediation task, deduped against a prior filing, and exits non-zero so it wraps cleanly into
 CI.
 

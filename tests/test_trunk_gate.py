@@ -72,11 +72,11 @@ def test_red_trunk_files_exactly_one_fix(tmp_path):
     assert result["green"] is False
     assert "test_unit" in result["failing"]
     assert result["filed"] is not None
-    # Exactly one remediation issue, labeled trunk-gate, carrying the failing command
+    # Exactly one remediation issue, labeled bug, carrying the failing command
     # name and its output tail + the run id.
     assert len(project.task_source.followups) == 1
     filed = project.task_source.followups[0]
-    assert filed["labels"] == ["trunk-gate"]
+    assert filed["labels"] == ["bug"]
     assert "r1" in filed["title"]
     assert "test_unit" in filed["body"]
     assert "boom-detail" in filed["body"]
