@@ -11,12 +11,13 @@ headless via `claude -p` from cron.
 
 **How it came to be** is a story worth reading before you adopt any of it:
 ["1,247 Recipes and Nothing to Eat"](https://craigperler.com/2026/07/26/1247-recipes-and-nothing-to-eat/)
-is the postmortem of the project this harness grew out of — a dinner-planning app that
-quietly became a machine for building a dinner-planning app. The harness is real, tested,
-and live-proven (real issues driven to merged PRs, including on its own tracker), and it
-is published here both as working infrastructure and as the artifact from that essay.
-The essay's warning stands: tools like this make it very cheap to generate more work,
-and very easy to stop noticing that the work is about the tool. Use accordingly.
+is the postmortem of a dinner-planning app that quietly became a machine for building a
+dinner-planning app. This repo is a translated export of that machine: the bash
+orchestration harness built alongside the recipe site, extracted to a spec and rebuilt
+in Python as a standalone, project-agnostic system. The harness is real, tested, and
+live-proven (real issues driven to merged PRs, including on its own tracker). The
+essay's warning stands: tools like this make it very cheap to generate more work, and
+very easy to stop noticing that the work is about the tool. Use accordingly.
 
 ---
 
