@@ -105,6 +105,18 @@ def test_generated_adapter_self_locates_repo_root(tmp_path) -> None:
     assert cfg.repo_root == str((tmp_path / "rr_svc").resolve().parent)
 
 
+def test_generated_adapter_has_env_gated_notify(tmp_path, capsys) -> None:
+    """Generated adapters carry the alerting seam by default: a stderr line always, email
+    only when the environment configures SMTP. With no SMTP env (the suite scrubs it —
+    tests must never mail the operator), notify must be a safe no-op that never raises."""
+    prof = profile_from_languages("nt-svc", ["python"], MANIFEST)
+    scaffold_adapter("nt-svc", tmp_path, profile=prof)
+    mod = _import_adapter(tmp_path, "nt-svc")
+    cfg = mod.get_config()
+    cfg.notify("task_completed", {"summary": "done", "task_id": "#1"})
+    assert "[orchestrator:task_completed] done" in capsys.readouterr().err
+
+
 # --- kit seeding into a project root -----------------------------------------
 
 def test_seeds_kit_into_project_root(tmp_path) -> None:

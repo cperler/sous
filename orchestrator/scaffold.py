@@ -438,8 +438,10 @@ written once and are yours to tune.
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
+from adapters.project.email_sink import email_sink_from_env
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
@@ -485,6 +487,21 @@ class {cls}:
     def schema_for(self, ref: str) -> dict | None:
         return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
+    def notify(self, kind: str, payload: dict) -> None:
+        """Alerting sink: always a stderr line; additionally mails the payload when the
+        environment configures SMTP (see ``adapters.project.email_sink`` for the
+        ``ORCHESTRATOR_SMTP_*`` / ``ORCHESTRATOR_NOTIFY_EMAIL_TO`` vars). Unconfigured,
+        the email half is a silent no-op — so this is safe to ship on by default, and a
+        batch is never silently silent: without it, a detached driver's completion is
+        undiscoverable except by polling ``status``. Swallows all errors; an alert sink
+        must never break a run."""
+        print(f"[orchestrator:{{kind}}] {{payload.get('summary') or kind}}", file=sys.stderr)
+        try:
+            if sink := email_sink_from_env():
+                sink(kind, payload)  # swallows its own errors; short socket timeout
+        except Exception:  # noqa: BLE001 - an alert sink must never break the run
+            pass
+
     # --- optional seams the engine duck-types (add methods here to opt in) -----------
     #
     # def review_findings(self, *, worktree: str | None = None) -> list[dict]:
@@ -499,10 +516,6 @@ class {cls}:
     #     compile. SelfHostConfig.review_findings in the engine repo is a worked example
     #     (green -> [], red -> blocking finding carrying the tool output, tool that
     #     cannot RUN -> advisory so an unverified gate never reads as green).
-    #
-    # def notify(self, kind: str, payload: dict) -> None:
-    #     Alert sink for task_completed / task_failed / task_stale / run_* events.
-    #     adapters.project.email_sink (env-configured SMTP) is a ready-made one.
     #
     # def publish_progress(self, ...) / publish_note(self, ...) / file_followup(self, ...):
     #     Task-source write-backs: living progress comment, completion note, follow-up

@@ -107,6 +107,18 @@ the parts a generated default gets wrong silently.
 Seeded `$REPO/.claude/hooks/*.json` are examples — merge them into the project's
 `.claude/settings.json`.
 
+**Notifications are a decision point, not a default-on surprise.** The generated
+`config.py` already carries a `notify` seam: a stderr line always, plus email that
+activates ONLY when the driver's environment configures SMTP
+(`adapters/project/email_sink.py` documents the `ORCHESTRATOR_SMTP_*` /
+`ORCHESTRATOR_NOTIFY_EMAIL_TO` vars). Ask the human whether they want run/task emails —
+without them, a detached driver's completion is discoverable only by polling `status`.
+If yes, the ACTION is theirs to finish: hand them the export lines for their provider
+(e.g. Gmail: `smtp.gmail.com`, `ORCHESTRATOR_SMTP_SSL=1`, an app password — never the
+account password) to put in the shell that runs drivers. Secrets stay out of the repo;
+suggest `ORCHESTRATOR_NOTIFY_EMAIL_KINDS` if they only want completions/failures rather
+than every event. If no, say the default is silent and move on.
+
 ## 5. Verify the adapter
 
 ```
