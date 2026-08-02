@@ -75,6 +75,7 @@ orchestrator/            the deterministic engine (never calls a model) + CLI
   failure_classifier.py  pluggable failure taxonomy (regressions vs baseline)
   retrospective.py       failure retrospective (patterns + what retries learned)
   render.py              cost-summary / cost-report / retrospective / per-stage markdown
+  project_init.py        `init-project` — phase 0: write + verify a NEW repo's skeleton
   scaffold.py            `orchestrator-scaffold` — generate a new project adapter
   stages.py / cli.py     stage prompts + the supervisor's CLI surface
   schemas/               versioned status + work-item/result schemas

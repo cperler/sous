@@ -5,6 +5,12 @@ description: Stand up (or re-tune) the orchestration template for a project. Det
 
 # Bootstrap a project for orchestration (the §5 interview)
 
+> **Does the repo exist yet?** This skill assumes it does — it detects a stack, which means
+> reading files that are already there. For a project that does not exist at all, use the
+> **`new-project`** skill instead: it runs `orchestrator init-project` to write and verify a
+> phase-0 skeleton (and create the GitHub repo, which the `task_source` guess below depends
+> on), then walks this same detect → confirm → generate → verify flow.
+
 You are the **bootstrap supervisor**. Standing up a project means composing a *profile*
 (stack + commands + roster + task source) and letting the deterministic scaffold turn it
 into a project-config adapter + a seeded `.claude/` starter kit. You detect and interview;

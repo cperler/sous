@@ -1,5 +1,10 @@
 # Project starter kit (the default orchestration template)
 
+> Not to be confused with its sibling **`templates/project-skeleton/`**, which is the
+> *repo* a new project starts as (src layout, one passing test, lint/type config) written by
+> `orchestrator init-project` before any adapter exists. This kit is what gets seeded into a
+> project's `.claude/` once it has one. Skeleton first, kit second.
+
 The customizable source of "stuff" a new project starts from when you bootstrap it for
 orchestration. The bootstrap skill (`run_targets/adapter_bootstrap_skill.md`) and the
 profile-driven scaffold (`orchestrator-scaffold`) read `manifest.toml` to roll a

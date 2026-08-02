@@ -54,7 +54,10 @@ written.
               Workflow shim JS + the adapter-bootstrap skill;
               templates/project-default/ is the scaffold kit seeded into a
               new project's .claude/ — its skill copies are byte-identical
-              to .claude/skills/, pinned by a test)
+              to .claude/skills/, pinned by a test;
+              templates/project-skeleton/ is a DIFFERENT thing — the phase-0
+              repo skeleton init-project writes for a project that does not
+              exist yet, before any adapter exists to seed a kit into)
 ```
 
 - **Two orthogonal axes:** `execution_mode × provider`. `ExecutionMode ∈ {interactive,
@@ -205,6 +208,15 @@ conversation:
 - **batch-plan** (`orchestrator/batch_plan.py`, `schemas/batch_plan.json`) — a pile of
   *already-filed*, independently-authored issues → a validated dependency-ordered plan
   applied to a run via `Engine.add_task`. Reuses spec-intake's DAG validation.
+
+Upstream of all three, but deliberately **not** a fourth front door — it produces a repo,
+not tasks — is **project_init** (`orchestrator/project_init.py`, `init-project`,
+`templates/project-skeleton/`): the phase-0 skeleton for a project that does not exist yet,
+paired with the `new-project` skill on the same deterministic-module + skill split. It
+writes, commits, and then runs the skeleton's own verification commands, creating the
+GitHub repo only on green — those commands become the adapter's declared contract in the
+bootstrap step, so a skeleton that cannot pass them would hand the engine gates it can
+never satisfy.
 
 ## Control loops (all in the engine; adapters supply no logic)
 
