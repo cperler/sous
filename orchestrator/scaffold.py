@@ -460,6 +460,11 @@ _ROSTER: dict[str, str] = {{
 class {cls}:
     name = "{name}"
 
+    # The deterministic INTAKE runner creates task worktrees from this path; without it,
+    # intake falls back to the DRIVER's process CWD — the engine checkout, i.e. the wrong
+    # repo (#368). The adapter always lives at <repo>/.orchestration, so self-locate.
+    repo_root = str(Path(__file__).resolve().parent.parent)
+
     def __init__(self, tasks_path: str = "tasks.json") -> None:
         self._classifier = {cls}Classifier()
         self._task_source = LocalTaskSource(tasks_path)

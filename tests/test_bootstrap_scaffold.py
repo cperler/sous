@@ -92,6 +92,19 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     assert rp.languages == ["python"] and rp.roster["implement"] == "python-backend-developer"
 
 
+def test_generated_adapter_self_locates_repo_root(tmp_path) -> None:
+    """#368: intake worktrees must come from the product repo, not driver CWD.
+
+    The generated config exposes ``repo_root`` pointing at the adapter dir's parent —
+    for the real ``<repo>/.orchestration`` layout, the product repo itself — so the
+    deterministic INTAKE runner never falls back to the engine checkout it runs from."""
+    prof = profile_from_languages("rr-svc", ["python"], MANIFEST)
+    scaffold_adapter("rr-svc", tmp_path, profile=prof)
+    mod = _import_adapter(tmp_path, "rr-svc")
+    cfg = mod.get_config()
+    assert cfg.repo_root == str((tmp_path / "rr_svc").resolve().parent)
+
+
 # --- kit seeding into a project root -----------------------------------------
 
 def test_seeds_kit_into_project_root(tmp_path) -> None:
