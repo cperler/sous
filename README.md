@@ -1,5 +1,25 @@
 # orchestration-template
 
+**What this is, in one breath:** you point it at a pile of GitHub issues, and it drives
+each one through a staged pipeline — scope → implement → test → deliver → review — in an
+isolated git worktree, with Claude (or Codex) doing the model work and a deterministic
+Python engine doing everything else: sequencing, retries-with-learnings, dependency
+ordering, cost attribution, and resume-after-crash. Out the other end come pull requests.
+The engine itself never calls a model; every model interaction goes through a pluggable
+adapter, so the same harness can run in-session on a Claude subscription or fully
+headless via `claude -p` from cron.
+
+**How it came to be** is a story worth reading before you adopt any of it:
+["1,247 Recipes and Nothing to Eat"](https://craigperler.com/2026/07/26/1247-recipes-and-nothing-to-eat/)
+is the postmortem of the project this harness grew out of — a dinner-planning app that
+quietly became a machine for building a dinner-planning app. The harness is real, tested,
+and live-proven (real issues driven to merged PRs, including on its own tracker), and it
+is published here both as working infrastructure and as the artifact from that essay.
+The essay's warning stands: tools like this make it very cheap to generate more work,
+and very easy to stop noticing that the work is about the tool. Use accordingly.
+
+---
+
 A reusable, project-agnostic orchestration harness for driving multi-stage,
 dependency-aware coding tasks through Claude (and Codex) — runnable as an in-session
 Workflow on the subscription, and headless by shelling out to `claude -p` / `codex exec`
