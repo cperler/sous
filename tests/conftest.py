@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import UTC, datetime
 
 import pytest
@@ -10,6 +11,24 @@ from adapters.project.base import TaskSpec
 from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LaneUsed, StageResult, TokenUsage, WorkItem
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _no_email_env():
+    """Strip real SMTP/alerting config from the test process's environment.
+
+    `email_sink_from_env()` reads live `os.environ` at notify time, so on a machine where
+    the operator has configured email alerting, any test that drives the selfhost adapter
+    through a terminal transition would deliver REAL mail built from fixture data. The
+    sink's "unconfigured ⇒ no sink" default only protects unconfigured machines; this
+    makes the suite one of them. Tests that exercise the sink pass an env mapping
+    explicitly (or monkeypatch.setenv), which is unaffected.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        for key in list(os.environ):
+            if key.startswith(("ORCHESTRATOR_SMTP_", "ORCHESTRATOR_NOTIFY_EMAIL_")):
+                mp.delenv(key)
+        yield
 
 
 class FakeClassifier:

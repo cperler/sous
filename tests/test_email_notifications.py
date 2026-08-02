@@ -218,6 +218,19 @@ def test_sink_absent_unless_configured(env) -> None:
     assert email_sink_from_env(env) is None
 
 
+def test_suite_runs_with_no_smtp_config_in_environ() -> None:
+    """Regression: the suite must never see the operator's REAL alerting config.
+
+    The selfhost adapter's notify hook resolves `email_sink_from_env()` against live
+    `os.environ`, so without the session-scoped scrub in conftest a full-suite run on a
+    machine with SMTP configured mails the operator fixture events ("T1 — Tidy a module,
+    PR #1234"). Asserting the no-arg (os.environ) resolution yields no sink pins the
+    scrub in place; on an unconfigured machine this is vacuously green.
+    """
+    assert config_from_env() is None
+    assert email_sink_from_env() is None
+
+
 def test_config_defaults_and_overrides() -> None:
     cfg = config_from_env(_ENV)
     assert cfg is not None
