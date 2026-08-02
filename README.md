@@ -354,8 +354,9 @@ A project that **doesn't exist yet** starts one step earlier: `orchestrator init
 <name> --into <parent> --create-repo` writes the phase-0 skeleton (src layout, one passing
 test, ruff + mypy configured), commits it, runs the skeleton's own verification commands,
 and creates the GitHub repo only once they pass — because those exact commands become the
-adapter's contract below. The `/new-project` skill runs it and the adapter bootstrap as one
-guided interview.
+adapter's contract below. The `/new-project` skill runs that, the adapter bootstrap, and the
+front door as one guided session — ending not at a bare repo but at filed, dependency-ordered
+issues ready for a run.
 
 Standing up a **new project** is an interview, not boilerplate: `orchestrator-scaffold
 --detect <repo>` reads the repo's stack and prints a draft `profile.toml`;

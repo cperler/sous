@@ -1,19 +1,25 @@
 ---
 name: new-project
-description: Stand up a brand-new project for the harness end to end — interview, create the repo skeleton, create the GitHub repo, generate the project adapter, finish what the profile can't infer, verify, and hand off to spec-intake. The phase 0 + phase 1 front door for a project that does not exist yet; use adapter_bootstrap_skill.md instead when the repo already exists.
+description: Stand up a brand-new project for the harness end to end and leave it with work queued — interview, create the repo skeleton, create the GitHub repo, generate and verify the project adapter, then carry the idea through brainstorm (if fuzzy) and spec-intake into a filed, dependency-ordered set of issues. Phases 0-2 in one session, for a project that does not exist yet; use adapter_bootstrap_skill.md instead when the repo already exists.
 ---
 
-# New project — idea → a repo the harness can drive
+# New project — idea → a repo the harness can drive, with work queued
 
-You are the **phase 0 + phase 1 supervisor**. Nothing upstream of this turns *no repo at
-all* into a project the harness can be pointed at. You own the conversation and the
-oversight; the deterministic `orchestrator init-project` and `orchestrator-scaffold`
-commands own the file generation. **Never edit `orchestrator/`** — a project concern
-belongs in the project's adapter.
+You are the **phases 0–2 supervisor**. Nothing upstream of this turns *no repo at all* into
+a project the harness can be pointed at, with issues waiting for it. You own the
+conversation and the oversight; the deterministic `orchestrator init-project`,
+`orchestrator-scaffold`, `brainstorm`, and `spec` commands own the generation, ranking,
+validation, and filing. **Never edit `orchestrator/`** — a project concern belongs in the
+project's adapter.
+
+**Done means: a repo, a validated adapter, and filed dependency-ordered issues.** Stopping
+at a bare repo is an incomplete run of this skill — the human arrived with an idea, and
+steps 6–7 carry it to issues in the same session rather than naming the next skill and
+handing back.
 
 Use `run_targets/adapter_bootstrap_skill.md` instead when the repo already exists and only
-needs an adapter. This skill is for the greenfield case, and it ends by handing off to
-`/spec-intake` — it does **not** build the product.
+needs an adapter. This skill does **not** build the product — the harness does that, task
+by task, once the issues exist.
 
 ## Constants
 - `NAME` = kebab-case project name. `PARENT` = the dir the project is created inside
@@ -110,18 +116,41 @@ uv run orchestrator --project "$ADAPTER" validate
 Duck-checks the full `ProjectConfig` surface and the contract version with no run needed.
 Do not proceed past a failure here.
 
-## 6. Hand off — do NOT start building
+## 6. Shape the work — continue, don't stop here
 
-Phase 0 and 1 are done; the product gets built through the harness, task by task.
+**Keep going into this in the same session.** A repo with no issues is not a finished
+bootstrap: the human came here with an idea, and this skill's job ends when that idea is a
+filed, dependency-ordered set of issues ready for a run. Do not hand back a bare repo and
+name the next skill — invoke it.
 
-- **The human has a shape in mind** → `/spec-intake`. This is the normal path, and a
-  one-line idea ("ingest market data, flag mispricings") is already enough to decompose.
-- **The human genuinely has no shape yet** → `/brainstorm`, with a caveat you must state:
-  its evidence sources are the codebase, the backlog, and run history, and on a brand-new
-  project all three are empty. It will diverge on the idea space alone and its output is
-  correspondingly weaker. Prefer spec-intake whenever there is any shape at all.
+Pick the path from how formed the idea is. Ask if you genuinely cannot tell.
 
-Then point at `USING.md` phases 3–5 for the run and post-run loop.
+**Fuzzy — "I want to do something with prediction markets"** → run `/brainstorm` first,
+then feed the picks to `/spec-intake`.
+
+> Brainstorm's normal evidence sources — the codebase, the issue backlog, run history —
+> are all empty on a project that was created ten minutes ago, and its skill says to read
+> them. **Substitute the product's own domain** as the evidence base: what the venues/APIs
+> in this space actually offer, what the obvious v1 slices are, what is cheap versus
+> load-bearing, what a thin end-to-end path looks like. `evidence` is optional in the
+> schema (`orchestrator/schemas/brainstorm.json`) and ranking is on impact/effort/risk, so
+> a greenfield session validates and ranks normally. Cite real reasoning rather than
+> inventing file paths that do not exist yet.
+
+**Shaped — "ingest market data, flag mispricings"** → go straight to `/spec-intake`. One
+line of intent is already enough to decompose, and brainstorming an idea the human has
+already settled wastes a step.
+
+Either way the outward-facing gates still apply: the human picks from the brainstorm
+shortlist, and confirms the spec plan, before anything is filed.
+
+## 7. Close the loop
+
+Report what exists now — repo, adapter, and the filed issues with their dependency edges —
+and point at `USING.md` phases 3–5 for the run and post-run loop. Offer to continue into
+phase 3 (create a run, `add-task` per issue); the human decides whether to run a batch now
+or later. Do not start a run unasked: a live run writes to a real repo and opens PRs, which
+is the human's call.
 
 ## Notes
 - **Everything outward-facing is confirmed first**: creating the GitHub repo (step 2) and

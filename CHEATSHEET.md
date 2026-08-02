@@ -18,7 +18,7 @@ omitting it on a fresh `runs/` is a real footgun. Include it always.
 
 | Skill | Use it for | Produces |
 |---|---|---|
-| `/new-project` | A project that doesn't exist yet | Repo + adapter, handed off to spec-intake |
+| `/new-project` | A project that doesn't exist yet | Repo + adapter + filed issues (phases 0–2) |
 | `/brainstorm` | A fuzzy area, no specific idea yet | Ranked scored ideas → issues or a spec |
 | `/spec-intake` | A known idea → decompose and file | Dependency-linked issues + a spec archive |
 | `/batch-plan` | Issues that already exist, edges unknown | A validated plan applied to a run |
