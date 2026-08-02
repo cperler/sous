@@ -48,7 +48,7 @@ def test_reference_adapter_resolves_by_entry_point_name() -> None:
     # A short name isn't an importable module or a dir, so this exercises the real
     # `orchestrator.project_adapters` entry point registered by this package itself.
     # selfhost's config intentionally names itself after the repo it self-hosts.
-    assert load_project("selfhost").name == "orchestration-template"
+    assert load_project("selfhost").name == "sous"
 
 
 def test_entry_point_configclass_form(monkeypatch) -> None:
@@ -84,7 +84,7 @@ def test_unknown_project_adapter_is_a_clear_error(monkeypatch) -> None:
 def test_path_based_loading_unchanged(monkeypatch) -> None:
     # No entry points at all: the dotted-module lane must still resolve in-repo adapters.
     monkeypatch.setattr(project_loader, "_project_adapter_entry_points", lambda: [])
-    assert load_project("adapters.project.selfhost").name == "orchestration-template"
+    assert load_project("adapters.project.selfhost").name == "sous"
 
 
 # ---------------------------------------------------------------------------------------

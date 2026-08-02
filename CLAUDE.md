@@ -24,7 +24,7 @@ tracker or fix-forward.
   BLOCKING finding on red, which overrides an approving reviewer and re-opens the fix
   cycle with the tool output as learnings. A leg that cannot run at all degrades to
   advisory, so unverified never reads as green.
-- **Nothing is silently dropped** (`gh issue list -R cperler/orchestration-template`).
+- **Nothing is silently dropped** (`gh issue list -R cperler/sous`).
   Anything cut, thinned, or found-missing while building gets an ordinary issue with a
   `**Source:** #N` line naming the task that cut it — that line, not a label, is what
   `triage-followups` matches on. **The label set is deliberately small and standard** —
@@ -107,7 +107,7 @@ tracker or fix-forward.
   `commit_attribution_scanned` receipt (clean and never-looked must not read alike).
   Report-only — it NEVER amends, because DELIVER pushes before its checkpoint lands and an
   engine-side amend would rewrite already-remote history. Work on `main`. Remote:
-  `github.com/cperler/orchestration-template` (private; push `main` after committing).
+  `github.com/cperler/sous` (private; push `main` after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the
   worktree, the task branch, and checkpoint tags — but NEVER the run's log dir under
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).

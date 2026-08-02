@@ -1,4 +1,4 @@
-"""Self-host project-config adapter — the orchestration-template repo itself.
+"""Self-host project-config adapter — the sous repo itself.
 
 A pure Python/uv/pytest/ruff library: no frontend build, no lambda, no E2E/bats.
 Demonstrates Phase 5 generality — the engine drives this with ZERO changes; only
@@ -23,7 +23,7 @@ from orchestrator.schemas.stage_schemas import resolve_stage_schema
 from .classifier import SelfHostClassifier
 from .task_source import LocalFileTaskSource
 
-_SELF_REPO = "cperler/orchestration-template"
+_SELF_REPO = "cperler/sous"
 
 _NOOP = ["true"]  # this project has no e2e / shell / infra layer
 
@@ -47,7 +47,7 @@ _ROSTER: dict[str, str] = {
 
 
 class SelfHostConfig:
-    name = "orchestration-template"
+    name = "sous"
 
     def __init__(self, tasks_path: str | None = None, repo: str = _SELF_REPO) -> None:
         self._classifier = SelfHostClassifier()

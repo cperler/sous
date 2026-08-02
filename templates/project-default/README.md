@@ -24,7 +24,7 @@ project-config adapter.
 
 ## Customizing it
 
-This kit is **version-controlled in the orchestration-template repo**, so editing it
+This kit is **version-controlled in the sous repo**, so editing it
 changes what every future scaffolded project starts from. To tailor a single project,
 the bootstrap is **Keep / Modify / Replace / Delete**:
 

@@ -1,4 +1,4 @@
-# orchestration-template
+# sous
 
 **What this is, in one breath:** you point it at a pile of GitHub issues, and it drives
 each one through a staged pipeline — scope → implement → test → deliver → review — in an
@@ -160,9 +160,9 @@ path), or install it as a library so any repo can drive its own project:
 
 ```bash
 # console scripts: `orchestrator` + `orchestrator-scaffold`
-uv tool install "git+https://github.com/cperler/orchestration-template"
+uv tool install "git+https://github.com/cperler/sous"
 # or into a project's own venv
-uv pip install "git+https://github.com/cperler/orchestration-template"
+uv pip install "git+https://github.com/cperler/sous"
 ```
 
 (PyPI publication isn't in scope — install from git.) The starter kit, stage schemas,
@@ -426,7 +426,7 @@ the task that cut it — nothing is silently dropped.
   changing the engine.
 - **`CLAUDE.md`** — the working norms any change to this repo must respect.
 - **Scope ledger** — the live ledger is
-  [GitHub issues](https://github.com/cperler/orchestration-template/issues); the discipline
+  [GitHub issues](https://github.com/cperler/sous/issues); the discipline
   and the label taxonomy live in `CLAUDE.md`, and the pre-migration ledger is frozen at
   `docs/deferred-history.md`.
 - **`docs/`** — the frozen build record (original design notes, the phased plan, and the

@@ -1,4 +1,4 @@
-# AGENTS.md — orchestration-template
+# AGENTS.md — sous
 
 Codex reads this file from the working directory; Claude Code reads `CLAUDE.md`. **`CLAUDE.md`
 is the source of truth for how to work in this repo** — read it. This file carries only the
@@ -12,7 +12,7 @@ git worktree of this repo carries it, so it rides into every codex stage dispatc
   in any commit, hand-authored or run-produced. Your CLI has a standing instruction to sign
   commits; this repo overrides it. Per-stage provenance already lives in
   `runs/<run>/events.jsonl` and `stage-costs.jsonl`, and a post-hoc audit flags violations.
-- **Work on `main`.** Remote: `github.com/cperler/orchestration-template` (private).
+- **Work on `main`.** Remote: `github.com/cperler/sous` (private).
 - **The engine never calls a model.** Nothing under `orchestrator/` may import `adapters`, and
   no project-specific logic belongs in the engine. Both rules are enforced by tests and lint,
   not convention.

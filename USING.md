@@ -187,13 +187,13 @@ run. A half-finished adapter fails here rather than twenty minutes into a batch.
 
 ### Where you run all of this from: the cockpit model
 
-**This repo (`orchestration-template`) is the cockpit; project repos are the workpieces.**
+**This repo (`sous`) is the cockpit; project repos are the workpieces.**
 Sessions and commands start *here* and reach outward via `--project`:
 
 - The front-door skills — `/new-project`, `/brainstorm`, `/spec-intake`, `/batch-plan`,
   the orchestrate-* runners, `/triage-followups` — live in **this repo's** `.claude/skills/`.
   A session started inside `~/Development/sample-project` does not have them: typing
-  `/spec-intake` there hits nothing. Start the session in `orchestration-template`.
+  `/spec-intake` there hits nothing. Start the session in `sous`.
 - The scaffolded project's own `.claude/` gets only the four **run-lane supervisor skills**
   (plus agents, schemas, hooks) — the pieces a *stage dispatch* needs when the engine runs
   work inside that repo's worktree. It is deliberately not a second cockpit.

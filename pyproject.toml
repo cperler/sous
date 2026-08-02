@@ -1,5 +1,5 @@
 [project]
-name = "orchestration-template"
+name = "sous"
 version = "0.1.0"
 description = "Installable, project-agnostic orchestration engine + interactive/headless execution lanes and project-config adapters"
 license = "MIT"

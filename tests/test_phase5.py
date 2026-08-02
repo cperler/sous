@@ -44,7 +44,7 @@ def test_selfhost_defaults_to_own_github_issue_log(monkeypatch) -> None:
     monkeypatch.delenv("SELFHOST_TASKS", raising=False)
     cfg = selfhost_config()
     assert isinstance(cfg.task_source, GitHubIssuesSource)
-    assert cfg.task_source.repo == "cperler/orchestration-template"
+    assert cfg.task_source.repo == "cperler/sous"
 
 
 def test_selfhost_env_selects_local_file_mode(tmp_path, monkeypatch) -> None:

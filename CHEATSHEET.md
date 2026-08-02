@@ -12,7 +12,7 @@ O="uv run orchestrator --root runs --shared-root --run $RUN --project $PROJECT"
 `--shared-root` is a no-op once run-nesting exists, so it is safe on every call — and
 omitting it on a fresh `runs/` is a real footgun. Include it always.
 
-**Sit in this repo.** The skills below live in `orchestration-template/.claude/skills/`, so
+**Sit in this repo.** The skills below live in `sous/.claude/skills/`, so
 sessions start here and reach a project via `--project` — a session started inside the
 project repo has no front doors. (Cockpit model — `USING.md` phase 1.)
 

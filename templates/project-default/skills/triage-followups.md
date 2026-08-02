@@ -24,7 +24,7 @@ second pass skips everything already triaged.
 
 ## Constants
 - `ROOT` = the shared runs-root (top-level `runs/`). `RUN` = the run id to triage.
-- `REPO` = the GitHub repo (`cperler/orchestration-template` for self-host; the project
+- `REPO` = the GitHub repo (`cperler/sous` for self-host; the project
   adapter's repo otherwise). `PROJECT` = the project adapter module.
 - Read-only engine call shape (for the task list): `uv run orchestrator --root "$ROOT"
   --shared-root --run "$RUN" --project "$PROJECT" status`.
