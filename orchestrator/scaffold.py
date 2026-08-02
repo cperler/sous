@@ -480,6 +480,29 @@ class {cls}:
     def schema_for(self, ref: str) -> dict | None:
         return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
+    # --- optional seams the engine duck-types (add methods here to opt in) -----------
+    #
+    # def review_findings(self, *, worktree: str | None = None) -> list[dict]:
+    #     A DETERMINISTIC review gate the model cannot talk past. Called after every
+    #     REVIEW with the task worktree; each returned finding is
+    #     {{"description": str, "severity"?: str, "file"?: str, "suggested_fix"?: str,
+    #     "blocking"?: bool (default True)}}. A blocking finding forces approved=false
+    #     and re-opens the bounded fix cycle with the finding as learnings; advisory
+    #     ones become tracked follow-up issues. Use it for anything a reviewer must not
+    #     be able to approve past: a linter/type-checker leg the TEST stage doesn't run,
+    #     a policy check ("frontend change must touch an e2e spec"), a build that must
+    #     compile. SelfHostConfig.review_findings in the engine repo is a worked example
+    #     (green -> [], red -> blocking finding carrying the tool output, tool that
+    #     cannot RUN -> advisory so an unverified gate never reads as green).
+    #
+    # def notify(self, kind: str, payload: dict) -> None:
+    #     Alert sink for task_completed / task_failed / task_stale / run_* events.
+    #     adapters.project.email_sink (env-configured SMTP) is a ready-made one.
+    #
+    # def publish_progress(self, ...) / publish_note(self, ...) / file_followup(self, ...):
+    #     Task-source write-backs: living progress comment, completion note, follow-up
+    #     issue filing. See orchestrator/ports/project.py for the full optional surface.
+
 
 def get_config() -> {cls}:
     return {cls}(tasks_path=os.environ.get("{env}", "tasks.json"))
