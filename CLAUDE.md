@@ -17,7 +17,13 @@ tracker or fix-forward.
   the bare `uv run mypy` (no path arguments) must stay green (the same trio CI enforces —
   `.github/workflows/ci.yml`). `tests/` is intentionally outside the mypy gate via
   `[tool.mypy] files` in `pyproject.toml`; explicit paths surface pre-existing, out-of-gate
-  errors. Add a regression test with each fix.
+  errors. Add a regression test with each fix. **A run enforces this too, not just CI:**
+  only pytest used to execute during a task (the deterministic TEST runner shells the
+  `test_*_cmd` family and nothing else), so `SelfHostConfig.review_findings` — the #65
+  policy-gate seam — runs ruff and mypy over the task worktree at REVIEW and returns a
+  BLOCKING finding on red, which overrides an approving reviewer and re-opens the fix
+  cycle with the tool output as learnings. A leg that cannot run at all degrades to
+  advisory, so unverified never reads as green.
 - **Nothing is silently dropped** (`gh issue list -R cperler/orchestration-template`).
   Anything cut, thinned, or found-missing while building gets an ordinary issue with a
   `**Source:** #N` line naming the task that cut it — that line, not a label, is what
