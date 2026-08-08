@@ -46,6 +46,7 @@ _COMMAND_METHODS: list[tuple[str, str, bool]] = [
     ("test_unit_cmd", "test_unit", True),
     ("test_e2e_cmd", "test_e2e", True),
     ("test_shell_cmd", "test_shell", True),
+    ("lint_cmd", "lint", False),
     ("typecheck_cmd", "typecheck", False),
     ("infra_reset", "infra_reset", False),
 ]
@@ -162,9 +163,11 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
 # manifest's per-language defaults (a lockfile is stronger evidence than the default PM).
 _PM_COMMANDS: dict[str, dict[str, list[str]]] = {
     "poetry": {"install": ["poetry", "install"], "test_unit": ["poetry", "run", "pytest", "-q"],
+               "lint": ["poetry", "run", "ruff", "check", "."],
                "typecheck": ["poetry", "run", "mypy", "."]},
     "pip": {"install": ["pip", "install", "-r", "requirements.txt"],
-            "test_unit": ["python", "-m", "pytest", "-q"]},
+            "test_unit": ["python", "-m", "pytest", "-q"],
+            "lint": ["python", "-m", "ruff", "check", "."]},
     "pnpm": {"install": ["pnpm", "install"], "test_unit": ["pnpm", "test"],
              "typecheck": ["pnpm", "exec", "tsc", "--noEmit"],
              "test_e2e": ["pnpm", "exec", "playwright", "test"]},
@@ -438,6 +441,7 @@ written once and are yours to tune.
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -449,6 +453,11 @@ from .classifier import {cls}Classifier
 from .task_source import LocalTaskSource
 
 _NOOP = ["true"]
+
+# Review-gate bounds mirror the self-host adapter: keep the useful output tail without
+# allowing a noisy tool to consume the review context, and never wait forever on a gate.
+_GATE_TIMEOUT_S = 300
+_GATE_OUTPUT_CAP = 2000
 
 # Optional per-stage schema overrides live next to this file (CWD-independent); absent
 # a <ref>.json the engine's canonical stage contract is used (codex full-validation).
@@ -487,6 +496,56 @@ class {cls}:
     def schema_for(self, ref: str) -> dict | None:
         return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
+    def review_findings(self, *, worktree: str | None = None) -> list[dict]:
+        """Run profile-declared lint/typecheck policy gates in the task worktree.
+
+        A red command blocks REVIEW. A command that cannot run is advisory instead: the
+        gate is visibly UNVERIFIED without deadlocking a task on a missing tool or timeout.
+        """
+        if not worktree or not os.path.isdir(worktree):
+            return []
+        findings: list[dict] = []
+        for label, argv in (("lint", self.lint_cmd()),
+                            ("typecheck", self.typecheck_cmd())):
+            if (finding := self._gate(worktree, label, argv)) is not None:
+                findings.append(finding)
+        return findings
+
+    def _gate(self, worktree: str, label: str, argv: list[str]) -> dict | None:
+        """Run one configured gate leg and translate its outcome into a finding."""
+        if not argv or argv == _NOOP:
+            return None
+        command = " ".join(argv)
+        try:
+            proc = self._run_gate(argv, worktree)
+        except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
+            return {{
+                "description": f"{{label}} gate could not run in the task worktree "
+                               f"({{type(exc).__name__}}: {{exc}}). The gate is UNVERIFIED "
+                               "for this change.",
+                "severity": "important",
+                "blocking": False,
+            }}
+        if proc.returncode == 0:
+            return None
+        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+        if len(detail) > _GATE_OUTPUT_CAP:
+            detail = "…\\n" + detail[-_GATE_OUTPUT_CAP:]
+        return {{
+            "description": f"{{label}} gate is RED on this change — profile.toml declares "
+                           f"`{{command}}` as a project gate. Output:\\n{{detail}}",
+            "severity": "critical",
+            "suggested_fix": f"Run `{{command}}` in the worktree and fix what it reports.",
+            "blocking": True,
+        }}
+
+    @staticmethod
+    def _run_gate(argv: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
+        """Injectable subprocess seam for deterministic review-gate tests."""
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=True, text=True, timeout=_GATE_TIMEOUT_S, check=False
+        )
+
     def notify(self, kind: str, payload: dict) -> None:
         """Alerting sink: always a stderr line; additionally mails the payload when the
         environment configures SMTP (see ``adapters.project.email_sink`` for the
@@ -504,18 +563,8 @@ class {cls}:
 
     # --- optional seams the engine duck-types (add methods here to opt in) -----------
     #
-    # def review_findings(self, *, worktree: str | None = None) -> list[dict]:
-    #     A DETERMINISTIC review gate the model cannot talk past. Called after every
-    #     REVIEW with the task worktree; each returned finding is
-    #     {{"description": str, "severity"?: str, "file"?: str, "suggested_fix"?: str,
-    #     "blocking"?: bool (default True)}}. A blocking finding forces approved=false
-    #     and re-opens the bounded fix cycle with the finding as learnings; advisory
-    #     ones become tracked follow-up issues. Use it for anything a reviewer must not
-    #     be able to approve past: a linter/type-checker leg the TEST stage doesn't run,
-    #     a policy check ("frontend change must touch an e2e spec"), a build that must
-    #     compile. SelfHostConfig.review_findings in the engine repo is a worked example
-    #     (green -> [], red -> blocking finding carrying the tool output, tool that
-    #     cannot RUN -> advisory so an unverified gate never reads as green).
+    # review_findings above wires profile.toml's lint/typecheck commands by default. Extend
+    # it here for project-specific policies (for example, "frontend changes need e2e specs").
     #
     # def publish_progress(self, ...) / publish_note(self, ...) / file_followup(self, ...):
     #     Task-source write-backs: living progress comment, completion note, follow-up

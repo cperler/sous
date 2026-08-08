@@ -118,6 +118,14 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
     # make the project dir an isolated git repo and run there, so nothing touches this repo.
     import subprocess
 
+    # Generated adapters run lint/typecheck at REVIEW. Keep those deterministic legs green
+    # here: this smoke test exercises CLI plumbing, not the fixture repo's toolchain.
+    config_type = type(load_project(str(pkg)))
+    monkeypatch.setattr(
+        config_type, "_run_gate",
+        staticmethod(lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")),
+    )
+
     for argv in (["git", "init", "-q"], ["git", "add", "-A"],
                  ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]):
         subprocess.run(argv, cwd=proj, check=True)

@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import importlib
+import json
+import subprocess
 import sys
 
+from orchestrator.cost_ledger import CostLedger
+from orchestrator.engine import Engine
 from orchestrator.scaffold import (
     detect_profile,
     load_kit_manifest,
@@ -14,6 +18,9 @@ from orchestrator.scaffold import (
     scaffold_adapter,
     select_kit_assets,
 )
+from orchestrator.schemas.enums import Stage
+from orchestrator.status_store import StatusStore
+from tests.conftest import make_result
 
 MANIFEST = load_kit_manifest()
 
@@ -50,6 +57,7 @@ def test_profile_selects_stack_agents_and_commands() -> None:
     assert p.roster["review"] == "code-reviewer"
     # commands unioned from both stacks' manifest defaults
     assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]
+    assert p.commands["lint"] == ["uv", "run", "ruff", "check", "."]
     assert p.commands["test_e2e"] == ["pnpm", "exec", "playwright", "test"]
     # seed picks generic + both stacks' agents/hooks
     assert "python-backend-developer" in p.seed["agents"]
@@ -83,13 +91,91 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     scaffold_adapter("py-svc", tmp_path, profile=prof)
     mod = _import_adapter(tmp_path, "py-svc")
     cfg = mod.get_config()
-    from orchestrator.schemas.enums import Stage
     assert cfg.agent_for(Stage.IMPLEMENT, "implement") == "python-backend-developer"
     assert cfg.test_unit_cmd() == ["uv", "run", "pytest", "-q"]
+    assert cfg.lint_cmd() == ["uv", "run", "ruff", "check", "."]
     assert cfg.schema_for("test")["title"] == "test"  # schema_for inherits canonical
     # profile.toml round-trips
     rp = read_profile(tmp_path / "py_svc" / "profile.toml")
     assert rp.languages == ["python"] and rp.roster["implement"] == "python-backend-developer"
+    assert rp.commands["lint"] == ["uv", "run", "ruff", "check", "."]
+
+
+def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
+    tmp_path, monkeypatch
+) -> None:
+    """A declared lint command must be live at REVIEW, not decorative profile data."""
+    prof = profile_from_languages("gate-svc", ["python"], MANIFEST)
+    scaffold_adapter("gate-svc", tmp_path, profile=prof)
+    mod = _import_adapter(tmp_path, "gate-svc")
+    tasks = tmp_path / "tasks.json"
+    tasks.write_text(json.dumps({"T1": {"title": "lint me"}}))
+    cfg = mod.get_config().__class__(tasks_path=str(tasks))
+    outcomes = {
+        "ruff": subprocess.CompletedProcess(["ruff"], 0, "", ""),
+        "mypy": subprocess.CompletedProcess(["mypy"], 0, "", ""),
+    }
+    calls: list[tuple[list[str], str]] = []
+
+    def fake_run(argv, cwd):  # noqa: ANN001 - mirrors the generated subprocess seam
+        calls.append((argv, cwd))
+        tool = next(tool for tool in outcomes if tool in argv)
+        return outcomes[tool]
+
+    monkeypatch.setattr(cfg, "_run_gate", fake_run)
+    assert cfg.review_findings(worktree=str(tmp_path)) == []
+    assert ["ruff" in argv for argv, _ in calls] == [True, False]
+    assert all(cwd == str(tmp_path) for _, cwd in calls)
+
+    noise = "x" * 2500 + "\nclassifier.py:4:101: E501 line too long"
+    outcomes["ruff"] = subprocess.CompletedProcess(["ruff"], 1, noise, "")
+    findings = cfg.review_findings(worktree=str(tmp_path))
+    lint_finding = next(finding for finding in findings if "lint gate" in finding["description"])
+    assert lint_finding["blocking"] is True
+    assert lint_finding["severity"] == "critical"
+    assert "uv run ruff check ." in lint_finding["description"]
+    assert "E501 line too long" in lint_finding["description"]
+    assert len(lint_finding["description"]) < 2300  # noisy output is tail-capped
+
+    eng = Engine(StatusStore(tmp_path / "run"), CostLedger(tmp_path / "costs.jsonl"), cfg)
+    eng.create_run("r1")
+    eng.add_task("r1", "T1")
+    while True:
+        work = eng.next_work("r1", "T1")
+        assert work is not None
+        if work.stage is Stage.REVIEW:
+            break
+        output = None
+        if work.stage is Stage.INTAKE:
+            output = {"branch": "task/T1", "worktree": str(tmp_path),
+                      "baseline_captured": True}
+        eng.record("r1", make_result(work, structured_output=output))
+
+    result = eng.record(
+        "r1", make_result(work, structured_output={"approved": True, "issues": []})
+    )
+    assert result["outcome"] == "review_rejected_fix_cycle"
+    assert "ruff" in eng.store.load_task("r1", "T1").learnings[-1]
+
+
+def test_generated_review_gate_reports_unrunnable_lint_as_advisory(
+    tmp_path, monkeypatch
+) -> None:
+    prof = profile_from_languages("unverified-svc", ["python"], MANIFEST)
+    scaffold_adapter("unverified-svc", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "unverified-svc").get_config()
+
+    def fake_run(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
+        if "ruff" in argv:
+            raise FileNotFoundError("ruff missing")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(cfg, "_run_gate", fake_run)
+    findings = cfg.review_findings(worktree=str(tmp_path))
+    assert len(findings) == 1
+    assert findings[0]["blocking"] is False
+    assert findings[0]["severity"] == "important"
+    assert "UNVERIFIED" in findings[0]["description"]
 
 
 def test_generated_adapter_self_locates_repo_root(tmp_path) -> None:
@@ -175,6 +261,7 @@ def test_detect_python_poetry(tmp_path) -> None:
     p = detect_profile(root, "svc", MANIFEST)
     assert p.commands["test_unit"] == ["poetry", "run", "pytest", "-q"]
     assert p.commands["install"] == ["poetry", "install"]
+    assert p.commands["lint"] == ["poetry", "run", "ruff", "check", "."]
 
 
 def test_detect_typescript_pnpm_with_playwright(tmp_path) -> None:
