@@ -45,6 +45,7 @@ class FakeTaskSource:
         self.deps: dict[str, list[str]] = {}  # task_id -> depends_on (test-configurable)
         self.notes: list[dict] = []  # publish_note calls
         self.followups: list[dict] = []  # file_followup calls
+        self.followups_by_key: dict[str, str] = {}
         self.progress: list[dict] = []  # publish_progress calls (mid-run, #64)
         self.candidates: list[TaskSpec] = []  # list_tasks output (batch-plan #57)
         # task_id -> field overrides applied to what resolve() returns (#271): how a test
@@ -86,9 +87,23 @@ class FakeTaskSource:
             {"task_id": task_id, "body": body, "marker": marker, "pr_url": pr_url}
         )
 
-    def file_followup(self, title: str, body: str, labels: list[str] | None = None) -> str:
+    def file_followup(
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
+    ) -> str:
+        if idempotency_key is not None and idempotency_key in self.followups_by_key:
+            return self.followups_by_key[idempotency_key]
         ref = f"https://example.test/issues/{len(self.followups) + 1}"
-        self.followups.append({"title": title, "body": body, "labels": labels, "ref": ref})
+        self.followups.append(
+            {"title": title, "body": body, "labels": labels, "ref": ref,
+             "idempotency_key": idempotency_key}
+        )
+        if idempotency_key is not None:
+            self.followups_by_key[idempotency_key] = ref
         return ref
 
 

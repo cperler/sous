@@ -11,11 +11,13 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import json
 import math
 import os
 import re
 import socket
 import subprocess
+import tempfile
 import time
 import uuid
 from collections.abc import Callable
@@ -49,6 +51,7 @@ from .errors import (
     StatusNotFoundError,
     SupervisorParkDeferred,
 )
+from .gitcmd import run_git
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
 )
@@ -875,6 +878,19 @@ class Engine:
         self._resume_pending_decompositions(run_id)
         self._complete_ready_umbrellas(run_id)
         run = self.store.load_run(run_id)
+        # #370 makes run finalization a potentially long integration operation. A process
+        # killed after the last task document became terminal but before that operation
+        # completed leaves no task to dispatch on restart. Reconcile that durable boundary
+        # here (this method already reconciles pending decompositions/umbrellas) so a fresh
+        # scheduler re-runs or reuses the gate receipt instead of exiting with a RUNNING run
+        # whose every task is terminal.
+        if (
+            run.state not in TERMINAL_RUN_STATES
+            and run.task_refs
+            and all(ref.state in TERMINAL_TASK_STATES for ref in run.task_refs)
+        ):
+            self._maybe_finalize_run(run_id)
+            run = self.store.load_run(run_id)
         if run.state in (RunState.PAUSED, RunState.PARKED):
             return []
         states = {ref.task_id: ref.state for ref in run.task_refs}
@@ -5958,6 +5974,503 @@ class Engine:
         )
         return ref
 
+    def _run_verification_commands(
+        self, cwd: str | Path, *, timeout_s: int
+    ) -> tuple[list[dict], list[dict]]:
+        """Run every non-noop verification command declared by the project adapter.
+
+        Shared by the pre-merge batch integration gate and the post-merge trunk gate so
+        the two integrity checks cannot drift onto different command sets. A missing,
+        raising, or no-op command getter is returned in ``skipped`` rather than silently
+        disappearing; an invocation error is a red command result, never an exception.
+        """
+        commands: list[dict] = []
+        skipped: list[dict] = []
+        for name, getter in (
+            ("test_unit", self.project.test_unit_cmd),
+            ("test_e2e", getattr(self.project, "test_e2e_cmd", None)),
+            ("test_shell", getattr(self.project, "test_shell_cmd", None)),
+            ("typecheck", self.project.typecheck_cmd),
+            ("types", getattr(self.project, "types_cmd", None)),
+        ):
+            if getter is None:
+                skipped.append({"name": name, "reason": "absent"})
+                continue
+            try:
+                argv = getter()
+            except Exception:  # noqa: BLE001 - an adapter getter cannot break either gate
+                skipped.append({"name": name, "reason": "getter_raised"})
+                continue
+            if not argv or argv == ["true"]:
+                skipped.append({"name": name, "reason": "noop"})
+                continue
+            try:
+                proc = subprocess.run(  # noqa: S603
+                    argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s
+                )
+                rc = proc.returncode
+                tail, truncated = _tail((proc.stdout or "") + (proc.stderr or ""))
+            except (OSError, subprocess.SubprocessError) as exc:
+                rc = -1
+                tail, truncated = f"error ({type(exc).__name__}): {exc}", False
+            commands.append(
+                {
+                    "name": name,
+                    "argv": list(argv),
+                    "rc": rc,
+                    "output_tail": tail,
+                    "truncated": truncated,
+                }
+            )
+        return commands, skipped
+
+    def _run_batch_install(
+        self, cwd: str | Path, *, timeout_s: int
+    ) -> tuple[dict | None, dict | None]:
+        """Prepare a fresh composite worktree using only the adapter's install argv."""
+        getter = getattr(self.project, "install_cmd", None)
+        if getter is None:
+            return None, {"name": "install", "reason": "absent"}
+        try:
+            argv = getter()
+        except Exception:  # noqa: BLE001 - a project getter cannot escape finalization
+            return None, {"name": "install", "reason": "getter_raised"}
+        if not argv or argv == ["true"]:
+            return None, {"name": "install", "reason": "noop"}
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=str(cwd), capture_output=True, text=True, timeout=timeout_s
+            )
+            rc = proc.returncode
+            tail, truncated = _tail((proc.stdout or "") + (proc.stderr or ""))
+        except (OSError, subprocess.SubprocessError) as exc:
+            rc = -1
+            tail, truncated = f"error ({type(exc).__name__}): {exc}", False
+        return {
+            "name": "install", "argv": list(argv), "rc": rc,
+            "output_tail": tail, "truncated": truncated,
+        }, None
+
+    def _batch_branch_entries(
+        self, run: Run
+    ) -> tuple[list[dict], list[dict], list[dict]]:
+        """Completed leaf-task branches in stable dependency order, plus every omission.
+
+        Decomposition umbrellas deliberately have no branch of their own. Failed/rejected
+        tasks and a completed non-code task can likewise have nothing to compose; keeping
+        those omissions in the result makes the gate's exact input auditable without
+        turning an expected umbrella into a false red.
+        """
+        ref_order = {ref.task_id: index for index, ref in enumerate(run.task_refs)}
+        remaining = set(ref_order)
+        ordered: list[str] = []
+        while remaining:
+            ready = [
+                task_id
+                for task_id in remaining
+                if not (set(run.dependency_graph.get(task_id, ())) & remaining)
+            ]
+            # The graph was validated on task registration; retain a defensive fallback so
+            # a legacy/corrupt graph cannot wedge finalization forever.
+            if not ready:
+                ready = list(remaining)
+            ready.sort(key=ref_order.__getitem__)
+            ordered.extend(ready)
+            remaining.difference_update(ready)
+
+        entries: list[dict] = []
+        skipped_tasks: list[dict] = []
+        input_errors: list[dict] = []
+        states = {ref.task_id: ref.state for ref in run.task_refs}
+        for task_id in ordered:
+            if states[task_id] is not TaskState.COMPLETED:
+                skipped_tasks.append(
+                    {"task_id": task_id, "reason": f"state_{states[task_id].value}"}
+                )
+                continue
+            try:
+                task = self.store.load_task(run.run_id, task_id)
+            except Exception as exc:  # noqa: BLE001 - report an unreadable branch input
+                input_errors.append(
+                    {"task_id": task_id, "reason": f"task_unreadable:{type(exc).__name__}"}
+                )
+                continue
+            if task.decomposition_children:
+                skipped_tasks.append({"task_id": task_id, "reason": "decomposition_umbrella"})
+                continue
+            branch = (task.context or {}).get("branch")
+            if not isinstance(branch, str) or not branch.strip():
+                target = input_errors if Stage.INTAKE in task.pipeline else skipped_tasks
+                target.append({"task_id": task_id, "reason": "no_branch"})
+                continue
+            entries.append({"task_id": task_id, "branch": branch.strip()})
+        return entries, skipped_tasks, input_errors
+
+    @staticmethod
+    def _git_command_result(name: str, argv: list[str], proc: subprocess.CompletedProcess) -> dict:
+        tail, truncated = _tail((proc.stdout or "") + (proc.stderr or ""))
+        return {
+            "name": name,
+            "argv": argv,
+            "rc": proc.returncode,
+            "output_tail": tail,
+            "truncated": truncated,
+        }
+
+    @staticmethod
+    def _remove_scratch_worktree(repo_root: str, scratch: Path) -> dict:
+        """Best-effort physical and administrative cleanup for a gate worktree."""
+        cleanup: dict = {"attempted": True, "rc": None}
+        try:
+            removed = run_git(repo_root, "worktree", "remove", "--force", str(scratch))
+        except (OSError, subprocess.SubprocessError) as exc:
+            cleanup.update(rc=-1, error=f"{type(exc).__name__}: {exc}")
+        else:
+            cleanup.update(rc=removed.returncode)
+            if removed.returncode != 0:
+                tail, truncated = _tail((removed.stdout or "") + (removed.stderr or ""))
+                cleanup.update(output_tail=tail, truncated=truncated)
+        # Clear a stale administrative entry even if removal failed; TemporaryDirectory
+        # handles the physical path best-effort after this method returns.
+        with contextlib.suppress(Exception):
+            run_git(repo_root, "worktree", "prune")
+        return cleanup
+
+    def _compose_batch_branches(
+        self, entries: list[dict], *, timeout_s: int
+    ) -> tuple[list[dict], list[dict], dict]:
+        """Compose ``entries`` over current trunk and verify the disposable worktree."""
+        commands: list[dict] = []
+        skipped: list[dict] = []
+        cleanup: dict = {"attempted": False, "rc": None}
+        repo_candidate = str(getattr(self.project, "repo_root", None) or ".")
+        try:
+            top = run_git(repo_candidate, "rev-parse", "--show-toplevel")
+        except (OSError, subprocess.SubprocessError) as exc:
+            commands.append(
+                {"name": "repo_check", "argv": ["git", "rev-parse", "--show-toplevel"],
+                 "rc": -1, "output_tail": f"error ({type(exc).__name__}): {exc}",
+                 "truncated": False}
+            )
+            return commands, skipped, cleanup
+        commands.append(
+            self._git_command_result(
+                "repo_check", ["git", "rev-parse", "--show-toplevel"], top
+            )
+        )
+        if top.returncode != 0:
+            return commands, skipped, cleanup
+        repo_root = top.stdout.strip()
+
+        with tempfile.TemporaryDirectory(
+            prefix="sous-batch-integration-", ignore_cleanup_errors=True
+        ) as temp_root:
+            scratch = Path(temp_root) / "worktree"
+            add_argv = ["git", "worktree", "add", "--detach", str(scratch), "HEAD"]
+            try:
+                add = run_git(repo_root, "worktree", "add", "--detach", str(scratch), "HEAD")
+            except (OSError, subprocess.SubprocessError) as exc:
+                commands.append(
+                    {"name": "scratch_setup", "argv": add_argv, "rc": -1,
+                     "output_tail": f"error ({type(exc).__name__}): {exc}",
+                     "truncated": False}
+                )
+                cleanup = self._remove_scratch_worktree(repo_root, scratch)
+                return commands, skipped, cleanup
+            commands.append(self._git_command_result("scratch_setup", add_argv, add))
+            if add.returncode != 0:
+                cleanup = self._remove_scratch_worktree(repo_root, scratch)
+                return commands, skipped, cleanup
+
+            try:
+                composition_green = True
+                for entry in entries:
+                    branch = entry["branch"]
+                    merge_args = (
+                        "-c", "user.name=sous integration gate",
+                        "-c", "user.email=sous-integration@invalid",
+                        "-c", "commit.gpgSign=false",
+                        "merge", "--no-edit", "--no-verify", branch,
+                    )
+                    merge_argv = ["git", *merge_args]
+                    try:
+                        merge = run_git(str(scratch), *merge_args)
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        commands.append(
+                            {"name": f"merge:{entry['task_id']}", "argv": merge_argv,
+                             "rc": -1,
+                             "output_tail": f"error ({type(exc).__name__}): {exc}",
+                             "truncated": False}
+                        )
+                        composition_green = False
+                        break
+                    commands.append(
+                        self._git_command_result(f"merge:{entry['task_id']}", merge_argv, merge)
+                    )
+                    if merge.returncode != 0:
+                        with contextlib.suppress(Exception):
+                            run_git(str(scratch), "merge", "--abort")
+                        composition_green = False
+                        break
+                if composition_green:
+                    install, install_skip = self._run_batch_install(
+                        scratch, timeout_s=timeout_s
+                    )
+                    if install_skip is not None:
+                        skipped.append(install_skip)
+                    if install is not None:
+                        commands.append(install)
+                    if install is None or install["rc"] == 0:
+                        verification, verification_skips = self._run_verification_commands(
+                            scratch, timeout_s=timeout_s
+                        )
+                        commands.extend(verification)
+                        skipped.extend(verification_skips)
+                    else:
+                        skipped.append({"name": "verification", "reason": "install_red"})
+                else:
+                    skipped.append({"name": "verification", "reason": "composition_red"})
+            finally:
+                cleanup = self._remove_scratch_worktree(repo_root, scratch)
+        return commands, skipped, cleanup
+
+    def batch_integration_gate(self, run_id: str, *, timeout_s: int = 1800) -> dict:
+        """Pre-merge batch gate (#370): compose completed branches, verify, report, file.
+
+        A dedicated lock spans composition through filing. Concurrent/repeated finalizers
+        therefore run the expensive gate once and cannot create duplicate tracker issues.
+        The detailed result is retained as ``batch-integration-gate.json`` in the run log.
+        """
+        artifact = self.store.root / "batch-integration-gate.json"
+        lock_key = self.store.root / f"batch-integration-{run_id}"
+        with self.store.with_lock(lock_key):
+            prior_receipt = next(
+                (
+                    event
+                    for event in self.store.read_events(run_id)
+                    if event.get("type")
+                    in {"batch_integration_gate_ran", "batch_integration_gate_skipped"}
+                ),
+                None,
+            )
+            if prior_receipt is not None:
+                with contextlib.suppress(OSError, ValueError, TypeError):
+                    result = json.loads(artifact.read_text(encoding="utf-8"))
+                    result["deduped"] = True
+                    return result
+                return {
+                    "run_id": run_id,
+                    "green": bool(prior_receipt.get("green", True)),
+                    "deduped": True,
+                    "filed": prior_receipt.get("filed"),
+                }
+
+            run = self.store.load_run(run_id)
+            entries, skipped_tasks, input_errors = self._batch_branch_entries(run)
+            if len(run.task_refs) < 2:
+                reason = "single_task_run"
+                result = {
+                    "run_id": run_id, "green": True, "reason": reason,
+                    "branches": entries, "skipped_tasks": skipped_tasks,
+                    "input_errors": input_errors, "commands": [], "failing": [],
+                    "skipped": [], "cleanup": None, "filed": None, "deduped": False,
+                }
+                self.store.write_run_artifact(
+                    "batch-integration-gate.json", json.dumps(result, indent=2)
+                )
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_skipped",
+                     "run_id": run_id, "green": True, "reason": reason,
+                     "branch_count": len(entries), "skipped_tasks": skipped_tasks},
+                )
+                return result
+
+            if input_errors:
+                commands = [
+                    {"name": f"branch_input:{error['task_id']}", "argv": [], "rc": -1,
+                     "output_tail": error["reason"], "truncated": False}
+                    for error in input_errors
+                ]
+                failing = [command["name"] for command in commands]
+                result = {
+                    "run_id": run_id, "green": False, "reason": "branch_inputs_invalid",
+                    "branches": entries, "skipped_tasks": skipped_tasks,
+                    "input_errors": input_errors, "commands": commands, "failing": failing,
+                    "skipped": [{"name": "verification", "reason": "branch_inputs_invalid"}],
+                    "cleanup": None, "filed": None, "deduped": False,
+                }
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_red", "run_id": run_id,
+                     "failing": failing, "branches": entries,
+                     "input_errors": input_errors},
+                )
+                result["filed"] = self._file_batch_integration_fix(
+                    run_id, commands, failing, entries
+                )
+                self.store.write_run_artifact(
+                    "batch-integration-gate.json", json.dumps(result, indent=2)
+                )
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_ran", "run_id": run_id,
+                     "green": False, "failing": failing, "branches": entries,
+                     "commands": [{"name": c["name"], "rc": c["rc"]} for c in commands],
+                     "skipped": result["skipped"], "filed": result["filed"]},
+                )
+                return result
+
+            if len(entries) < 2:
+                reason = (
+                    "fewer_than_two_completed_branches"
+                )
+                result = {
+                    "run_id": run_id, "green": True, "reason": reason,
+                    "branches": entries, "skipped_tasks": skipped_tasks,
+                    "input_errors": [], "commands": [], "failing": [], "skipped": [],
+                    "cleanup": None, "filed": None, "deduped": False,
+                }
+                self.store.write_run_artifact(
+                    "batch-integration-gate.json", json.dumps(result, indent=2)
+                )
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_skipped",
+                     "run_id": run_id, "green": True, "reason": reason,
+                     "branch_count": len(entries), "skipped_tasks": skipped_tasks},
+                )
+                return result
+
+            commands, skipped, cleanup = self._compose_batch_branches(
+                entries, timeout_s=timeout_s
+            )
+            failing = [command["name"] for command in commands if command["rc"] != 0]
+            green = not failing
+            result = {
+                "run_id": run_id, "green": green, "reason": None,
+                "branches": entries, "skipped_tasks": skipped_tasks,
+                "input_errors": [], "commands": commands, "failing": failing,
+                "skipped": skipped,
+                "cleanup": cleanup, "filed": None, "deduped": False,
+            }
+            if not green:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_red", "run_id": run_id,
+                     "failing": failing, "branches": entries},
+                )
+                result["filed"] = self._file_batch_integration_fix(
+                    run_id, commands, failing, entries
+                )
+            self.store.write_run_artifact(
+                "batch-integration-gate.json", json.dumps(result, indent=2)
+            )
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "batch_integration_gate_ran", "run_id": run_id,
+                 "green": green, "failing": failing, "branches": entries,
+                 "commands": [{"name": c["name"], "rc": c["rc"]} for c in commands],
+                 "skipped": skipped, "filed": result["filed"]},
+            )
+            return result
+
+    def _file_batch_integration_fix(
+        self, run_id: str, commands: list[dict], failing: list[str], branches: list[dict]
+    ) -> str | None:
+        """Best-effort, crash-idempotent filing for a red pre-merge batch gate.
+
+        The intent is durable before the external side effect. A recovery that finds an
+        intent without a receipt asks the task source to create-or-look-up the follow-up
+        under the same key, closing the crash window between those two operations.
+        """
+        events = self.store.read_events(run_id)
+        prior = next(
+            (
+                event
+                for event in events
+                if event.get("type") == "batch_integration_gate_fix_filed"
+            ),
+            None,
+        )
+        if prior is not None:
+            return prior.get("ref")
+        task_source = getattr(self.project, "task_source", None)
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return None
+        title = f"Pre-merge batch integration gate red: {', '.join(failing)} (run {run_id})"
+        lines = [
+            f"The pre-merge integration gate for run `{run_id}` is **red**. The completed "
+            "task branches do not compose into a verified batch, even though each task was "
+            "reviewed independently (#370).",
+            "",
+            f"**Failing operations:** {', '.join(failing) or 'unknown'}",
+            "",
+        ]
+        for command in commands:
+            if command["rc"] == 0:
+                continue
+            trunc = " (last lines only)" if command.get("truncated") else ""
+            lines.extend(
+                [
+                    f"### `{command['name']}` — rc={command['rc']}",
+                    f"`{' '.join(command['argv'])}`",
+                    "",
+                    f"```\n{command['output_tail']}\n```{trunc}",
+                    "",
+                ]
+            )
+        lines.append("**Completed branches composed in dependency order:**")
+        lines.extend(
+            f"- `{entry['task_id']}` — `{entry['branch']}`" for entry in branches
+        )
+        lines.extend(["", "_Filed automatically by the pre-merge batch gate (#370)._"])
+        intent = next(
+            (
+                event
+                for event in events
+                if event.get("type") == "batch_integration_gate_fix_filing_intent"
+            ),
+            None,
+        )
+        idempotency_key = (
+            str(intent["idempotency_key"])
+            if intent is not None and intent.get("idempotency_key")
+            else f"batch-integration-gate-fix:{run_id}"
+        )
+        if intent is None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "batch_integration_gate_fix_filing_intent",
+                 "run_id": run_id, "title": title,
+                 "idempotency_key": idempotency_key, "failing": failing},
+            )
+        try:
+            ref = file_followup(
+                title=title,
+                body="\n".join(lines),
+                labels=["bug"],
+                idempotency_key=idempotency_key,
+            )
+            if not ref:
+                raise RuntimeError("file_followup returned no reference")
+        except Exception as exc:  # noqa: BLE001 - finalization survives a flaky task source
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "followup_failed", "run_id": run_id,
+                 "title": title, "idempotency_key": idempotency_key,
+                 "error": str(exc)},
+            )
+            return None
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "batch_integration_gate_fix_filed", "run_id": run_id,
+             "title": title, "ref": ref, "idempotency_key": idempotency_key,
+             "failing": failing},
+        )
+        return ref
+
     def trunk_gate(
         self, run_id: str, *, cwd: str | Path, file_fix: bool = True,
         timeout_s: int = 1800,
@@ -6016,46 +6529,7 @@ class Engine:
                 "failing": ["cwd_check"], "file_fix": file_fix, "filed": None,
                 "deduped": False,
             }
-        run_cwd = str(cwd_path)
-        commands: list[dict] = []
-        # Never-silent: a leg the gate does NOT run — the adapter omits the method
-        # (``types`` on a pre-#243 adapter), its getter raised, or it returned the
-        # ``['true']``/empty no-op sentinel — is recorded here with WHY, not dropped, so a
-        # reader can tell an absent/skipped leg from one that ran green.
-        skipped: list[dict] = []
-        for name, getter in (
-            ("test_unit", self.project.test_unit_cmd),
-            ("test_e2e", getattr(self.project, "test_e2e_cmd", None)),
-            ("test_shell", getattr(self.project, "test_shell_cmd", None)),
-            ("typecheck", self.project.typecheck_cmd),
-            # Distinct static-typing leg (#243): the adapter's type checker where that is a
-            # command separate from the linter (selfhost: mypy vs ruff). Duck-typed —
-            # ``getattr(..., None)`` so a legacy/external adapter without ``types_cmd``
-            # degrades to a skip (recorded below), never a crash.
-            ("types", getattr(self.project, "types_cmd", None)),
-        ):
-            if getter is None:
-                skipped.append({"name": name, "reason": "absent"})
-                continue
-            try:
-                argv = getter()
-            except Exception:  # noqa: BLE001 - a project command surface must never break the gate
-                skipped.append({"name": name, "reason": "getter_raised"})
-                continue
-            if not argv or argv == ["true"]:  # skip the no-op sentinel, not just empty
-                skipped.append({"name": name, "reason": "noop"})
-                continue
-            try:
-                proc = subprocess.run(  # noqa: S603
-                    argv, cwd=run_cwd, capture_output=True, text=True, timeout=timeout_s
-                )
-                rc = proc.returncode
-                tail, truncated = _tail((proc.stdout or "") + (proc.stderr or ""))
-            except (OSError, subprocess.SubprocessError) as exc:
-                rc = -1  # a command that could not even run (missing binary, timeout) is red
-                tail, truncated = f"error ({type(exc).__name__}): {exc}", False
-            commands.append({"name": name, "argv": list(argv), "rc": rc,
-                             "output_tail": tail, "truncated": truncated})
+        commands, skipped = self._run_verification_commands(cwd_path, timeout_s=timeout_s)
 
         # `all([])` is True: a gate with nothing to run is not "red" — auto-filing on an
         # empty command set would be a false alarm, so an empty gate reports green.
@@ -6610,12 +7084,36 @@ class Engine:
             new_state = RunState.COMPLETED_WITH_REJECTIONS
         else:
             new_state = RunState.COMPLETED
+        integration_gate: dict | None = None
         if run.state is not new_state:
+            # #370: the last per-task approval is not evidence that the branches compose.
+            # Build and verify the completed batch BEFORE announcing finalization. The gate
+            # is report-and-file: red is carried in the final evidence but does not rewrite
+            # the honest task-derived run rollup (nor does the engine merge any PR).
+            try:
+                integration_gate = self.batch_integration_gate(run_id)
+            except Exception as exc:  # noqa: BLE001 - integration evidence cannot wedge finalize
+                integration_gate = {
+                    "green": False,
+                    "failing": ["gate_error"],
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "batch_integration_gate_error",
+                     "severity": "warning", "run_id": run_id,
+                     "error": integration_gate["error"]},
+                )
             self.store.update_run(run_id, lambda r: setattr(r, "state", new_state))
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "run_finalized", "run_id": run_id,
-                 "state": new_state.value},
+                 "state": new_state.value,
+                 "integration_gate": {
+                     "green": integration_gate.get("green"),
+                     "failing": integration_gate.get("failing", []),
+                     "filed": integration_gate.get("filed"),
+                 }},
             )
             # Alerting (#55): the "batch is done" ping. Emitted at the finalize
             # transition so it fires exactly once, on every path that finalizes a run
@@ -6630,7 +7128,12 @@ class Engine:
                  # task landed where — instead of only a completed/total count that says
                  # nothing about which of N tasks shipped.
                  "run_dir": str(self.store.root),
-                 "tasks": self._finalize_roster(run)},
+                 "tasks": self._finalize_roster(run),
+                 "integration_gate": {
+                     "green": integration_gate.get("green"),
+                     "failing": integration_gate.get("failing", []),
+                     "filed": integration_gate.get("filed"),
+                 }},
             )
         self._write_final_cost_artifacts(run_id, run)
         self._emit_retrospective(run_id)

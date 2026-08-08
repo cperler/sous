@@ -670,6 +670,35 @@ def test_github_source_publish_note_and_file_followup() -> None:
     assert ref == "https://github.com/o/r/issues/99"
 
 
+def test_github_source_keyed_followup_recovers_existing_issue() -> None:
+    calls: list[list[str]] = []
+    created_body: str | None = None
+
+    def runner(argv: list[str]) -> str:
+        nonlocal created_body
+        calls.append(argv)
+        if argv[1] == "api":
+            if created_body is None:
+                return "[]"
+            return json.dumps(
+                [[{"html_url": "https://github.com/o/r/issues/99", "body": created_body}]]
+            )
+        created_body = argv[argv.index("--body") + 1]
+        return "https://github.com/o/r/issues/99\n"
+
+    src = GitHubIssuesSource("o/r", runner=runner)
+
+    first = src.file_followup("Title", "Body", labels=["bug"], idempotency_key="key-1")
+    second = src.file_followup(
+        "Title", "Body", labels=["bug"], idempotency_key="key-1"
+    )
+
+    assert first == second == "https://github.com/o/r/issues/99"
+    assert sum(argv[1:3] == ["issue", "create"] for argv in calls) == 1
+    assert created_body is not None
+    assert "orchestrator:followup-idempotency:" in created_body
+
+
 def test_github_source_create_task_returns_hash_ref(tmp_path) -> None:
     # The spec front door's filing hook (#18): thin `gh issue create`, ref parsed to #N.
     calls: list[list[str]] = []
@@ -695,6 +724,15 @@ def test_localfile_source_publish_note_and_file_followup(tmp_path) -> None:
     assert ref == "local:A title"
     log = (tmp_path / "followups.log").read_text()
     assert "bug" in log and "A title" in log
+
+    first = src.file_followup(
+        "Keyed title", "Keyed body", labels=["bug"], idempotency_key="key-1"
+    )
+    second = src.file_followup(
+        "Keyed title", "Keyed body", labels=["bug"], idempotency_key="key-1"
+    )
+    assert first == second == "local:Keyed title"
+    assert (tmp_path / "followups.log").read_text().count("local:Keyed title") == 1
 
 
 def test_localfile_source_create_task_appends_and_returns_id(tmp_path) -> None:

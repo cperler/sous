@@ -566,7 +566,8 @@ class {cls}:
     # review_findings above wires profile.toml's lint/typecheck commands by default. Extend
     # it here for project-specific policies (for example, "frontend changes need e2e specs").
     #
-    # def publish_progress(self, ...) / publish_note(self, ...) / file_followup(self, ...):
+    # def publish_progress(self, ...) / publish_note(self, ...) /
+    # file_followup(self, ..., idempotency_key=None):
     #     Task-source write-backs: living progress comment, completion note, follow-up
     #     issue filing. See orchestrator/ports/project.py for the full optional surface.
 

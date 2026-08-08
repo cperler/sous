@@ -8,6 +8,7 @@ injectable so unit tests never hit the network.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import subprocess
@@ -33,6 +34,12 @@ def _ref_from_url(url: str) -> str:
     url = url.strip()
     m = re.search(r"/(\d+)/?$", url)
     return f"#{m.group(1)}" if m else url
+
+
+def _followup_marker(idempotency_key: str) -> str:
+    """Return a searchable, non-user-visible marker for one follow-up side effect."""
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+    return f"<!-- orchestrator:followup-idempotency:{digest} -->"
 
 
 def _find_pr_url(texts: list[str], repo: str) -> str | None:
@@ -248,10 +255,38 @@ class GitHubIssuesSource:
         self._run(["gh", "pr", "edit", pr_url, "--body", new_body])
 
     def file_followup(
-        self, title: str, body: str, labels: list[str] | None = None
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> str | None:
-        """Open a follow-up issue (e.g. a review's non-blocking finding) and return the
-        new issue URL (`gh issue create` prints it on stdout)."""
+        """Create or recover a follow-up issue and return its URL.
+
+        A keyed call first searches issue bodies for the exact hidden marker. This lets a
+        caller recover when issue creation succeeded but its local receipt was interrupted.
+        Unkeyed calls retain the original create-only behavior.
+        """
+        if idempotency_key is not None:
+            marker = _followup_marker(idempotency_key)
+            raw = self._run(
+                ["gh", "api", f"repos/{self.repo}/issues?state=all&per_page=100",
+                 "--paginate", "--slurp"]
+            )
+            pages = json.loads(raw) if raw.strip() else []
+            matches = [issue for page in pages for issue in page]
+            existing = next(
+                (
+                    issue.get("html_url")
+                    for issue in matches
+                    if marker in str(issue.get("body") or "") and issue.get("html_url")
+                ),
+                None,
+            )
+            if existing is not None:
+                return str(existing)
+            body = f"{body}\n\n{marker}"
         argv = ["gh", "issue", "create", "--repo", self.repo, "--title", title, "--body", body]
         for label in labels or []:
             argv += ["--label", label]
