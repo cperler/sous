@@ -1,6 +1,9 @@
 """Local-file task source (target.md §5 — a second TaskSource impl, not GitHub).
 
-Tasks live in a JSON file: {"<id>": {"title", "body", "depends_on": [...], "labels": [...]}}.
+Tasks live in a JSON file: {"<id>": {"title", "body", "comments": [...],
+"depends_on": [...], "labels": [...]}}. Comments may be strings or GitHub-shaped objects
+with ``body``, ``author``, and created/updated timestamps; ``resolve`` appends the same
+bounded discussion section as the GitHub source.
 ``labels`` is not decoration — engine policies read it (e.g. the #71 meta-authoring
 delivery gate), so a task file that omits it silently opts out of those policies.
 ``mark_complete`` appends to a sibling ``completed.log``; the optional evidence-out
@@ -15,6 +18,7 @@ import json
 import re
 from pathlib import Path
 
+from adapters.project.task_discussion import append_discussion
 from orchestrator.errors import OrchestratorError
 from orchestrator.ports.project import TaskSpec
 
@@ -37,10 +41,12 @@ class LocalFileTaskSource:
         if task_id not in data:
             raise OrchestratorError(f"unknown task {task_id!r} in {self.tasks_path}")
         t = data[task_id]
+        raw_comments = t.get("comments", []) or []
+        comments = raw_comments if isinstance(raw_comments, list) else []
         return TaskSpec(
             task_id=task_id,
             title=t.get("title", ""),
-            body=t.get("body", ""),
+            body=append_discussion(t.get("body", ""), comments),
             depends_on=list(t.get("depends_on", [])),
             labels=list(t.get("labels", [])),
             provider_tag=t.get("provider_tag"),
