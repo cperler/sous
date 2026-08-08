@@ -1578,8 +1578,17 @@ def codex_cli_transport(
                         "-c", 'approval_policy="never"', *tail]
                 invocation = f"codex exec --sandbox read-only --json (model {work.model})"
             else:
+                # codex-cli 0.147.0 REMOVED `--full-auto` (`error: unexpected argument`), so it
+                # is spelled out as the two things it stood for: workspace-write plus
+                # non-blocking approvals — the same pair the resume branch above already sets
+                # via `-c`. Latent until batch-369-371: this branch is the only one that needs
+                # a COLD start on a WRITING stage, and SCOPE (write-denying, so read-only)
+                # normally seeds the session every later stage resumes. A REVIEW fix-cycle
+                # re-dispatch of IMPLEMENT arrives with no session_ref and lands here.
                 add_dir = ["--add-dir", grant] if grant else []
-                argv = ["codex", "exec", "--full-auto", *add_dir, *_CODEX_NETWORK_CFG, *tail]
+                argv = ["codex", "exec", "--sandbox", "workspace-write",
+                        "-c", 'approval_policy="never"',
+                        *add_dir, *_CODEX_NETWORK_CFG, *tail]
                 invocation = f"codex exec --json (model {work.model})"
             stream_files: dict | None = None
             try:

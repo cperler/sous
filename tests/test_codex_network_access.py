@@ -10,8 +10,8 @@ here flips codex's own banner to `(network access enabled)` and all three succee
 
 The load-bearing properties:
 
-* BOTH workspace-write call shapes carry the grant — the fresh `--full-auto` call and the
-  `resume` call. Continuity must not silently revert it, which is exactly how #272's posture
+* BOTH workspace-write call shapes carry the grant — the fresh call (`--full-auto` when this
+  was written; `--sandbox workspace-write` since #375 removed the flag) and the `resume` call. Continuity must not silently revert it, which is exactly how #272's posture
   bug worked and why the resume shape is tested separately rather than assumed;
 * the read-only sandbox does NOT get it: the key is namespaced under `sandbox_workspace_write`
   and codex exposes no network knob for `--sandbox read-only`, so emitting it there would be
@@ -58,7 +58,9 @@ def test_fresh_workspace_write_call_grants_network(monkeypatch) -> None:
     monkeypatch.setattr(subprocess, "run", _stub_run(calls))
     codex_cli_transport()(_work())
     argv = calls[0]
-    assert "--full-auto" in argv
+    # #375: the fresh workspace-write shape is `--sandbox workspace-write`, not the
+    # `--full-auto` codex-cli 0.147.0 removed.
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write"
     assert NETWORK_CFG in argv
     # ...and it is a `-c` config override, not a bare argument the CLI would reject.
     assert argv[argv.index(NETWORK_CFG) - 1] == "-c"

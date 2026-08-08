@@ -270,8 +270,9 @@ def test_codex_isolated_review_uses_writable_sandbox_fresh_and_resume(monkeypatc
         model="gpt-5.5", tool_policy=READ_ONLY, cwd=None, workspace_isolated=True
     )
     codex_cli_transport()(isolated)
-    assert "--full-auto" in calls[0]
-    assert "--sandbox" not in calls[0]
+    # #375: the write posture is `--sandbox workspace-write` since codex-cli 0.147.0 dropped
+    # `--full-auto`; what matters here is that it is NOT read-only.
+    assert calls[0][calls[0].index("--sandbox") + 1] == "workspace-write"
 
     calls.clear()
     codex_cli_transport()(isolated.model_copy(update={"session_ref": "thread-1"}))
@@ -283,7 +284,7 @@ def test_codex_argv_without_a_posture_is_unchanged(monkeypatch) -> None:
     calls: list = []
     monkeypatch.setattr(subprocess, "run", _stub_run(calls))
     codex_cli_transport()(_work(model="gpt-5.5", cwd=None))
-    assert "--full-auto" in calls[0] and "--sandbox" not in calls[0]
+    assert calls[0][calls[0].index("--sandbox") + 1] == "workspace-write"  # #375
     calls.clear()
     codex_cli_transport()(_work(model="gpt-5.5", session_ref="thread-1", cwd=None))
     assert 'sandbox_mode="workspace-write"' in calls[0]
@@ -516,7 +517,8 @@ def test_a_lane_level_restriction_does_not_read_only_codex(monkeypatch) -> None:
         model="gpt-5.5", cwd=None, stage=Stage.IMPLEMENT, schema_ref="implement",
         permission_posture=PermissionPosture.RESTRICTED,
     ))
-    assert "--full-auto" in calls[0] and "--sandbox" not in calls[0]
+    # #375: still the write sandbox — a lane-level RESTRICTED must not go read-only.
+    assert calls[0][calls[0].index("--sandbox") + 1] == "workspace-write"
 
 
 def test_permission_posture_is_excluded_from_content_hash() -> None:
