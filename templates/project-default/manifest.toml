@@ -72,6 +72,7 @@ always = [
 [commands.python]
 install = ["uv", "sync"]
 test_unit = ["uv", "run", "pytest", "-q"]
+lint = ["uv", "run", "ruff", "check", "."]
 typecheck = ["uv", "run", "mypy", "."]
 [commands.typescript]
 install = ["pnpm", "install"]
