@@ -567,7 +567,7 @@ class {cls}:
     # it here for project-specific policies (for example, "frontend changes need e2e specs").
     #
     # def publish_progress(self, ...) / publish_note(self, ...) /
-    # file_followup(self, ..., idempotency_key=None):
+    # file_followup(self, ...) / file_followup_keyed(self, ..., idempotency_key=...):
     #     Task-source write-backs: living progress comment, completion note, follow-up
     #     issue filing. See orchestrator/ports/project.py for the full optional surface.
 

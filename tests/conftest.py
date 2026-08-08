@@ -88,22 +88,28 @@ class FakeTaskSource:
         )
 
     def file_followup(
+        self, title: str, body: str, labels: list[str] | None = None
+    ) -> str:
+        ref = f"https://example.test/issues/{len(self.followups) + 1}"
+        self.followups.append(
+            {"title": title, "body": body, "labels": labels, "ref": ref,
+             "idempotency_key": None}
+        )
+        return ref
+
+    def file_followup_keyed(
         self,
         title: str,
         body: str,
         labels: list[str] | None = None,
         *,
-        idempotency_key: str | None = None,
+        idempotency_key: str,
     ) -> str:
-        if idempotency_key is not None and idempotency_key in self.followups_by_key:
+        if idempotency_key in self.followups_by_key:
             return self.followups_by_key[idempotency_key]
-        ref = f"https://example.test/issues/{len(self.followups) + 1}"
-        self.followups.append(
-            {"title": title, "body": body, "labels": labels, "ref": ref,
-             "idempotency_key": idempotency_key}
-        )
-        if idempotency_key is not None:
-            self.followups_by_key[idempotency_key] = ref
+        ref = self.file_followup(title, body, labels)
+        self.followups[-1]["idempotency_key"] = idempotency_key
+        self.followups_by_key[idempotency_key] = ref
         return ref
 
 

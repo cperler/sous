@@ -6397,7 +6397,8 @@ class Engine:
             return prior.get("ref")
         task_source = getattr(self.project, "task_source", None)
         file_followup = getattr(task_source, "file_followup", None)
-        if not callable(file_followup):
+        file_followup_keyed = getattr(task_source, "file_followup_keyed", None)
+        if not callable(file_followup) and not callable(file_followup_keyed):
             return None
         title = f"Pre-merge batch integration gate red: {', '.join(failing)} (run {run_id})"
         lines = [
@@ -6439,20 +6440,38 @@ class Engine:
             if intent is not None and intent.get("idempotency_key")
             else f"batch-integration-gate-fix:{run_id}"
         )
-        if intent is None:
+        recovering = intent is not None
+        if not recovering:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "batch_integration_gate_fix_filing_intent",
                  "run_id": run_id, "title": title,
                  "idempotency_key": idempotency_key, "failing": failing},
             )
-        try:
-            ref = file_followup(
-                title=title,
-                body="\n".join(lines),
-                labels=["bug"],
-                idempotency_key=idempotency_key,
+        if recovering and not callable(file_followup_keyed):
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "batch_integration_gate_fix_recovery_skipped",
+                 "run_id": run_id, "title": title,
+                 "idempotency_key": idempotency_key,
+                 "reason": "task_source_has_no_keyed_followup_hook"},
             )
+            return None
+        try:
+            if callable(file_followup_keyed):
+                ref = file_followup_keyed(
+                    title=title,
+                    body="\n".join(lines),
+                    labels=["bug"],
+                    idempotency_key=idempotency_key,
+                )
+            else:
+                assert callable(file_followup)
+                ref = file_followup(
+                    title=title,
+                    body="\n".join(lines),
+                    labels=["bug"],
+                )
             if not ref:
                 raise RuntimeError("file_followup returned no reference")
         except Exception as exc:  # noqa: BLE001 - finalization survives a flaky task source

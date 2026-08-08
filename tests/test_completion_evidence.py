@@ -688,8 +688,10 @@ def test_github_source_keyed_followup_recovers_existing_issue() -> None:
 
     src = GitHubIssuesSource("o/r", runner=runner)
 
-    first = src.file_followup("Title", "Body", labels=["bug"], idempotency_key="key-1")
-    second = src.file_followup(
+    first = src.file_followup_keyed(
+        "Title", "Body", labels=["bug"], idempotency_key="key-1"
+    )
+    second = src.file_followup_keyed(
         "Title", "Body", labels=["bug"], idempotency_key="key-1"
     )
 
@@ -725,10 +727,10 @@ def test_localfile_source_publish_note_and_file_followup(tmp_path) -> None:
     log = (tmp_path / "followups.log").read_text()
     assert "bug" in log and "A title" in log
 
-    first = src.file_followup(
+    first = src.file_followup_keyed(
         "Keyed title", "Keyed body", labels=["bug"], idempotency_key="key-1"
     )
-    second = src.file_followup(
+    second = src.file_followup_keyed(
         "Keyed title", "Keyed body", labels=["bug"], idempotency_key="key-1"
     )
     assert first == second == "local:Keyed title"

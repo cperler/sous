@@ -121,8 +121,10 @@ tracker or fix-forward.
   `batch-integration-gate.json`, carried on the final notification, and best-effort files ONE
   `bug`, but does not merge PRs or rewrite the task-derived run outcome. A per-run lock and
   receipt dedupe the expensive check; external filing writes a stable-key intent first, then
-  the shipped task sources create-or-look-up on that key so a crash before the receipt cannot
-  duplicate the issue. Decomposition umbrellas,
+  the shipped task sources use a separate keyed create-or-look-up hook so a crash before the
+  receipt cannot duplicate the issue without changing the legacy `file_followup` signature.
+  A legacy source files normally on the first attempt but recovery will not replay its
+  unknowable external side effect. Decomposition umbrellas,
   rejected/failed tasks, and branchless non-code tasks are recorded as skipped inputs; a
   completed code task missing its expected branch makes the gate red. The same command
   executor powers the post-merge gate, while the disposable pre-merge checkout first runs
