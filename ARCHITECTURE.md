@@ -328,6 +328,17 @@ never satisfy.
   count — a human `reject` doesn't), and a paused run refuses to schedule until
   `orchestrator unpause`. All state is persisted by the engine, so a fresh scheduler on the
   same run dir resumes where a kill left off.
+- **Pre-merge batch integration gate.** At the all-tasks-terminal boundary, the engine
+  resolves completed leaf-task branches in stable dependency order and merges them over
+  current trunk in a disposable detached worktree. Merge conflicts are red immediately;
+  otherwise the composite runs the adapter's install command and then the same declared
+  unit/e2e/shell/lint/type commands as the post-merge trunk gate. The result is
+  report-and-file rather than merge orchestration:
+  it is persisted and included in the final notification, and one deduplicated `bug` is filed
+  on red, while the run's state remains the honest rollup of its task outcomes. A dedicated
+  per-run lock makes repeated/concurrent finalizers reuse the receipt instead of re-running
+  the gate or filing twice; dispatch eligibility reconciles an all-terminal/RUNNING run so
+  restarting after a kill during the gate resumes finalization rather than exiting early.
 
 ## Observability
 
@@ -346,6 +357,7 @@ cross-run `learnings-kb.jsonl` share one parent:
                                                    a heartbeat per tick + per sleep
                                                    slice, and an exit record
     stage-costs.jsonl                              per-call cost ledger rows
+    batch-integration-gate.json                    pre-merge composite gate detail (#370)
     approval-<run>-<task>.json                     human gate decision
     cost-summary.md, cost-report.md                rendered rollups
     stages/<task>/NN-<stage>.{json,md}             per-stage record + prose
