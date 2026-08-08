@@ -13,6 +13,7 @@ import re
 import subprocess
 from collections.abc import Callable
 
+from adapters.project.task_discussion import append_discussion
 from orchestrator.ports.project import TaskSpec
 
 Runner = Callable[[list[str]], str]
@@ -79,7 +80,7 @@ class GitHubIssuesSource:
         num = _issue_number(task_id)
         raw = self._run(
             ["gh", "issue", "view", num, "--repo", self.repo,
-             "--json", "number,title,body,labels,state,updatedAt"]
+             "--json", "number,title,body,labels,state,updatedAt,comments"]
         )
         data = json.loads(raw)
         # Already-closed early exit (ports implement-orchestrator.sh:519): a batch over
@@ -92,10 +93,15 @@ class GitHubIssuesSource:
                 f"(pass allow_closed=True to the task source to override)"
             )
         labels = [lbl["name"] for lbl in data.get("labels", [])]
+        raw_comments = data.get("comments", []) or []
+        comments = raw_comments if isinstance(raw_comments, list) else []
         return TaskSpec(
             task_id=task_id,
             title=data.get("title", ""),
-            body=data.get("body") or "",
+            # Discussion is composed into the body rather than adding a TaskSpec field:
+            # snapshot persistence, prompt rendering, fingerprinting, and refresh-spec then
+            # all see the exact same bounded content without changing the adapter contract.
+            body=append_discussion(data.get("body") or "", comments),
             issue_number=data.get("number"),
             depends_on=[],  # no analysis step yet; add-task --depends-on supplies edges
             labels=labels,

@@ -289,6 +289,15 @@ One `add-task` per issue. **The task source supplies each task's `depends_on`** 
 already wrote `Depends-on: #N` into the bodies — so the engine builds the correct DAG with no
 further analysis.
 
+The snapshot also includes issue comments under a bounded `## Discussion` section: the newest
+20 non-empty comments are eligible, with 4,000 characters per comment and 16,000 across their
+text. Marker-tagged orchestrator progress comments are excluded, and any count or character
+truncation is stated in the snapshot. Comments added or edited after `add-task` do not alter an
+in-progress run automatically; use `refresh-spec --task '#7'` (or first inspect with `--check`)
+before the next stage is dispatched. Local `tasks.json` sources have the same behavior via an
+optional `comments` list whose entries may be strings or objects with `body`, `author`,
+`created_at`, and `updated_at` fields.
+
 ### Route B — `/batch-plan` (inferred edges, or per-task lane pins)
 
 Use it when the edges must be *inferred* (issues filed independently over weeks, no shared

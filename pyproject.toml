@@ -171,6 +171,7 @@ module = [
     "adapters.project",
     "adapters.project.base",
     "adapters.project.github_issues",
+    "adapters.project.task_discussion",
     "adapters.project.selfhost",
     "adapters.project.selfhost.classifier",
     "adapters.project.selfhost.config",
