@@ -174,6 +174,50 @@ def test_filing_recovers_crash_after_external_create_before_receipt(
     assert receipts[0]["ref"] == result["filed"]
 
 
+def test_legacy_followup_hook_files_without_keyword_and_is_not_repeated_on_recovery(
+    tmp_path, monkeypatch
+) -> None:
+    class LegacyTaskSource:
+        def __init__(self) -> None:
+            self.followups: list[dict] = []
+
+        def file_followup(self, title: str, body: str, labels=None) -> str:
+            ref = f"https://example.test/issues/{len(self.followups) + 1}"
+            self.followups.append(
+                {"title": title, "body": body, "labels": labels, "ref": ref}
+            )
+            return ref
+
+    project = _IntegrationProject(_repo(tmp_path))
+    legacy = LegacyTaskSource()
+    project._task_source = legacy
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    real_append = eng.store.append_event
+
+    def crash_before_receipt(run_id: str, event: dict) -> None:
+        if event.get("type") == "batch_integration_gate_fix_filed":
+            raise RuntimeError("simulated process death before filing receipt")
+        real_append(run_id, event)
+
+    monkeypatch.setattr(eng.store, "append_event", crash_before_receipt)
+    with pytest.raises(RuntimeError, match="simulated process death"):
+        eng._file_batch_integration_fix("r1", [], ["test_unit"], [])
+
+    assert len(legacy.followups) == 1
+
+    recovered = _engine(tmp_path, project)
+    assert recovered._file_batch_integration_fix("r1", [], ["test_unit"], []) is None
+    assert len(legacy.followups) == 1
+    skipped = [
+        event
+        for event in recovered.store.read_events("r1")
+        if event["type"] == "batch_integration_gate_fix_recovery_skipped"
+    ]
+    assert len(skipped) == 1
+    assert skipped[0]["reason"] == "task_source_has_no_keyed_followup_hook"
+
+
 def test_merge_conflict_is_red_and_verification_does_not_run(tmp_path) -> None:
     repo = _repo(tmp_path)
     _branch(repo, "task/a", {"shared.txt": "from a\n"})

@@ -259,38 +259,44 @@ class GitHubIssuesSource:
         title: str,
         body: str,
         labels: list[str] | None = None,
-        *,
-        idempotency_key: str | None = None,
     ) -> str | None:
-        """Create or recover a follow-up issue and return its URL.
-
-        A keyed call first searches issue bodies for the exact hidden marker. This lets a
-        caller recover when issue creation succeeded but its local receipt was interrupted.
-        Unkeyed calls retain the original create-only behavior.
-        """
-        if idempotency_key is not None:
-            marker = _followup_marker(idempotency_key)
-            raw = self._run(
-                ["gh", "api", f"repos/{self.repo}/issues?state=all&per_page=100",
-                 "--paginate", "--slurp"]
-            )
-            pages = json.loads(raw) if raw.strip() else []
-            matches = [issue for page in pages for issue in page]
-            existing = next(
-                (
-                    issue.get("html_url")
-                    for issue in matches
-                    if marker in str(issue.get("body") or "") and issue.get("html_url")
-                ),
-                None,
-            )
-            if existing is not None:
-                return str(existing)
-            body = f"{body}\n\n{marker}"
+        """Create a follow-up issue and return its URL."""
         argv = ["gh", "issue", "create", "--repo", self.repo, "--title", title, "--body", body]
         for label in labels or []:
             argv += ["--label", label]
         return self._run(argv).strip() or None
+
+    def file_followup_keyed(
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        *,
+        idempotency_key: str,
+    ) -> str | None:
+        """Create or recover a follow-up issue under a stable key.
+
+        The call first searches issue bodies for the exact hidden marker. This lets a
+        caller recover when issue creation succeeded but its local receipt was interrupted.
+        """
+        marker = _followup_marker(idempotency_key)
+        raw = self._run(
+            ["gh", "api", f"repos/{self.repo}/issues?state=all&per_page=100",
+             "--paginate", "--slurp"]
+        )
+        pages = json.loads(raw) if raw.strip() else []
+        matches = [issue for page in pages for issue in page]
+        existing = next(
+            (
+                issue.get("html_url")
+                for issue in matches
+                if marker in str(issue.get("body") or "") and issue.get("html_url")
+            ),
+            None,
+        )
+        if existing is not None:
+            return str(existing)
+        return self.file_followup(title, f"{body}\n\n{marker}", labels)
 
     def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
         """Open a new issue and return its ``#N`` ref (the spec front door's filing hook,

@@ -338,8 +338,11 @@ never satisfy.
   on red, while the run's state remains the honest rollup of its task outcomes. A dedicated
   per-run lock makes repeated/concurrent finalizers reuse the receipt instead of re-running
   the gate. Filing persists a stable-key intent before the external call; the GitHub and
-  local-file sources create-or-look-up by that key, so recovery cannot duplicate an issue if
-  the process dies before the filing receipt. Dispatch eligibility reconciles an
+  local-file sources expose a separate `file_followup_keyed` create-or-look-up hook, so
+  recovery cannot duplicate an issue if the process dies before the filing receipt without
+  changing the existing `file_followup` signature. Legacy sources still file on the initial
+  attempt; an unresolved intent is explicitly skipped on recovery because replaying an
+  unknowable external side effect could duplicate it. Dispatch eligibility reconciles an
   all-terminal/RUNNING run so restarting after a kill during the gate resumes finalization
   rather than exiting early.
 
@@ -391,7 +394,8 @@ cross-run `learnings-kb.jsonl` share one parent:
 - **Seams** (`orchestrator/ports/project.py`, all duck-typed/best-effort): `notify` /
   `emit_notification` for stall + transition alerts (`alerting.py`), `publish_progress` /
   `publish_note` to post progress to the task source, `file_followup` to file follow-up
-  issues. A raising or missing hook never breaks a run.
+  issues, and `file_followup_keyed` for idempotent create-or-look-up behavior. A raising or
+  missing hook never breaks a run.
 - **Alerting payloads + email** (#359): the per-task pair is symmetric — `task_failed` from
   `_terminal_effects`, and `task_completed` from `_on_task_completed` (the choke point BOTH
   `record`'s success path and the decomposition-parent path pass through, so it fires exactly

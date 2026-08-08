@@ -136,19 +136,28 @@ class LocalFileTaskSource:
         title: str,
         body: str,
         labels: list[str] | None = None,
-        *,
-        idempotency_key: str | None = None,
     ) -> str | None:
-        """Create or recover a follow-up in the sibling ``followups.log``."""
+        """Append a follow-up to the sibling ``followups.log``."""
         log = self.tasks_path.with_name("followups.log")
         ref = f"local:{title}"
-        key_digest = (
-            hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
-            if idempotency_key is not None
-            else ""
-        )
+        with file_lock(log), open(log, "a", encoding="utf-8") as fh:
+            fh.write(f"{ref}\t{','.join(labels or [])}\t{title}\n{body}\n\n")
+        return ref
+
+    def file_followup_keyed(
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        *,
+        idempotency_key: str,
+    ) -> str | None:
+        """Create or recover a follow-up in ``followups.log`` under a stable key."""
+        log = self.tasks_path.with_name("followups.log")
+        ref = f"local:{title}"
+        key_digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
         with file_lock(log):
-            if idempotency_key is not None and log.exists():
+            if log.exists():
                 for line in log.read_text(encoding="utf-8").splitlines():
                     columns = line.split("\t")
                     if len(columns) >= 4 and columns[3] == key_digest:
