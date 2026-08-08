@@ -517,7 +517,8 @@ class {cls}:
     #     (green -> [], red -> blocking finding carrying the tool output, tool that
     #     cannot RUN -> advisory so an unverified gate never reads as green).
     #
-    # def publish_progress(self, ...) / publish_note(self, ...) / file_followup(self, ...):
+    # def publish_progress(self, ...) / publish_note(self, ...) /
+    # file_followup(self, ..., idempotency_key=None):
     #     Task-source write-backs: living progress comment, completion note, follow-up
     #     issue filing. See orchestrator/ports/project.py for the full optional surface.
 

@@ -6378,11 +6378,17 @@ class Engine:
     def _file_batch_integration_fix(
         self, run_id: str, commands: list[dict], failing: list[str], branches: list[dict]
     ) -> str | None:
-        """Best-effort, idempotent remediation filing for a red pre-merge batch gate."""
+        """Best-effort, crash-idempotent filing for a red pre-merge batch gate.
+
+        The intent is durable before the external side effect. A recovery that finds an
+        intent without a receipt asks the task source to create-or-look-up the follow-up
+        under the same key, closing the crash window between those two operations.
+        """
+        events = self.store.read_events(run_id)
         prior = next(
             (
                 event
-                for event in self.store.read_events(run_id)
+                for event in events
                 if event.get("type") == "batch_integration_gate_fix_filed"
             ),
             None,
@@ -6420,19 +6426,48 @@ class Engine:
             f"- `{entry['task_id']}` — `{entry['branch']}`" for entry in branches
         )
         lines.extend(["", "_Filed automatically by the pre-merge batch gate (#370)._"])
+        intent = next(
+            (
+                event
+                for event in events
+                if event.get("type") == "batch_integration_gate_fix_filing_intent"
+            ),
+            None,
+        )
+        idempotency_key = (
+            str(intent["idempotency_key"])
+            if intent is not None and intent.get("idempotency_key")
+            else f"batch-integration-gate-fix:{run_id}"
+        )
+        if intent is None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "batch_integration_gate_fix_filing_intent",
+                 "run_id": run_id, "title": title,
+                 "idempotency_key": idempotency_key, "failing": failing},
+            )
         try:
-            ref = file_followup(title=title, body="\n".join(lines), labels=["bug"])
+            ref = file_followup(
+                title=title,
+                body="\n".join(lines),
+                labels=["bug"],
+                idempotency_key=idempotency_key,
+            )
+            if not ref:
+                raise RuntimeError("file_followup returned no reference")
         except Exception as exc:  # noqa: BLE001 - finalization survives a flaky task source
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "followup_failed", "run_id": run_id,
-                 "title": title, "error": str(exc)},
+                 "title": title, "idempotency_key": idempotency_key,
+                 "error": str(exc)},
             )
             return None
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "batch_integration_gate_fix_filed", "run_id": run_id,
-             "title": title, "ref": ref, "failing": failing},
+             "title": title, "ref": ref, "idempotency_key": idempotency_key,
+             "failing": failing},
         )
         return ref
 

@@ -11,6 +11,8 @@ import json
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import TaskState
@@ -120,6 +122,56 @@ def test_finalize_catches_clean_auto_merge_that_is_red_only_when_combined(tmp_pa
     repeated = eng.batch_integration_gate("r1")
     assert repeated["deduped"] is True
     assert len(project.task_source.followups) == 1
+
+
+def test_filing_recovers_crash_after_external_create_before_receipt(
+    tmp_path, monkeypatch
+) -> None:
+    repo = _repo(tmp_path)
+    _branch(repo, "task/a", {"changed-api": "three values\n"})
+    _branch(repo, "task/b", {"old-caller": "two values\n"})
+    project = _IntegrationProject(
+        repo,
+        "test ! -f changed-api || test ! -f old-caller",
+    )
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "a")
+    eng.add_task("r1", "b")
+    _complete(eng, "a", "task/a")
+    _complete(eng, "b", "task/b")
+
+    real_append = eng.store.append_event
+
+    def crash_before_receipt(run_id: str, event: dict) -> None:
+        if event.get("type") == "batch_integration_gate_fix_filed":
+            raise RuntimeError("simulated process death before filing receipt")
+        real_append(run_id, event)
+
+    monkeypatch.setattr(eng.store, "append_event", crash_before_receipt)
+    with pytest.raises(RuntimeError, match="simulated process death"):
+        eng.batch_integration_gate("r1")
+
+    assert len(project.task_source.followups) == 1
+    intents = [
+        event
+        for event in eng.store.read_events("r1")
+        if event["type"] == "batch_integration_gate_fix_filing_intent"
+    ]
+    assert len(intents) == 1
+
+    recovered = _engine(tmp_path, project)
+    result = recovered.batch_integration_gate("r1")
+
+    assert len(project.task_source.followups) == 1
+    assert result["filed"] == project.task_source.followups[0]["ref"]
+    receipts = [
+        event
+        for event in recovered.store.read_events("r1")
+        if event["type"] == "batch_integration_gate_fix_filed"
+    ]
+    assert len(receipts) == 1
+    assert receipts[0]["ref"] == result["filed"]
 
 
 def test_merge_conflict_is_red_and_verification_does_not_run(tmp_path) -> None:

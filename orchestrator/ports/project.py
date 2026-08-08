@@ -84,8 +84,10 @@ class TaskSource(Protocol):
     #       comment — one method, one seam. Same duck-typed best-effort contract as
     #       publish_note: getattr-called at stage boundaries, a raising/missing hook is
     #       swallowed + evented (``progress_publish_failed``) and NEVER breaks record().
-    #   file_followup(title, body, labels=None) -> str | None
+    #   file_followup(title, body, labels=None, *, idempotency_key=None) -> str | None
     #       open a follow-up (e.g. a review's non-blocking finding); return its ref/URL.
+    #       When a key is supplied, create-or-look-up semantics make recovery after an
+    #       interrupted external call safe. Callers that do not need this omit the key.
     # The shared GitHubIssuesSource and LocalFileTaskSource implement all three.
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig

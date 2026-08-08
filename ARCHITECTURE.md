@@ -337,8 +337,11 @@ never satisfy.
   it is persisted and included in the final notification, and one deduplicated `bug` is filed
   on red, while the run's state remains the honest rollup of its task outcomes. A dedicated
   per-run lock makes repeated/concurrent finalizers reuse the receipt instead of re-running
-  the gate or filing twice; dispatch eligibility reconciles an all-terminal/RUNNING run so
-  restarting after a kill during the gate resumes finalization rather than exiting early.
+  the gate. Filing persists a stable-key intent before the external call; the GitHub and
+  local-file sources create-or-look-up by that key, so recovery cannot duplicate an issue if
+  the process dies before the filing receipt. Dispatch eligibility reconciles an
+  all-terminal/RUNNING run so restarting after a kill during the gate resumes finalization
+  rather than exiting early.
 
 ## Observability
 

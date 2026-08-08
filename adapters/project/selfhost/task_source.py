@@ -11,12 +11,14 @@ source with zero engine changes.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from pathlib import Path
 
 from orchestrator.errors import OrchestratorError
 from orchestrator.ports.project import TaskSpec
+from orchestrator.status_store import file_lock
 
 
 class LocalFileTaskSource:
@@ -124,14 +126,32 @@ class LocalFileTaskSource:
         path.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def file_followup(
-        self, title: str, body: str, labels: list[str] | None = None
+        self,
+        title: str,
+        body: str,
+        labels: list[str] | None = None,
+        *,
+        idempotency_key: str | None = None,
     ) -> str | None:
-        """Append a follow-up to a sibling ``followups.log`` and return a local ref (the
-        offline stand-in for an opened GitHub issue)."""
+        """Create or recover a follow-up in the sibling ``followups.log``."""
         log = self.tasks_path.with_name("followups.log")
         ref = f"local:{title}"
-        with open(log, "a", encoding="utf-8") as fh:
-            fh.write(f"{ref}\t{','.join(labels or [])}\t{title}\n{body}\n\n")
+        key_digest = (
+            hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()
+            if idempotency_key is not None
+            else ""
+        )
+        with file_lock(log):
+            if idempotency_key is not None and log.exists():
+                for line in log.read_text(encoding="utf-8").splitlines():
+                    columns = line.split("\t")
+                    if len(columns) >= 4 and columns[3] == key_digest:
+                        return columns[0]
+            with open(log, "a", encoding="utf-8") as fh:
+                fh.write(
+                    f"{ref}\t{','.join(labels or [])}\t{title}"
+                    f"\t{key_digest}\n{body}\n\n"
+                )
         return ref
 
     def create_task(self, title: str, body: str, labels: list[str] | None = None) -> str:
