@@ -101,11 +101,39 @@ _RATE_LIMIT_MARKERS = (
     "overloaded", "usage limit", "rate-limited",
 )
 
+# The provider CLI's OWN limit notice does NOT arrive on stderr: claude prints it in the
+# terminal ``result`` envelope under ``is_error: true``, so it lands in ``raw_output`` while
+# ``error`` (built from stderr at the transport's non-zero-exit branch) is empty. Scanning
+# only ``error`` therefore missed it entirely — a live "You've hit your session limit ·
+# resets 3:50pm" classified FAILURE, burned both TEST attempts 2.3s apart with no backoff,
+# and failed the task, while the engine's cooldown path (``not_before`` /
+# ``max_rate_limit_waits``) never engaged because it keys on ResultStatus.RATE_LIMITED.
+#
+# These are matched against ``raw_output``, which on a failing stage ALSO carries task
+# content (a test log, the model's final message), so unlike ``_RATE_LIMIT_MARKERS`` they
+# are anchored to the CLI's own first-person phrasing. A bare "session limit" or "429" is
+# deliberately excluded here: a task whose tests exercise a rate limiter would otherwise be
+# reclassified out of the retry/breaker accounting, which is the exact failure mode the
+# narrowness of ``_RATE_LIMIT_MARKERS`` was already guarding against. Case-insensitive.
+_PROVIDER_LIMIT_NOTICE_MARKERS = (
+    "hit your session limit", "hit your usage limit",
+    "session limit reached", "usage limit reached",
+)
+
 
 def is_rate_limited(raw: RawResult) -> bool:
-    """True if a RawResult's error looks like a transient rate-limit / overload."""
+    """True if a RawResult looks like a transient rate-limit / overload.
+
+    Two channels, deliberately asymmetric. The broad ``_RATE_LIMIT_MARKERS`` are matched
+    against ``error`` only (CLI stderr — never a task's own output). The narrow
+    ``_PROVIDER_LIMIT_NOTICE_MARKERS`` are additionally matched against ``raw_output``,
+    where the claude CLI actually reports a spent session/usage limit.
+    """
     text = (raw.error or "").lower()
-    return bool(text) and any(m in text for m in _RATE_LIMIT_MARKERS)
+    if text and any(m in text for m in _RATE_LIMIT_MARKERS):
+        return True
+    notice = f"{text}\n{(raw.raw_output or '').lower()}"
+    return any(m in notice for m in _PROVIDER_LIMIT_NOTICE_MARKERS)
 
 
 # Substrings marking the PROVIDER itself being unavailable — an auth/login failure, NOT a
