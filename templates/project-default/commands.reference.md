@@ -21,3 +21,9 @@ Notes:
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).
 - These are defaults; the interview confirms/overrides them against what's actually in the
   repo (lockfiles, `package.json` scripts, `pyproject.toml`, Makefile targets).
+- Declare `fresh_install_paths()` for environment artifacts that cannot move between
+  worktrees, and `worktree_origin_probes()` for the test runner and imported project source.
+  Each named probe is `(name, argv, kind)`, prints its absolute path as its final stdout line,
+  and uses `kind="launcher"` only when the final executable symlink may target a shared
+  interpreter; imported modules use `kind="source"` so their real path must remain inside the
+  worktree. If probes are omitted, verification is explicitly recorded as skipped.

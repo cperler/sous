@@ -67,6 +67,12 @@ class CapabilityDescriptor(BaseModel):
     # tool restriction on its ``agent()`` call — pairs with #262) and for the deterministic
     # ENGINE lane (no model, hence no toolset to narrow).
     enforces_tool_policy: bool = False
+    # #381: can this cell provision an isolated REVIEW workspace and run the project's
+    # declared toolchain-origin probes before the reviewer may trust tests? Interactive
+    # Workflow code has no filesystem, so it must stay False there. In-process model runners
+    # wrap REVIEW in ReviewIsolation and declare True; the engine uses this as a capability
+    # requirement whenever the project opts into fresh-install/origin hooks.
+    verifies_worktree_origin: bool = False
     # #304: the PERMISSION gate this cell dispatches under when the stage declares no tool
     # posture — lane-declared vocabulary rather than a constant buried in ``transport.py``,
     # which is what "usually right" (headless dispatch has no human to answer a prompt) was
@@ -164,6 +170,7 @@ def default_registry() -> Registry:
             # `render_prompt` adds for a non-enforcing lane, plus the per-dispatch
             # `tool_policy_unenforced` event. See `runners.build_registry` for the full note.
             enforces_tool_policy=False,
+            verifies_worktree_origin=False,
             status=SUPPORTED,
         )
     )

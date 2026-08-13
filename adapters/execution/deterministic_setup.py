@@ -19,7 +19,9 @@ them — they are execution-adapter concerns).
 
 For INTAKE a project may override the git logic with a ``setup_task(task_id) -> dict``
 method (the intake structured_output) — duck-typed, so tests supply a no-git fake and
-offline projects can pick their own worktree convention.
+offline projects can pick their own worktree convention.  The harness still owns dependency
+installation, origin verification, and baseline capture for the returned worktree; baseline
+fields supplied by the override are replaced with verified results.
 
 The built-in git path discovers the product repo from an explicit ``repo_root`` the
 project supplies (``ProjectConfig.repo_root`` — optional, duck-typed), falling back to
@@ -46,6 +48,12 @@ from orchestrator.schemas.work import StageResult, WorkItem
 
 from . import install_cache
 from .transport import RawResult, _git, _tag_head, to_stage_result
+from .worktree_origin import (
+    environment_reset_notice,
+    fresh_install_paths,
+    remove_fresh_install_paths,
+    verify_worktree_origin,
+)
 
 
 def _ref_safe(s: str) -> str:
@@ -56,6 +64,10 @@ def _ref_safe(s: str) -> str:
 
 class _SetupError(Exception):
     """A deterministic-setup failure (e.g. git error) — surfaced as ResultStatus.FAILURE."""
+
+    def __init__(self, message: str, *, notices: tuple[dict[str, object], ...] = ()) -> None:
+        super().__init__(message)
+        self.notices = notices
 
 
 class DeterministicSetupRunner:
@@ -72,6 +84,7 @@ class DeterministicSetupRunner:
                 provider=Provider.NONE,
                 in_process=True,
                 schema_enforced=True,
+                verifies_worktree_origin=True,
                 status=SUPPORTED,
             )
         ]
@@ -98,23 +111,49 @@ class DeterministicSetupRunner:
             if callable(override):
                 out = dict(override(work.task_id))
                 wt = out.get("worktree")
+                if not isinstance(wt, str) or not wt:
+                    raise _SetupError("setup_task did not return a worktree path")
+                worktree = Path(wt)
+                # The override contract returns only a path, so the runner cannot tell a new
+                # checkout from a legitimate retry cache. Treat it as fresh: a redundant
+                # install is cheap, an inherited sibling environment is not.
+                install_note, install_meta, notices = self._install_and_verify(
+                    worktree, fresh_provisioning=True
+                )
+                port_env = port_env_for(self._project, *ports) if ports else None
+                baseline = self._capture_baseline(worktree, port_env)
+                out.update({
+                    "baseline_captured": baseline["captured"],
+                    "baseline_failures": baseline["failures"],
+                    "baseline": (
+                        f"custom worktree; install: {install_note}; "
+                        f"tests: {baseline['note']}"
+                    ),
+                    **install_meta,
+                })
                 checkpoint = (
                     _tag_head(wt, work.checkpoint_tag)
                     if work.checkpoint_tag and wt and Path(wt).exists()
                     else None
                 )
             else:
-                out, checkpoint = self._git_setup(work, ports)
+                out, checkpoint, notices = self._git_setup(work, ports)
             if ports is not None:
                 out["port_base"], out["port_count"] = ports
         except Exception as exc:  # noqa: BLE001 - every dispatch MUST yield a StageResult,
             # never an escaped exception (a _git timeout / stale index.lock, or a raising
             # project setup_task, would otherwise leave the dispatch lease held with no CLI
             # path to clear it). Mirror claude_cli_transport's convert-to-FAILURE contract.
-            raw = RawResult(None, exit_code=1, error=str(exc), invocation="engine:setup")
+            raw = RawResult(
+                None, exit_code=1, error=str(exc), invocation="engine:setup",
+                execution_notices=getattr(exc, "notices", ()),
+            )
             return to_stage_result(work, raw, ResultStatus.FAILURE,
                                    mode=ExecutionMode.ENGINE, provider=Provider.NONE)
-        raw = RawResult(out, exit_code=0, invocation="engine:setup", checkpoint=checkpoint)
+        raw = RawResult(
+            out, exit_code=0, invocation="engine:setup", checkpoint=checkpoint,
+            execution_notices=notices,
+        )
         return to_stage_result(work, raw, ResultStatus.SUCCESS,
                                mode=ExecutionMode.ENGINE, provider=Provider.NONE)
 
@@ -133,7 +172,7 @@ class DeterministicSetupRunner:
 
     def _git_setup(
         self, work: WorkItem, ports: tuple[int, int] | None = None
-    ) -> tuple[dict, dict | None]:
+    ) -> tuple[dict, dict | None, tuple[dict[str, object], ...]]:
         # #42: discover the project repo from an EXPLICIT path the project supplies
         # (``ProjectConfig.repo_root`` — optional, duck-typed), not process CWD. The
         # documented fallback is "." (process CWD) so existing callers that run the
@@ -147,7 +186,7 @@ class DeterministicSetupRunner:
         safe = _ref_safe(work.task_id.lstrip("#"))
         branch = f"task/{safe}"
         worktree = repo_root / ".worktrees" / safe
-        self._ensure_worktree(repo_root, worktree, branch)
+        created = self._ensure_worktree(repo_root, worktree, branch)
 
         # #216: compose each COMPLETED DAG dependency's branch into this worktree BEFORE
         # install/baseline, so a dependent's per-PR gate runs against the sibling's shared
@@ -159,7 +198,12 @@ class DeterministicSetupRunner:
         # Best-effort dependency install (never fatal — a later stage's `uv run`/`npm`
         # re-syncs; a broken install shouldn't block worktree readiness). #63: skip it
         # when this worktree already holds a successful install of the same lockfiles.
-        install_note, install_meta = self._install(worktree)
+        # A newly created worktree is fresh-provisioned: declared artifacts are discarded and
+        # the install forced, so a stale directory attached with BOTH a copied environment and
+        # a copied install marker cannot skip its way past the lockfile-hash cache (#381).
+        install_note, install_meta, origin_notices = self._install_and_verify(
+            worktree, fresh_provisioning=created
+        )
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         # #216: capture base_sha AFTER the dep merges so the TEST stage's base_sha..worktree
@@ -199,9 +243,58 @@ class DeterministicSetupRunner:
             ),
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
         }
-        return out, checkpoint
+        return out, checkpoint, origin_notices
 
-    def _install(self, worktree: Path) -> tuple[str, dict]:
+    def _install_and_verify(
+        self, worktree: Path, *, fresh_provisioning: bool = False
+    ) -> tuple[str, dict, tuple[dict[str, object], ...]]:
+        """Install dependencies and fail closed unless their declared origins are local.
+
+        A freshly provisioned workspace can never legitimately arrive carrying a declared
+        environment, so its artifacts are discarded and the install forced WITHOUT consulting
+        the probes. Probe declaration is optional by contract (an absent hook is a trusted
+        skip), which would otherwise let a copied ``.venv`` survive into an installer like
+        ``uv sync`` that preserves stale launchers — the original false green (#381).
+
+        For a reused workspace the probes remain the discriminator: an existing environment is
+        checked before the installer runs, so a copied one is removed early enough, while a
+        trusted same-worktree environment keeps the ordinary lockfile cache path. The
+        post-install probe is unconditional because installation itself can change the
+        resolved toolchain.
+        """
+        declared_paths = fresh_install_paths(self._project)
+        environment_present = any(
+            (worktree.joinpath(*relative.parts).exists()
+             or worktree.joinpath(*relative.parts).is_symlink())
+            for relative in declared_paths
+        )
+        notices: tuple[dict[str, object], ...] = ()
+        force = False
+        if fresh_provisioning and declared_paths:
+            # Unconditional: forcing costs one install, while trusting an unverifiable
+            # inherited environment costs a false green in the check meant to prevent one.
+            if environment_present:
+                notices += (environment_reset_notice(worktree, "freshly provisioned worktree"),)
+            remove_fresh_install_paths(worktree, self._project)
+            force = True
+        elif environment_present:
+            inherited = verify_worktree_origin(self._project, worktree)
+            if not inherited.trusted:
+                notices = inherited.notices
+                remove_fresh_install_paths(worktree, self._project)
+                force = True
+
+        install_note, install_meta = self._install(worktree, force=force)
+        origin = verify_worktree_origin(self._project, worktree)
+        notices += origin.notices
+        if not origin.trusted:
+            raise _SetupError(
+                "worktree toolchain origin could not be verified; refusing baseline tests",
+                notices=notices,
+            )
+        return install_note, install_meta, notices
+
+    def _install(self, worktree: Path, *, force: bool = False) -> tuple[str, dict]:
         """Run (or skip) the project's dependency install, keyed per-worktree on the
         lockfile hash (#63). Returns a short human note plus the honest structured-output
         fields (``install_skipped`` / ``install_reason`` / ``install_lockfiles``) so the
@@ -211,7 +304,7 @@ class DeterministicSetupRunner:
         digest = install_cache.compute_hash(present)
         lockfiles = [p.name for p in present]
         marker = self._install_marker(worktree)
-        if install_cache.should_skip(marker, digest):
+        if not force and install_cache.should_skip(marker, digest):
             return "skipped (lockfile-hash-match)", {
                 "install_skipped": True,
                 "install_reason": "lockfile-hash-match",
@@ -242,6 +335,8 @@ class DeterministicSetupRunner:
     def _install_marker(self, worktree: Path) -> Path | None:
         """The per-worktree cache marker path (inside this worktree's private git dir), or
         None when it can't be resolved (a non-git worktree => never cache => always install)."""
+        if not worktree.is_dir():
+            return None
         gd = _git(str(worktree), "rev-parse", "--absolute-git-dir")
         if gd.returncode != 0 or not gd.stdout.strip():
             return None
@@ -291,7 +386,7 @@ class DeterministicSetupRunner:
         except Exception:  # noqa: BLE001 - classification must never fail setup
             return []
 
-    def _ensure_worktree(self, repo_root: Path, worktree: Path, branch: str) -> None:
+    def _ensure_worktree(self, repo_root: Path, worktree: Path, branch: str) -> bool:
         """Create the worktree+branch, or reuse an existing one (retry idempotency).
         Ports the reference ``run_setup_stage`` create/reuse + stale-branch retry."""
         if worktree.exists():
@@ -301,7 +396,7 @@ class DeterministicSetupRunner:
             if co.returncode != 0:
                 raise _SetupError(f"could not check out {branch} in existing worktree: "
                                   f"{co.stderr.strip()[:200]}")
-            return
+            return False
         worktree.parent.mkdir(parents=True, exist_ok=True)
         add = _git(str(repo_root), "worktree", "add", str(worktree), "-b", branch, self._base_ref)
         if add.returncode != 0:
@@ -310,13 +405,14 @@ class DeterministicSetupRunner:
             # `branch -D` first, which would discard unmerged commits on that branch.
             reuse = _git(str(repo_root), "worktree", "add", str(worktree), branch)
             if reuse.returncode == 0:
-                return
+                return True
             # Last resort: the branch is checked out elsewhere / genuinely stale. Delete
             # and recreate from base (matches the reference run_setup_stage retry).
             _git(str(repo_root), "branch", "-D", branch)
             add = _git(str(repo_root), "worktree", "add", str(worktree), "-b", branch, self._base_ref)
         if add.returncode != 0:
             raise _SetupError(f"git worktree add failed: {add.stderr.strip()[:200]}")
+        return True
 
     def _compose_dep_branches(self, worktree: Path, work: WorkItem) -> list[str]:
         """#216: merge every ``dep_branches`` entry (the engine-resolved branch names of

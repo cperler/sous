@@ -68,6 +68,9 @@ class RawResult:
     # {"tag", "sha"} stamped by the checkpoint wrapper after a successful
     # git-affecting stage (design pass §3); None otherwise.
     checkpoint: dict | None = None
+    # Adapter-detected degraded/refused execution evidence.  The engine is the sole event
+    # writer; ``to_stage_result`` carries these notices across that seam.
+    execution_notices: tuple[dict[str, object], ...] = ()
     # {"anchor", "count", "commits": [...]} stamped by the checkpoint wrapper when a
     # FAILED/TIMED-OUT attempt left commits past the anchor (#59); None otherwise.
     salvage: dict | None = None
@@ -617,6 +620,7 @@ def to_stage_result(
         persona_injected=raw.persona_injected,
         sub_results=sub_results,
         sub_calls=sub_calls,
+        execution_notices=raw.execution_notices,
         token_usage=raw.usage,
         usage_recovered=raw.usage_recovered,
         completed_at=datetime.now(UTC).isoformat(),

@@ -330,7 +330,10 @@ _TESTS_MEANINGFUL_DIRECTIVE = (
     "is NOT a pass, and it does not save you the work. But do not answer `false` merely "
     "because a change has no tests to judge: a literal `false` reads as a rejection for "
     "having vacuous tests and drives a fix cycle. `false` means \"there ARE tests and they "
-    "would NOT fail if this change regressed\"."
+    "would NOT fail if this change regressed\".\n"
+    "If a revert-based check or deliberate mutation suspiciously fails to make any test "
+    "fail, resolve the exercised module's `__file__` inside the test process and confirm it "
+    "belongs to this review worktree before concluding the test is not meaningful."
 )
 
 

@@ -29,13 +29,14 @@ loops engage; a green (or only-inherited) run succeeds.
 from __future__ import annotations
 
 import subprocess
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
 from .transport import RawResult, _git, _tag_head, subprocess_env, to_stage_result
+from .worktree_origin import verify_worktree_origin
 
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
 
@@ -97,6 +98,23 @@ class DeterministicTestRunner:
         self._timeout_s = timeout_s
 
     def dispatch(self, work: WorkItem) -> StageResult:
+        if not work.cwd:
+            raw = RawResult(
+                None, exit_code=1,
+                error="test worktree is unspecified; refusing to run verification commands",
+                invocation="engine:test",
+            )
+            return to_stage_result(work, raw, ResultStatus.FAILURE,
+                                   mode=ExecutionMode.ENGINE, provider=Provider.NONE)
+        origin = verify_worktree_origin(self._project, Path(work.cwd))
+        if not origin.trusted:
+            raw = RawResult(
+                None, exit_code=1,
+                error="worktree toolchain origin mismatch; refusing to trust test results",
+                invocation="engine:test", execution_notices=origin.notices,
+            )
+            return to_stage_result(work, raw, ResultStatus.FAILURE,
+                                   mode=ExecutionMode.ENGINE, provider=Provider.NONE)
         try:
             out, error, ok = self._run_tests(work)
         except Exception as exc:  # noqa: BLE001 - every dispatch MUST yield a StageResult,
@@ -112,8 +130,11 @@ class DeterministicTestRunner:
             if ok and work.checkpoint_tag and work.cwd else None
         )
         status = ResultStatus.SUCCESS if ok else ResultStatus.FAILURE
-        raw = RawResult(out, exit_code=0 if ok else 1, error=error,
-                        invocation="engine:test", checkpoint=checkpoint)
+        raw = RawResult(
+            out, exit_code=0 if ok else 1, error=error,
+            invocation="engine:test", checkpoint=checkpoint,
+            execution_notices=origin.notices,
+        )
         return to_stage_result(work, raw, status,
                                mode=ExecutionMode.ENGINE, provider=Provider.NONE)
 

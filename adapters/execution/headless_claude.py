@@ -54,6 +54,7 @@ class HeadlessClaudeRunner:
                 # is enforced even under `--dangerously-skip-permissions` (probed: the tool is
                 # absent from the toolset, not merely prompted for).
                 enforces_tool_policy=True,
+                verifies_worktree_origin=True,
                 status=SUPPORTED,
             )
         ]

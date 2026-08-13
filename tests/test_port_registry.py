@@ -236,7 +236,7 @@ def test_env_injection_lands_in_test_subprocess(tmp_path, monkeypatch) -> None:
 
     port_env = {ENV_PORT_BASE: "42010", ENV_PORT_COUNT: "10", ENV_PORT: "42010",
                 "REACT_PORT": "42010"}
-    work = _test_work(env=port_env)
+    work = _test_work(env=port_env).model_copy(update={"cwd": str(tmp_path)})
     # A project with a real test command so the runner actually shells one.
     result = DeterministicTestRunner(FakeProject()).dispatch(work)
     assert result.status is ResultStatus.SUCCESS
@@ -262,7 +262,8 @@ def test_no_env_means_inherit_unchanged(tmp_path, monkeypatch) -> None:
 
     import adapters.execution.deterministic_test as dt
     monkeypatch.setattr(dt.subprocess, "run", fake_run)
-    DeterministicTestRunner(FakeProject()).dispatch(_test_work(env=None))
+    work = _test_work(env=None).model_copy(update={"cwd": str(tmp_path)})
+    DeterministicTestRunner(FakeProject()).dispatch(work)
     assert seen["called"] is True
     assert seen["env"] is None  # None => inherit the process env unchanged
 

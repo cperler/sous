@@ -8,6 +8,7 @@ import importlib
 import json
 import sys
 
+from adapters.execution.runners import build_registry
 from adapters.project.base import ProjectConfig
 from adapters.project.selfhost import get_config as selfhost_config
 from adapters.project.selfhost.config import SelfHostConfig
@@ -34,6 +35,11 @@ def test_selfhost_satisfies_protocol() -> None:
     cfg = selfhost_config()
     assert isinstance(cfg, ProjectConfig)
     assert cfg.install_cmd() == ["uv", "sync"]
+    assert cfg.fresh_install_paths() == [".venv"]
+    assert [(name, kind) for name, _, kind in cfg.worktree_origin_probes()] == [
+        ("pytest shebang interpreter", "launcher"),
+        ("orchestrator module", "source"),
+    ]
     assert cfg.test_e2e_cmd() == ["true"]  # this repo has no E2E layer
     assert cfg.typecheck_cmd() == ["uv", "run", "ruff", "check", "."]
 
@@ -70,6 +76,7 @@ def test_second_project_completes_a_task_engine_untouched(tmp_path) -> None:
         StatusStore(tmp_path / "run"),
         CostLedger(tmp_path / "run" / "c.jsonl"),
         cfg,
+        registry=build_registry(setup_project=cfg),
         meta_task_source=cfg.engine_task_source,
     )
     eng.create_run("r1")
