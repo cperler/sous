@@ -19,7 +19,9 @@ them — they are execution-adapter concerns).
 
 For INTAKE a project may override the git logic with a ``setup_task(task_id) -> dict``
 method (the intake structured_output) — duck-typed, so tests supply a no-git fake and
-offline projects can pick their own worktree convention.
+offline projects can pick their own worktree convention.  The harness still owns dependency
+installation, origin verification, and baseline capture for the returned worktree; baseline
+fields supplied by the override are replaced with verified results.
 
 The built-in git path discovers the product repo from an explicit ``repo_root`` the
 project supplies (``ProjectConfig.repo_root`` — optional, duck-typed), falling back to
@@ -108,7 +110,21 @@ class DeterministicSetupRunner:
             if callable(override):
                 out = dict(override(work.task_id))
                 wt = out.get("worktree")
-                notices: tuple[dict[str, object], ...] = ()
+                if not isinstance(wt, str) or not wt:
+                    raise _SetupError("setup_task did not return a worktree path")
+                worktree = Path(wt)
+                install_note, install_meta, notices = self._install_and_verify(worktree)
+                port_env = port_env_for(self._project, *ports) if ports else None
+                baseline = self._capture_baseline(worktree, port_env)
+                out.update({
+                    "baseline_captured": baseline["captured"],
+                    "baseline_failures": baseline["failures"],
+                    "baseline": (
+                        f"custom worktree; install: {install_note}; "
+                        f"tests: {baseline['note']}"
+                    ),
+                    **install_meta,
+                })
                 checkpoint = (
                     _tag_head(wt, work.checkpoint_tag)
                     if work.checkpoint_tag and wt and Path(wt).exists()
@@ -181,23 +197,7 @@ class DeterministicSetupRunner:
         # Best-effort dependency install (never fatal — a later stage's `uv run`/`npm`
         # re-syncs; a broken install shouldn't block worktree readiness). #63: skip it
         # when this worktree already holds a successful install of the same lockfiles.
-        install_note, install_meta = self._install(worktree)
-        origin = verify_worktree_origin(self._project, worktree)
-        origin_notices = origin.notices
-        if not origin.trusted and fresh_install_paths(self._project):
-            # `uv sync` and analogous installers need not rewrite stale launchers/editable
-            # links. Delete the adapter-declared environment first, then force a fresh
-            # install even if the lockfile cache marker matches.
-            remove_fresh_install_paths(worktree, self._project)
-            install_note, install_meta = self._install(worktree, force=True)
-            repaired = verify_worktree_origin(self._project, worktree)
-            origin_notices += repaired.notices
-            origin = repaired
-        if not origin.trusted:
-            raise _SetupError(
-                "worktree toolchain origin could not be verified; refusing baseline tests",
-                notices=origin_notices,
-            )
+        install_note, install_meta, origin_notices = self._install_and_verify(worktree)
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         # #216: capture base_sha AFTER the dep merges so the TEST stage's base_sha..worktree
@@ -238,6 +238,42 @@ class DeterministicSetupRunner:
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
         }
         return out, checkpoint, origin_notices
+
+    def _install_and_verify(
+        self, worktree: Path
+    ) -> tuple[str, dict, tuple[dict[str, object], ...]]:
+        """Install dependencies and fail closed unless their declared origins are local.
+
+        When a declared environment already exists, probe it before invoking the installer.
+        This catches a copied environment early enough to remove it before ``uv sync`` or an
+        analogous command can preserve stale launchers/editable links. A trusted same-
+        worktree environment keeps the ordinary lockfile cache path. The post-install probe
+        is unconditional because installation itself can change the resolved toolchain.
+        """
+        declared_paths = fresh_install_paths(self._project)
+        environment_present = any(
+            (worktree.joinpath(*relative.parts).exists()
+             or worktree.joinpath(*relative.parts).is_symlink())
+            for relative in declared_paths
+        )
+        notices: tuple[dict[str, object], ...] = ()
+        force = False
+        if environment_present:
+            inherited = verify_worktree_origin(self._project, worktree)
+            if not inherited.trusted:
+                notices = inherited.notices
+                remove_fresh_install_paths(worktree, self._project)
+                force = True
+
+        install_note, install_meta = self._install(worktree, force=force)
+        origin = verify_worktree_origin(self._project, worktree)
+        notices += origin.notices
+        if not origin.trusted:
+            raise _SetupError(
+                "worktree toolchain origin could not be verified; refusing baseline tests",
+                notices=notices,
+            )
+        return install_note, install_meta, notices
 
     def _install(self, worktree: Path, *, force: bool = False) -> tuple[str, dict]:
         """Run (or skip) the project's dependency install, keyed per-worktree on the
@@ -280,6 +316,8 @@ class DeterministicSetupRunner:
     def _install_marker(self, worktree: Path) -> Path | None:
         """The per-worktree cache marker path (inside this worktree's private git dir), or
         None when it can't be resolved (a non-git worktree => never cache => always install)."""
+        if not worktree.is_dir():
+            return None
         gd = _git(str(worktree), "rev-parse", "--absolute-git-dir")
         if gd.returncode != 0 or not gd.stdout.strip():
             return None

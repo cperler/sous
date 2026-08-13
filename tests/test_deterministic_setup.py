@@ -268,16 +268,113 @@ def test_no_dep_branches_is_byte_identical_base_only(tmp_path, monkeypatch) -> N
 
 def test_project_setup_task_override_skips_git(tmp_path, monkeypatch) -> None:
     monkeypatch.chdir(tmp_path)  # NOT a git repo — the override must not touch git
+    worktree = tmp_path / "custom-worktree"
+    worktree.mkdir()
 
     class P:
         def install_cmd(self) -> list[str]:
             return ["true"]
 
         def setup_task(self, task_id: str) -> dict:
-            return {"branch": f"b/{task_id.lstrip('#')}", "worktree": "/wt/x",
+            return {"branch": f"b/{task_id.lstrip('#')}", "worktree": str(worktree),
                     "baseline_captured": True}
 
     res = DeterministicSetupRunner(P()).dispatch(_wi())
 
     assert res.status is ResultStatus.SUCCESS
     assert res.structured_output["branch"] == "b/7"
+    assert not (tmp_path / ".worktrees").exists()
+
+
+def test_project_setup_task_override_repairs_sibling_environment_before_baseline(
+    tmp_path, monkeypatch
+) -> None:
+    """Custom provisioning cannot carry a sibling environment into baseline tests."""
+    monkeypatch.chdir(tmp_path)  # NOT a git repo — setup_task remains the provisioning seam
+    worktree = tmp_path / "review"
+    sibling = tmp_path / "sibling" / ".venv"
+    (worktree / ".venv").mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (worktree / ".venv" / "origin").write_text(f"{sibling}\n")
+
+    class P:
+        def install_cmd(self) -> list[str]:
+            return ["sh", "-c", "mkdir -p .venv && pwd > .venv/origin"]
+
+        def test_unit_cmd(self, files=None) -> list[str]:
+            return [
+                "sh", "-c",
+                'test "$(cat .venv/origin)" = "$PWD" && touch baseline-ran',
+            ]
+
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+            return [("environment source", ["sh", "-c", "cat .venv/origin"])]
+
+        def setup_task(self, task_id: str) -> dict:
+            return {
+                "branch": f"b/{task_id.lstrip('#')}",
+                "worktree": str(worktree),
+                # These unverified claims must be replaced by the harness-owned baseline.
+                "baseline_captured": True,
+                "baseline_failures": ["bogus"],
+            }
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.SUCCESS
+    assert res.structured_output["baseline_captured"] is True
+    assert res.structured_output["baseline_failures"] == []
+    assert (worktree / "baseline-ran").exists()
+    assert (worktree / ".venv" / "origin").read_text().strip() == str(worktree)
+    mismatch = next(
+        notice for notice in res.execution_notices
+        if notice["notice"] == "worktree_origin_mismatch"
+    )
+    assert mismatch["expected_worktree"] == str(worktree)
+    assert mismatch["resolved_path"] == str(sibling)
+
+
+def test_project_setup_task_override_refuses_unrepairable_sibling_environment(
+    tmp_path, monkeypatch
+) -> None:
+    """A stale override environment cannot retain a fabricated green baseline claim."""
+    monkeypatch.chdir(tmp_path)
+    worktree = tmp_path / "review"
+    sibling = tmp_path / "sibling" / ".venv"
+    (worktree / ".venv").mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    (worktree / ".venv" / "origin").write_text(f"{sibling}\n")
+
+    class P:
+        def install_cmd(self) -> list[str]:
+            return ["true"]  # cannot recreate the removed environment
+
+        def test_unit_cmd(self, files=None) -> list[str]:
+            return ["sh", "-c", "touch should-not-run"]
+
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+            return [("environment source", ["sh", "-c", "cat .venv/origin"])]
+
+        def setup_task(self, task_id: str) -> dict:
+            return {
+                "branch": f"b/{task_id.lstrip('#')}",
+                "worktree": str(worktree),
+                "baseline_captured": True,
+            }
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.FAILURE
+    assert not (worktree / "should-not-run").exists()
+    mismatch = next(
+        notice for notice in res.execution_notices
+        if notice["notice"] == "worktree_origin_mismatch"
+    )
+    assert mismatch["expected_worktree"] == str(worktree)
+    assert mismatch["resolved_path"] == str(sibling)
