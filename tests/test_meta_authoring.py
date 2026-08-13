@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import orchestrator.engine as engine_module
 from orchestrator import learnings_kb as kb
 from orchestrator import meta_authoring as meta
@@ -12,13 +14,21 @@ from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage, TaskState
 from orchestrator.schemas.status import Task
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import FakeTaskSource, make_result
 
 TARGET = {"kind": "stage-template", "ref": "REVIEW"}
 
 
-def _engine(tmp_path, project) -> Engine:
-    return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "cost.jsonl"), project)
+def _engine(tmp_path, project, *, meta_task_source=None) -> Engine:
+    # Most tests in this module model a self-hosted run, where both explicitly resolved
+    # sources point at the same tracker. The external-routing case passes a distinct source.
+    meta_task_source = meta_task_source or project.task_source
+    return Engine(
+        StatusStore(tmp_path),
+        CostLedger(tmp_path / "cost.jsonl"),
+        project,
+        meta_task_source=meta_task_source,
+    )
 
 
 def _review_run(eng: Engine, run_id: str, task_id: str, *, detail: str) -> None:
@@ -41,6 +51,18 @@ def _review_run(eng: Engine, run_id: str, task_id: str, *, detail: str) -> None:
             },
         ),
     )
+
+
+def test_engine_never_falls_back_to_product_task_source(tmp_path, project) -> None:
+    class ProductOnlyConfig:
+        task_source = project.task_source
+
+    with pytest.raises(TypeError, match="requires meta_task_source"):
+        Engine(
+            StatusStore(tmp_path),
+            CostLedger(tmp_path / "cost.jsonl"),
+            ProductOnlyConfig(),  # type: ignore[arg-type]
+        )
 
 
 def test_process_entries_dedupe_per_run_and_never_reach_recall(tmp_path) -> None:
@@ -134,6 +156,24 @@ def test_second_run_files_one_meta_task_and_ledger_prevents_refiling(tmp_path, p
     assert len(project.task_source.followups) == 1
 
 
+def test_external_run_files_meta_task_only_in_engine_tracker(tmp_path, project) -> None:
+    engine_tracker = FakeTaskSource()
+    eng = _engine(tmp_path, project, meta_task_source=engine_tracker)
+
+    _review_run(eng, "r1", "t1", detail="First observation")
+    _review_run(eng, "r2", "t2", detail="Independent observation")
+
+    assert project.task_source.followups == []
+    assert len(engine_tracker.followups) == 1
+    assert engine_tracker.followups[0]["labels"] == ["meta-authoring", "enhancement"]
+
+    # The shared ledger still owns dedupe even though the filing target is now distinct
+    # from the run's product task source.
+    eng._file_meta_proposals("r2")
+    assert len(engine_tracker.followups) == 1
+    assert len(meta.read_filing_ledger(eng._meta_proposals_path())) == 1
+
+
 def test_concurrent_finalizers_file_one_meta_task(tmp_path, project, monkeypatch) -> None:
     path = tmp_path / "learnings-kb.jsonl"
     kb.append_learnings(path, [
@@ -180,10 +220,20 @@ def test_filing_failure_is_evented_without_ledger_and_can_retry(tmp_path, projec
     assert eng.store.load_run("r2").state.value == "completed"
     assert meta.read_filing_ledger(eng._meta_proposals_path()) == []
     assert any(e["type"] == "meta_proposal_failed" for e in eng.store.read_events("r2"))
+    audit = eng.status("r2")["meta_proposals"]
+    assert audit["clean"] is False
+    assert audit["failed"] == 1
+    assert audit["failures"][0]["error"] == "tracker unavailable"
 
     project.task_source.file_followup = real_file
     eng._file_meta_proposals("r2")
     assert len(meta.read_filing_ledger(eng._meta_proposals_path())) == 1
+    assert eng.status("r2")["meta_proposals"] == {
+        "failed": 0,
+        "failures": [],
+        "filed": 1,
+        "clean": True,
+    }
 
 
 def test_meta_authoring_label_holds_before_delivery_until_exact_gate_approved(

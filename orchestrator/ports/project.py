@@ -185,6 +185,13 @@ class ProjectConfig(Protocol):
     #       records it under ``skipped``), never a crash. Return the no-op sentinel when the
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
+    #
+    # Optional engine-tracker source (duck-typed, no contract-version bump):
+    #   engine_task_source: TaskSource
+    #       Dedicated task source for engine-owned meta-authoring proposals. Composition roots
+    #       normally inject this independently through ``load_engine_task_source``; the Engine
+    #       also accepts this config hook for direct self-hosted embedding. It MUST NOT alias an
+    #       external product's ordinary ``task_source``.
 
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...

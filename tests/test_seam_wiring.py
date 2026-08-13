@@ -18,6 +18,9 @@ from tests.conftest import make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
+    kw.setdefault(
+        "meta_task_source", getattr(project, "engine_task_source", project.task_source)
+    )
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"), project, **kw)
 
 
