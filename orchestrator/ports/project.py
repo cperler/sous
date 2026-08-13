@@ -190,11 +190,13 @@ class ProjectConfig(Protocol):
     #   fresh_install_paths() -> list[str]
     #       Relative dependency artifacts that must not be copied to a disposable REVIEW
     #       checkout and must be removed before reinstall (for example `.venv`).
-    #   worktree_origin_probes() -> list[tuple[str, list[str]]]
+    #   worktree_origin_probes() -> list[tuple[str, list[str], str]]
     #       Named argv commands whose final non-empty stdout line is an absolute runner or
-    #       source path. The execution adapter verifies every path is below the provisioned
-    #       worktree before accepting baseline, TEST, or REVIEW verification. Omission is
-    #       supported but emits an explicit warning-grade skipped-verification notice.
+    #       source path. The kind is "launcher" (the final symlink may target a shared
+    #       interpreter) or "source" (the fully resolved path must remain in the worktree).
+    #       Legacy two-value declarations default conservatively to "source". The execution
+    #       adapter verifies every path before accepting baseline, TEST, or REVIEW results.
+    #       Omission emits an explicit warning-grade skipped-verification notice.
 
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...

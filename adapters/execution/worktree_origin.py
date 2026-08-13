@@ -7,9 +7,11 @@ runner or source tree.  Projects may therefore declare two small, duck-typed hoo
     Worktree-relative dependency artifacts which must never be copied into a disposable
     REVIEW checkout (for example ``.venv``).
 
-``worktree_origin_probes() -> list[tuple[str, list[str]]]``
-    Named commands whose final non-empty stdout line is an absolute resolved path used by
-    the toolchain.  Every reported path must live below the worktree being verified.
+``worktree_origin_probes() -> list[tuple[str, list[str], str]]``
+    Named commands whose final non-empty stdout line is an absolute path used by the
+    toolchain.  The third value is ``"launcher"`` for an in-worktree executable whose final
+    symlink may target a shared interpreter, or ``"source"`` for imported code whose real
+    path must live below the worktree.  Legacy two-value probes are treated as ``"source"``.
 
 Omitting the probe hook is an explicit, warning-grade skip rather than a guessed pass.
 Declaring a probe makes it fail closed: an unrunnable probe or an outside path means no test
@@ -95,15 +97,29 @@ def verify_worktree_origin(project: object, worktree: Path) -> OriginVerificatio
     notices: list[dict[str, object]] = []
     for value in probes:
         try:
-            name, argv = value
+            parts = list(value)
+            if len(parts) == 2:
+                name, argv = parts
+                kind = "source"
+            elif len(parts) == 3:
+                name, argv, kind = parts
+            else:
+                raise ValueError
             command = list(argv)
         except (TypeError, ValueError):
-            notices.append(_error_notice(root, "invalid probe", "expected (name, argv)"))
+            notices.append(
+                _error_notice(root, "invalid probe", "expected (name, argv[, kind])")
+            )
             continue
         if not isinstance(name, str) or not name or not command or not all(
             isinstance(arg, str) and arg for arg in command
         ):
             notices.append(_error_notice(root, str(name), "probe name/argv is invalid"))
+            continue
+        if not isinstance(kind, str) or kind not in {"launcher", "source"}:
+            notices.append(
+                _error_notice(root, name, f"probe kind must be launcher or source, got {kind!r}")
+            )
             continue
         try:
             proc = subprocess.run(  # noqa: S603
@@ -122,18 +138,24 @@ def verify_worktree_origin(project: object, worktree: Path) -> OriginVerificatio
         if not reported.is_absolute():
             notices.append(_error_notice(root, name, f"probe returned non-absolute path: {reported}"))
             continue
-        # Check the path the toolchain actually reported without dereferencing its final
-        # component. A healthy venv commonly keeps `.venv/bin/python` inside the worktree as
-        # a symlink to a shared base interpreter; the launcher belongs to this worktree even
-        # though that implementation binary does not. Resolve as a fallback for worktrees
-        # reached through a filesystem alias, while lexical `..` escapes stay normalized.
-        resolved = Path(os.path.abspath(reported))
-        belongs = resolved.is_relative_to(root) or resolved.resolve().is_relative_to(root)
+        normalized = Path(os.path.abspath(reported))
+        # Only a launcher's FINAL component may point to a shared interpreter. Its parent is
+        # still resolved so a copied `.venv` symlink cannot smuggle a sibling launcher under
+        # an in-worktree lexical spelling. Imported source is dereferenced completely: an
+        # intermediate package symlink executes its real sibling target, not its local alias.
+        resolved = (
+            normalized.parent.resolve() / normalized.name
+            if kind == "launcher"
+            else normalized.resolve()
+        )
+        belongs = resolved.is_relative_to(root)
         if not belongs:
             notices.append({
                 "notice": "worktree_origin_mismatch",
                 "probe": name,
+                "probe_kind": kind,
                 "expected_worktree": str(root),
+                "reported_path": str(normalized),
                 "resolved_path": str(resolved),
                 "detail": f"{name} resolved outside the provisioned worktree",
             })

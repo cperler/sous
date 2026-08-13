@@ -21,8 +21,9 @@ Three operational modes share this CLI:
   (#281); the queue file and learnings KB stay at the shared root. See
   ``orchestrator.queue_file`` for the contract.
 
-The CLI never calls a model. All model-level work is delegated to the execution
-lane runners wired into the engine registry.
+The CLI never calls a model directly. All model-level work is delegated to the execution
+lane runners wired into the engine registry; interactive ``next`` may drain a contained
+in-process REVIEW runner when filesystem-origin verification requires it.
 """
 
 from __future__ import annotations
@@ -45,8 +46,8 @@ from .ports.project import ADAPTER_CONTRACT_VERSION
 from .project_init import DEFAULT_STACK
 from .project_loader import load_project, validate_config
 from .routing import Router
-from .schemas.enums import ExecutionLane, ExecutionMode, Provider
-from .schemas.work import StageResult
+from .schemas.enums import ExecutionLane, ExecutionMode, Provider, Stage
+from .schemas.work import StageResult, WorkItem
 
 
 def _budget_usd(raw: str) -> float:
@@ -1236,8 +1237,6 @@ def main(argv: list[str] | None = None) -> int:
                "max_filed_followups": run.max_filed_followups,
                "review_workflow": run.review_workflow})
     elif args.cmd == "add-task":
-        from .schemas.enums import Stage
-
         pipeline = (
             [Stage(s.strip()) for s in args.pipeline.split(",") if s.strip()]
             if args.pipeline else None
@@ -1265,10 +1264,10 @@ def main(argv: list[str] | None = None) -> int:
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
         # the ENGINE lane — #33) run in-process — drain them here so the interactive
         # supervisor only ever sees model WorkItems (never hand-creates a worktree or runs
-        # `gh pr create`). Keyed on the engine-chosen lane (ExecutionMode.ENGINE), the
-        # single source of truth for "deterministic", so it covers per-task opt-ins without
-        # re-deriving from STAGE_SPECS. The headless scheduler dispatches these itself via
-        # the registry, so this drain is the interactive lane's equivalent.
+        # `gh pr create`). A REVIEW rerouted to a contained runner for #381's origin
+        # verification is drained here too: the filesystem-free Workflow shim cannot
+        # provision or preflight its disposable worktree. All other model work still returns
+        # to the interactive supervisor. The headless scheduler dispatches these itself.
         # --resume applies only to the FIRST call — the one recovering a lease a crashed
         # supervisor left held (#50). Any deterministic stages drained afterward are fresh
         # dispatches with no outstanding lease, so they take the normal path.
@@ -1292,7 +1291,17 @@ def main(argv: list[str] | None = None) -> int:
                 supervisor_min_remaining_pct=args.supervisor_min_remaining_pct,
                 supervisor_resume_command=args.supervisor_resume_command,
             )
-            while work is not None and work.lane_policy.execution_mode is ExecutionMode.ENGINE:
+            def _drain_in_process(candidate: WorkItem) -> bool:
+                if candidate.lane_policy.execution_mode is ExecutionMode.ENGINE:
+                    return True
+                descriptor = eng.registry.describe(candidate.lane_policy)
+                return (
+                    candidate.stage is Stage.REVIEW
+                    and descriptor.in_process
+                    and descriptor.verifies_worktree_origin
+                )
+
+            while work is not None and _drain_in_process(work):
                 stage_result = eng.registry.resolve(work.lane_policy).dispatch(work)
                 eng.record(args.run, stage_result)
                 work = eng.next_work(

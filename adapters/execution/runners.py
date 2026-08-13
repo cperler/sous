@@ -114,6 +114,7 @@ def build_registry(
                 # differs. Flip to True in the SAME change that lands a tool option on
                 # `agent()`, which also retires that directive.
                 enforces_tool_policy=False,
+                verifies_worktree_origin=False,
                 # No claude CLI argv exists on this lane at all (the call is in-session), so
                 # the permission posture is untranslatable here for the same reason. It keeps
                 # the BYPASS default only because nothing reads it for an external cell.

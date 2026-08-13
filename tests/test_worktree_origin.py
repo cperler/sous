@@ -8,11 +8,13 @@ from pathlib import Path
 
 from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.review_isolation import ReviewIsolation
+from adapters.execution.runners import build_registry
 from adapters.execution.transport import RawResult
 from adapters.execution.worktree_origin import verify_worktree_origin
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import ResultStatus, Stage
+from orchestrator.routing import Router
+from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.status_store import StatusStore
 from tests.conftest import FakeProject, make_result
 
@@ -37,10 +39,46 @@ def test_in_worktree_launcher_symlink_to_shared_interpreter_is_valid(tmp_path) -
     launcher.symlink_to(shared)
 
     class Project:
-        def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
-            return [("runner interpreter", [sys.executable, "-c", f"print({str(launcher)!r})"])]
+        def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+            return [(
+                "runner interpreter",
+                [sys.executable, "-c", f"print({str(launcher)!r})"],
+                "launcher",
+            )]
 
     assert verify_worktree_origin(Project(), tmp_path).trusted is True
+
+
+def test_source_probe_rejects_intermediate_symlink_into_sibling(tmp_path) -> None:
+    worktree = tmp_path / "review"
+    sibling_module = tmp_path / "sibling" / "pkg" / "module.py"
+    sibling_module.parent.mkdir(parents=True)
+    sibling_module.write_text("executed_elsewhere = True\n")
+    local_package = worktree / "src" / "pkg"
+    local_package.parent.mkdir(parents=True)
+    local_package.symlink_to(sibling_module.parent)
+    reported = local_package / "module.py"
+
+    class Project:
+        def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+            return [(
+                "project module",
+                [sys.executable, "-c", f"print({str(reported)!r})"],
+                "source",
+            )]
+
+    result = verify_worktree_origin(Project(), worktree)
+
+    assert result.trusted is False
+    assert result.notices == ({
+        "notice": "worktree_origin_mismatch",
+        "probe": "project module",
+        "probe_kind": "source",
+        "expected_worktree": str(worktree),
+        "reported_path": str(reported),
+        "resolved_path": str(sibling_module),
+        "detail": "project module resolved outside the provisioned worktree",
+    },)
 
 
 class _ContaminatedProject(FakeProject):
@@ -49,12 +87,20 @@ class _ContaminatedProject(FakeProject):
         self.sibling = sibling
         self.sentinel = sentinel
 
-    def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+    def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
         # These represent the two production failures: the console runner's interpreter
         # and an editable-installed module both resolve to a sibling worktree.
         return [
-            ("test runner", [sys.executable, "-c", f"print({str(self.sibling)!r})"]),
-            ("project module", [sys.executable, "-c", f"print({str(self.sibling)!r})"]),
+            (
+                "test runner",
+                [sys.executable, "-c", f"print({str(self.sibling)!r})"],
+                "launcher",
+            ),
+            (
+                "project module",
+                [sys.executable, "-c", f"print({str(self.sibling)!r})"],
+                "source",
+            ),
         ]
 
     def test_unit_cmd(self, files=None) -> list[str]:  # noqa: ANN001
@@ -107,6 +153,49 @@ def test_sibling_toolchain_is_rejected_and_evented_before_tests_run(tmp_path) ->
     assert all(event["resolved_path"] == str(sibling) for event in events)
 
 
+def test_interactive_review_with_origin_hooks_is_rerouted_to_contained_runner(tmp_path) -> None:
+    """The filesystem-free Workflow shim must never receive a probe-bearing REVIEW."""
+
+    class Project(FakeProject):
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+            return [("project source", ["probe", "source"], "source")]
+
+    project = Project()
+    registry = build_registry(
+        setup_project=project,
+        headless_transport=lambda _work: RawResult({"approved": True, "issues": []}),
+    )
+    engine = Engine(
+        StatusStore(tmp_path / "run"),
+        CostLedger(tmp_path / "run" / "costs.jsonl"),
+        project,
+        router=Router(execution_mode=ExecutionMode.INTERACTIVE),
+        registry=registry,
+    )
+    engine.create_run("r1")
+    engine.add_task("r1", "T1")
+
+    while True:
+        work = engine.next_work("r1", "T1")
+        assert work is not None
+        if work.stage is Stage.REVIEW:
+            break
+        engine.record("r1", make_result(work))
+
+    assert work.lane_policy.execution_mode is ExecutionMode.HEADLESS
+    assert work.lane_policy.provider is Provider.CLAUDE
+    event = next(
+        event for event in engine.store.read_events("r1")
+        if event["type"] == "stage_rerouted_for_worktree_origin"
+    )
+    assert event["level"] == "warning"
+    assert event["from"] == "interactive:claude"
+    assert event["to"] == "headless:claude"
+
+
 def _git(cwd: Path, *args: str) -> None:
     subprocess.run(["git", *args], cwd=cwd, check=True, capture_output=True, text=True)
 
@@ -132,8 +221,8 @@ class _ReviewProject:
     def install_cmd(self) -> list[str]:
         return ["sh", "-c", "mkdir -p .venv && pwd > .venv/origin"]
 
-    def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
-        return [("review environment", ["sh", "-c", "cat .venv/origin"])]
+    def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+        return [("review environment", ["sh", "-c", "cat .venv/origin"], "source")]
 
 
 def test_disposable_review_does_not_copy_venv_and_installs_fresh(tmp_path) -> None:

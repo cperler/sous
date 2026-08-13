@@ -59,6 +59,7 @@ class CodexRunner:
                 # uses workspace-write only after moving REVIEW into an independent disposable
                 # checkout; every non-isolated write-denying call remains read-only.
                 enforces_tool_policy=True,
+                verifies_worktree_origin=True,
                 status=SUPPORTED,
             ),
             # codex never runs in-session — declare the empty cell honestly.

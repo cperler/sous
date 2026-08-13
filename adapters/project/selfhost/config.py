@@ -62,7 +62,7 @@ class SelfHostConfig:
         """Artifacts a disposable review must rebuild instead of copying."""
         return [".venv"]
 
-    def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+    def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
         """Resolve both the pytest launcher and this package through the worktree venv."""
         return [
             (
@@ -73,6 +73,7 @@ class SelfHostConfig:
                     "line=Path('.venv/bin/pytest').read_text().splitlines()[0]; "
                     "print(line.removeprefix('#!'))",
                 ],
+                "launcher",
             ),
             (
                 "orchestrator module",
@@ -80,6 +81,7 @@ class SelfHostConfig:
                     "uv", "run", "python", "-c",
                     "import orchestrator.engine as module; print(module.__file__)",
                 ],
+                "source",
             ),
         ]
 

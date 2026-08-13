@@ -1096,10 +1096,13 @@ class Engine:
         # overrides an explicitly model-pinned stage; it is evented rather than applied
         # silently, because a run that quietly stopped using the lane it was told to use is
         # exactly the kind of drift `lane_audit` exists to catch.
+        requested_lane = self.router.lane_for(stage, task)
         reroute_reason: str | None = None
         if not deterministic:
-            reroute_reason = engine_lane_required(stage, self.router.lane_for(stage, task))
+            reroute_reason = engine_lane_required(stage, requested_lane)
             deterministic = reroute_reason is not None
+        review_origin_rerouted_from: LanePolicy | None = None
+        review_origin_skip_reason: str | None = None
         # Resolved to an Effort (from the task pin or stage spec) or downshifted via
         # effort_below below — always an Effort member or None (#161/#202 narrowed the
         # transitional ``str | Effort | None``). StrEnum, so it flows identically into the
@@ -1119,10 +1122,28 @@ class Engine:
                     {"ts": _now(), "type": "stage_rerouted_to_engine_lane", "run_id": run_id,
                      "task_id": task_id, "stage": stage.value, "level": "warning",
                      "reason": reroute_reason,
-                     "from": self.router.lane_for(stage, task).provider.value},
+                     "from": requested_lane.provider.value},
                 )
         else:
-            lane = self.router.lane_for(stage, task)  # execution_mode × provider (§4)
+            lane = requested_lane  # execution_mode × provider (§4)
+            if stage is Stage.REVIEW and not self._lane_verifies_worktree_origin(lane):
+                if self._project_declares_worktree_origin():
+                    contained = LanePolicy(
+                        execution_mode=ExecutionMode.HEADLESS,
+                        provider=lane.provider,
+                        allow_fallback=lane.allow_fallback,
+                    )
+                    if not self._lane_verifies_worktree_origin(contained):
+                        raise ContractError(
+                            "REVIEW requires adapter-declared worktree-origin verification, "
+                            f"but neither {lane.execution_mode.value}:{lane.provider.value} "
+                            f"nor {contained.execution_mode.value}:{contained.provider.value} "
+                            "declares that capability"
+                        )
+                    review_origin_rerouted_from = lane
+                    lane = contained
+                else:
+                    review_origin_skip_reason = "adapter-declared review origin hooks absent"
             # Model resolution precedence for a model-lane stage (highest first):
             #   1. pending_fallback_model — a rate-limit re-queue already picked the cheaper
             #      model; it MUST win so the degrade is never undone (fable→opus stays opus).
@@ -1466,6 +1487,45 @@ class Engine:
                 event["plan"] = True
                 event["plan_lenses"] = [f.lens for f in work.plan.finders]
             evs.append(event)
+            if review_origin_rerouted_from is not None:
+                evs.append(
+                    {
+                        "ts": _now(),
+                        "type": "stage_rerouted_for_worktree_origin",
+                        "level": "warning",
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "stage": stage.value,
+                        "attempt": attempt,
+                        "work_item_id": work.id,
+                        "reason": "adapter-declared REVIEW origin verification",
+                        "from": (
+                            f"{review_origin_rerouted_from.execution_mode.value}:"
+                            f"{review_origin_rerouted_from.provider.value}"
+                        ),
+                        "to": f"{lane.execution_mode.value}:{lane.provider.value}",
+                    }
+                )
+            if review_origin_skip_reason is not None:
+                evs.append(
+                    {
+                        "ts": _now(),
+                        "type": "execution_notice",
+                        "level": "warning",
+                        "notice": "worktree_origin_verification_skipped",
+                        "run_id": run_id,
+                        "task_id": task_id,
+                        "stage": stage.value,
+                        "attempt": attempt,
+                        "work_item_id": work.id,
+                        "expected_worktree": work.cwd,
+                        "reason": review_origin_skip_reason,
+                        "detail": (
+                            "toolchain origin was not verified before REVIEW: "
+                            f"{review_origin_skip_reason}"
+                        ),
+                    }
+                )
             # #314: the persisted prompt was capped, so the `.prompt.txt` is not the whole
             # input. Warning-grade and explicit about how much was cut — the "never silent"
             # convention: the writer returned what it dropped, this call site emits it.
@@ -1577,6 +1637,25 @@ class Engine:
             return self.registry.describe(lane).enforces_tool_policy
         except NoRunnerError:
             return False
+
+    def _lane_verifies_worktree_origin(self, lane: LanePolicy) -> bool:
+        """Whether the resolved cell structurally preflights REVIEW's disposable worktree."""
+        try:
+            return self.registry.describe(lane).verifies_worktree_origin
+        except NoRunnerError:
+            return False
+
+    def _project_declares_worktree_origin(self) -> bool:
+        """Whether the adapter opted into fresh provisioning or origin probes.
+
+        Presence, rather than invoking either hook here, is deliberate: hook evaluation and
+        command execution belong to the execution adapter. A broken hook therefore still
+        routes to the contained runner, which turns the error into a loud refusal.
+        """
+        return any(
+            callable(getattr(self.project, name, None))
+            for name in ("fresh_install_paths", "worktree_origin_probes")
+        )
 
     def _permission_posture(
         self, lane: LanePolicy, tool_policy: ToolPolicy | None

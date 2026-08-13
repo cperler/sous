@@ -8,6 +8,7 @@ import importlib
 import json
 import sys
 
+from adapters.execution.runners import build_registry
 from adapters.project.base import ProjectConfig
 from adapters.project.selfhost import get_config as selfhost_config
 from adapters.project.selfhost.config import SelfHostConfig
@@ -35,8 +36,9 @@ def test_selfhost_satisfies_protocol() -> None:
     assert isinstance(cfg, ProjectConfig)
     assert cfg.install_cmd() == ["uv", "sync"]
     assert cfg.fresh_install_paths() == [".venv"]
-    assert [name for name, _ in cfg.worktree_origin_probes()] == [
-        "pytest shebang interpreter", "orchestrator module",
+    assert [(name, kind) for name, _, kind in cfg.worktree_origin_probes()] == [
+        ("pytest shebang interpreter", "launcher"),
+        ("orchestrator module", "source"),
     ]
     assert cfg.test_e2e_cmd() == ["true"]  # this repo has no E2E layer
     assert cfg.typecheck_cmd() == ["uv", "run", "ruff", "check", "."]
@@ -70,7 +72,12 @@ def test_selfhost_classifier_taxonomy() -> None:
 def test_second_project_completes_a_task_engine_untouched(tmp_path) -> None:
     tasks = _tasks_file(tmp_path, {"T1": {"title": "Tidy a module", "body": "do it"}})
     cfg = SelfHostConfig(tasks_path=tasks)
-    eng = Engine(StatusStore(tmp_path / "run"), CostLedger(tmp_path / "run" / "c.jsonl"), cfg)
+    eng = Engine(
+        StatusStore(tmp_path / "run"),
+        CostLedger(tmp_path / "run" / "c.jsonl"),
+        cfg,
+        registry=build_registry(setup_project=cfg),
+    )
     eng.create_run("r1")
     eng.add_task("r1", "T1")
     _drive(eng, "r1", "T1")

@@ -81,6 +81,7 @@ class DeterministicSetupRunner:
                 provider=Provider.NONE,
                 in_process=True,
                 schema_enforced=True,
+                verifies_worktree_origin=True,
                 status=SUPPORTED,
             )
         ]
