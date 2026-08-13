@@ -206,6 +206,8 @@ def test_review_prompt_scopes_the_omission_carve_out_to_an_absent_test_surface()
     prompt = render_prompt(Stage.REVIEW, task_id="t1", title="x", body="",
                            context={"pr_url": "http://x/pr/1"})
     assert "## Reporting tests_meaningful" in prompt
+    assert "resolve the exercised module's `__file__`" in prompt
+    assert "belongs to this review worktree" in prompt
     assert "JUDGE `tests_meaningful` whenever this change has tests you can read" in prompt
     assert "OMIT the field ONLY when there is genuinely NO test surface" in prompt
     assert "not judged" in prompt and "NOT a pass" in prompt

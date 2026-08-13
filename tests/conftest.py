@@ -184,6 +184,7 @@ def make_result(
     checkpoint: dict | None = None,
     salvage: dict | None = None,
     sub_results: dict | None = None,
+    execution_notices: tuple[dict[str, object], ...] = (),
 ) -> StageResult:
     """Simulate a runner's StageResult answering a WorkItem. The lane defaults to the
     WorkItem's own policy (so a deterministic engine-lane stage records as engine:none),
@@ -202,6 +203,7 @@ def make_result(
         session_ref=session_ref,
         checkpoint=checkpoint,
         salvage=salvage,
+        execution_notices=execution_notices,
         work_item_id=work.id,
         content_hash=work.content_hash,
         run_id=work.run_id,

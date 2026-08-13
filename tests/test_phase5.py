@@ -34,6 +34,10 @@ def test_selfhost_satisfies_protocol() -> None:
     cfg = selfhost_config()
     assert isinstance(cfg, ProjectConfig)
     assert cfg.install_cmd() == ["uv", "sync"]
+    assert cfg.fresh_install_paths() == [".venv"]
+    assert [name for name, _ in cfg.worktree_origin_probes()] == [
+        "pytest shebang interpreter", "orchestrator module",
+    ]
     assert cfg.test_e2e_cmd() == ["true"]  # this repo has no E2E layer
     assert cfg.typecheck_cmd() == ["uv", "run", "ruff", "check", "."]
 

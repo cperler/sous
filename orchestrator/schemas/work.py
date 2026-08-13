@@ -448,6 +448,11 @@ class StageResult(BaseModel):
     #     SubCall. None on single-call dispatches.
     sub_results: dict | None = None
     sub_calls: tuple[SubCall, ...] | None = None
+    # Warning-grade runner evidence that must reach the engine event stream.  Execution
+    # adapters return notices rather than writing events themselves, preserving the
+    # engine-owned-I/O boundary.  Used first by worktree-origin verification (#381), but
+    # intentionally generic so adapters never need to smuggle warnings through prose.
+    execution_notices: tuple[dict[str, object], ...] = ()
     token_usage: TokenUsage = Field(default_factory=TokenUsage)
     # Did ``token_usage`` come from a usage report the PROVIDER actually returned (#319)?
     # False means the call ran but its usage could not be read (killed before the terminal

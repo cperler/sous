@@ -92,6 +92,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
         raise ValueError("run_review_panel requires a plan-bearing WorkItem")
 
     notices: list[dict[str, object]] = []
+    execution_notices: list[dict[str, object]] = []
     sub_calls: list[SubCall] = []
     findings_by_lens: dict[str, dict] = {}
 
@@ -99,6 +100,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
         raw, call = _dispatch_sub(work, transport, phase=finder.lens, prompt=finder.prompt,
                                   schema_ref=finder.schema_ref, agent=finder.agent)
         sub_calls.append(call)
+        execution_notices.extend(raw.execution_notices)
         status = classify_raw(raw)
         if status is not ResultStatus.SUCCESS:
             # No partial-panel verdicts: a missing lens fails the dispatch, one attempt is
@@ -128,6 +130,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
             schema_ref=plan.verify_schema_ref, agent=None,
         )
         sub_calls.append(call)
+        execution_notices.extend(raw.execution_notices)
         verdict, problem = _verdict_of(raw, fingerprint)
         if verdict is None:
             # Errored / timed out / unmatchable fingerprint => NO verdict, so the fold leaves
@@ -145,7 +148,7 @@ def run_review_panel(work: WorkItem, transport: Transport) -> StageResult:
     }
     return to_stage_result(
         work,
-        _panel_raw(sub_calls, findings_by_lens, verdicts),
+        _panel_raw(sub_calls, findings_by_lens, verdicts, execution_notices),
         ResultStatus.SUCCESS,
         mode=ExecutionMode.HEADLESS,
         provider=Provider.CLAUDE,
@@ -353,7 +356,8 @@ def _verdict_of(raw: RawResult, fingerprint: str) -> tuple[dict | None, str]:
 
 
 def _panel_raw(
-    sub_calls: list[SubCall], findings_by_lens: dict[str, dict], verdicts: list[dict]
+    sub_calls: list[SubCall], findings_by_lens: dict[str, dict], verdicts: list[dict],
+    execution_notices: list[dict[str, object]],
 ) -> RawResult:
     """The dispatch-level RawResult a completed panel reports.
 
@@ -374,6 +378,7 @@ def _panel_raw(
         exit_code=0,
         invocation=f"review panel ({len(sub_calls)} sub-calls)",
         stream_files=_panel_stream_files(sub_calls),
+        execution_notices=tuple(execution_notices),
         schema_retries=sum(call.schema_retries for call in sub_calls),
         # One sub-call with unreadable usage makes the dispatch-level sum an understatement,
         # and saying so is the honest direction (#319) — the same `all(...)` rule the ledger's
@@ -403,6 +408,7 @@ def _panel_failure(
         invocation=raw.invocation or f"review panel finder {finder.lens}",
         raw_stderr=raw.raw_stderr,
         stream_files=files,
+        execution_notices=raw.execution_notices,
         schema_retries=sum(call.schema_retries for call in sub_calls),
         usage_recovered=all(call.usage_recovered for call in sub_calls),
     )

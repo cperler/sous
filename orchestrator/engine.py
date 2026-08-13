@@ -2374,6 +2374,8 @@ class Engine:
             # fold did NOT run on (a FAILED review) keeps its own structured_output.
             if result.sub_results is not None:
                 payload["sub_results"] = result.sub_results
+            if result.execution_notices:
+                payload["execution_notices"] = result.execution_notices
             if synthesized is not None:
                 payload["structured_output"] = synthesized
             # #285: the panel's deterministic telemetry (per-lens totals, cross-lens
@@ -2457,6 +2459,15 @@ class Engine:
                      "run_id": run_id, "task_id": result.task_id,
                      "stage": result.stage.value, **test_validation}
                 )
+            # Execution adapters return warnings; the engine owns durable event I/O.  A
+            # toolchain-origin mismatch is status-affecting in the runner AND observable
+            # here with both the expected worktree and offending resolved path (#381).
+            events.extend(
+                {**notice, "ts": _now(), "type": "execution_notice", "level": "warning",
+                 "run_id": run_id, "task_id": result.task_id,
+                 "stage": result.stage.value}
+                for notice in effective.execution_notices
+            )
             # Audit the WHY of a feasibility park alongside the generic stage record, so the
             # event stream shows the blocked_reason that routed the task to the human gate.
             if scope_blocked_reason is not None:

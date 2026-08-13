@@ -58,6 +58,31 @@ class SelfHostConfig:
     def install_cmd(self) -> list[str]:
         return ["uv", "sync"]
 
+    def fresh_install_paths(self) -> list[str]:
+        """Artifacts a disposable review must rebuild instead of copying."""
+        return [".venv"]
+
+    def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+        """Resolve both the pytest launcher and this package through the worktree venv."""
+        return [
+            (
+                "pytest shebang interpreter",
+                [
+                    "uv", "run", "python", "-c",
+                    "from pathlib import Path; "
+                    "line=Path('.venv/bin/pytest').read_text().splitlines()[0]; "
+                    "print(line.removeprefix('#!'))",
+                ],
+            ),
+            (
+                "orchestrator module",
+                [
+                    "uv", "run", "python", "-c",
+                    "import orchestrator.engine as module; print(module.__file__)",
+                ],
+            ),
+        ]
+
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]:
         return ["uv", "run", "pytest", *files, "-q"] if files else ["uv", "run", "pytest", "-q"]
 

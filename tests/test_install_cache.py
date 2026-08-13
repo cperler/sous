@@ -12,7 +12,7 @@ from pathlib import Path
 
 from adapters.execution import install_cache as ic
 from adapters.execution.deterministic_setup import DeterministicSetupRunner
-from orchestrator.schemas.enums import ExecutionMode, Provider, Stage
+from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LanePolicy, WorkItem
 
 _ENGINE = LanePolicy(execution_mode=ExecutionMode.ENGINE, provider=Provider.NONE, allow_fallback=False)
@@ -236,3 +236,42 @@ def test_env_escape_hatch_forces_full_install(tmp_path, monkeypatch) -> None:
     assert r2.structured_output["install_skipped"] is False
     assert r2.structured_output["install_reason"] == "cache-disabled"
     assert (wt / "deps.installed").exists()
+
+
+def test_cached_worktree_rebuilds_environment_when_origin_points_to_sibling(
+    tmp_path, monkeypatch
+) -> None:
+    """A matching lockfile marker must not preserve a movable/stale environment (#381)."""
+    _repo_with_lock(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    class OriginProject(_InstallProj):
+        def __init__(self) -> None:
+            super().__init__(["sh", "-c", "mkdir -p .venv && pwd > .venv/origin"])
+
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+            return [("environment source", ["sh", "-c", "cat .venv/origin"])]
+
+    runner = DeterministicSetupRunner(OriginProject())
+    first = runner.dispatch(_wi())
+    assert first.status is ResultStatus.SUCCESS
+    wt = Path(first.structured_output["worktree"])
+
+    sibling = tmp_path / ".worktrees" / "sibling" / ".venv"
+    sibling.mkdir(parents=True)
+    (wt / ".venv" / "origin").write_text(str(sibling))
+
+    second = runner.dispatch(_wi())
+
+    assert second.status is ResultStatus.SUCCESS
+    assert second.structured_output["install_skipped"] is False
+    assert (wt / ".venv" / "origin").read_text().strip() == str(wt)
+    mismatch = next(
+        notice for notice in second.execution_notices
+        if notice["notice"] == "worktree_origin_mismatch"
+    )
+    assert mismatch["expected_worktree"] == str(wt)
+    assert mismatch["resolved_path"] == str(sibling)

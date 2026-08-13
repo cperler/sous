@@ -20,6 +20,7 @@ import subprocess
 import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from dataclasses import replace
 from pathlib import Path
 
 from orchestrator.port_registry import (
@@ -34,12 +35,21 @@ from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.work import WorkItem
 
 from .transport import RawResult, Transport
+from .worktree_origin import (
+    fresh_install_paths,
+    remove_fresh_install_paths,
+    verify_worktree_origin,
+)
 
 _GIT_TIMEOUT_S = 120
 
 
 class _IsolationError(RuntimeError):
     """A REVIEW could not be contained; the call must fail instead of using the live tree."""
+
+    def __init__(self, message: str, *, notices: tuple[dict[str, object], ...] = ()) -> None:
+        super().__init__(message)
+        self.notices = notices
 
 
 class ReviewIsolation:
@@ -89,7 +99,16 @@ class ReviewIsolation:
                 with tempfile.TemporaryDirectory(
                     prefix="orchestrator-review-", ignore_cleanup_errors=True
                 ) as tmp:
-                    isolated_cwd = self._copy_worktree(source, Path(tmp) / "worktree")
+                    isolated_cwd = self._copy_worktree(
+                        source, Path(tmp) / "worktree", self._project
+                    )
+                    self._prepare_toolchain(isolated_cwd)
+                    origin = verify_worktree_origin(self._project or object(), isolated_cwd)
+                    if not origin.trusted:
+                        raise _IsolationError(
+                            "toolchain origin does not belong to disposable review worktree",
+                            notices=origin.notices,
+                        )
                     prompt = sub.prompt.replace(str(source), str(isolated_cwd))
                     if work.cwd:
                         prompt = prompt.replace(work.cwd, str(isolated_cwd))
@@ -102,13 +121,18 @@ class ReviewIsolation:
                         "prompt": prompt,
                         "workspace_isolated": True,
                     })
-                    return inner(isolated_work)
+                    raw = inner(isolated_work)
+                    return replace(
+                        raw,
+                        execution_notices=raw.execution_notices + origin.notices,
+                    )
             except _IsolationError as exc:
                 return RawResult(
                     None,
                     exit_code=1,
                     error=f"review isolation failed: {exc}",
                     invocation="review isolation",
+                    execution_notices=exc.notices,
                 )
 
         try:
@@ -143,7 +167,9 @@ class ReviewIsolation:
         return registry, key, env
 
     @staticmethod
-    def _copy_worktree(source: Path, destination: Path) -> Path:
+    def _copy_worktree(
+        source: Path, destination: Path, project: ProjectConfig | None = None
+    ) -> Path:
         if not (source / ".git").exists():
             raise _IsolationError(f"review cwd is not a Git worktree: {source}")
         clone = ReviewIsolation._run_git(
@@ -166,8 +192,11 @@ class ReviewIsolation:
             raise _IsolationError((remote.stderr.strip() or "could not remove clone origin")[:300])
 
         try:
+            excluded = {path.parts[0] for path in fresh_install_paths(project or object())}
             for entry in source.iterdir():
                 if entry.name == ".git":
+                    continue
+                if entry.name in excluded:
                     continue
                 target = destination / entry.name
                 if entry.is_symlink():
@@ -187,6 +216,35 @@ class ReviewIsolation:
         if reset.returncode != 0:
             raise _IsolationError((reset.stderr.strip() or "could not initialize clone index")[:300])
         return destination
+
+    def _prepare_toolchain(self, worktree: Path) -> None:
+        """Create disposable dependencies fresh when the adapter declares copied artifacts."""
+        project = self._project
+        if project is None or not fresh_install_paths(project):
+            return
+        # Defense in depth for nested declarations: top-level artifacts were never copied,
+        # and anything below a copied directory is removed before any project command runs.
+        remove_fresh_install_paths(worktree, project)
+        getter = getattr(project, "install_cmd", None)
+        try:
+            argv = getter() if callable(getter) else None
+        except Exception as exc:  # noqa: BLE001 - fail the contained review, never escape it
+            raise _IsolationError(f"could not resolve review install command: {exc}") from exc
+        if not argv or argv == ["true"]:
+            raise _IsolationError(
+                "fresh review dependencies were requested but no install command is declared"
+            )
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=worktree, capture_output=True, text=True, timeout=600
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            raise _IsolationError(f"review dependency install failed: {exc}") from exc
+        if proc.returncode != 0:
+            detail = (proc.stderr or proc.stdout).strip()[-300:]
+            raise _IsolationError(
+                f"review dependency install failed (rc={proc.returncode}): {detail}"
+            )
 
     @staticmethod
     def _run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:

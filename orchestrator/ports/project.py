@@ -186,6 +186,16 @@ class ProjectConfig(Protocol):
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
 
+    # Optional worktree-provenance hooks (#381; duck-typed, no contract-version bump):
+    #   fresh_install_paths() -> list[str]
+    #       Relative dependency artifacts that must not be copied to a disposable REVIEW
+    #       checkout and must be removed before reinstall (for example `.venv`).
+    #   worktree_origin_probes() -> list[tuple[str, list[str]]]
+    #       Named argv commands whose final non-empty stdout line is an absolute runner or
+    #       source path. The execution adapter verifies every path is below the provisioned
+    #       worktree before accepting baseline, TEST, or REVIEW verification. Omission is
+    #       supported but emits an explicit warning-grade skipped-verification notice.
+
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]: ...
