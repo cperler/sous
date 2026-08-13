@@ -66,7 +66,12 @@ def test_selfhost_classifier_taxonomy() -> None:
 def test_second_project_completes_a_task_engine_untouched(tmp_path) -> None:
     tasks = _tasks_file(tmp_path, {"T1": {"title": "Tidy a module", "body": "do it"}})
     cfg = SelfHostConfig(tasks_path=tasks)
-    eng = Engine(StatusStore(tmp_path / "run"), CostLedger(tmp_path / "run" / "c.jsonl"), cfg)
+    eng = Engine(
+        StatusStore(tmp_path / "run"),
+        CostLedger(tmp_path / "run" / "c.jsonl"),
+        cfg,
+        meta_task_source=cfg.engine_task_source,
+    )
     eng.create_run("r1")
     eng.add_task("r1", "T1")
     _drive(eng, "r1", "T1")
@@ -99,7 +104,12 @@ def test_scaffold_produces_working_adapter(tmp_path) -> None:
         tasks = _tasks_file(tmp_path, {"X": {"title": "demo"}})
         cfg = mod.SelfHostConfig if hasattr(mod, "SelfHostConfig") else mod.get_config().__class__
         run_cfg = cfg(tasks_path=tasks)
-        eng = Engine(StatusStore(tmp_path / "r"), CostLedger(tmp_path / "r" / "c.jsonl"), run_cfg)
+        eng = Engine(
+            StatusStore(tmp_path / "r"),
+            CostLedger(tmp_path / "r" / "c.jsonl"),
+            run_cfg,
+            meta_task_source=run_cfg.task_source,
+        )
         eng.create_run("r1")
         eng.add_task("r1", "X")
         _drive(eng, "r1", "X")

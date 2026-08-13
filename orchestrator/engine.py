@@ -365,6 +365,7 @@ class Engine:
         ledger: CostLedger,
         project: ProjectConfig,
         *,
+        meta_task_source: TaskSource | None = None,
         model_table: ModelTable = DEFAULT_MODEL_TABLE,
         capacity: CapacityPolicy = DEFAULT_CAPACITY,
         router: Router = DEFAULT_ROUTER,
@@ -382,7 +383,6 @@ class Engine:
         max_filed_followups: int = MAX_FILED_FOLLOWUPS_PER_TASK,
         progress_throttle_s: float = 60.0,
         use_learnings_kb: bool = True,
-        meta_task_source: TaskSource | None = None,
     ) -> None:
         # Process-boundary persistence (#206): the tuning knobs below are engine-DEFAULT
         # holders, not durable run config. Every CLI subcommand rebuilds the Engine from
@@ -404,12 +404,20 @@ class Engine:
         self.ledger = ledger
         self.project = project
         # Meta-authoring changes this engine, irrespective of the product repo being run.
-        # Production composition roots inject the engine project's task source by adapter
-        # name. The fallback preserves the direct-construction/self-host behavior for
-        # embedders and tests that predate the dedicated seam.
-        self.meta_task_source = (
-            meta_task_source if meta_task_source is not None else project.task_source
+        # Direct embedders must either inject the engine tracker or use a config that exposes
+        # a dedicated one. Never fall back to project.task_source: that is precisely the
+        # external-product routing bug this seam prevents.
+        resolved_meta_source = (
+            meta_task_source
+            if meta_task_source is not None
+            else getattr(project, "engine_task_source", None)
         )
+        if resolved_meta_source is None:
+            raise TypeError(
+                "Engine requires meta_task_source; the run project's task_source is not "
+                "a safe engine-tracker fallback"
+            )
+        self.meta_task_source = resolved_meta_source
         self.models = model_table
         # Single pricing source: the ledger prices with the engine's model table.
         self.ledger.model_table = model_table

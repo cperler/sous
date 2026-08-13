@@ -53,8 +53,9 @@ def test_reference_adapter_resolves_by_entry_point_name() -> None:
 
 def test_engine_task_source_defaults_to_selfhost_tracker(monkeypatch) -> None:
     monkeypatch.delenv(project_loader.ENGINE_PROJECT_ENV, raising=False)
-    monkeypatch.delenv("SELFHOST_TASKS", raising=False)
-    monkeypatch.delenv("SELFHOST_REPO", raising=False)
+    # Generic selfhost settings configure a product run, not the engine tracker.
+    monkeypatch.setenv("SELFHOST_TASKS", "/tmp/product-tasks.json")
+    monkeypatch.setenv("SELFHOST_REPO", "cperler/family-finance")
 
     source = load_engine_task_source()
 
@@ -66,7 +67,8 @@ def test_engine_task_source_project_is_configurable(monkeypatch) -> None:
     seen: list[str] = []
 
     class Config:
-        task_source = sentinel
+        task_source = object()
+        engine_task_source = sentinel
 
     def fake_load_project(spec: str):
         seen.append(spec)

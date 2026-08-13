@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import threading
 
+import pytest
+
 import orchestrator.engine as engine_module
 from orchestrator import learnings_kb as kb
 from orchestrator import meta_authoring as meta
@@ -18,6 +20,9 @@ TARGET = {"kind": "stage-template", "ref": "REVIEW"}
 
 
 def _engine(tmp_path, project, *, meta_task_source=None) -> Engine:
+    # Most tests in this module model a self-hosted run, where both explicitly resolved
+    # sources point at the same tracker. The external-routing case passes a distinct source.
+    meta_task_source = meta_task_source or project.task_source
     return Engine(
         StatusStore(tmp_path),
         CostLedger(tmp_path / "cost.jsonl"),
@@ -46,6 +51,18 @@ def _review_run(eng: Engine, run_id: str, task_id: str, *, detail: str) -> None:
             },
         ),
     )
+
+
+def test_engine_never_falls_back_to_product_task_source(tmp_path, project) -> None:
+    class ProductOnlyConfig:
+        task_source = project.task_source
+
+    with pytest.raises(TypeError, match="requires meta_task_source"):
+        Engine(
+            StatusStore(tmp_path),
+            CostLedger(tmp_path / "cost.jsonl"),
+            ProductOnlyConfig(),  # type: ignore[arg-type]
+        )
 
 
 def test_process_entries_dedupe_per_run_and_never_reach_recall(tmp_path) -> None:
