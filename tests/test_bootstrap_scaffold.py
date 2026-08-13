@@ -137,7 +137,12 @@ def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
     assert "E501 line too long" in lint_finding["description"]
     assert len(lint_finding["description"]) < 2300  # noisy output is tail-capped
 
-    eng = Engine(StatusStore(tmp_path / "run"), CostLedger(tmp_path / "costs.jsonl"), cfg)
+    eng = Engine(
+        StatusStore(tmp_path / "run"),
+        CostLedger(tmp_path / "costs.jsonl"),
+        cfg,
+        meta_task_source=cfg.task_source,
+    )
     eng.create_run("r1")
     eng.add_task("r1", "T1")
     while True:

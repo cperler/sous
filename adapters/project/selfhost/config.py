@@ -181,6 +181,16 @@ class SelfHostConfig:
     def task_source(self) -> LocalFileTaskSource | GitHubIssuesSource:
         return self._task_source
 
+    @property
+    def engine_task_source(self) -> GitHubIssuesSource:
+        """Engine-owned issue tracker, independent of product/local task overrides.
+
+        ``SELFHOST_REPO`` and ``SELFHOST_TASKS`` configure ordinary runs. Meta-authoring
+        always targets this harness unless ``ORCHESTRATOR_ENGINE_PROJECT`` selects a
+        different dedicated adapter at the composition root.
+        """
+        return GitHubIssuesSource(_SELF_REPO)
+
     def agent_for(self, stage: Stage, role: str | None = None) -> str | None:
         return _ROSTER.get(role) if role else None
 

@@ -24,7 +24,7 @@ import pytest
 from adapters.project.base import ADAPTER_CONTRACT_VERSION
 from adapters.project.selfhost.config import SelfHostConfig
 from orchestrator import project_loader
-from orchestrator.project_loader import load_project
+from orchestrator.project_loader import load_engine_task_source, load_project
 
 REPO = Path(__file__).resolve().parent.parent
 
@@ -49,6 +49,36 @@ def test_reference_adapter_resolves_by_entry_point_name() -> None:
     # `orchestrator.project_adapters` entry point registered by this package itself.
     # selfhost's config intentionally names itself after the repo it self-hosts.
     assert load_project("selfhost").name == "sous"
+
+
+def test_engine_task_source_defaults_to_selfhost_tracker(monkeypatch) -> None:
+    monkeypatch.delenv(project_loader.ENGINE_PROJECT_ENV, raising=False)
+    # Generic selfhost settings configure a product run, not the engine tracker.
+    monkeypatch.setenv("SELFHOST_TASKS", "/tmp/product-tasks.json")
+    monkeypatch.setenv("SELFHOST_REPO", "cperler/family-finance")
+
+    source = load_engine_task_source()
+
+    assert getattr(source, "repo", None) == "cperler/sous"
+
+
+def test_engine_task_source_project_is_configurable(monkeypatch) -> None:
+    sentinel = object()
+    seen: list[str] = []
+
+    class Config:
+        task_source = object()
+        engine_task_source = sentinel
+
+    def fake_load_project(spec: str):
+        seen.append(spec)
+        return Config()
+
+    monkeypatch.setenv(project_loader.ENGINE_PROJECT_ENV, "company-engine")
+    monkeypatch.setattr(project_loader, "load_project", fake_load_project)
+
+    assert load_engine_task_source() is sentinel
+    assert seen == ["company-engine"]
 
 
 def test_entry_point_configclass_form(monkeypatch) -> None:

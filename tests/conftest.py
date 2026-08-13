@@ -119,6 +119,7 @@ class FakeProject:
     def __init__(self) -> None:
         self._classifier = FakeClassifier()
         self._task_source = FakeTaskSource()
+        self._engine_task_source = FakeTaskSource()
 
     def install_cmd(self):
         return ["echo", "install"]
@@ -145,6 +146,11 @@ class FakeProject:
     @property
     def task_source(self):
         return self._task_source
+
+    @property
+    def engine_task_source(self):
+        """Dedicated-source seam used by direct Engine construction in unit tests."""
+        return self._engine_task_source
 
     def agent_for(self, stage: Stage, role: str | None = None):
         return {"implement": "impl-agent", "review": "code-reviewer", "docstring": "docstring-agent"}.get(role)

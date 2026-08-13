@@ -44,7 +44,7 @@ from .engine import DEFAULT_ABANDON_MIN_IDLE_S, Engine
 from .lane_loader import build_registry
 from .ports.project import ADAPTER_CONTRACT_VERSION
 from .project_init import DEFAULT_STACK
-from .project_loader import load_project, validate_config
+from .project_loader import load_engine_task_source, load_project, validate_config
 from .routing import Router
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider, Stage
 from .schemas.work import StageResult, WorkItem
@@ -228,7 +228,14 @@ def _engine(args: argparse.Namespace) -> Engine:
         run_log_root=root,  # #56: tee each provider call's raw stdout/stderr under stages/
     )
     router = Router(execution_mode=mode, orchestrator_provider=provider)
-    return Engine(store, ledger, project, router=router, registry=registry)
+    return Engine(
+        store,
+        ledger,
+        project,
+        router=router,
+        registry=registry,
+        meta_task_source=load_engine_task_source(),
+    )
 
 
 def _emit(obj: object) -> None:
@@ -1179,6 +1186,7 @@ def main(argv: list[str] | None = None) -> int:
             eng = Engine(
                 StatusStore(root), CostLedger(root / "stage-costs.jsonl"), project,
                 router=router, registry=registry,
+                meta_task_source=load_engine_task_source(),
             )
             return eng, registry_runner(registry)
 

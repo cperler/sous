@@ -314,8 +314,18 @@ never satisfy.
   is the manual surface. REVIEW process retrospectives use a detector-only `process` kind:
   they never enter task prompts. `orchestrator/meta_authoring.py` groups those observations
   by their optional stage-template/agent/skill/schema/kit target and, after the same target
-  appears in two distinct runs, files one evidence-backed `meta-authoring` task through the
-  adapter's `file_followup` seam. `<runs-root>/meta-proposals.jsonl` prevents refiling.
+  appears in two distinct runs, files one evidence-backed `meta-authoring` task through a
+  dedicated **engine** task source—not the product run's task source. The composition root
+  resolves that source by adapter name through `project_loader.load_engine_task_source`, so
+  `orchestrator/` still imports no concrete adapter: `ORCHESTRATOR_ENGINE_PROJECT` selects an
+  adapter spec and defaults to the bundled `selfhost` adapter. That adapter exposes a
+  dedicated engine source pinned to `cperler/sous`, independent of `SELFHOST_REPO` and
+  `SELFHOST_TASKS`; only `ORCHESTRATOR_ENGINE_PROJECT` changes engine-tracker resolution.
+  `Engine` requires this source explicitly (or through a config's dedicated
+  `engine_task_source`), so direct embedders cannot fall back to the run project's tracker.
+  `<runs-root>/meta-proposals.jsonl` prevents refiling across either self-hosted or
+  external-product runs. Best-effort filing failures remain non-fatal but are surfaced in
+  `status.meta_proposals` rather than living only in `events.jsonl`.
 - **Meta-authoring delivery gate.** Tasks sourced from issues labeled `meta-authoring`
   persist `hold_before=deliver`. They may scope, implement, test, and review normally, but
   `next_work` parks them `BLOCKED_ON_HUMAN` before DELIVER. Approval is keyed to the exact

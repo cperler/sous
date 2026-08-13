@@ -126,7 +126,7 @@ def default_engine_factory(
     from .cost_ledger import CostLedger
     from .engine import Engine
     from .lane_loader import build_registry
-    from .project_loader import load_project
+    from .project_loader import load_engine_task_source, load_project
     from .routing import Router
     from .schemas.enums import ExecutionMode, Provider
     from .status_store import StatusStore
@@ -137,6 +137,7 @@ def default_engine_factory(
     exec_mode = ExecutionMode(mode)
     prov = Provider(provider) if provider else None
     schema_provider = getattr(project, "schema_for", None)
+    meta_task_source = load_engine_task_source()
 
     def factory(run_root: Path) -> Engine:
         store = StatusStore(run_root)
@@ -149,7 +150,14 @@ def default_engine_factory(
             run_log_root=run_root,
         )
         router = Router(execution_mode=exec_mode, orchestrator_provider=prov)
-        return Engine(store, ledger, project, router=router, registry=registry)
+        return Engine(
+            store,
+            ledger,
+            project,
+            meta_task_source=meta_task_source,
+            router=router,
+            registry=registry,
+        )
 
     return factory
 

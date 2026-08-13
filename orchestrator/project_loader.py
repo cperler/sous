@@ -32,6 +32,7 @@ import importlib
 import importlib.metadata
 import importlib.util
 import inspect
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -39,10 +40,18 @@ from importlib.metadata import EntryPoint, EntryPoints
 from pathlib import Path
 from types import ModuleType
 
-from orchestrator.ports.project import ADAPTER_CONTRACT_VERSION, ProjectConfig
+from orchestrator.ports.project import ADAPTER_CONTRACT_VERSION, ProjectConfig, TaskSource
 
 # The entry-point group a packaged project (or third-party) registers its adapter under.
 ENTRY_POINT_GROUP = "orchestrator.project_adapters"
+
+# Meta-authoring proposals change this harness, not the product a run happens to target.
+# Resolve their tracker independently at the composition root. The env override accepts the
+# same adapter spec forms as ``--project`` (name, module, directory, or entry point), while the
+# bundled selfhost adapter exposes a dedicated source pinned to the engine's own
+# ``cperler/sous`` tracker.
+ENGINE_PROJECT_ENV = "ORCHESTRATOR_ENGINE_PROJECT"
+DEFAULT_ENGINE_PROJECT = "selfhost"
 
 # Mirrors the ProjectConfig Protocol (orchestrator/ports/project.py). ``schema_for`` and
 # ``types_cmd`` are deliberately absent: both are optional, duck-typed via ``getattr``
@@ -180,3 +189,20 @@ def load_project(spec: str) -> ProjectConfig:
         f"unknown project adapter {spec!r}: not a directory, an importable module, or a "
         f"registered `{ENTRY_POINT_GROUP}` entry point"
     )
+
+
+def load_engine_task_source(spec: str | None = None) -> TaskSource:
+    """Resolve the engine-owned tracker used for meta-authoring proposals.
+
+    This belongs in the composition root rather than :mod:`orchestrator.engine`: resolving
+    an adapter by name keeps the dependency arrow pointing inward, while injecting only its
+    engine-owned ``TaskSource`` port keeps product runs from filing harness work into their
+    own tracker. ``ORCHESTRATOR_ENGINE_PROJECT`` overrides the bundled ``selfhost`` default.
+    An adapter may expose ``engine_task_source`` to keep this source independent from its
+    ordinary task-source configuration; otherwise its normal ``task_source`` is used because
+    the adapter itself was selected specifically as the engine tracker.
+    """
+    project_spec = spec or os.environ.get(ENGINE_PROJECT_ENV) or DEFAULT_ENGINE_PROJECT
+    project = load_project(project_spec)
+    source = getattr(project, "engine_task_source", None)
+    return source if source is not None else project.task_source

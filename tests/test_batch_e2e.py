@@ -230,6 +230,7 @@ def _engine(tmp_path: Path, project: E2EProject, *, router: Router | None = None
         StatusStore(tmp_path / "store"),
         CostLedger(tmp_path / "stage-costs.jsonl"),
         project,
+        meta_task_source=project.task_source,
         registry=registry,
         router=router or Router(),
         **kw,

@@ -87,7 +87,7 @@ from .port_registry import (
     registry_for_project,
 )
 from .ports.execution import Registry, default_registry
-from .ports.project import ProjectConfig
+from .ports.project import ProjectConfig, TaskSource
 from .render import (
     format_review_issue,
     render_completion_note,
@@ -365,6 +365,7 @@ class Engine:
         ledger: CostLedger,
         project: ProjectConfig,
         *,
+        meta_task_source: TaskSource | None = None,
         model_table: ModelTable = DEFAULT_MODEL_TABLE,
         capacity: CapacityPolicy = DEFAULT_CAPACITY,
         router: Router = DEFAULT_ROUTER,
@@ -402,6 +403,21 @@ class Engine:
         self.store = store
         self.ledger = ledger
         self.project = project
+        # Meta-authoring changes this engine, irrespective of the product repo being run.
+        # Direct embedders must either inject the engine tracker or use a config that exposes
+        # a dedicated one. Never fall back to project.task_source: that is precisely the
+        # external-product routing bug this seam prevents.
+        resolved_meta_source = (
+            meta_task_source
+            if meta_task_source is not None
+            else getattr(project, "engine_task_source", None)
+        )
+        if resolved_meta_source is None:
+            raise TypeError(
+                "Engine requires meta_task_source; the run project's task_source is not "
+                "a safe engine-tracker fallback"
+            )
+        self.meta_task_source = resolved_meta_source
         self.models = model_table
         # Single pricing source: the ledger prices with the engine's model table.
         self.ledger.model_table = model_table
@@ -5430,6 +5446,45 @@ class Engine:
             # findings it was carrying, which have no other channel — so such a run does not
             # read as clean from a poll.
             "completion_notes": self.completion_notes_audit(run_id, events=events),
+            # #380: best-effort engine self-improvement filing must not break finalization,
+            # but its failures still need a human-facing surface rather than being recoverable
+            # only by grepping events.jsonl.
+            "meta_proposals": self.meta_proposals_audit(run_id, events=events),
+        }
+
+    def meta_proposals_audit(
+        self, run_id: str, *, events: list[dict] | None = None
+    ) -> dict:
+        """Current meta-authoring filing failures and successful filing count for a run.
+
+        A later success for the same proposal clears its earlier failure, while repeated
+        failures are counted in ``attempts``. Detection-level failures have no cluster key,
+        so they share the explicit ``detection`` bucket. Derived from the same events read as
+        the other status audits; status remains an offline poll with no tracker round trip.
+        """
+        events = self.store.read_events(run_id) if events is None else events
+        failures: dict[str, dict] = {}
+        filed = 0
+        for ev in events:
+            kind = ev.get("type")
+            key = str(ev.get("key") or "detection")
+            if kind == "meta_proposal_failed":
+                prior = failures.get(key)
+                failures[key] = {
+                    "key": ev.get("key"),
+                    "title": ev.get("title"),
+                    "error": str(ev.get("error") or ""),
+                    "attempts": int(prior["attempts"]) + 1 if prior else 1,
+                }
+            elif kind == "meta_proposal_filed":
+                filed += 1
+                failures.pop(key, None)
+        current = [failures[key] for key in sorted(failures)]
+        return {
+            "failed": len(current),
+            "failures": current,
+            "filed": filed,
+            "clean": not current,
         }
 
     def completion_notes_audit(self, run_id: str, *, events: list[dict] | None = None) -> dict:
@@ -6966,7 +7021,7 @@ class Engine:
         return self._learnings_kb_path().with_name("meta-proposals.jsonl")
 
     def _file_meta_proposals(self, run_id: str) -> None:
-        """File newly recurring process complaints through the current task source.
+        """File newly recurring process complaints through the engine's task source.
 
         Detection and filing are best-effort run-finalize effects. A successful tracker
         reference is ledgered; a missing/raising hook is non-fatal and leaves the cluster
@@ -6975,18 +7030,27 @@ class Engine:
         """
         if not self._learnings_kb_enabled():
             return
-        file_followup = getattr(self.project.task_source, "file_followup", None)
-        if not callable(file_followup):
-            return
         try:
             proposals = recurring_proposals(read_kb_entries(self._learnings_kb_path()))
             ledger_path = self._meta_proposals_path()
         except Exception as exc:  # noqa: BLE001 - detection is best-effort evidence-out
             self.store.append_event(
                 run_id,
-                {"ts": _now(), "type": "meta_proposal_failed", "run_id": run_id,
+                {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                 "run_id": run_id,
                  "error": str(exc)},
             )
+            return
+        file_followup = getattr(self.meta_task_source, "file_followup", None)
+        if not callable(file_followup):
+            for proposal in proposals:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                     "run_id": run_id, "key": proposal["key"],
+                     "title": proposal_title(proposal),
+                     "error": "engine task source has no file_followup hook"},
+                )
             return
         for proposal in proposals:
             title = proposal_title(proposal)
@@ -7011,7 +7075,8 @@ class Engine:
             except Exception as exc:  # noqa: BLE001 - filing must never break finalize
                 self.store.append_event(
                     run_id,
-                    {"ts": _now(), "type": "meta_proposal_failed", "run_id": run_id,
+                    {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                     "run_id": run_id,
                      "key": proposal["key"], "title": title, "error": str(exc)},
                 )
                 continue
