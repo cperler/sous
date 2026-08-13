@@ -329,12 +329,66 @@ def test_project_setup_task_override_repairs_sibling_environment_before_baseline
     assert res.structured_output["baseline_failures"] == []
     assert (worktree / "baseline-ran").exists()
     assert (worktree / ".venv" / "origin").read_text().strip() == str(worktree)
-    mismatch = next(
+    # Since #381 the inherited environment is discarded on provisioning grounds alone, so the
+    # sibling is gone BEFORE any probe could report a mismatch. The discard is the record.
+    reset = next(
         notice for notice in res.execution_notices
-        if notice["notice"] == "worktree_origin_mismatch"
+        if notice["notice"] == "worktree_environment_reset"
     )
-    assert mismatch["expected_worktree"] == str(worktree)
-    assert mismatch["resolved_path"] == str(sibling)
+    assert reset["expected_worktree"] == str(worktree.resolve())
+    assert not any(
+        notice["notice"] == "worktree_origin_mismatch" for notice in res.execution_notices
+    )
+    assert not sibling.joinpath("origin").exists()  # cleanup never escaped the worktree
+
+
+def test_probeless_override_still_discards_inherited_environment(
+    tmp_path, monkeypatch
+) -> None:
+    """Declaring fresh_install_paths without probes must not trust an inherited environment.
+
+    worktree_origin_probes is optional by contract, so verification returns a trusted SKIP.
+    Before #381's fix that let a copied .venv survive an installer which preserves stale
+    launchers — the false green this whole mechanism exists to prevent.
+    """
+    monkeypatch.chdir(tmp_path)
+    worktree = tmp_path / "review"
+    sibling = tmp_path / "sibling" / ".venv"
+    (worktree / ".venv").mkdir(parents=True)
+    sibling.mkdir(parents=True)
+    # A stale launcher an incremental `uv sync`-style install would leave untouched.
+    (worktree / ".venv" / "origin").write_text(f"{sibling}\n")
+
+    class P:
+        def install_cmd(self) -> list[str]:
+            # Incremental: only writes origin when the environment was actually removed.
+            return ["sh", "-c", "mkdir -p .venv && [ -f .venv/origin ] || pwd > .venv/origin"]
+
+        def test_unit_cmd(self, files=None) -> list[str]:
+            return ["sh", "-c", 'test "$(cat .venv/origin)" = "$PWD" && touch baseline-ran']
+
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        # NOTE: no worktree_origin_probes — the supported, unverifiable configuration.
+
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": f"b/{task_id.lstrip('#')}", "worktree": str(worktree)}
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.SUCCESS
+    # The sibling-pointing launcher is gone: the install rebuilt it in THIS worktree.
+    assert (worktree / ".venv" / "origin").read_text().strip() == str(worktree)
+    assert (worktree / "baseline-ran").exists()
+    assert res.structured_output["baseline_captured"] is True
+    # The discard is auditable even though no probe reported a mismatch.
+    reset = next(
+        notice for notice in res.execution_notices
+        if notice["notice"] == "worktree_environment_reset"
+    )
+    assert reset["expected_worktree"] == str(worktree.resolve())
+    assert reset["reason"] == "freshly provisioned worktree"
 
 
 def test_project_setup_task_override_refuses_unrepairable_sibling_environment(
@@ -372,9 +426,12 @@ def test_project_setup_task_override_refuses_unrepairable_sibling_environment(
 
     assert res.status is ResultStatus.FAILURE
     assert not (worktree / "should-not-run").exists()
-    mismatch = next(
+    # The stale environment is discarded first; the installer cannot rebuild it, so the
+    # post-install probe has nothing to resolve and fails closed rather than passing.
+    assert not (worktree / ".venv").exists()
+    failed = next(
         notice for notice in res.execution_notices
-        if notice["notice"] == "worktree_origin_mismatch"
+        if notice["notice"] == "worktree_origin_probe_failed"
     )
-    assert mismatch["expected_worktree"] == str(worktree)
-    assert mismatch["resolved_path"] == str(sibling)
+    assert failed["expected_worktree"] == str(worktree)
+    assert failed["probe"] == "environment source"

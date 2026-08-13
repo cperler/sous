@@ -162,6 +162,20 @@ def verify_worktree_origin(project: object, worktree: Path) -> OriginVerificatio
     return OriginVerification(not notices, tuple(notices))
 
 
+def environment_reset_notice(worktree: Path, reason: str) -> dict[str, object]:
+    """Record that declared artifacts were discarded before install.
+
+    Emitted when provisioning itself is the reason an inherited environment cannot be
+    trusted, so the discard is auditable even though no probe reported a mismatch.
+    """
+    return {
+        "notice": "worktree_environment_reset",
+        "expected_worktree": str(worktree.resolve()),
+        "reason": reason,
+        "detail": f"declared dependency artifacts were removed before install: {reason}",
+    }
+
+
 def _skip_notice(root: Path, reason: str) -> dict[str, object]:
     return {
         "notice": "worktree_origin_verification_skipped",

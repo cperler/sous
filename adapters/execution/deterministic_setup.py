@@ -49,6 +49,7 @@ from orchestrator.schemas.work import StageResult, WorkItem
 from . import install_cache
 from .transport import RawResult, _git, _tag_head, to_stage_result
 from .worktree_origin import (
+    environment_reset_notice,
     fresh_install_paths,
     remove_fresh_install_paths,
     verify_worktree_origin,
@@ -113,7 +114,12 @@ class DeterministicSetupRunner:
                 if not isinstance(wt, str) or not wt:
                     raise _SetupError("setup_task did not return a worktree path")
                 worktree = Path(wt)
-                install_note, install_meta, notices = self._install_and_verify(worktree)
+                # The override contract returns only a path, so the runner cannot tell a new
+                # checkout from a legitimate retry cache. Treat it as fresh: a redundant
+                # install is cheap, an inherited sibling environment is not.
+                install_note, install_meta, notices = self._install_and_verify(
+                    worktree, fresh_provisioning=True
+                )
                 port_env = port_env_for(self._project, *ports) if ports else None
                 baseline = self._capture_baseline(worktree, port_env)
                 out.update({
@@ -181,11 +187,6 @@ class DeterministicSetupRunner:
         branch = f"task/{safe}"
         worktree = repo_root / ".worktrees" / safe
         created = self._ensure_worktree(repo_root, worktree, branch)
-        # A new provisioned worktree starts without adapter-declared environment artifacts.
-        # This is normally a no-op for `git worktree add`, but closes the door on a stale
-        # directory being attached/reused with a copied environment (#381).
-        if created:
-            remove_fresh_install_paths(worktree, self._project)
 
         # #216: compose each COMPLETED DAG dependency's branch into this worktree BEFORE
         # install/baseline, so a dependent's per-PR gate runs against the sibling's shared
@@ -197,7 +198,12 @@ class DeterministicSetupRunner:
         # Best-effort dependency install (never fatal — a later stage's `uv run`/`npm`
         # re-syncs; a broken install shouldn't block worktree readiness). #63: skip it
         # when this worktree already holds a successful install of the same lockfiles.
-        install_note, install_meta, origin_notices = self._install_and_verify(worktree)
+        # A newly created worktree is fresh-provisioned: declared artifacts are discarded and
+        # the install forced, so a stale directory attached with BOTH a copied environment and
+        # a copied install marker cannot skip its way past the lockfile-hash cache (#381).
+        install_note, install_meta, origin_notices = self._install_and_verify(
+            worktree, fresh_provisioning=created
+        )
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         # #216: capture base_sha AFTER the dep merges so the TEST stage's base_sha..worktree
@@ -240,15 +246,21 @@ class DeterministicSetupRunner:
         return out, checkpoint, origin_notices
 
     def _install_and_verify(
-        self, worktree: Path
+        self, worktree: Path, *, fresh_provisioning: bool = False
     ) -> tuple[str, dict, tuple[dict[str, object], ...]]:
         """Install dependencies and fail closed unless their declared origins are local.
 
-        When a declared environment already exists, probe it before invoking the installer.
-        This catches a copied environment early enough to remove it before ``uv sync`` or an
-        analogous command can preserve stale launchers/editable links. A trusted same-
-        worktree environment keeps the ordinary lockfile cache path. The post-install probe
-        is unconditional because installation itself can change the resolved toolchain.
+        A freshly provisioned workspace can never legitimately arrive carrying a declared
+        environment, so its artifacts are discarded and the install forced WITHOUT consulting
+        the probes. Probe declaration is optional by contract (an absent hook is a trusted
+        skip), which would otherwise let a copied ``.venv`` survive into an installer like
+        ``uv sync`` that preserves stale launchers — the original false green (#381).
+
+        For a reused workspace the probes remain the discriminator: an existing environment is
+        checked before the installer runs, so a copied one is removed early enough, while a
+        trusted same-worktree environment keeps the ordinary lockfile cache path. The
+        post-install probe is unconditional because installation itself can change the
+        resolved toolchain.
         """
         declared_paths = fresh_install_paths(self._project)
         environment_present = any(
@@ -258,7 +270,14 @@ class DeterministicSetupRunner:
         )
         notices: tuple[dict[str, object], ...] = ()
         force = False
-        if environment_present:
+        if fresh_provisioning and declared_paths:
+            # Unconditional: forcing costs one install, while trusting an unverifiable
+            # inherited environment costs a false green in the check meant to prevent one.
+            if environment_present:
+                notices += (environment_reset_notice(worktree, "freshly provisioned worktree"),)
+            remove_fresh_install_paths(worktree, self._project)
+            force = True
+        elif environment_present:
             inherited = verify_worktree_origin(self._project, worktree)
             if not inherited.trusted:
                 notices = inherited.notices
