@@ -204,6 +204,9 @@ class ProjectConfig(Protocol):
     #       Legacy two-value declarations default conservatively to "source". The execution
     #       adapter verifies every path before accepting baseline, TEST, or REVIEW results.
     #       Omission emits an explicit warning-grade skipped-verification notice.
+    #       ``orchestrator-scaffold`` generates BOTH for a python profile from profile.toml's
+    #       ``[worktree]`` table (#391), so a scaffolded project inherits the defense rather
+    #       than the skip notice nobody reads.
 
     # --- commands (shelled by runners / test-support, never by the engine itself) ---
     def install_cmd(self) -> list[str]: ...

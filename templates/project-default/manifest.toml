@@ -69,6 +69,15 @@ always = [
 ]
 
 # ── Stack -> default adapter commands (the interview maps answers to these) ──
+# ── Worktree provenance: what a disposable REVIEW checkout must NOT inherit (#391) ──
+# A copied virtualenv carries console-script shebangs hardcoded to the worktree it was
+# built in, so `pytest`/`mypy` can silently run against ANOTHER worktree's source. The
+# scaffold turns these into the adapter's fresh_install_paths() + worktree_origin_probes();
+# `launcher_dir` is only used for package managers whose scripts live in the project tree.
+[worktree.python]
+fresh_install_paths = [".venv"]
+launcher_dir = ".venv/bin"
+
 [commands.python]
 install = ["uv", "sync"]
 test_unit = ["uv", "run", "pytest", "-q"]

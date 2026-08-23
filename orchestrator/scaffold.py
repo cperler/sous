@@ -7,6 +7,13 @@ subset of the starter kit (``templates/project-default/``) into the new project'
 ``.claude/``. It is deterministic ("profile in -> files out"), idempotent, and
 *additive* on re-run (it extends a project without clobbering hand-edits).
 
+A generated adapter also carries the worktree-provenance defenses this repo wrote for
+itself (#391): a copied virtualenv keeps the ORIGINATING worktree's interpreter in its
+console-script shebangs, so without them a REVIEW stage can test a different worktree's
+source and approve on a false green. They are derived from the profile — the probe follows
+the launcher the project actually declares — and live in profile.toml's ``[worktree]``
+table, so a project can tune them without hand-editing generated code.
+
 The interactive interview that *composes* a profile (detect stack -> ask -> tune) is a
 separate run-target skill; this is the deterministic layer it drives.
 """
@@ -77,6 +84,10 @@ class Profile:
     roster: dict[str, str] = field(default_factory=dict)
     layers: dict[str, bool] = field(default_factory=dict)
     seed: dict[str, list[str]] = field(default_factory=dict)
+    # Worktree-provenance declarations (#391): which dependency artifacts a disposable
+    # REVIEW checkout must rebuild, and which launchers/modules must resolve inside the
+    # worktree under test. Derived from the stack + commands; hand-editable in profile.toml.
+    worktree: dict[str, list[str]] = field(default_factory=dict)
     # The adapter-contract version the generated files target (checked at load for
     # project-owned adapters). (Re)generation always writes the engine's current one.
     contract_version: int = ADAPTER_CONTRACT_VERSION
@@ -104,6 +115,85 @@ def select_kit_assets(profile: Profile, manifest: dict) -> dict[str, list[str]]:
     return {"agents": sorted(agents), "hooks": sorted(hooks), "skills": skills}
 
 
+# Runner prefixes a project's commands may carry, mapped to the interpreter invocation a
+# worktree-origin probe must use. Only the FIRST match against the declared commands wins.
+_PYTHON_RUNNERS: list[tuple[list[str], list[str]]] = [
+    (["uv", "run"], ["uv", "run", "python"]),
+    (["poetry", "run"], ["poetry", "run", "python"]),
+    (["pipenv", "run"], ["pipenv", "run", "python"]),
+    (["python", "-m"], ["python"]),
+]
+
+# Package managers whose console scripts live in the project's OWN ``.venv/bin``. poetry and
+# pipenv keep the environment outside the tree by default, so a ``.venv/bin/<script>`` probe
+# would fail on a perfectly healthy worktree — those profiles get the module probe only.
+_IN_TREE_VENV_RUNNERS: set[tuple[str, ...]] = {("uv", "run")}
+
+# The gates whose green/red decides a stage's verdict — so these are the launchers whose
+# origin must be proven. Probing every declared command would only add subprocess cost.
+_PROBED_COMMAND_KEYS = ("test_unit", "typecheck")
+
+
+def _python_runner(commands: dict[str, list[str]]) -> tuple[list[str], list[str]] | None:
+    """The (prefix, python-invocation) pair this profile's python commands run through."""
+    for key in (*_PROBED_COMMAND_KEYS, "lint", "install"):
+        argv = commands.get(key) or []
+        for prefix, runner in _PYTHON_RUNNERS:
+            if argv[: len(prefix)] == prefix:
+                return prefix, runner
+    return None
+
+
+def derive_worktree(languages: list[str], commands: dict[str, list[str]], manifest: dict) -> dict[str, list[str]]:
+    """Default worktree-provenance declarations for a stack (#391).
+
+    A copied virtualenv carries console-script shebangs hardcoded to the ORIGINATING
+    worktree's interpreter, so a review can run its tests against another worktree's source
+    and approve on a false green. ``fresh_install_paths`` makes the disposable REVIEW
+    checkout rebuild instead of copying; the probes make a wrong origin LOUD rather than
+    merely unlikely. Everything here is derived from what the profile actually declares, so
+    the probe matches the launcher the project really runs.
+
+    A mixed-language profile can have ``_PROBED_COMMAND_KEYS`` claimed by a NON-python
+    toolchain (e.g. typescript's ``typecheck`` is ``pnpm exec tsc``); such a key is skipped
+    rather than sliced at the python runner's offset, which would otherwise derive a
+    launcher that can never exist in the venv (see the ``argv[:len(prefix)]`` guard below).
+    """
+    worktree: dict[str, list[str]] = {}
+    for lang in languages:
+        defaults = manifest.get("worktree", {}).get(lang, {})
+        if not defaults:
+            continue
+        for path in defaults.get("fresh_install_paths", []):
+            worktree.setdefault("fresh_install_paths", [])
+            if path not in worktree["fresh_install_paths"]:
+                worktree["fresh_install_paths"].append(path)
+        launcher_dir = defaults.get("launcher_dir")
+        resolved = _python_runner(commands) if lang == "python" else None
+        if not launcher_dir or resolved is None:
+            continue
+        prefix, runner = resolved
+        worktree.setdefault("python", list(runner))
+        if tuple(prefix) not in _IN_TREE_VENV_RUNNERS:
+            continue
+        for key in _PROBED_COMMAND_KEYS:
+            argv = commands.get(key) or []
+            if argv[: len(prefix)] != prefix:
+                # A mixed-language profile can have this gate claimed by ANOTHER toolchain
+                # (typescript's typecheck is `pnpm exec tsc`). Slicing it at the python
+                # runner's offset would derive a launcher that can never exist in the venv,
+                # and the probe would silently pass forever. Skip rather than mis-slice.
+                continue
+            launcher = argv[len(prefix)] if len(argv) > len(prefix) else ""
+            if not launcher or launcher in ("python", "python3"):
+                continue  # module invocation resolves the interpreter directly — nothing to probe
+            path = f"{launcher_dir}/{launcher}"
+            worktree.setdefault("launcher_probes", [])
+            if path not in worktree["launcher_probes"]:
+                worktree["launcher_probes"].append(path)
+    return worktree
+
+
 def profile_from_languages(name: str, languages: list[str], manifest: dict) -> Profile:
     """Synthesize a default profile for a stack from the kit manifest."""
     langs = [lower for lang in languages if (lower := lang.strip().lower())]
@@ -126,18 +216,22 @@ def profile_from_languages(name: str, languages: list[str], manifest: dict) -> P
             commands.setdefault(key, list(argv))
 
     profile = Profile(name=name, languages=langs, commands=commands, roster=roster)
+    profile.worktree = derive_worktree(langs, commands, manifest)
     profile.seed = select_kit_assets(profile, manifest)
     return profile
 
 
-def _overrides(profile: Profile, manifest: dict) -> tuple[dict[str, list[str]], dict[str, str]]:
-    """A profile's HAND-edits: the commands/roster entries that differ from what
+def _overrides(
+    profile: Profile, manifest: dict
+) -> tuple[dict[str, list[str]], dict[str, str], dict[str, list[str]]]:
+    """A profile's HAND-edits: the commands/roster/worktree entries that differ from what
     profile_from_languages would derive as defaults for its own languages. This lets a
     re-run keep human overrides without a fully-defaulted incoming profile clobbering them."""
     base = profile_from_languages(profile.name, profile.languages, manifest)
     cmd = {k: v for k, v in profile.commands.items() if base.commands.get(k) != v}
     roster = {k: v for k, v in profile.roster.items() if base.roster.get(k) != v}
-    return cmd, roster
+    worktree = {k: v for k, v in profile.worktree.items() if base.worktree.get(k) != v}
+    return cmd, roster, worktree
 
 
 def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Profile:
@@ -146,10 +240,14 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
     languages = list(dict.fromkeys([*existing.languages, *incoming.languages]))
     merged = profile_from_languages(existing.name, languages, manifest)
     merged.task_source = incoming.task_source or existing.task_source
-    ex_cmd, ex_roster = _overrides(existing, manifest)
-    in_cmd, in_roster = _overrides(incoming, manifest)
+    ex_cmd, ex_roster, ex_worktree = _overrides(existing, manifest)
+    in_cmd, in_roster, in_worktree = _overrides(incoming, manifest)
     merged.commands.update({**ex_cmd, **in_cmd})
     merged.roster.update({**ex_roster, **in_roster})
+    # Re-derive from the merged commands first, so a newly added language's defaults land,
+    # then re-apply hand edits (and detection results, which read as edits) on top.
+    merged.worktree = derive_worktree(merged.languages, merged.commands, manifest)
+    merged.worktree.update({**ex_worktree, **in_worktree})
     merged.layers = {**existing.layers, **incoming.layers}
     merged.seed = select_kit_assets(merged, manifest)
     return merged
@@ -234,6 +332,35 @@ def _detect_commands(root: Path, languages: list[str], manifest: dict) -> dict[s
     return cmds
 
 
+# Directories that look like a package but are not the project's own importable source.
+_NON_PACKAGE_DIRS = frozenset({
+    "tests", "test", "testing", "docs", "doc", "scripts", "examples", "example",
+    "build", "dist", "site-packages", "node_modules", "venv", "migrations",
+})
+
+
+def _detect_package(root: Path) -> str | None:
+    """The project's own importable top-level package, for a 'source' origin probe.
+
+    A launcher probe proves the RUNNER came from this worktree; this proves the imported
+    project code did too. Returns None when no unambiguous package exists (a flat script
+    repo, or src-less namespace layout) — the scaffold then declares no module probe and
+    says so in the generated adapter rather than guessing a name that would not import.
+    """
+    if not root.is_dir():
+        return None
+    src = root / "src"
+    roots = [src] if src.is_dir() else [root]
+    for parent in roots:
+        for path in sorted(parent.iterdir()):
+            if not path.is_dir() or path.name.startswith((".", "_")):
+                continue
+            if path.name in _NON_PACKAGE_DIRS or not (path / "__init__.py").exists():
+                continue
+            return path.name
+    return None
+
+
 def _detect_task_source(root: Path) -> str:
     cfg = root / ".git" / "config"
     if cfg.exists() and "github.com" in cfg.read_text(errors="ignore"):
@@ -251,6 +378,11 @@ def detect_profile(repo_root: str | Path, name: str, manifest: dict) -> Profile:
     profile = profile_from_languages(name, languages, manifest)
     profile.commands = _detect_commands(root, languages, manifest)
     profile.task_source = _detect_task_source(root)
+    # Re-derive from the DETECTED commands (the package manager may differ from the
+    # manifest default), then add the module probe only if a real package was found.
+    profile.worktree = derive_worktree(languages, profile.commands, manifest)
+    if profile.worktree.get("python") and (pkg := _detect_package(root)):
+        profile.worktree["source_modules"] = [pkg]
     return profile
 
 
@@ -291,7 +423,7 @@ def profile_to_toml(profile: Profile) -> str:
     ]
     for section, data in (
         ("commands", profile.commands), ("roster", profile.roster),
-        ("layers", profile.layers), ("seed", profile.seed),
+        ("layers", profile.layers), ("worktree", profile.worktree), ("seed", profile.seed),
     ):
         if data:
             lines += ["", f"[{section}]"]
@@ -313,6 +445,7 @@ def read_profile(path: Path) -> Profile:
         commands={k: list(v) for k, v in raw.get("commands", {}).items()},
         roster=dict(raw.get("roster", {})),
         layers=dict(raw.get("layers", {})),
+        worktree={k: list(v) for k, v in raw.get("worktree", {}).items()},
         seed={k: list(v) for k, v in raw.get("seed", {}).items()},
         contract_version=int(proj.get("contract_version", ADAPTER_CONTRACT_VERSION)),
     )
@@ -424,6 +557,86 @@ def _command_method(method: str, key: str, takes_files: bool, profile: Profile, 
     return f"    def {method}({sig_arg}) -> list[str]:\n{body}"
 
 
+_WORKTREE_HELPERS = """
+
+# Worktree-origin probes (#391) — generated from profile.toml [worktree]. A virtualenv
+# copied from another worktree keeps THAT worktree's interpreter in its console-script
+# shebangs, so `{runner} pytest` can validate the wrong source and a review can approve on
+# a false green. Each probe prints the path a launcher or import really resolves to; the
+# execution adapter refuses any path that lands outside the worktree under test.
+_PROBE_PY = {runner_argv}
+
+
+def _launcher_probe(relative: str) -> tuple[str, list[str], str]:
+    \"\"\"Read a console script's shebang — a stale one names another worktree's python.
+
+    A launcher the project never installed is NOT the hazard this guards: a missing file
+    cannot point at another worktree. Absence therefore falls back to the interpreter
+    running the probe — still inside this worktree if the environment is honest, and still
+    caught if it is not — rather than failing a worktree for a tool it does not have.
+    \"\"\"
+    code = ("import sys; from pathlib import Path; "
+            f"p = Path({{relative!r}}); "
+            "print(p.read_text().splitlines()[0].removeprefix('#!') if p.is_file() "
+            "else sys.executable)")
+    return (f"{{relative}} shebang interpreter", [*_PROBE_PY, "-c", code], "launcher")
+
+
+def _module_probe(module: str) -> tuple[str, list[str], str]:
+    \"\"\"Resolve an imported project module to the file it was actually loaded from.\"\"\"
+    code = f"import {{module}} as _m; print(_m.__file__)"
+    return (f"{{module}} module", [*_PROBE_PY, "-c", code], "source")
+"""
+
+_NO_PROBES_COMMENT = """
+    # No worktree-origin probes are declared: this stack has no derivable launcher or
+    # importable module to prove came from the worktree under test. Verification is
+    # therefore SKIPPED (observably — the engine emits a skipped-verification notice).
+    # Add `launcher_probes` / `source_modules` under [worktree] in profile.toml to close it.
+"""
+
+
+def _worktree_methods(profile: Profile) -> tuple[str, str]:
+    """Render (module-level helpers, class methods) for the worktree-provenance hooks.
+
+    A profile that declares nothing generates nothing, so a stack without these defaults is
+    byte-identical to a pre-#391 scaffold.
+    """
+    wt = profile.worktree
+    fresh, launchers = wt.get("fresh_install_paths", []), wt.get("launcher_probes", [])
+    modules, runner = wt.get("source_modules", []), wt.get("python", [])
+    if not (fresh or ((launchers or modules) and runner)):
+        return "", ""
+
+    methods = ""
+    if fresh:
+        methods += f"""
+    def fresh_install_paths(self) -> list[str]:
+        \"\"\"Dependency artifacts a disposable REVIEW checkout must rebuild, never copy.\"\"\"
+        return {_argv_literal(fresh)}
+"""
+    if not runner or not (launchers or modules):
+        return "", methods + _NO_PROBES_COMMENT
+
+    sources = []
+    if launchers:
+        sources.append(f"[_launcher_probe(p) for p in {_argv_literal(launchers)}]")
+    if modules:
+        sources.append(f"[_module_probe(m) for m in {_argv_literal(modules)}]")
+    body = "\n            + ".join(sources)
+    methods += f"""
+    def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+        \"\"\"Prove the runner and the imported source both come from THIS worktree.\"\"\"
+        return (
+            {body}
+        )
+"""
+    helpers = _WORKTREE_HELPERS.format(
+        runner=" ".join(runner[:-1]) or "python", runner_argv=_argv_literal(runner)
+    )
+    return helpers, methods
+
+
 def render_config(name: str, profile: Profile) -> str:
     """Render config.py as a generated VIEW of the profile (commands + roster baked in)."""
     cls, env = _class_name(name), _env_var(name)
@@ -431,6 +644,7 @@ def render_config(name: str, profile: Profile) -> str:
     commands = "\n\n".join(
         _command_method(m, k, f, profile, name) for m, k, f in _COMMAND_METHODS
     )
+    worktree_helpers, worktree_methods = _worktree_methods(profile)
     return f'''"""{name} project-config adapter (GENERATED from profile.toml — do not hand-edit).
 
 Edit profile.toml (or re-run orchestrator-scaffold) and this file is regenerated.
@@ -466,7 +680,7 @@ _SCHEMA_DIR = Path(__file__).parent / "schemas"
 # Stage (sub-)role -> agent name (from the starter kit), baked from profile.toml [roster].
 _ROSTER: dict[str, str] = {{
 {roster_lines}}}
-
+{worktree_helpers}
 
 class {cls}:
     name = "{name}"
@@ -481,7 +695,7 @@ class {cls}:
         self._task_source = LocalTaskSource(tasks_path)
 
 {commands}
-
+{worktree_methods}
     @property
     def classifier(self) -> {cls}Classifier:
         return self._classifier

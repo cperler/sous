@@ -9,6 +9,14 @@ import sys
 
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
+from orchestrator.ports.execution import (
+    SUPPORTED,
+    CapabilityDescriptor,
+    ExecutionMode,
+    Provider,
+    Registry,
+    default_registry,
+)
 from orchestrator.scaffold import (
     detect_profile,
     load_kit_manifest,
@@ -23,6 +31,27 @@ from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
 MANIFEST = load_kit_manifest()
+
+
+def _origin_verifying_registry() -> Registry:
+    """The default lanes plus a headless cell that preflights REVIEW's worktree origin.
+
+    A scaffolded python adapter now declares the #391 worktree hooks, so the engine contains
+    REVIEW on a lane that can honour them (``Engine._project_declares_worktree_origin``).
+    The in-repo runners declare exactly that; ``default_registry`` has no headless cell.
+    """
+    reg = default_registry()
+    reg.register_external(
+        CapabilityDescriptor(
+            execution_mode=ExecutionMode.HEADLESS,
+            provider=Provider.CLAUDE,
+            in_process=False,
+            schema_enforced=True,
+            verifies_worktree_origin=True,
+            status=SUPPORTED,
+        )
+    )
+    return reg
 
 
 def _repo(tmp_path, files: dict[str, str], _ctr=[0]):  # noqa: B006 - unique dir per call
@@ -142,6 +171,7 @@ def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
         CostLedger(tmp_path / "costs.jsonl"),
         cfg,
         meta_task_source=cfg.task_source,
+        registry=_origin_verifying_registry(),
     )
     eng.create_run("r1")
     eng.add_task("r1", "T1")
@@ -325,3 +355,143 @@ def test_merge_is_additive_and_incoming_wins() -> None:
     assert merged.commands["test_unit"] == ["custom", "test"]     # existing override preserved
     assert merged.commands["install"]  # go/python install defaults present
     assert "generic-implementer" in select_kit_assets(merged, MANIFEST)["agents"]
+
+
+# --- worktree provenance (#391) ----------------------------------------------
+
+def test_python_scaffold_declares_worktree_origin_defenses(tmp_path) -> None:
+    """A scaffolded python adapter must ship the defenses this repo wrote for itself.
+
+    Without them a REVIEW checkout inherits a copied `.venv` whose console-script shebangs
+    point at the worktree it was built in, so the stage can validate another worktree's
+    source and approve on a false green (#391).
+    """
+    root = _repo(tmp_path, {
+        "pyproject.toml": "[project]\nname='svc'\n", "uv.lock": "",
+        "src/svc/__init__.py": "", "tests/test_x.py": "",
+    })
+    prof = detect_profile(root, "svc", MANIFEST)
+    scaffold_adapter("svc", tmp_path / "adapters", profile=prof)
+    cfg = _import_adapter(tmp_path / "adapters", "svc").get_config()
+
+    assert cfg.fresh_install_paths() == [".venv"]
+    probes = cfg.worktree_origin_probes()
+    assert [(name, kind) for name, _, kind in probes] == [
+        (".venv/bin/pytest shebang interpreter", "launcher"),
+        (".venv/bin/mypy shebang interpreter", "launcher"),  # driven off declared typecheck
+        ("svc module", "source"),                            # the detected package
+    ]
+    # The probe argv must run the launcher THIS profile declares, through its own runner.
+    assert all(argv[:4] == ["uv", "run", "python", "-c"] for _, argv, _ in probes)
+    assert ".venv/bin/pytest" in probes[0][1][4] and "shebang" not in probes[0][1][4]
+    assert "import svc as _m" in probes[2][1][4]
+
+
+def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path) -> None:
+    """The generated declarations must satisfy the execution adapter's probe contract.
+
+    Exercised against a real interpreter in a real worktree, because the whole value of the
+    hooks is what they do to an actual environment, not the shape of the tuples.
+    """
+    from adapters.execution.worktree_origin import verify_worktree_origin
+
+    prof = profile_from_languages("svc", ["python"], MANIFEST)
+    prof.worktree["source_modules"] = ["svc"]
+    scaffold_adapter("svc", tmp_path / "adapters", profile=prof)
+    cfg = _import_adapter(tmp_path / "adapters", "svc").get_config()
+
+    worktree = tmp_path / "wt"
+    (worktree / "svc").mkdir(parents=True)
+    (worktree / "svc" / "__init__.py").write_text("")
+    subprocess.run(  # noqa: S603 - a venv is the environment under test
+        [sys.executable, "-m", "venv", "--without-pip", str(worktree / ".venv")], check=True
+    )
+    interpreter = worktree / ".venv" / "bin" / "python"
+
+    class _Probed:
+        """The generated probes with `uv run python` swapped for this worktree's own venv."""
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
+            return [
+                (name, [str(interpreter), *argv[3:]], kind)
+                for name, argv, kind in cfg.worktree_origin_probes()
+            ]
+
+    # Nothing installed yet: a launcher that does not exist cannot be pointing at another
+    # worktree, so absence falls back to this venv's interpreter rather than a false red.
+    assert verify_worktree_origin(_Probed(), worktree).trusted
+
+    # An installed launcher whose shebang names ANOTHER worktree is exactly #391.
+    foreign = tmp_path / "other" / ".venv" / "bin" / "python"
+    foreign.parent.mkdir(parents=True)
+    foreign.write_text("")
+    (worktree / ".venv" / "bin" / "pytest").write_text(f"#!{foreign}\n")
+    verdict = verify_worktree_origin(_Probed(), worktree)
+    assert not verdict.trusted
+    assert [n["probe"] for n in verdict.notices] == [".venv/bin/pytest shebang interpreter"]
+    assert verdict.notices[0]["notice"] == "worktree_origin_mismatch"
+
+    # The same launcher, honestly built in this worktree, verifies.
+    (worktree / ".venv" / "bin" / "pytest").write_text(f"#!{interpreter}\n")
+    assert verify_worktree_origin(_Probed(), worktree).trusted
+
+
+def test_worktree_table_round_trips_and_survives_a_rerun(tmp_path) -> None:
+    dest = tmp_path / "adapters"
+    scaffold_adapter("svc", dest, profile=profile_from_languages("svc", ["python"], MANIFEST))
+    rp = read_profile(dest / "svc" / "profile.toml")
+    assert rp.worktree["fresh_install_paths"] == [".venv"]
+    assert rp.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+
+    # A hand-added module probe must survive re-running the scaffold for another language.
+    rp.worktree["source_modules"] = ["svc"]
+    merged = merge_profiles(rp, profile_from_languages("svc", ["go"], MANIFEST), MANIFEST)
+    assert merged.worktree["source_modules"] == ["svc"]
+    assert merged.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+
+
+def test_non_python_stack_declares_no_worktree_hooks(tmp_path) -> None:
+    """No defaults to derive means no generated hooks — not a guessed, wrong one."""
+    prof = profile_from_languages("gosvc", ["go"], MANIFEST)
+    assert prof.worktree == {}
+    scaffold_adapter("gosvc", tmp_path / "adapters", profile=prof)
+    cfg = _import_adapter(tmp_path / "adapters", "gosvc").get_config()
+    assert not hasattr(cfg, "fresh_install_paths")
+    assert not hasattr(cfg, "worktree_origin_probes")
+
+
+def test_out_of_tree_venv_manager_gets_no_launcher_probe(tmp_path) -> None:
+    """poetry keeps its env outside the tree, so a `.venv/bin/pytest` probe would be a
+    false red on a healthy worktree — that profile declares the module probe only."""
+    root = _repo(tmp_path, {
+        "pyproject.toml": "[tool.poetry]\n", "poetry.lock": "", "svc/__init__.py": "",
+    })
+    prof = detect_profile(root, "svc", MANIFEST)
+    assert prof.worktree["fresh_install_paths"] == [".venv"]
+    assert "launcher_probes" not in prof.worktree
+    assert prof.worktree["source_modules"] == ["svc"]
+    assert prof.worktree["python"] == ["poetry", "run", "python"]
+
+
+def test_gate_claimed_by_another_toolchain_is_skipped_not_mis_sliced(tmp_path) -> None:
+    """A mixed stack shares the `test_unit`/`typecheck` keys, and the non-python toolchain
+    can win them. Deriving the launcher by POSITION alone would slice `pnpm exec tsc` at the
+    `uv run` offset and declare `.venv/bin/tsc` — a file that can never exist, so the probe
+    would fall back to the interpreter and pass forever, silently reopening #391."""
+    for prof in (
+        profile_from_languages("svc", ["typescript", "python"], MANIFEST),
+        merge_profiles(
+            profile_from_languages("svc", ["typescript"], MANIFEST),
+            profile_from_languages("svc", ["python"], MANIFEST),
+            MANIFEST,
+        ),
+    ):
+        # The python runner is still resolved (via `lint`), so the module probe survives.
+        assert prof.worktree["python"] == ["uv", "run", "python"]
+        assert prof.worktree["fresh_install_paths"] == [".venv"]
+        # But no launcher probe is invented for a gate python does not own.
+        assert prof.worktree.get("launcher_probes", []) == []
+
+    # The single-language case still probes the launchers it really runs.
+    pure = profile_from_languages("svc", ["python"], MANIFEST)
+    assert pure.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
