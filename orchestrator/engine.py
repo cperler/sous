@@ -334,7 +334,14 @@ SALVAGEABLE_FAILURE_STATUSES = frozenset({ResultStatus.TIMEOUT, ResultStatus.RAT
 # back like this is NOT evidence that the runner ignored its plan, so the
 # ``review_plan_not_executed`` marker is withheld for them (no crying wolf on a run whose
 # retry does execute the panel).
-_PLAN_UNRUN_STATUSES = frozenset({ResultStatus.RATE_LIMITED, ResultStatus.PROVIDER_UNAVAILABLE})
+# INVOCATION_ERROR joins them (#375) for the same reason: the CLI rejected the argv before
+# running anything, so a plan it never saw cannot be a plan it ignored — even though this
+# status, unlike the other two, is terminal rather than re-dispatched.
+_PLAN_UNRUN_STATUSES = frozenset({
+    ResultStatus.RATE_LIMITED,
+    ResultStatus.PROVIDER_UNAVAILABLE,
+    ResultStatus.INVOCATION_ERROR,
+})
 
 # The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
 # from this set, so the two types must be listed together: a park that only looked for a
@@ -2501,6 +2508,20 @@ class Engine:
                      "reason": provider_out_reason,
                      "attempt": result.attempt}
                 )
+            # #375: a stage that died before the model ran — the CLI rejected our argv — is a
+            # distinct enough signature to deserve its own error-grade line. Previously it
+            # showed up only as two ordinary `stage_recorded` retries in the same second, with
+            # the actual clap/commander message visible only in the per-stage Markdown.
+            if outcome == "task_failed_invocation_rejected":
+                events.append(
+                    {"ts": _now(), "type": "stage_invocation_rejected", "level": "error",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value, "attempt": result.attempt,
+                     "lane": f"{result.lane_used.execution_mode.value}:"
+                             f"{result.lane_used.provider.value}",
+                     "invocation": result.lane_used.invocation,
+                     "error": effective.error}
+                )
             # Audit a cooldown park: when the task may dispatch again, and how much of the
             # wait budget is spent — so a stalled-looking run explains itself in the events.
             if outcome == "stage_rate_limited_cooldown":
@@ -3553,6 +3574,26 @@ class Engine:
         return task.salvage_in_place
 
     def _handle_failure(self, task: Task, result: StageResult, *, run: Run) -> str:
+        # #375: the provider CLI refused to PARSE the command the harness built (a removed or
+        # misspelled flag). Terminal on the FIRST attempt, ahead of every other failure path:
+        # the retry would re-send a byte-identical argv, so the whole attempt budget burns in
+        # milliseconds and the breaker — seeing the identical signature twice — fails the task
+        # anyway, just louder and later (run batch-369-371 lost a task whose DELIVER had
+        # already pushed its PR that way). No signature is stacked (the streak belongs to code
+        # failures), no salvage/infra-reset/cooldown applies (nothing ran), and no cross-
+        # provider fallthrough: a bad argv is our bug to fix, not a provider to route around.
+        if result.status is ResultStatus.INVOCATION_ERROR:
+            task.state = TaskState.FAILED
+            task.error_signatures = []  # never carry a poisoned streak into a re-queue
+            task.learnings.append(
+                f"{result.stage.value} (attempt {result.attempt}): the provider CLI rejected "
+                f"the invocation itself ({result.lane_used.invocation}) — a harness bug, not a "
+                f"provider failure, so no retry was spent. Fix the command the transport "
+                f"builds: {result.error or 'no error text'}"
+            )
+            # Terminal: nothing follows, so the session is cleared like any fail-out.
+            self._settle_failed_session(task, result, run=run, infra_only=False, retrying=False)
+            return "task_failed_invocation_rejected"
         failures = None
         if result.structured_output:
             failures = result.structured_output.get("failures")

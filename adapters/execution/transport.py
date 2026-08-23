@@ -177,6 +177,52 @@ def is_provider_unavailable(raw: RawResult) -> bool:
     return bool(text) and any(m in text for m in _PROVIDER_UNAVAILABLE_MARKERS)
 
 
+# Substrings marking the CLI rejecting the INVOCATION ITSELF — an argv/usage parse error the
+# binary raised before any model call (→ ResultStatus.INVOCATION_ERROR, which the engine fails
+# terminally instead of retrying). #375: codex-cli 0.147.0 removed `--full-auto`, so a stage
+# dispatched a flag clap could not parse; the transport reported an ordinary failure, the engine
+# re-dispatched a BYTE-IDENTICAL command, and the whole attempt budget was gone inside one
+# second with the breaker taking the task down.
+#
+# Matched against ``error`` only — the CLI's own stderr excerpt (or, on codex, the event
+# stream's failure cause), never a task's test output. Every marker is anchored on the
+# ``error:`` prefix the arg parsers emit (clap on codex, commander on claude, argparse for a
+# python-shaped CLI), so a model's prose or a test log quoting "unknown option" cannot match.
+# Exit code alone is NOT sufficient: codex/clap exits 2 on a usage error, but commander exits 1,
+# which is indistinguishable from an ordinary run failure — so the markers are the primary
+# signal and exit 2 only widens it to a bare ``Usage:`` block. Case-insensitive.
+_INVOCATION_REJECTED_MARKERS = (
+    "error: unexpected argument",  # clap: an unknown/removed flag (the #375 case)
+    "error: unrecognized argument",  # argparse
+    "error: unrecognized subcommand",  # clap
+    "error: unknown option",  # commander (the claude CLI)
+    "error: unknown command",  # commander
+    "error: invalid value for",  # clap: a flag value the parser refuses
+    "error: a value is required for",  # clap: a flag given without its value
+    "error: missing required argument",  # commander
+    "error: the following required arguments were not provided",  # clap
+)
+
+
+def is_invocation_rejected(raw: RawResult) -> bool:
+    """True if a RawResult signals the provider CLI refused to PARSE the command we built —
+    a harness bug (a wrong/removed flag), not a task failure and not a flaky provider (#375).
+    Deterministic by construction: the same argv fails the same way forever, so the engine
+    treats it as ``INVOCATION_ERROR`` and fails the stage without spending a retry.
+
+    A missing binary (exit 127) is deliberately NOT this: nothing parsed the argv at all, and
+    ``is_provider_unavailable`` already owns that case (and its cross-provider fallthrough)."""
+    if raw.exit_code == 127:  # the CLI never ran — provider-unavailable's case, not ours
+        return False
+    text = (raw.error or "").lower()
+    if not text:
+        return False
+    if any(m in text for m in _INVOCATION_REJECTED_MARKERS):
+        return True
+    # clap exits 2 for a usage error only, and prints an anchored ``Usage:`` block with it.
+    return raw.exit_code == 2 and "usage:" in text
+
+
 # Errors meaning "the session to resume no longer exists" (expired/gc'd/unknown) — and
 # ONLY that. A lost session falls back to a fresh one inside the same dispatch (design
 # pass §2: a session ref is routing metadata; correctness never depends on continuity).
@@ -562,12 +608,18 @@ def classify_raw(raw: RawResult) -> ResultStatus:
     """The success policy every claude-lane dispatch (single call or review-panel sub-call)
     classifies with — extracted from ``HeadlessClaudeRunner.dispatch`` so the panel's
     short-circuit reports the SAME status the equivalent single dispatch would (#73): a
-    timeout is a TIMEOUT, a rate-limit is RATE_LIMITED (the engine re-dispatches cheaper),
-    any other transport error is a FAILURE, and an exit-0 call with no structured output
-    (the schema-retry loop exhausted) is a SCHEMA_VIOLATION."""
+    timeout is a TIMEOUT, an argv the CLI refused to parse is an INVOCATION_ERROR (#375: a
+    harness bug no retry can fix), a rate-limit is RATE_LIMITED (the engine re-dispatches
+    cheaper), any other transport error is a FAILURE, and an exit-0 call with no structured
+    output (the schema-retry loop exhausted) is a SCHEMA_VIOLATION."""
     if raw.exit_code != 0 or raw.error:
         if raw.exit_code == 124:
             return ResultStatus.TIMEOUT
+        # Before the rate-limit / generic-failure fallbacks so a mis-built command reads as
+        # the harness bug it is. Exit 127 (binary missing) is excluded by the detector — it
+        # is a missing provider, not a bad argv — and keeps its as-was FAILURE here.
+        if is_invocation_rejected(raw):
+            return ResultStatus.INVOCATION_ERROR
         if is_rate_limited(raw):
             return ResultStatus.RATE_LIMITED
         return ResultStatus.FAILURE

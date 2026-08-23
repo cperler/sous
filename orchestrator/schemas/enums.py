@@ -288,6 +288,12 @@ class ResultStatus(StrEnum):
     # engine may cross-provider-fall through to claude when the run opts in (#7); with the flag
     # off it degrades to a normal FAILURE (retry-then-fail), so pre-#7 behavior is unchanged.
     PROVIDER_UNAVAILABLE = "provider_unavailable"
+    # The provider CLI rejected the ARGV ITSELF — a usage/parse error raised before any model
+    # ran (#375: codex-cli 0.147.0 removed `--full-auto`, so both attempts of a stage died in
+    # the same second on a byte-identical command and the breaker lost the task). This is a
+    # HARNESS bug, not a flaky provider: nothing about a retry changes the command, so the
+    # engine fails the task immediately rather than spending the attempt budget on it.
+    INVOCATION_ERROR = "invocation_error"
 
 
 class ExecutionLane(StrEnum):

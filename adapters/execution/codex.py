@@ -24,6 +24,7 @@ from .transport import (
     Transport,
     checkpointing_transport,
     codex_cli_transport,
+    is_invocation_rejected,
     is_provider_unavailable,
     is_rate_limited,
     to_stage_result,
@@ -81,6 +82,13 @@ class CodexRunner:
         if raw.exit_code != 0 or raw.error:
             if raw.exit_code == 124:
                 return ResultStatus.TIMEOUT
+            # codex refused to PARSE the command we built (clap exits 2 on a usage error) —
+            # a harness bug, not a provider one (#375). Checked ahead of the provider/rate
+            # fallbacks and terminal in the engine: a retry re-sends the same unparseable
+            # argv, which is how a removed `--full-auto` burned a whole attempt budget in
+            # under a second and tripped the breaker on run batch-369-371.
+            if is_invocation_rejected(raw):
+                return ResultStatus.INVOCATION_ERROR
             # The codex PROVIDER itself is out (CLI missing / auth expired) — checked before
             # the rate-limit/failure fallbacks so a persistently-unavailable provider surfaces
             # as PROVIDER_UNAVAILABLE, which the engine can cross-provider-fall-through on (#7)
