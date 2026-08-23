@@ -10,10 +10,12 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+import orchestrator.engine as engine_module
+import orchestrator.scheduler as scheduler_module
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import CapacityExhausted
-from orchestrator.scheduler import Scheduler
+from orchestrator.scheduler import EXIT_MAX_TICKS, Scheduler
 from orchestrator.schemas.enums import ResultStatus, Stage
 from orchestrator.status_store import StatusStore
 from orchestrator.usage_probe import Usage, fetch_usage, read_usage, resolve_util
@@ -154,6 +156,55 @@ def test_scheduler_run_sleeps_through_cooldown(tmp_path, project) -> None:
     status = Scheduler(eng, max_concurrent=1).run("r1", runner, sleeper=sleeper)
     assert slept and 0 < slept[0] <= 121  # slept the cooldown remainder, then resumed
     assert status["run_state"] == "completed"
+
+
+def test_scheduler_uses_one_clock_read_at_cooldown_boundary(
+    tmp_path, project, monkeypatch,
+) -> None:
+    eng = _engine(tmp_path, project)
+    _walk_to_floor(eng)
+    boundary = datetime(2030, 1, 1, tzinfo=UTC)
+    before = boundary - timedelta(microseconds=100)
+    after = boundary + timedelta(microseconds=100)
+    eng.store.update_task(
+        "r1", "t1", lambda t: setattr(t, "not_before", boundary.isoformat())
+    )
+
+    class TickClock(datetime):
+        reads = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.reads += 1
+            return before if cls.reads == 1 else after
+
+    class EngineClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # Before the fix, the second plan still sees the cooldown while the following
+            # scheduler clock read sees it expired. Once two tick clocks have been read,
+            # next_work() must also see the stamp as expired.
+            return before if TickClock.reads < 2 else after
+
+    monkeypatch.setattr(engine_module, "datetime", EngineClock)
+    monkeypatch.setattr(scheduler_module, "datetime", TickClock)
+    dispatched = []
+    slept = []
+
+    def runner(work):
+        dispatched.extend(work)
+        return [make_result(w) for w in work]
+
+    status = Scheduler(eng, max_concurrent=1).run(
+        "r1",
+        runner,
+        sleeper=slept.append,
+        max_ticks=2,
+    )
+
+    assert slept == [1]
+    assert [work.stage for work in dispatched] == [Stage.SCOPE]
+    assert status["scheduler"]["exit_reason"] == EXIT_MAX_TICKS
 
 
 def test_scheduler_run_without_sleeper_returns_on_cooldown(tmp_path, project) -> None:
