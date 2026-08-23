@@ -73,16 +73,23 @@ always = [
 # A copied virtualenv carries console-script shebangs hardcoded to the worktree it was
 # built in, so `pytest`/`mypy` can silently run against ANOTHER worktree's source. The
 # scaffold turns these into the adapter's fresh_install_paths() + worktree_origin_probes();
-# `launcher_dir` is only used for package managers whose scripts live in the project tree.
+# `launcher_dir` is only used for package managers whose scripts live in the project tree,
+# and only for commands declared in the bare-console-script form — the `python -m ...`
+# commands below are proven by an interpreter probe instead (#396).
 [worktree.python]
 fresh_install_paths = [".venv"]
 launcher_dir = ".venv/bin"
 
+# Module invocation (`python -m <tool>`), not the bare console script (#396). A console
+# script bakes its interpreter into a shebang, so a `.venv` copied from another worktree
+# runs THAT worktree's python; `python -m` resolves the interpreter through the runner and
+# cannot inherit a stale path at all. This is the prevention half of #391's detection half
+# — and it is why a python profile's origin probe proves the INTERPRETER, not a launcher.
 [commands.python]
 install = ["uv", "sync"]
-test_unit = ["uv", "run", "pytest", "-q"]
-lint = ["uv", "run", "ruff", "check", "."]
-typecheck = ["uv", "run", "mypy", "."]
+test_unit = ["uv", "run", "python", "-m", "pytest", "-q"]
+lint = ["uv", "run", "python", "-m", "ruff", "check", "."]
+typecheck = ["uv", "run", "python", "-m", "mypy", "."]
 [commands.typescript]
 install = ["pnpm", "install"]
 test_unit = ["pnpm", "test"]

@@ -18,6 +18,7 @@ from orchestrator.ports.execution import (
     default_registry,
 )
 from orchestrator.scaffold import (
+    derive_worktree,
     detect_profile,
     load_kit_manifest,
     merge_profiles,
@@ -65,11 +66,16 @@ def _repo(tmp_path, files: dict[str, str], _ctr=[0]):  # noqa: B006 - unique dir
 
 
 def _import_adapter(dest, name: str):
+    package = name.replace("-", "_")
+    # Drop the whole package tree, not just its root: reloading `svc` alone re-executes
+    # __init__.py but leaves a previously-cached `svc.config` in place, so a second adapter
+    # scaffolded under the same name in another tmp_path would silently import the first
+    # one's commands and probes.
+    for cached in [m for m in sys.modules if m == package or m.startswith(f"{package}.")]:
+        del sys.modules[cached]
     sys.path.insert(0, str(dest))
     try:
-        mod = importlib.import_module(name.replace("-", "_"))
-        importlib.reload(mod)  # avoid cross-test caching of a same-named package
-        return mod
+        return importlib.import_module(package)
     finally:
         sys.path.remove(str(dest))
 
@@ -85,8 +91,8 @@ def test_profile_selects_stack_agents_and_commands() -> None:
     assert p.roster["test"] == "test-validator"
     assert p.roster["review"] == "code-reviewer"
     # commands unioned from both stacks' manifest defaults
-    assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]
-    assert p.commands["lint"] == ["uv", "run", "ruff", "check", "."]
+    assert p.commands["test_unit"] == ["uv", "run", "python", "-m", "pytest", "-q"]
+    assert p.commands["lint"] == ["uv", "run", "python", "-m", "ruff", "check", "."]
     assert p.commands["test_e2e"] == ["pnpm", "exec", "playwright", "test"]
     # seed picks generic + both stacks' agents/hooks
     assert "python-backend-developer" in p.seed["agents"]
@@ -121,13 +127,13 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     mod = _import_adapter(tmp_path, "py-svc")
     cfg = mod.get_config()
     assert cfg.agent_for(Stage.IMPLEMENT, "implement") == "python-backend-developer"
-    assert cfg.test_unit_cmd() == ["uv", "run", "pytest", "-q"]
-    assert cfg.lint_cmd() == ["uv", "run", "ruff", "check", "."]
+    assert cfg.test_unit_cmd() == ["uv", "run", "python", "-m", "pytest", "-q"]
+    assert cfg.lint_cmd() == ["uv", "run", "python", "-m", "ruff", "check", "."]
     assert cfg.schema_for("test")["title"] == "test"  # schema_for inherits canonical
     # profile.toml round-trips
     rp = read_profile(tmp_path / "py_svc" / "profile.toml")
     assert rp.languages == ["python"] and rp.roster["implement"] == "python-backend-developer"
-    assert rp.commands["lint"] == ["uv", "run", "ruff", "check", "."]
+    assert rp.commands["lint"] == ["uv", "run", "python", "-m", "ruff", "check", "."]
 
 
 def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
@@ -162,7 +168,7 @@ def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
     lint_finding = next(finding for finding in findings if "lint gate" in finding["description"])
     assert lint_finding["blocking"] is True
     assert lint_finding["severity"] == "critical"
-    assert "uv run ruff check ." in lint_finding["description"]
+    assert "uv run python -m ruff check ." in lint_finding["description"]
     assert "E501 line too long" in lint_finding["description"]
     assert len(lint_finding["description"]) < 2300  # noisy output is tail-capped
 
@@ -286,7 +292,7 @@ def test_detect_python_uv(tmp_path) -> None:
     root = _repo(tmp_path, {"pyproject.toml": "[project]\nname='x'\n", "uv.lock": ""})
     p = detect_profile(root, "svc", MANIFEST)
     assert p.languages == ["python"]
-    assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]  # manifest default (uv)
+    assert p.commands["test_unit"] == ["uv", "run", "python", "-m", "pytest", "-q"]  # manifest default
     assert p.roster["implement"] == "python-backend-developer"
     assert p.task_source == "local-file"
 
@@ -294,9 +300,9 @@ def test_detect_python_uv(tmp_path) -> None:
 def test_detect_python_poetry(tmp_path) -> None:
     root = _repo(tmp_path, {"pyproject.toml": "[tool.poetry]\n", "poetry.lock": ""})
     p = detect_profile(root, "svc", MANIFEST)
-    assert p.commands["test_unit"] == ["poetry", "run", "pytest", "-q"]
+    assert p.commands["test_unit"] == ["poetry", "run", "python", "-m", "pytest", "-q"]
     assert p.commands["install"] == ["poetry", "install"]
-    assert p.commands["lint"] == ["poetry", "run", "ruff", "check", "."]
+    assert p.commands["lint"] == ["poetry", "run", "python", "-m", "ruff", "check", "."]
 
 
 def test_detect_typescript_pnpm_with_playwright(tmp_path) -> None:
@@ -329,7 +335,7 @@ def test_detect_mixed_python_first_wins_shared_keys(tmp_path) -> None:
     })
     p = detect_profile(root, "svc", MANIFEST)
     assert set(p.languages) == {"python", "typescript"}
-    assert p.commands["test_unit"] == ["uv", "run", "pytest", "-q"]   # python (first) wins
+    assert p.commands["test_unit"] == ["uv", "run", "python", "-m", "pytest", "-q"]  # python wins
     assert p.commands["test_e2e"] == ["pnpm", "exec", "playwright", "test"]  # ts contributes e2e
 
 
@@ -376,15 +382,18 @@ def test_python_scaffold_declares_worktree_origin_defenses(tmp_path) -> None:
 
     assert cfg.fresh_install_paths() == [".venv"]
     probes = cfg.worktree_origin_probes()
+    # The kit defaults are module invocation (#396), which has no shebang to inherit — so
+    # the runner's INTERPRETER is what must be proven, not a `.venv/bin/<script>` launcher
+    # this profile would never invoke.
     assert [(name, kind) for name, _, kind in probes] == [
-        (".venv/bin/pytest shebang interpreter", "launcher"),
-        (".venv/bin/mypy shebang interpreter", "launcher"),  # driven off declared typecheck
-        ("svc module", "source"),                            # the detected package
+        ("uv run python interpreter", "launcher"),
+        ("svc module", "source"),  # the detected package
     ]
-    # The probe argv must run the launcher THIS profile declares, through its own runner.
+    # The probe argv must run through the runner THIS profile declares.
     assert all(argv[:4] == ["uv", "run", "python", "-c"] for _, argv, _ in probes)
-    assert ".venv/bin/pytest" in probes[0][1][4] and "shebang" not in probes[0][1][4]
-    assert "import svc as _m" in probes[2][1][4]
+    assert probes[0][1][4] == "import sys; print(sys.executable)"
+    assert "import svc as _m" in probes[1][1][4]
+    assert not any(".venv/bin" in arg for _, argv, _ in probes for arg in argv)
 
 
 def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path) -> None:
@@ -397,6 +406,9 @@ def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path)
 
     prof = profile_from_languages("svc", ["python"], MANIFEST)
     prof.worktree["source_modules"] = ["svc"]
+    # A project that keeps BARE console scripts still declares launcher probes, so this
+    # exercises that path too rather than letting the #396 default retire its coverage.
+    prof.worktree["launcher_probes"] = [".venv/bin/pytest"]
     scaffold_adapter("svc", tmp_path / "adapters", profile=prof)
     cfg = _import_adapter(tmp_path / "adapters", "svc").get_config()
 
@@ -436,18 +448,91 @@ def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path)
     assert verify_worktree_origin(_Probed(), worktree).trusted
 
 
+def test_module_form_derives_an_interpreter_probe_and_bare_scripts_still_derive_launchers() -> None:
+    """The probe follows the COMMAND FORM, so moving the defaults to `python -m` (#396)
+    swaps the launcher probe for an interpreter probe instead of silently dropping it."""
+    module_form = derive_worktree(["python"], {
+        "test_unit": ["uv", "run", "python", "-m", "pytest", "-q"],
+        "typecheck": ["uv", "run", "python", "-m", "mypy", "."],
+    }, MANIFEST)
+    assert module_form["interpreter_probe"] == ["uv", "run", "python"]
+    assert "launcher_probes" not in module_form  # nobody invokes `.venv/bin/pytest` here
+
+    bare = derive_worktree(["python"], {
+        "test_unit": ["uv", "run", "pytest", "-q"],
+        "typecheck": ["uv", "run", "mypy", "."],
+    }, MANIFEST)
+    assert bare["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+    assert "interpreter_probe" not in bare  # a shebang is the thing that can go stale
+
+    # A profile mid-migration declares one of each, and gets one of each.
+    mixed = derive_worktree(["python"], {
+        "test_unit": ["uv", "run", "python", "-m", "pytest", "-q"],
+        "typecheck": ["uv", "run", "mypy", "."],
+    }, MANIFEST)
+    assert mixed["interpreter_probe"] == ["uv", "run", "python"]
+    assert mixed["launcher_probes"] == [".venv/bin/mypy"]
+
+
+def test_interpreter_probe_catches_a_runner_resolving_outside_the_worktree(tmp_path) -> None:
+    """The #396 counterpart of the shebang case, against real interpreters.
+
+    Module invocation cannot inherit a stale shebang, but the runner can still resolve to an
+    environment belonging to another worktree (a stray VIRTUAL_ENV, a redirected project
+    environment). That is what this probe has to make loud.
+    """
+    from adapters.execution.worktree_origin import verify_worktree_origin
+
+    prof = profile_from_languages("svc", ["python"], MANIFEST)
+    assert prof.worktree["interpreter_probe"] == ["uv", "run", "python"]
+    scaffold_adapter("svc", tmp_path / "adapters", profile=prof)
+    cfg = _import_adapter(tmp_path / "adapters", "svc").get_config()
+    (name, argv, kind), = cfg.worktree_origin_probes()
+    assert (name, kind) == ("uv run python interpreter", "launcher")
+
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    for where in (worktree, tmp_path / "other"):
+        subprocess.run(  # noqa: S603 - a venv is the environment under test
+            [sys.executable, "-m", "venv", "--without-pip", str(where / ".venv")], check=True
+        )
+
+    def _probed(interpreter):
+        """The generated probe with `uv run python` swapped for a concrete interpreter."""
+        return type("P", (), {"worktree_origin_probes": lambda self: [
+            (name, [str(interpreter), *argv[3:]], kind)
+        ]})()
+
+    # `.venv/bin/python` is itself a symlink to a SHARED base interpreter, so this also
+    # pins that a healthy in-tree venv is trusted rather than read as an outside path.
+    own = worktree / ".venv" / "bin" / "python"
+    assert own.is_symlink() and not own.resolve().is_relative_to(worktree.resolve())
+    assert verify_worktree_origin(_probed(own), worktree).trusted
+
+    # The same command run through ANOTHER worktree's environment is exactly the hazard.
+    verdict = verify_worktree_origin(_probed(tmp_path / "other" / ".venv" / "bin" / "python"), worktree)
+    assert not verdict.trusted
+    assert [n["notice"] for n in verdict.notices] == ["worktree_origin_mismatch"]
+    assert verdict.notices[0]["probe"] == "uv run python interpreter"
+
+
 def test_worktree_table_round_trips_and_survives_a_rerun(tmp_path) -> None:
     dest = tmp_path / "adapters"
     scaffold_adapter("svc", dest, profile=profile_from_languages("svc", ["python"], MANIFEST))
     rp = read_profile(dest / "svc" / "profile.toml")
     assert rp.worktree["fresh_install_paths"] == [".venv"]
-    assert rp.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+    assert rp.worktree["interpreter_probe"] == ["uv", "run", "python"]
 
     # A hand-added module probe must survive re-running the scaffold for another language.
     rp.worktree["source_modules"] = ["svc"]
     merged = merge_profiles(rp, profile_from_languages("svc", ["go"], MANIFEST), MANIFEST)
     assert merged.worktree["source_modules"] == ["svc"]
-    assert merged.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+    assert merged.worktree["interpreter_probe"] == ["uv", "run", "python"]
+
+    # Clearing the key in profile.toml is the opt-out, and a re-run must not resurrect it.
+    rp.worktree["interpreter_probe"] = []
+    opted_out = merge_profiles(rp, profile_from_languages("svc", ["go"], MANIFEST), MANIFEST)
+    assert opted_out.worktree["interpreter_probe"] == []
 
 
 def test_non_python_stack_declares_no_worktree_hooks(tmp_path) -> None:
@@ -462,13 +547,16 @@ def test_non_python_stack_declares_no_worktree_hooks(tmp_path) -> None:
 
 def test_out_of_tree_venv_manager_gets_no_launcher_probe(tmp_path) -> None:
     """poetry keeps its env outside the tree, so a `.venv/bin/pytest` probe would be a
-    false red on a healthy worktree — that profile declares the module probe only."""
+    false red on a healthy worktree — and so would an interpreter probe, since a healthy
+    poetry interpreter legitimately lives outside it. That profile declares the module
+    probe only."""
     root = _repo(tmp_path, {
         "pyproject.toml": "[tool.poetry]\n", "poetry.lock": "", "svc/__init__.py": "",
     })
     prof = detect_profile(root, "svc", MANIFEST)
     assert prof.worktree["fresh_install_paths"] == [".venv"]
     assert "launcher_probes" not in prof.worktree
+    assert "interpreter_probe" not in prof.worktree
     assert prof.worktree["source_modules"] == ["svc"]
     assert prof.worktree["python"] == ["poetry", "run", "python"]
 
@@ -489,9 +577,10 @@ def test_gate_claimed_by_another_toolchain_is_skipped_not_mis_sliced(tmp_path) -
         # The python runner is still resolved (via `lint`), so the module probe survives.
         assert prof.worktree["python"] == ["uv", "run", "python"]
         assert prof.worktree["fresh_install_paths"] == [".venv"]
-        # But no launcher probe is invented for a gate python does not own.
+        # But no launcher or interpreter probe is invented for a gate python does not own.
         assert prof.worktree.get("launcher_probes", []) == []
+        assert prof.worktree.get("interpreter_probe", []) == []
 
-    # The single-language case still probes the launchers it really runs.
+    # The single-language case still probes the runner it really uses.
     pure = profile_from_languages("svc", ["python"], MANIFEST)
-    assert pure.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
+    assert pure.worktree["interpreter_probe"] == ["uv", "run", "python"]
