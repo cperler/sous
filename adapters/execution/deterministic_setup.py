@@ -5,8 +5,10 @@ agentic work then answers in prose, failing schema validation. So the mechanical
 are scripts, not model calls. This runner serves the whole
 ``(ExecutionMode.ENGINE, Provider.NONE)`` cell and dispatches by stage:
 
-  - INTAKE  → this module: create/reuse an isolated worktree+branch, best-effort install,
-    tag the baseline, actually run the unit tests to capture the baseline (``intake``).
+  - INTAKE  → this module: create/reuse an isolated worktree+branch, report any uncommitted
+    work a REUSED worktree inherited from a previous, dead run (#385 — report-only),
+    best-effort install, tag the baseline, actually run the unit tests to capture the
+    baseline (``intake``).
     Ports ``run_setup_stage`` from the reference bash system.
   - TEST    → ``deterministic_test.DeterministicTestRunner`` (#33): run the project's test
     commands, classify failures, split inherited baseline red from caused (``test``).
@@ -62,6 +64,90 @@ def _ref_safe(s: str) -> str:
     return re.sub(r"[^\w.\-]", "-", s) or "x"
 
 
+# --- #385: inherited-worktree uncommitted state -----------------------------------------
+# The worktree is REUSED when one is already on disk (retry idempotency), which silently
+# adopts whatever a previous, DEAD run left uncommitted there. Report it; never act on it.
+_MAX_INHERITED_FILES = 20  # porcelain entries listed in the output/notice (count stays true)
+
+
+def _inherited_unreadable(worktree: Path, reason: str) -> tuple[dict[str, object],
+                                                                tuple[dict[str, object], ...]]:
+    """The read failed: report UNKNOWN, never clean. ``inherited_changes_count`` is OMITTED
+    (absent = unknown), because a 0 there would read as a verified-empty tree."""
+    return (
+        {"inherited_changes": [], "inherited_changes_note": f"unreadable: {reason}"},
+        ({
+            "notice": "worktree_status_unreadable",
+            "expected_worktree": str(worktree),
+            "reason": reason,
+            "detail": f"could not read the worktree's uncommitted state at intake: {reason}",
+        },),
+    )
+
+
+def _inherited_changes(worktree: Path) -> tuple[dict[str, object],
+                                                tuple[dict[str, object], ...]]:
+    """Report the uncommitted changes the worktree ALREADY carried at intake (#385).
+
+    Report-only, by design: uncommitted work from a dead run may be a finished
+    implementation (the live near-miss: a rate-limited DELIVER left ~2,400 passing lines
+    uncommitted, and the next run's IMPLEMENT would have rewritten them) or a half-edit
+    from a stage that died mid-write. The engine cannot tell which, so it resets, stashes
+    and adopts NOTHING — it makes the state visible and lets the stage decide.
+
+    Must be called BEFORE dep composition and install so neither pollutes the read. Returns
+    ``(output fields, notices)``: the fields fold into every downstream stage's context the
+    way ``baseline_failures`` does, and the notices are the engine's warning-grade events.
+    Four honest states, distinguished by ``inherited_changes_note``: clean, dirty, ``n/a``
+    (a project ``setup_task`` may legitimately provision a non-git worktree), and
+    ``unreadable`` — an unreadable tree must never render as a clean one.
+    """
+    try:
+        proc = _git(str(worktree), "status", "--porcelain")
+    except (OSError, subprocess.SubprocessError) as exc:  # a git timeout must not fail intake
+        return _inherited_unreadable(worktree, type(exc).__name__)
+    if proc.returncode != 0:
+        # Ask git itself whether this is a worktree at all rather than matching on its
+        # stderr prose: a non-git provisioning convention is a legitimate n/a, not a fault.
+        try:
+            inside = _git(str(worktree), "rev-parse", "--is-inside-work-tree")
+        except (OSError, subprocess.SubprocessError) as exc:  # pragma: no cover - defensive
+            return _inherited_unreadable(worktree, type(exc).__name__)
+        if inside.returncode != 0:
+            return {"inherited_changes": [],
+                    "inherited_changes_note": "n/a (not a git worktree)"}, ()
+        detail = proc.stderr.strip()[:120]
+        return _inherited_unreadable(
+            worktree, f"rc={proc.returncode}: {detail}" if detail else f"rc={proc.returncode}"
+        )
+
+    entries = [line for line in proc.stdout.splitlines() if line.strip()]
+    count = len(entries)
+    listed: list[str] = entries[:_MAX_INHERITED_FILES]
+    if count > _MAX_INHERITED_FILES:
+        listed = [*listed, f"… ({count - _MAX_INHERITED_FILES} more)"]
+    if not count:
+        return ({"inherited_changes": [], "inherited_changes_count": 0,
+                 "inherited_changes_note": "clean (no uncommitted changes at intake)"}, ())
+    note = (
+        f"{count} uncommitted change(s) were ALREADY in the worktree at intake — this run "
+        f"did not make them (likely a previous, dead run); nothing was reset or adopted"
+    )
+    fields = {
+        "inherited_changes": listed,
+        "inherited_changes_count": count,
+        "inherited_changes_note": note,
+    }
+    notice = {
+        "notice": "worktree_inherited_changes",
+        "expected_worktree": str(worktree),
+        "count": count,
+        "files": listed,
+        "detail": note,
+    }
+    return fields, (notice,)
+
+
 class _SetupError(Exception):
     """A deterministic-setup failure (e.g. git error) — surfaced as ResultStatus.FAILURE."""
 
@@ -114,12 +200,21 @@ class DeterministicSetupRunner:
                 if not isinstance(wt, str) or not wt:
                     raise _SetupError("setup_task did not return a worktree path")
                 worktree = Path(wt)
+                # #385: same read as the git path, and for the same reason — the override is
+                # a provisioning seam, not an exemption: it can hand back a directory a dead
+                # run left dirty just as easily. Before install, so artifacts don't count.
+                inherited, inherited_notices = _inherited_changes(worktree)
                 # The override contract returns only a path, so the runner cannot tell a new
                 # checkout from a legitimate retry cache. Treat it as fresh: a redundant
                 # install is cheap, an inherited sibling environment is not.
-                install_note, install_meta, notices = self._install_and_verify(
-                    worktree, fresh_provisioning=True
-                )
+                try:
+                    install_note, install_meta, notices = self._install_and_verify(
+                        worktree, fresh_provisioning=True
+                    )
+                except _SetupError as exc:  # a refused install must not swallow the #385 read
+                    exc.notices = inherited_notices + exc.notices
+                    raise
+                notices = inherited_notices + notices
                 port_env = port_env_for(self._project, *ports) if ports else None
                 baseline = self._capture_baseline(worktree, port_env)
                 out.update({
@@ -130,6 +225,8 @@ class DeterministicSetupRunner:
                         f"tests: {baseline['note']}"
                     ),
                     **install_meta,
+                    # #385: engine-verified, so it overrides any claim the override made.
+                    **inherited,
                 })
                 checkpoint = (
                     _tag_head(wt, work.checkpoint_tag)
@@ -188,6 +285,11 @@ class DeterministicSetupRunner:
         worktree = repo_root / ".worktrees" / safe
         created = self._ensure_worktree(repo_root, worktree, branch)
 
+        # #385: read the worktree's uncommitted state FIRST — before the dep merges below
+        # and before install — so neither this run's own writes nor install artifacts are
+        # mistaken for work an inherited (dead-run) worktree was already carrying.
+        inherited, inherited_notices = _inherited_changes(worktree)
+
         # #216: compose each COMPLETED DAG dependency's branch into this worktree BEFORE
         # install/baseline, so a dependent's per-PR gate runs against the sibling's shared
         # type/signature change instead of pre-dep trunk. Idempotent (an already-merged
@@ -201,9 +303,14 @@ class DeterministicSetupRunner:
         # A newly created worktree is fresh-provisioned: declared artifacts are discarded and
         # the install forced, so a stale directory attached with BOTH a copied environment and
         # a copied install marker cannot skip its way past the lockfile-hash cache (#381).
-        install_note, install_meta, origin_notices = self._install_and_verify(
-            worktree, fresh_provisioning=created
-        )
+        try:
+            install_note, install_meta, origin_notices = self._install_and_verify(
+                worktree, fresh_provisioning=created
+            )
+        except _SetupError as exc:  # the dirty-tree warning is most wanted on a FAILED intake
+            exc.notices = inherited_notices + exc.notices
+            raise
+        notices = inherited_notices + origin_notices
 
         checkpoint = _tag_head(str(worktree), work.checkpoint_tag) if work.checkpoint_tag else None
         # #216: capture base_sha AFTER the dep merges so the TEST stage's base_sha..worktree
@@ -242,8 +349,10 @@ class DeterministicSetupRunner:
                 f"tests: {baseline['note']}"
             ),
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
+            # #385: what the worktree already held before this run touched it.
+            **inherited,
         }
-        return out, checkpoint, origin_notices
+        return out, checkpoint, notices
 
     def _install_and_verify(
         self, worktree: Path, *, fresh_provisioning: bool = False

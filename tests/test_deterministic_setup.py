@@ -435,3 +435,196 @@ def test_project_setup_task_override_refuses_unrepairable_sibling_environment(
     )
     assert failed["expected_worktree"] == str(worktree)
     assert failed["probe"] == "environment source"
+
+
+# --- #385: uncommitted work inherited from a previous, dead run ---------------------------
+
+
+def _dirty(path: Path) -> None:
+    """Leave a staged, an unstaged, and an untracked change behind — the shape a run that
+    died mid-flight (rate-limited at DELIVER) leaves in its worktree."""
+    _commit(path, "tracked.txt", "base\n", "tracked")
+    (path / "tracked.txt").write_text("edited by a dead run\n")  # unstaged
+    (path / "staged.txt").write_text("staged\n")
+    subprocess.run(["git", "add", "staged.txt"], cwd=path, check=True)
+    (path / "untracked.txt").write_text("untracked\n")  # untracked
+
+
+def test_reused_dirty_worktree_is_reported_and_evented(tmp_path, monkeypatch) -> None:
+    """The near-miss this exists for: a dead run left finished work uncommitted, the next
+    run REUSES that worktree, and intake must SAY SO — in its output, in the folded context,
+    and in the event stream — instead of letting IMPLEMENT discover it by overwriting it."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    runner = DeterministicSetupRunner(_Proj())
+
+    first = runner.dispatch(_wi())
+    worktree = Path(first.structured_output["worktree"])
+    assert first.structured_output["inherited_changes_count"] == 0  # fresh: explicitly clean
+    _dirty(worktree)  # a previous run dies here, leaving work uncommitted
+
+    second = runner.dispatch(_wi())  # a NEW run picks the task back up
+
+    out = second.structured_output
+    assert second.status is ResultStatus.SUCCESS  # reporting it is not a failure
+    assert out["inherited_changes_count"] == 3
+    entries = out["inherited_changes"]
+    assert {line.split()[-1] for line in entries} == {
+        "tracked.txt", "staged.txt", "untracked.txt"}
+    assert "did not make them" in out["inherited_changes_note"]
+    notice = next(n for n in second.execution_notices
+                  if n["notice"] == "worktree_inherited_changes")
+    assert notice["count"] == 3 and notice["expected_worktree"] == str(worktree)
+    # Report, don't act: the inherited work is still there, untouched.
+    assert (worktree / "untracked.txt").exists()
+    assert (worktree / "tracked.txt").read_text() == "edited by a dead run\n"
+
+
+def test_clean_reused_worktree_reports_clean_without_a_notice(tmp_path, monkeypatch) -> None:
+    """An ordinary in-run retry must stay quiet: an explicit clean signal (so 'clean' and
+    'never looked' don't read alike) and no warning event."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    runner = DeterministicSetupRunner(_Proj())
+
+    runner.dispatch(_wi())
+    second = runner.dispatch(_wi())
+
+    out = second.structured_output
+    assert out["inherited_changes"] == [] and out["inherited_changes_count"] == 0
+    assert out["inherited_changes_note"].startswith("clean")
+    assert not any(n["notice"] == "worktree_inherited_changes"
+                   for n in second.execution_notices)
+
+
+def test_install_artifacts_are_not_reported_as_inherited(tmp_path, monkeypatch) -> None:
+    """The read happens BEFORE install, so this run's own dependency artifacts can never be
+    mistaken for a dead run's leftovers."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+
+    class P(_Proj):
+        def install_cmd(self) -> list[str]:
+            return ["sh", "-c", "echo junk > installed-artifact.txt"]
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    out = res.structured_output
+    assert (Path(out["worktree"]) / "installed-artifact.txt").exists()  # install really ran
+    assert out["inherited_changes"] == [] and out["inherited_changes_count"] == 0
+
+
+def test_large_inherited_diff_is_truncated_but_the_count_is_true(tmp_path, monkeypatch) -> None:
+    """A 2,400-line rewrite starts as a few dozen files: the LIST is bounded for the prompt,
+    while the COUNT stays honest so nobody reads the cap as the size of the loss."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    runner = DeterministicSetupRunner(_Proj())
+
+    worktree = Path(runner.dispatch(_wi()).structured_output["worktree"])
+    for i in range(25):
+        (worktree / f"f{i:02d}.txt").write_text("x\n")
+
+    out = runner.dispatch(_wi()).structured_output
+
+    assert out["inherited_changes_count"] == 25  # the truth
+    assert len(out["inherited_changes"]) == 21  # 20 entries + the explicit tail
+    assert out["inherited_changes"][-1] == "… (5 more)"
+
+
+def test_unreadable_status_never_reports_clean(tmp_path, monkeypatch) -> None:
+    """A git that cannot answer must yield UNKNOWN, not a fabricated clean tree: the note
+    says unreadable, the count is absent (absent = unknown), and it is evented."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    import adapters.execution.deterministic_setup as ds
+
+    real_git = ds._git
+
+    def flaky_git(cwd: str, *args: str):
+        if args[:1] == ("status",):
+            raise subprocess.TimeoutExpired(cmd="git status", timeout=1)
+        return real_git(cwd, *args)
+
+    monkeypatch.setattr(ds, "_git", flaky_git)
+    res = DeterministicSetupRunner(_Proj()).dispatch(_wi())
+
+    out = res.structured_output
+    assert res.status is ResultStatus.SUCCESS  # never fatal
+    assert out["inherited_changes_note"].startswith("unreadable: TimeoutExpired")
+    assert "inherited_changes_count" not in out  # absent = unknown, never 0
+    assert any(n["notice"] == "worktree_status_unreadable" for n in res.execution_notices)
+
+
+def test_non_git_override_worktree_reports_n_a_without_a_warning(tmp_path, monkeypatch) -> None:
+    """A project ``setup_task`` may legitimately provision a non-git worktree; that is an
+    honest n/a, not a fault — so it must not cry wolf on every dispatch."""
+    monkeypatch.chdir(tmp_path)  # deliberately NOT a git repo
+    worktree = tmp_path / "custom"
+    worktree.mkdir()
+
+    class P(_Proj):
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": "b/7", "worktree": str(worktree), "baseline_captured": False}
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    out = res.structured_output
+    assert out["inherited_changes_note"] == "n/a (not a git worktree)"
+    assert not any(n["notice"] in ("worktree_inherited_changes", "worktree_status_unreadable")
+                   for n in res.execution_notices)
+
+
+def test_override_worktree_reports_inherited_changes(tmp_path, monkeypatch) -> None:
+    """The provisioning override is a seam, not an exemption (the #381 review lesson): a
+    dirty directory handed back by ``setup_task`` is reported the same way, and the
+    engine-verified fields override whatever the project claimed."""
+    repo = tmp_path / "product"
+    repo.mkdir()
+    _git_repo(repo)
+    monkeypatch.chdir(tmp_path)
+    _dirty(repo)
+
+    class P(_Proj):
+        def setup_task(self, task_id: str) -> dict:
+            return {
+                "branch": "b/7",
+                "worktree": str(repo),
+                "inherited_changes": ["a lie the project told"],  # must not survive
+                "inherited_changes_note": "clean",
+            }
+
+    out = DeterministicSetupRunner(P()).dispatch(_wi()).structured_output
+
+    assert out["inherited_changes_count"] == 3
+    assert "a lie the project told" not in out["inherited_changes"]
+    assert "did not make them" in out["inherited_changes_note"]
+
+
+def test_inherited_changes_survive_a_failed_intake(tmp_path, monkeypatch) -> None:
+    """A FAILED intake is exactly when a human most needs to know the tree was already
+    dirty, so the report must not be swallowed when install/origin verification aborts."""
+    monkeypatch.chdir(tmp_path)
+    repo = tmp_path / "product"
+    repo.mkdir()
+    _git_repo(repo)
+    _dirty(repo)
+    (repo / ".venv").mkdir()
+    (repo / ".venv" / "origin").write_text(f"{tmp_path / 'sibling'}\n")
+
+    class P(_Proj):
+        def fresh_install_paths(self) -> list[str]:
+            return [".venv"]
+
+        def worktree_origin_probes(self) -> list[tuple[str, list[str]]]:
+            return [("environment source", ["sh", "-c", "cat .venv/origin"])]
+
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": "b/7", "worktree": str(repo), "baseline_captured": True}
+
+    res = DeterministicSetupRunner(P()).dispatch(_wi())
+
+    assert res.status is ResultStatus.FAILURE  # the origin refusal still stands
+    inherited = next(n for n in res.execution_notices
+                     if n["notice"] == "worktree_inherited_changes")
+    assert inherited["count"] == 4  # the three dirty entries plus the stale .venv
