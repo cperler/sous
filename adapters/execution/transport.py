@@ -18,8 +18,9 @@ import tempfile
 import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from jsonschema import Draft202012Validator
 from jsonschema import ValidationError as _JSONSchemaError
@@ -123,6 +124,12 @@ _PROVIDER_LIMIT_NOTICE_MARKERS = (
     "session limit reached", "usage limit reached",
 )
 
+_RATE_LIMIT_RESET_RE = re.compile(
+    r"\bresets\s+(?P<hour>\d{1,2}):(?P<minute>\d{2})\s*"
+    r"(?P<meridiem>[ap]m)(?:\s*\((?P<timezone>[^()]+)\))?",
+    re.IGNORECASE,
+)
+
 
 def is_rate_limited(raw: RawResult) -> bool:
     """True if a RawResult looks like a transient rate-limit / overload.
@@ -137,6 +144,77 @@ def is_rate_limited(raw: RawResult) -> bool:
         return True
     notice = f"{text}\n{(raw.raw_output or '').lower()}"
     return any(m in notice for m in _PROVIDER_LIMIT_NOTICE_MARKERS)
+
+
+def parse_rate_limit_reset_at(
+    raw: RawResult,
+    *,
+    now: datetime | None = None,
+    local_timezone: tzinfo | None = None,
+) -> str | None:
+    """Return a provider limit notice's next reset as an ISO UTC timestamp.
+
+    Claude renders a time only (``resets 3:50pm``), optionally followed by an IANA
+    timezone. Qualified notices use that zone; bare notices use the host-local zone, which
+    is the display context the CLI used. Because no date is supplied, a time at or before
+    the current local clock is the next day's occurrence rather than a deadline in the past.
+
+    Raw output can also contain task-authored text, so it is eligible only when it contains
+    Claude's narrow first-person provider notice. Stderr is provider-owned and remains
+    eligible when it carries either the ordinary rate-limit markers or the narrow notice.
+    """
+    error = raw.error or ""
+    raw_output = raw.raw_output or ""
+    candidates: list[str] = []
+    error_lower = error.lower()
+    if any(marker in error_lower for marker in (*_RATE_LIMIT_MARKERS,
+                                                *_PROVIDER_LIMIT_NOTICE_MARKERS)):
+        candidates.append(error)
+    raw_lower = raw_output.lower()
+    if any(marker in raw_lower for marker in _PROVIDER_LIMIT_NOTICE_MARKERS):
+        candidates.append(raw_output)
+
+    match = next(
+        (found for text in candidates if (found := _RATE_LIMIT_RESET_RE.search(text))),
+        None,
+    )
+    if match is None:
+        return None
+
+    hour = int(match.group("hour"))
+    minute = int(match.group("minute"))
+    if not 1 <= hour <= 12 or not 0 <= minute <= 59:
+        return None
+    if match.group("meridiem").lower() == "pm":
+        hour = hour % 12 + 12
+    else:
+        hour %= 12
+
+    current = now if now is not None else datetime.now(UTC)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=UTC)
+    timezone_name = match.group("timezone")
+    if timezone_name:
+        try:
+            zone: tzinfo = ZoneInfo(timezone_name.strip())
+        except (ValueError, ZoneInfoNotFoundError):
+            return None
+    else:
+        zone = local_timezone or current.astimezone().tzinfo or UTC
+
+    local_now = current.astimezone(zone)
+    target_date = local_now.date()
+    reset = datetime(
+        target_date.year, target_date.month, target_date.day,
+        hour, minute, tzinfo=zone,
+    )
+    if reset <= local_now:
+        target_date += timedelta(days=1)
+        reset = datetime(
+            target_date.year, target_date.month, target_date.day,
+            hour, minute, tzinfo=zone,
+        )
+    return reset.astimezone(UTC).isoformat()
 
 
 # Substrings marking the PROVIDER itself being unavailable — an auth/login failure, NOT a
@@ -648,6 +726,7 @@ def to_stage_result(
     # StageResult.structured_output is dict|None; a non-dict payload (list/scalar)
     # is coerced to None here (the raw text is preserved in raw_output).
     structured = raw.structured_output if isinstance(raw.structured_output, dict) else None
+    completed_at = datetime.now(UTC)
     return StageResult(
         work_item_id=work.id,
         content_hash=work.content_hash,
@@ -660,6 +739,10 @@ def to_stage_result(
         status=status,
         structured_output=structured,
         raw_output=raw.raw_output,
+        rate_limit_reset_at=(
+            parse_rate_limit_reset_at(raw, now=completed_at)
+            if status is ResultStatus.RATE_LIMITED else None
+        ),
         error=raw.error,
         lane_used=LaneUsed(
             execution_mode=mode, provider=provider, invocation=raw.invocation or provider.value
@@ -675,7 +758,7 @@ def to_stage_result(
         execution_notices=raw.execution_notices,
         token_usage=raw.usage,
         usage_recovered=raw.usage_recovered,
-        completed_at=datetime.now(UTC).isoformat(),
+        completed_at=completed_at.isoformat(),
     )
 
 

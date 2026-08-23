@@ -286,8 +286,9 @@ class Task(_StatusModel):
     pending_fallback_model: str | None = None
     # Rate-limit cooldown (the wait-out-the-window half of the old handle_rate_limit):
     # a floor-of-chain rate limit parks the task until this ISO timestamp instead of
-    # burning attempts; next_work/dispatchable refuse earlier dispatch. Bounded by
-    # rate_limit_waits vs the engine's max_rate_limit_waits.
+    # burning attempts; next_work/dispatchable refuse earlier dispatch. ``rate_limit_waits``
+    # counts blind fixed-cooldown guesses against max_rate_limit_waits. A provider-stated
+    # reset parks until the known deadline without consuming that guess budget.
     not_before: str | None = None
     rate_limit_waits: int = 0
     # Infra-failure reset loop (#14): how many environment resets this task has spent

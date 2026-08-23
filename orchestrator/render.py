@@ -870,7 +870,7 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
     if task.infra_resets:
         notes.append(f"{task.infra_resets} infra-reset(s)")
     if task.rate_limit_waits:
-        notes.append(f"{task.rate_limit_waits} rate-limit wait(s)")
+        notes.append(f"{task.rate_limit_waits} blind rate-limit wait(s)")
     if notes:
         lines.append(f"- **Recovery:** {', '.join(notes)}")
 
