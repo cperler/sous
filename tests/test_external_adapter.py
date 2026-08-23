@@ -125,6 +125,17 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
         config_type, "_run_gate",
         staticmethod(lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")),
     )
+    # Same reason for the #391 worktree hooks: this fixture is a git repo with an adapter
+    # in it, not an installed python project, so REVIEW's fresh reinstall has no
+    # pyproject.toml to sync and no interpreter here resolves inside the worktree — intake
+    # and review would (correctly) refuse. They are REMOVED rather than emptied because
+    # mere presence is what routes REVIEW to an origin-verifying lane, and this test wants
+    # the plain supervisor path. That the generated adapter DOES declare both is covered in
+    # tests/test_bootstrap_scaffold.py.
+    assert config_type.fresh_install_paths(config_type)  # not silently absent
+    assert config_type.worktree_origin_probes(config_type)
+    monkeypatch.delattr(config_type, "fresh_install_paths")
+    monkeypatch.delattr(config_type, "worktree_origin_probes")
 
     for argv in (["git", "init", "-q"], ["git", "add", "-A"],
                  ["git", "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", "init"]):
