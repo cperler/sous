@@ -402,6 +402,11 @@ class StageResult(BaseModel):
     status: ResultStatus
     structured_output: dict | None = None
     raw_output: str | None = None
+    # Provider-reported time when a RATE_LIMITED call should be dispatchable again,
+    # normalized by the execution adapter to an aware ISO-8601 timestamp. The engine may
+    # use this correctness metadata to park the SAME attempt; None retains the blind fixed
+    # cooldown. Optional for backward compatibility with lanes that cannot report a reset.
+    rate_limit_reset_at: str | None = None
     lane_used: LaneUsed
     # The provider session the runner used or created (design pass §2) — absorbed by
     # the engine on SUCCESS and threaded into the task's next WorkItem. None on

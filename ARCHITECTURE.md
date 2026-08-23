@@ -239,8 +239,10 @@ never satisfy.
   INFRA death, since that code isn't the defect — `SALVAGEABLE_FAILURE_STATUSES`), **warm-retry**
   (opt a failed attempt's provider session into the retry), **infra-reset** (`max_infra_resets`),
   and a **rate-limit cooldown** (park the task `not_before` a timestamp; the scheduler sleeps on
-  the soonest cooldown instead of spinning). Checkpoint tags let a retry hard-reset the worktree
-  to the last good state.
+  the soonest cooldown instead of spinning). A provider-stated reset is normalized by the
+  execution adapter and wins when later than the fixed cooldown. It does not consume
+  `rate_limit_waits`: that bounded budget counts only blind fixed-cooldown guesses. Checkpoint
+  tags let a retry hard-reset the worktree to the last good state.
 - **Capacity + cost bands.** `orchestrator/capacity.py` turns the current 5h utilization
   (`--util`, sensed by `usage_probe.py`) into the binding `dispatch_limit` (how many tasks may
   run) and a `dispatch_band` (which model a fresh dispatch runs on) — the execution adapter's

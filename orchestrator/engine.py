@@ -448,9 +448,9 @@ class Engine:
         # Review gate: how many rejection-triggered fix cycles (re-run implement→…→review
         # with the blocking issues as learnings) before the task parks BLOCKED_ON_HUMAN.
         self.max_review_cycles = max_review_cycles
-        # Rate-limit cooldown at the fallback-chain floor: wait this long and retry the
-        # ORIGINAL model (the old wait-until-reset behavior) instead of failing the
-        # attempt; bounded so a permanently-limited account still fails out.
+        # Rate-limit cooldown at the fallback-chain floor: absent a provider-stated reset,
+        # wait this long and retry the ORIGINAL model instead of failing the attempt. The
+        # guess budget bounds a permanently-limited account; known reset waits are exempt.
         self.max_rate_limit_waits = max_rate_limit_waits
         self.rate_limit_cooldown_s = rate_limit_cooldown_s
         # Infra-failure reset loop (#14): how many times an infra-classified TEST
@@ -2214,9 +2214,10 @@ class Engine:
             if effective.status is ResultStatus.RATE_LIMITED and lane_allows_fallback else None
         )
         # At the floor (or with fallback disabled) the rate limit can't be dodged with a
-        # cheaper model — wait it out (the old handle_rate_limit's wait-until-reset) and
-        # retry the ORIGINAL model, bounded by max_rate_limit_waits; only past that budget is
-        # the provider's same-provider budget exhausted. ``provider_out_reason`` captures the
+        # cheaper model — wait it out and retry the ORIGINAL model. Provider-stated reset
+        # waits do not consume max_rate_limit_waits; that budget bounds only blind fixed
+        # cooldown guesses. Only past the blind-wait budget is the provider's same-provider
+        # budget exhausted. ``provider_out_reason`` captures the
         # two "the (codex) provider is out" signals #7 falls through on: a runner-reported
         # PROVIDER_UNAVAILABLE (CLI missing / auth), OR a floor rate-limit whose wait budget is
         # spent. It stays None while a cooldown wait remains (that is not exhaustion yet).
@@ -2234,6 +2235,9 @@ class Engine:
         review_fixup_action: dict[str, object] | None = None
         fixups_applied: list[ReviewFixup] = []
         cooldown_until: str | None = None
+        cooldown_wait_source: Literal["fixed_cooldown", "provider_reset"] | None = None
+        cooldown_budget_charged = False
+        provider_reset_at: str | None = None
         provider_out_reason: str | None = None
         # #311: what the under-lock re-validation rejected (fresh doc + mismatch), captured
         # for the caller to audit AFTER the transaction aborts — the event is emitted
@@ -2244,7 +2248,8 @@ class Engine:
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
             nonlocal test_validation, review_fixup_action, fixups_applied
-            nonlocal cooldown_until, provider_out_reason, lease_rejection
+            nonlocal cooldown_until, cooldown_wait_source, cooldown_budget_charged
+            nonlocal provider_reset_at, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
             # validate→transition sequence is one read-modify-write on the fresh doc,
             # so of two concurrent duplicate records exactly one clears the lease —
@@ -2256,10 +2261,25 @@ class Engine:
             if effective.status is ResultStatus.PROVIDER_UNAVAILABLE:
                 provider_out_reason = effective.error or "provider reported unavailable"
             elif effective.status is ResultStatus.RATE_LIMITED and fallback_model is None:
-                if t.rate_limit_waits < self.max_rate_limit_waits:
-                    cooldown_until = (
-                        datetime.now(UTC) + timedelta(seconds=self.rate_limit_cooldown_s)
-                    ).isoformat()
+                cooldown_now = datetime.now(UTC)
+                fixed_until = cooldown_now + timedelta(seconds=self.rate_limit_cooldown_s)
+                parsed_reset: datetime | None = None
+                if effective.rate_limit_reset_at:
+                    try:
+                        candidate = datetime.fromisoformat(effective.rate_limit_reset_at)
+                    except ValueError:
+                        pass
+                    else:
+                        if candidate.tzinfo is not None:
+                            parsed_reset = candidate.astimezone(UTC)
+                if parsed_reset is not None:
+                    provider_reset_at = parsed_reset.isoformat()
+                    cooldown_until = max(fixed_until, parsed_reset).isoformat()
+                    cooldown_wait_source = "provider_reset"
+                elif t.rate_limit_waits < self.max_rate_limit_waits:
+                    cooldown_until = fixed_until.isoformat()
+                    cooldown_wait_source = "fixed_cooldown"
+                    cooldown_budget_charged = True
                 else:
                     provider_out_reason = (
                         "rate-limited with no cheaper fallback available and the "
@@ -2317,7 +2337,8 @@ class Engine:
                     t.pending_fallback_model = fallback_model
                     outcome = "stage_rate_limited_fallback"
                 else:
-                    t.rate_limit_waits += 1
+                    if cooldown_budget_charged:
+                        t.rate_limit_waits += 1
                     t.not_before = cooldown_until
                     outcome = "stage_rate_limited_cooldown"
             else:
@@ -2534,6 +2555,9 @@ class Engine:
                     {"ts": _now(), "type": "rate_limit_cooldown", "run_id": run_id,
                      "task_id": result.task_id, "stage": result.stage.value,
                      "not_before": t.not_before,
+                     "wait_source": cooldown_wait_source,
+                     "provider_reset_at": provider_reset_at,
+                     "budget_charged": cooldown_budget_charged,
                      "waits_used": t.rate_limit_waits,
                      "waits_budget": self.max_rate_limit_waits}
                 )
