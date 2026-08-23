@@ -354,6 +354,48 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
     assert "task/42" in body and "review-fix commits" in body and "fix cycle 2" in body
 
 
+def test_deliver_revalidates_open_pr_after_push_before_reuse(tmp_path) -> None:
+    views = 0
+
+    def responder(argv):
+        nonlocal views
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            views += 1
+            state = "OPEN" if views == 1 else "MERGED"
+            return _cp(0, _pr_json(77, state=state))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, "[]")
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        if "push" in argv:
+            return _cp(0)
+        if argv[:3] == ["git", "fetch", "--prune"]:
+            return _cp(0)
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _cp(0)
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _cp(0, "https://github.com/o/r/pull/78\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    assert views == 2
+    assert res.structured_output == {
+        "pr_number": 78,
+        "pr_url": "https://github.com/o/r/pull/78",
+    }
+    assert res.execution_notices[0]["previous_pr_state"] == "MERGED"
+    assert res.execution_notices[0]["current_pr_reused"] is False
+    assert gh.ran("git", "fetch") and gh.ran("gh", "pr", "create")
+    assert not gh.ran("gh", "pr", "comment")
+
+
 def test_deliver_reuse_comment_uses_discovered_pr_url(tmp_path) -> None:
     # No folded pr_url: reuse is discovered via `gh pr list`, and the advisory comment
     # selects that validated open PR.
@@ -364,6 +406,8 @@ def test_deliver_reuse_comment_uses_discovered_pr_url(tmp_path) -> None:
             return _cp(0, "1\n")
         if "push" in argv:
             return _cp(0)
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(88))
         if argv[:3] == ["gh", "pr", "list"]:
             return _cp(0, f'[{_pr_json(88)}]')
         return _cp(0)

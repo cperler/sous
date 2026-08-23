@@ -5588,7 +5588,9 @@ class Engine:
                     "error": "completed task has no PR validation receipt",
                 }
             if evidence.get("type") not in (
-                "completion_pr_invalid", "completion_pr_unverified"
+                "completion_pr_invalid",
+                "completion_pr_unverified",
+                "completion_pr_validation_skipped",
             ):
                 continue
             delivery_invalid_by_task[task_id] = 1
@@ -6084,11 +6086,13 @@ class Engine:
             return
         describe_pr = getattr(task_source, "describe_pr", None)
         if not callable(describe_pr):
+            error = "task source has no PR lifecycle hook"
             self.store.append_event(
                 run_id,
-                {"ts": _now(), "type": "completion_pr_validation_skipped", "run_id": run_id,
+                {"ts": _now(), "type": "completion_pr_validation_skipped",
+                 "level": "warning", "run_id": run_id,
                  "task_id": task.task_id, "pr_url": task.pr_url,
-                 "reason": "task source has no PR lifecycle hook"},
+                 "reason": error, "error": error},
             )
             return
         expected_ref = str((task.context or {}).get("branch") or "")

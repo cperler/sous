@@ -108,6 +108,24 @@ class DeterministicDeliverRunner:
             )
         self._push(cwd, branch)
         if existing:
+            # The push is a network-sized race window: an OPEN PR observed above can be
+            # merged or closed while git is sending the fix commits. Revalidate after the
+            # push before claiming reuse, and recover another OPEN PR for the head if one
+            # appeared in the meantime. A newly stale candidate follows the same guarded
+            # replacement path as a PR that was already stale at dispatch time.
+            existing, newly_stale = self._existing_pr(
+                cwd,
+                branch,
+                {"pr_url": existing["url"], "pr_number": existing["number"]},
+            )
+            if newly_stale is not None:
+                stale = newly_stale
+            if existing is None:
+                assert stale is not None  # _existing_pr only drops a selected PR as stale
+                replacement_base = self._replacement_base(cwd, stale)
+                self._require_current_base(cwd, branch, replacement_base)
+                out = self._open_pr(cwd, branch, work, ctx, base=replacement_base)
+                return out, self._transition_notices(stale, out)
             # Fix cycle: the branch was already pushed above, so the PR now reflects the new
             # commits. Reuse it — never open a duplicate.
             self._comment_fix_cycle(cwd, branch, existing, ctx)

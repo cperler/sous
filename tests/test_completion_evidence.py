@@ -1125,10 +1125,16 @@ def test_note_is_persisted_even_when_the_adapter_cannot_publish(tmp_path, projec
     assert outcomes[-1]["outcome"] == "task_completed"
     body = (tmp_path / "stages" / "t1" / "completion-note.md").read_text()
     assert "Two dict entries over-indented" in body
-    # no hook -> nothing was delivered and nothing failed; the run still reads clean
+    # The note has no publication hook, and the recorded PR has no lifecycle hook either.
+    # The latter is unverifiable delivery evidence, so completion must not read as clean.
     events = _events(tmp_path)
     assert not any(e["type"].startswith("completion_note_") for e in events)
-    assert eng.status("r1")["completion_notes"]["clean"] is True
+    skipped = [e for e in events if e["type"] == "completion_pr_validation_skipped"]
+    assert len(skipped) == 1 and skipped[0]["level"] == "warning"
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False
+    assert audit["undelivered"] == 1 and audit["delivery_invalid"] == 1
+    assert "no PR lifecycle hook" in audit["notes"][0]["error"]
 
 
 def test_note_survives_a_failure_in_the_filing_half(tmp_path, project) -> None:
