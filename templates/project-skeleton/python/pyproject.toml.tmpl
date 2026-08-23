@@ -32,7 +32,7 @@ select = ["E", "F", "I", "UP", "B"]
 # `files` is what makes the bare `uv run mypy` (no path arguments) check the right tree —
 # the harness's review stage shells the command as declared, with no arguments to add.
 # It lists BOTH trees on purpose: `orchestrator-scaffold --detect` writes the adapter's
-# typecheck command as `uv run mypy .`, so bare and dotted invocations must agree or the
+# typecheck command as `uv run python -m mypy .`, so bare and dotted invocations must agree or the
 # gate would check a different tree than this file claims. Starting strict-and-complete is
 # cheap on a new project; narrow it later if a tree becomes genuinely impractical.
 [tool.mypy]

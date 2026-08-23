@@ -11,8 +11,10 @@ A generated adapter also carries the worktree-provenance defenses this repo wrot
 itself (#391): a copied virtualenv keeps the ORIGINATING worktree's interpreter in its
 console-script shebangs, so without them a REVIEW stage can test a different worktree's
 source and approve on a false green. They are derived from the profile — the probe follows
-the launcher the project actually declares — and live in profile.toml's ``[worktree]``
-table, so a project can tune them without hand-editing generated code.
+the form the project actually declares, proving a console script's shebang or (for the
+``python -m ...`` default, #396) the interpreter the runner resolves to — and live in
+profile.toml's ``[worktree]`` table, so a project can tune them without hand-editing
+generated code.
 
 The interactive interview that *composes* a profile (detect stack -> ask -> tune) is a
 separate run-target skill; this is the deterministic layer it drives.
@@ -152,7 +154,15 @@ def derive_worktree(languages: list[str], commands: dict[str, list[str]], manife
     and approve on a false green. ``fresh_install_paths`` makes the disposable REVIEW
     checkout rebuild instead of copying; the probes make a wrong origin LOUD rather than
     merely unlikely. Everything here is derived from what the profile actually declares, so
-    the probe matches the launcher the project really runs.
+    the probe proves the thing the project really runs.
+
+    WHICH probe that is follows the command form (#396). A bare console script
+    (``uv run pytest``) is proven by its shebang, so it yields a ``launcher_probes`` entry.
+    Module invocation (``uv run python -m pytest``, the kit default) has no shebang to go
+    stale — the runner resolves the interpreter directly — so the thing worth proving is the
+    INTERPRETER, and it yields ``interpreter_probe`` instead. Without that, moving the
+    defaults to ``python -m`` would have quietly left a python profile with no probe at all:
+    the hazard would be unlikely, but no longer loud.
 
     A mixed-language profile can have ``_PROBED_COMMAND_KEYS`` claimed by a NON-python
     toolchain (e.g. typescript's ``typecheck`` is ``pnpm exec tsc``); such a key is skipped
@@ -185,8 +195,15 @@ def derive_worktree(languages: list[str], commands: dict[str, list[str]], manife
                 # and the probe would silently pass forever. Skip rather than mis-slice.
                 continue
             launcher = argv[len(prefix)] if len(argv) > len(prefix) else ""
-            if not launcher or launcher in ("python", "python3"):
-                continue  # module invocation resolves the interpreter directly — nothing to probe
+            if not launcher:
+                continue
+            if launcher in ("python", "python3"):
+                # Module invocation: no shebang to go stale, so there is no launcher worth
+                # probing — but the INTERPRETER this runner resolves to still has to come
+                # from the worktree under test (a stray VIRTUAL_ENV or a project-environment
+                # override points it elsewhere). Prove that instead, once (#396).
+                worktree.setdefault("interpreter_probe", list(runner))
+                continue
             path = f"{launcher_dir}/{launcher}"
             worktree.setdefault("launcher_probes", [])
             if path not in worktree["launcher_probes"]:
@@ -260,9 +277,12 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
 # Package-manager command sets, keyed by lockfile-detected PM. These OVERRIDE the
 # manifest's per-language defaults (a lockfile is stronger evidence than the default PM).
 _PM_COMMANDS: dict[str, dict[str, list[str]]] = {
-    "poetry": {"install": ["poetry", "install"], "test_unit": ["poetry", "run", "pytest", "-q"],
-               "lint": ["poetry", "run", "ruff", "check", "."],
-               "typecheck": ["poetry", "run", "mypy", "."]},
+    # Module invocation for the same reason as the manifest default (#396): a console
+    # script's shebang can name another worktree's interpreter, `python -m` cannot.
+    "poetry": {"install": ["poetry", "install"],
+               "test_unit": ["poetry", "run", "python", "-m", "pytest", "-q"],
+               "lint": ["poetry", "run", "python", "-m", "ruff", "check", "."],
+               "typecheck": ["poetry", "run", "python", "-m", "mypy", "."]},
     "pip": {"install": ["pip", "install", "-r", "requirements.txt"],
             "test_unit": ["python", "-m", "pytest", "-q"],
             "lint": ["python", "-m", "ruff", "check", "."]},
@@ -559,10 +579,13 @@ def _command_method(method: str, key: str, takes_files: bool, profile: Profile, 
 
 _WORKTREE_HELPERS = """
 
-# Worktree-origin probes (#391) — generated from profile.toml [worktree]. A virtualenv
-# copied from another worktree keeps THAT worktree's interpreter in its console-script
-# shebangs, so `{runner} pytest` can validate the wrong source and a review can approve on
-# a false green. Each probe prints the path a launcher or import really resolves to; the
+# Worktree-origin probes (#391, #396) — generated from profile.toml [worktree]. A
+# virtualenv copied from another worktree keeps THAT worktree's interpreter in its
+# console-script shebangs, so `{runner} pytest` can validate the wrong source and a review
+# can approve on a false green. Commands declared in the `{runner} python -m ...` form dodge
+# the shebang entirely, but the interpreter the runner picks can still come from outside
+# (a stray VIRTUAL_ENV, a redirected project environment) — hence the interpreter probe.
+# Each probe prints the path a launcher, interpreter, or import really resolves to; the
 # execution adapter refuses any path that lands outside the worktree under test.
 _PROBE_PY = {runner_argv}
 
@@ -586,13 +609,27 @@ def _module_probe(module: str) -> tuple[str, list[str], str]:
     \"\"\"Resolve an imported project module to the file it was actually loaded from.\"\"\"
     code = f"import {{module}} as _m; print(_m.__file__)"
     return (f"{{module}} module", [*_PROBE_PY, "-c", code], "source")
+
+
+def _interpreter_probe(argv: list[str]) -> tuple[str, list[str], str]:
+    \"\"\"Resolve the interpreter a `python -m ...` command actually runs on.
+
+    Module invocation has no shebang to inherit, so this is what a wrong environment looks
+    like instead: the runner resolving to a venv outside the worktree under test. Reported
+    as a launcher, because a healthy `.venv/bin/python` is itself a symlink to a SHARED base
+    interpreter — only its parent directory has to live inside the worktree.
+    \"\"\"
+    label = " ".join(argv)
+    code = "import sys; print(sys.executable)"
+    return (f"{{label}} interpreter", [*argv, "-c", code], "launcher")
 """
 
 _NO_PROBES_COMMENT = """
-    # No worktree-origin probes are declared: this stack has no derivable launcher or
-    # importable module to prove came from the worktree under test. Verification is
-    # therefore SKIPPED (observably — the engine emits a skipped-verification notice).
-    # Add `launcher_probes` / `source_modules` under [worktree] in profile.toml to close it.
+    # No worktree-origin probes are declared: this stack has no derivable launcher,
+    # interpreter, or importable module to prove came from the worktree under test.
+    # Verification is therefore SKIPPED (observably — the engine emits a
+    # skipped-verification notice). Add `launcher_probes` / `interpreter_probe` /
+    # `source_modules` under [worktree] in profile.toml to close it.
 """
 
 
@@ -605,7 +642,9 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
     wt = profile.worktree
     fresh, launchers = wt.get("fresh_install_paths", []), wt.get("launcher_probes", [])
     modules, runner = wt.get("source_modules", []), wt.get("python", [])
-    if not (fresh or ((launchers or modules) and runner)):
+    interpreter = wt.get("interpreter_probe", [])
+    probed = launchers or interpreter or modules
+    if not (fresh or (probed and runner)):
         return "", ""
 
     methods = ""
@@ -615,12 +654,14 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
         \"\"\"Dependency artifacts a disposable REVIEW checkout must rebuild, never copy.\"\"\"
         return {_argv_literal(fresh)}
 """
-    if not runner or not (launchers or modules):
+    if not runner or not probed:
         return "", methods + _NO_PROBES_COMMENT
 
     sources = []
     if launchers:
         sources.append(f"[_launcher_probe(p) for p in {_argv_literal(launchers)}]")
+    if interpreter:
+        sources.append(f"[_interpreter_probe({_argv_literal(interpreter)})]")
     if modules:
         sources.append(f"[_module_probe(m) for m in {_argv_literal(modules)}]")
     body = "\n            + ".join(sources)
