@@ -181,7 +181,11 @@ def apply_result(
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.INTAKE: ("branch", "worktree", "base_sha", "baseline_failures",
-                   "port_base", "port_count", "composed_deps"),
+                   "port_base", "port_count", "composed_deps",
+                   # #385: uncommitted work a REUSED worktree inherited from a previous,
+                   # dead run. Folded for the same reason baseline_failures is — it is
+                   # state the stage would otherwise discover by destroying it.
+                   "inherited_changes", "inherited_changes_note"),
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),

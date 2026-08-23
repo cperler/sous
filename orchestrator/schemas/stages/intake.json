@@ -17,7 +17,20 @@
     "baseline": {"type": "string", "description": "optional human note about the captured baseline"},
     "install_skipped": {"type": "boolean", "description": "#63: true when the dependency install was skipped because this worktree already holds a successful install of the same lockfiles"},
     "install_reason": {"type": "string", "description": "#63: why install ran or was skipped (lockfile-hash-match | installed | no-lockfiles | install-failed | cache-disabled)"},
-    "install_lockfiles": {"type": "array", "items": {"type": "string"}, "description": "#63: lockfile names hashed for the install-cache decision"}
+    "install_lockfiles": {"type": "array", "items": {"type": "string"}, "description": "#63: lockfile names hashed for the install-cache decision"},
+    "inherited_changes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "#385: `git status --porcelain` entries the worktree ALREADY carried at intake (a reused worktree can inherit uncommitted work from a previous, dead run). Bounded: at most 20 entries plus an explicit '… (N more)' tail. Report-only — the engine never resets, stashes or adopts them."
+    },
+    "inherited_changes_count": {
+      "type": "integer",
+      "description": "#385: the TRUE number of inherited uncommitted entries, correct even when the list above is truncated. ABSENT means unknown (the status read failed) — never assume 0."
+    },
+    "inherited_changes_note": {
+      "type": "string",
+      "description": "#385: which of the four honest states the read found — 'clean …', 'N uncommitted change(s) …', 'n/a (not a git worktree)' (a project setup_task may provision a non-git worktree), or 'unreadable: <reason>'. An unreadable tree must never read as a clean one."
+    }
   },
   "additionalProperties": true
 }

@@ -337,6 +337,27 @@ _TESTS_MEANINGFUL_DIRECTIVE = (
 )
 
 
+# #385: a REUSED worktree can inherit UNCOMMITTED work from a previous, dead run — the
+# engine reports it (intake's `inherited_changes`) but deliberately neither resets nor adopts
+# it, because it cannot tell a finished implementation from a half-write. Stated in-band
+# because the folded context line alone is a fact without an instruction, and the live
+# near-miss was exactly that: SCOPE found ~2,400 lines of finished, uncommitted work only
+# because it ran `git status` on its own initiative — IMPLEMENT would otherwise have rewritten
+# it from scratch, on top of the dirty tree. Conditional, so a clean task's prompt is
+# byte-identical to the pre-#385 one (no per-run token cost, no prompt-cache churn).
+_INHERITED_CHANGES_DIRECTIVE = (
+    "\n\n## Uncommitted changes already in the worktree (not made by this run)\n"
+    "`inherited_changes` in the context above lists uncommitted changes this worktree "
+    "ALREADY held when the run started — a previous run very likely died and left them. "
+    "They may be FINISHED work (a run that died before committing) or a half-edit from a "
+    "stage that died mid-write; nothing has reset, stashed, or adopted them.\n"
+    "INSPECT them (`git status`, `git diff`) BEFORE you edit or overwrite anything, and "
+    "decide deliberately: build on them, or discard them. Do not assume they are yours, and "
+    "do not silently write over them. This is the state observed at intake — an earlier "
+    "stage in THIS run may already have resolved it."
+)
+
+
 # #317: a run-produced commit carries NO model attribution trailer at all.
 #
 # The rejected alternative was engine-stamped attribution (name the models the engine really
@@ -453,6 +474,21 @@ _STACKED_DIFF_NO_BASE = (
     "belonging to the dependency branches named above (`git log <dependency-branch>` shows "
     "them). Do not take the raw PR diff for this task's change.\n"
 )
+
+
+def _inherited_changes_present(context: dict | None) -> bool:
+    """True when intake reported uncommitted work the worktree inherited (#385).
+
+    Pure and tolerant of the shapes the context plane can hold (the value is folded from a
+    stage output, so it is not typed): a bare string, a non-sequence, blank entries. False
+    for clean / ``n/a`` / unreadable trees, so those prompts stay byte-identical.
+    """
+    raw = (context or {}).get("inherited_changes") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return False
+    return any(str(entry).strip() for entry in raw)
 
 
 def _stacked_diff_directive(context: dict | None) -> str:
@@ -603,6 +639,11 @@ def render_prompt(
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
 
+    - any stage + inherited uncommitted work (#385): when intake reported that the worktree
+      already held uncommitted changes this run did not make, tells the stage to inspect them
+      before editing or overwriting. Not stage-specific — any stage that touches the tree can
+      be misled by it.
+
     - any posture-bearing stage on a lane that cannot enforce it (#302,
       ``tool_posture_unenforced``): states the stage's ``tool_policy`` in-band, because on
       that lane the prompt is the only place it can be stated at all. The caller passes the
@@ -646,6 +687,11 @@ def render_prompt(
     # wording; a project's own design tokens live in its adapter's design agent.
     if stage is Stage.REVIEW and _has_frontend_change((context or {}).get("files_changed")):
         instruction += _DESIGN_REVIEW_LENS
+    # #385: every prompt-reading stage is told when the worktree arrived carrying someone
+    # else's uncommitted work — no stage list to hand-maintain, because any stage that reads
+    # or writes the tree can be misled by it, and the block is empty unless it happened.
+    if _inherited_changes_present(context):
+        instruction += _INHERITED_CHANGES_DIRECTIVE
     # #317: every stage whose success ends in a commit (implement, test, deliver) is told NOT
     # to sign it. Keyed off the stage spec's own ``checkpoint`` flag rather than a second
     # hand-maintained stage list, so a future committing stage inherits it. Globally-

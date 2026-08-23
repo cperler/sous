@@ -157,8 +157,10 @@ opaque quality loop.
   `Task.pipeline`, never the constant. Lane presets `full | lite | micro` (`LANE_STAGES`)
   resolve to a concrete pipeline at `add_task`; e.g. `micro` drops scope and test.
 - **Deterministic stage executors** run on the `engine×none` lane — no model, $0. Intake
-  (`deterministic_setup.py`) creates the worktree/branch and captures the test baseline;
-  `deterministic_test.py` runs the suite and classifies failures; `deterministic_deliver.py`
+  (`deterministic_setup.py`) creates the worktree/branch, reports any uncommitted work a
+  REUSED worktree inherited from a previous, dead run (#385 — report-only: never reset,
+  never adopted), and captures the test baseline; `deterministic_test.py` runs the suite and
+  classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
 - **Dispatch/record contract.** `Engine.next_work()` emits an immutable `WorkItem` whose
@@ -172,9 +174,10 @@ opaque quality loop.
   `model_table`, never the runner's self-report (`orchestrator/cost_ledger.py`).
 - **Context plane.** Stages hand data forward through an engine-owned whitelist, not free
   text: `CONTEXT_KEYS` in `state_machine.py` names exactly which structured keys each stage
-  folds into `task.context` (e.g. intake → `branch`/`worktree`/`baseline_failures`, deliver
-  → `pr_url`). The fold is bounded (per-value caps + a 16 KB whole-context ceiling evicted
-  heaviest-key-first) and deterministic, so replay reproduces it. `DETERMINISTIC_ONLY_KEYS`
+  folds into `task.context` (e.g. intake → `branch`/`worktree`/`baseline_failures`/
+  `inherited_changes`, deliver → `pr_url`). The fold is bounded (per-value caps + a 16 KB
+  whole-context ceiling evicted heaviest-key-first) and deterministic, so replay reproduces
+  it. `DETERMINISTIC_ONLY_KEYS`
   (`change_class`) fold only from the ENGINE lane — a model can't claim "docs-only" to relax
   its own review.
 - **SCOPE decomposition.** A large task may return a validated `subtasks` DAG with local
