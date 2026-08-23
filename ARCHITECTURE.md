@@ -318,7 +318,16 @@ never satisfy.
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
   entries into the `prior_learnings` context key — read-only advisory text, folded once per
   task, rendered (hedged) into every stage prompt. `orchestrator kb capture|apply|show|gc`
-  is the manual surface. REVIEW process retrospectives use a detector-only `process` kind:
+  is the manual surface. Two filters keep the recall pool honest (#384): a provider
+  capacity/rate-limit notice is not a learning — it is an infra event already durable in
+  `events.jsonl`/`stage-costs.jsonl`, so `is_capacity_notice` drops it at harvest AND at
+  recall (the KB is append-only, so pre-filter rows can only be neutralised at read time),
+  and the drop is evented as `learnings_harvested.skipped_capacity` rather than being
+  silent; and an entry is tagged with only the changed files its own text NAMES
+  (`mentioned_files`), never the task's whole `files_changed` list, because file overlap
+  strictly dominates `_score` and an inherited path list let a contentless failure outrank
+  every real lesson in that package. A distilled retrospective pattern with no sample error
+  is likewise not persisted. REVIEW process retrospectives use a detector-only `process` kind:
   they never enter task prompts. `orchestrator/meta_authoring.py` groups those observations
   by their optional stage-template/agent/skill/schema/kit target and, after the same target
   appears in two distinct runs, files one evidence-backed `meta-authoring` task through a

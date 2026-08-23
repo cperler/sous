@@ -317,3 +317,140 @@ def test_cli_kb_add_and_show(tmp_path, capsys) -> None:
     assert cli_main(["--root", root, "kb", "show", "--query", "flaky auth cache"]) == 0
     q_out = json.loads(capsys.readouterr().out)
     assert q_out["count"] == 1 and "flaky auth cache" in q_out["learnings"][0]
+
+
+# --- #384: capacity notices are not learnings, and files must be earned ---------------
+
+
+def test_capacity_notice_channels_are_asymmetric() -> None:
+    """The provider's own first-person notice matches anywhere; the broad status words only
+    as the prefix of an engine-authored head line — so a task ABOUT rate limiting survives."""
+    # (a) a live limit notice quoted in a failed attempt's output tail
+    assert kb.is_capacity_notice(
+        "test (attempt 0): failed\n"
+        "  output tail: You've hit your session limit · resets 3:50pm (America/New_York)"
+    )
+    # (b) the status word as the head line's error text
+    assert kb.is_capacity_notice('deliver (attempt 0): rate-limited (429 too many requests)')
+    # (c) the same, distilled by the retrospective
+    assert kb.is_capacity_notice("recurring failure at test (2x): overloaded, retrying")
+
+    # NOT notices: a task whose own subject matter is rate limiting.
+    assert not kb.is_capacity_notice(
+        "review rejected (cycle 1) — blocking issues: important — src/api/limits.py:12 — "
+        "the rate limit retry drops the 429 body before logging it"
+    )
+    assert not kb.is_capacity_notice(
+        "test (attempt 0): failed\n  failing: tests/test_ratelimit.py::test_429 [unit]"
+    )
+    assert not kb.is_capacity_notice("")
+
+
+def test_mentioned_files_is_the_texts_own_locus() -> None:
+    files = ["src/pkg/cli.py", "src/pkg/registry_import.py", "docs/readme.md"]
+    # named by full path (with a line number) and by bare basename
+    assert kb.mentioned_files("blew up at src/pkg/cli.py:172 while importing", files) == [
+        "src/pkg/cli.py"
+    ]
+    assert kb.mentioned_files("registry_import.py raised on an empty row", files) == [
+        "src/pkg/registry_import.py"
+    ]
+    # a contentless failure names nothing -> inherits nothing
+    assert kb.mentioned_files("implement (attempt 0): failed", files) == []
+    # a near-miss basename is not a match
+    assert kb.mentioned_files("mycli.py is unrelated", files) == []
+
+
+def test_capacity_learnings_are_dropped_at_harvest(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    task = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
+    task.context = {"files_changed": ["src/pkg/cli.py"]}
+    task.learnings = [
+        "test (attempt 0): failed\n  output tail: You've hit your session limit · resets 3:50pm",
+        "implement (attempt 1): NameError in src/pkg/cli.py:12 — the import moved",
+    ]
+    written = kb.harvest_from_task(path, task, "r1")
+    assert [e["text"] for e in written] == [task.learnings[1]]  # the notice never lands
+
+
+def test_harvest_stamps_only_the_files_a_learning_names(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    task = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
+    task.context = {"files_changed": [f"src/pkg/mod{i}.py" for i in range(10)]}
+    task.learnings = [
+        "review rejected (cycle 1) — blocking issues: critical — src/pkg/mod3.py:12 — leak",
+        "implement (attempt 0): failed",  # no file locus at all
+    ]
+    written = kb.harvest_from_task(path, task, "r1")
+    assert written[0]["files"] == ["src/pkg/mod3.py"]
+    assert written[1]["files"] == []  # no longer inherits the task's whole change list
+
+
+def test_contentless_failure_no_longer_outranks_a_real_lesson(tmp_path) -> None:
+    """The issue's repro: a recall for a task inside the same package must return the
+    lessons with substance, not capacity noise wearing an inherited path list."""
+    path = tmp_path / "kb.jsonl"
+    task = Task(task_id="t9", run_id="r1", created_at="x", updated_at="x")
+    task.context = {"files_changed": ["src/pkg/cli.py", "src/pkg/registry_import.py"]}
+    task.learnings = [
+        "deliver (attempt 0): rate-limited — You've hit your session limit · resets 11:20pm",
+        "implement (attempt 0): failed",
+        "review rejected (cycle 1) — blocking issues: critical — src/pkg/cli.py:172 — "
+        "the importer swallows a partial write",
+    ]
+    kb.harvest_from_task(path, task, "r1")
+    hits = kb.relevant_learnings(
+        path,
+        {"files": ["src/pkg/other.py"], "stage": "implement", "title_tokens": []},
+        limit=5,
+    )
+    assert hits[0].startswith("review rejected")  # file overlap is earned, not inherited
+    assert not any("session limit" in h for h in hits)
+
+
+def test_legacy_capacity_rows_are_excluded_at_recall(tmp_path) -> None:
+    """The KB is append-only, so the rows written before the harvest filter existed can only
+    be neutralised at read time."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"text": "test (attempt 0): failed\n  output tail: You've hit your session limit "
+                 "· resets 3:50pm (America/New_York)",
+         "kind": "failure", "stage": "test",
+         "files": [f"src/pkg/mod{i}.py" for i in range(10)]},
+        {"text": "implement (attempt 2): the fixture factory needs an explicit tz",
+         "kind": "failure", "stage": "implement", "files": ["src/pkg/mod1.py"]},
+    ])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod5.py"], "stage": "test"}, limit=5)
+    assert hits == ["implement (attempt 2): the fixture factory needs an explicit tz"]
+
+
+def test_engine_filters_capacity_learnings_and_records_the_drop(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_attempts=2, breaker_threshold=9)
+    out = _run_failed_task(
+        eng, "r1", "t1",
+        error="rate-limited: You've hit your session limit · resets 3:50pm", attempts=2,
+    )
+    assert out["task_state"] == "failed"
+    assert kb.read_entries(eng._learnings_kb_path()) == []  # neither task nor retrospective
+    harvested = [e for e in eng.store.read_events("r1") if e["type"] == "learnings_harvested"]
+    assert harvested and harvested[0]["count"] == 0
+    assert harvested[0]["skipped_capacity"] >= 1  # the drop is evented, never silent
+
+
+def test_retrospective_pattern_without_a_sample_error_is_not_harvested(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project, max_attempts=9, breaker_threshold=2)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # scope
+    for _ in range(2):  # same (empty) signature twice -> a plateau pattern, no substance
+        w = eng.next_work("r1", "t1")
+        eng.record("r1", make_result(w, status=ResultStatus.FAILURE, error=None))
+    # the retrospective DOES distil a qualifying pattern — it just has nothing to say
+    patterns = eng.retrospective("r1")["patterns"]
+    assert any(
+        (p.get("cross_task") or (p.get("occurrences") or 0) >= 2) and not p.get("sample_error")
+        for p in patterns
+    )
+    entries = kb.read_entries(eng._learnings_kb_path())
+    assert not any(e["text"].startswith("recurring failure at") for e in entries)

@@ -57,6 +57,36 @@ _ATTEMPT_RE = re.compile(r"\(attempt \d+\)", re.IGNORECASE)
 _STAGE_PREFIX_RE = re.compile(r"^([a-z_]+) \(attempt", re.IGNORECASE)
 _FAILURE_KIND_TAG_RE = re.compile(r"\[(" + "|".join(sorted(_FAILURE_KIND_VALUES)) + r")\]")
 
+# --- capacity/rate-limit notices (#384) ---------------------------------------------
+#
+# A provider capacity notice ("You've hit your session limit · resets 3:50pm") is an INFRA
+# event, already durable in ``events.jsonl`` + ``stage-costs.jsonl``. As a cross-run learning
+# it teaches nothing and carries a wall-clock time that is meaningless by the next run, yet
+# it competed for — and won — recall slots ahead of real lessons. These markers are a
+# deliberate engine-side COPY of ``adapters.execution.transport``'s: the dependency arrow
+# points inward (#273), so ``orchestrator/`` may not import ``adapters`` to share them.
+#
+# The two channels are asymmetric for the same reason they are in the transport. A learning's
+# BODY carries task content (a test log, a reviewer's prose about a rate limiter the task is
+# implementing), so only the provider CLI's own first-person phrasing is matched there. The
+# broad status words are matched only against an engine-generated head line's error text, and
+# only as a PREFIX of it — that is where ``_failure_learning``/``_harvest_retrospective`` put
+# ``result.error``, and nowhere a task's own subject matter can reach.
+_PROVIDER_LIMIT_NOTICE_MARKERS = (
+    "hit your session limit", "hit your usage limit",
+    "session limit reached", "usage limit reached",
+)
+_HEAD_LIMIT_PREFIXES = (
+    "rate-limited", "rate limited", "rate_limited", "rate limit", "ratelimit",
+    "429", "too many requests", "overloaded", "usage limit", "session limit",
+)
+# The engine-authored prefixes a learning's error text can follow: one failed attempt
+# (``_failure_learning``) or one distilled retrospective pattern (``_harvest_retrospective``).
+_LEARNING_HEAD_RE = re.compile(
+    r"^(?:[a-z_]+ \(attempt \d+\)|recurring failure at [a-z_]+ \([^)]*\)):\s*",
+    re.IGNORECASE,
+)
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
@@ -105,6 +135,58 @@ def classify_kind(text: str) -> str:
     if "committed work before it failed" in low or "warm retry" in low:
         return "salvage"
     return "failure"
+
+
+def is_capacity_notice(text: str) -> bool:
+    """True if one learning is a provider capacity/rate-limit notice rather than a lesson.
+
+    Deterministic and pure. Two deliberately asymmetric channels (see the marker tables):
+    the provider CLI's first-person limit notice matches ANYWHERE in the text, while the
+    broad status words ("rate-limited", "429", "overloaded") match only as the PREFIX of an
+    engine-authored head line's error text. So a live limit notice quoted in a failure's
+    output tail is caught, and a review finding *about* a rate limiter the task is building
+    is not.
+    """
+    low = str(text or "").strip().lower()
+    if not low:
+        return False
+    if any(m in low for m in _PROVIDER_LIMIT_NOTICE_MARKERS):
+        return True
+    head = low.split("\n", 1)[0]
+    m = _LEARNING_HEAD_RE.match(head)
+    if not m:
+        return False  # no engine-authored prefix — never guess from a task's own prose
+    return head[m.end():].lstrip("\"'").startswith(_HEAD_LIMIT_PREFIXES)
+
+
+def mentioned_files(text: str, files: list[str]) -> list[str]:
+    """The subset of ``files`` a learning's text actually names — its FILE LOCUS (#384).
+
+    A learning used to inherit its task's whole ``files_changed`` list, and ``_score`` lets
+    any file overlap strictly dominate every other tier, so a contentless failure stamped
+    with ten paths outranked every real lesson for any later task touching that package. An
+    entry that cannot say which file it is about should compete on kind/stage/tokens
+    instead, so it gets no files at all.
+
+    Matched by full path or by basename with word-ish boundaries (``cli.py:172``,
+    ``tests/test_x.py::test_y``), against the task's OWN changed files only — never an
+    arbitrary path-shaped token in the prose.
+    """
+    low = str(text or "").lower()
+    if not low.strip():
+        return []
+    out: list[str] = []
+    for raw in files:
+        path = str(raw).strip()
+        if not path:
+            continue
+        lp = path.lower()
+        base = lp.rstrip("/").rsplit("/", 1)[-1]
+        if lp in low or (
+            base and re.search(rf"(?:^|[^\w./-]){re.escape(base)}(?![\w-])", low)
+        ):
+            out.append(path)
+    return out
 
 
 def extract_stage(text: str) -> str | None:
@@ -232,8 +314,17 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
 def harvest_from_task(path: str | Path, task: object, run_id: str, *, now: str | None = None) -> list[dict]:
     """Distil one finished task's ``learnings`` into the KB (dedupe-guarded). Returns the
     entries written — empty for a task that learned nothing (a clean first-pass task), so
-    the engine can skip the harvest event for it. The task's ``files_changed`` context (if
-    folded) tags every entry, so later file-overlap recall can find them."""
+    the engine can skip the harvest event for it.
+
+    Two #384 filters keep the KB's recall pool honest:
+
+    - A provider capacity/rate-limit notice is NOT a learning (``is_capacity_notice``) and is
+      dropped here. It is an infra event, already durable in the run log, and its wall-clock
+      reset time is meaningless by the next run.
+    - Each entry is tagged with only the task files its own text NAMES (``mentioned_files``),
+      not the task's whole ``files_changed`` list. File overlap strictly dominates recall, so
+      an inherited path list let an entry with no file locus outrank every real lesson.
+    """
     learnings = list(getattr(task, "learnings", None) or [])
     if not learnings:
         return []
@@ -245,12 +336,13 @@ def harvest_from_task(path: str | Path, task: object, run_id: str, *, now: str |
             "task_id": task_id,
             "kind": classify_kind(text),
             "text": text,
-            "files": files,
+            "files": mentioned_files(text, files),
             "failure_kind": extract_failure_kind(text),
             "stage": extract_stage(text),
             "ts": now,
         }
         for text in learnings
+        if not is_capacity_notice(text)
     ]
     return append_learnings(path, entries)
 
@@ -347,11 +439,16 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
     with at least ONE positive signal are returned — a task matching nothing gets nothing
     (the fold is advisory 'may or may not apply', never random noise). Texts are already
     bounded at write time. ``process`` entries are excluded unconditionally because they
-    are harness-maintainer evidence, not advice for a product task."""
+    are harness-maintainer evidence, not advice for a product task; capacity/rate-limit
+    notices are excluded for the same reason they are no longer harvested (#384) — the
+    filter is applied at READ time too because the KB is append-only, so rows written
+    before the harvest filter existed would otherwise keep winning slots forever."""
     scored: list[tuple[tuple[int, int, int, int], str, dict]] = []
     for entry in read_entries(path):
         if entry.get("kind") == "process":
             continue  # detector fuel, never advice for an unrelated product task
+        if is_capacity_notice(str(entry.get("text") or "")):
+            continue  # an infra event, not a lesson — and legacy rows carry inherited files
         s = _score(entry, query)
         if sum(s) == 0:
             continue  # no signal at all — not relevant
