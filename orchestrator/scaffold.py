@@ -153,6 +153,11 @@ def derive_worktree(languages: list[str], commands: dict[str, list[str]], manife
     checkout rebuild instead of copying; the probes make a wrong origin LOUD rather than
     merely unlikely. Everything here is derived from what the profile actually declares, so
     the probe matches the launcher the project really runs.
+
+    A mixed-language profile can have ``_PROBED_COMMAND_KEYS`` claimed by a NON-python
+    toolchain (e.g. typescript's ``typecheck`` is ``pnpm exec tsc``); such a key is skipped
+    rather than sliced at the python runner's offset, which would otherwise derive a
+    launcher that can never exist in the venv (see the ``argv[:len(prefix)]`` guard below).
     """
     worktree: dict[str, list[str]] = {}
     for lang in languages:
