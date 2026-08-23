@@ -173,6 +173,12 @@ def derive_worktree(languages: list[str], commands: dict[str, list[str]], manife
             continue
         for key in _PROBED_COMMAND_KEYS:
             argv = commands.get(key) or []
+            if argv[: len(prefix)] != prefix:
+                # A mixed-language profile can have this gate claimed by ANOTHER toolchain
+                # (typescript's typecheck is `pnpm exec tsc`). Slicing it at the python
+                # runner's offset would derive a launcher that can never exist in the venv,
+                # and the probe would silently pass forever. Skip rather than mis-slice.
+                continue
             launcher = argv[len(prefix)] if len(argv) > len(prefix) else ""
             if not launcher or launcher in ("python", "python3"):
                 continue  # module invocation resolves the interpreter directly — nothing to probe

@@ -471,3 +471,27 @@ def test_out_of_tree_venv_manager_gets_no_launcher_probe(tmp_path) -> None:
     assert "launcher_probes" not in prof.worktree
     assert prof.worktree["source_modules"] == ["svc"]
     assert prof.worktree["python"] == ["poetry", "run", "python"]
+
+
+def test_gate_claimed_by_another_toolchain_is_skipped_not_mis_sliced(tmp_path) -> None:
+    """A mixed stack shares the `test_unit`/`typecheck` keys, and the non-python toolchain
+    can win them. Deriving the launcher by POSITION alone would slice `pnpm exec tsc` at the
+    `uv run` offset and declare `.venv/bin/tsc` — a file that can never exist, so the probe
+    would fall back to the interpreter and pass forever, silently reopening #391."""
+    for prof in (
+        profile_from_languages("svc", ["typescript", "python"], MANIFEST),
+        merge_profiles(
+            profile_from_languages("svc", ["typescript"], MANIFEST),
+            profile_from_languages("svc", ["python"], MANIFEST),
+            MANIFEST,
+        ),
+    ):
+        # The python runner is still resolved (via `lint`), so the module probe survives.
+        assert prof.worktree["python"] == ["uv", "run", "python"]
+        assert prof.worktree["fresh_install_paths"] == [".venv"]
+        # But no launcher probe is invented for a gate python does not own.
+        assert prof.worktree.get("launcher_probes", []) == []
+
+    # The single-language case still probes the launchers it really runs.
+    pure = profile_from_languages("svc", ["python"], MANIFEST)
+    assert pure.worktree["launcher_probes"] == [".venv/bin/pytest", ".venv/bin/mypy"]
