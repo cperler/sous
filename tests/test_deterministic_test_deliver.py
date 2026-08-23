@@ -241,6 +241,15 @@ def _deliver_wi(cwd="/wt/42", context=None) -> WorkItem:
     return _wi(Stage.DELIVER, schema_ref="deliver", cwd=cwd, context=ctx)
 
 
+def _pr_json(
+    number: int, *, state: str = "OPEN", head: str = "task/42", base: str = "main"
+) -> str:
+    return (
+        f'{{"number":{number},"url":"https://github.com/o/r/pull/{number}",'
+        f'"state":"{state}","headRefName":"{head}","baseRefName":"{base}"}}'
+    )
+
+
 def test_deliver_opens_fresh_pr_with_closes(tmp_path) -> None:
     def responder(argv):
         if argv[:2] == ["git", "rev-parse"]:
@@ -320,6 +329,8 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
             return _cp(0, "1\n")
         if "push" in argv:
             return _cp(0)
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77))
         return _cp(0)
 
     gh = _FakeGh(responder)
@@ -343,9 +354,51 @@ def test_deliver_fix_cycle_reuses_pr_no_duplicate(tmp_path) -> None:
     assert "task/42" in body and "review-fix commits" in body and "fix cycle 2" in body
 
 
-def test_deliver_reuse_comment_uses_number_when_no_url(tmp_path) -> None:
-    # No folded pr_url: reuse is discovered via `gh pr list`, and the advisory comment then
-    # selects the PR by number (a url isn't available from the list shape here).
+def test_deliver_revalidates_open_pr_after_push_before_reuse(tmp_path) -> None:
+    views = 0
+
+    def responder(argv):
+        nonlocal views
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            views += 1
+            state = "OPEN" if views == 1 else "MERGED"
+            return _cp(0, _pr_json(77, state=state))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, "[]")
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        if "push" in argv:
+            return _cp(0)
+        if argv[:3] == ["git", "fetch", "--prune"]:
+            return _cp(0)
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _cp(0)
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _cp(0, "https://github.com/o/r/pull/78\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    assert views == 2
+    assert res.structured_output == {
+        "pr_number": 78,
+        "pr_url": "https://github.com/o/r/pull/78",
+    }
+    assert res.execution_notices[0]["previous_pr_state"] == "MERGED"
+    assert res.execution_notices[0]["current_pr_reused"] is False
+    assert gh.ran("git", "fetch") and gh.ran("gh", "pr", "create")
+    assert not gh.ran("gh", "pr", "comment")
+
+
+def test_deliver_reuse_comment_uses_discovered_pr_url(tmp_path) -> None:
+    # No folded pr_url: reuse is discovered via `gh pr list`, and the advisory comment
+    # selects that validated open PR.
     def responder(argv):
         if argv[:2] == ["git", "rev-parse"]:
             return _cp(0, "task/42\n")
@@ -353,15 +406,17 @@ def test_deliver_reuse_comment_uses_number_when_no_url(tmp_path) -> None:
             return _cp(0, "1\n")
         if "push" in argv:
             return _cp(0)
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(88))
         if argv[:3] == ["gh", "pr", "list"]:
-            return _cp(0, '[{"number": 88}]')  # existing PR, number only
+            return _cp(0, f'[{_pr_json(88)}]')
         return _cp(0)
 
     gh = _FakeGh(responder)
     res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(_deliver_wi())
     assert res.status is ResultStatus.SUCCESS and res.structured_output.get("reused") is True
     comment = next(c for c in gh.calls if c[0][:3] == ["gh", "pr", "comment"])
-    assert "88" in comment[0]  # PR selected by number
+    assert "https://github.com/o/r/pull/88" in comment[0]
     body = comment[0][comment[0].index("--body") + 1]
     # #118: no review_cycles in context (a raw re-run) → generic wording, never "review-fix
     # commits" or a cycle number the run didn't have.
@@ -378,6 +433,8 @@ def test_deliver_reuse_comment_failure_never_fails_stage(tmp_path) -> None:
             return _cp(0, "1\n")
         if "push" in argv:
             return _cp(0)
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77))
         if argv[:3] == ["gh", "pr", "comment"]:
             raise RuntimeError("gh comment exploded")
         return _cp(0)
@@ -442,6 +499,8 @@ def test_deliver_no_commits_reuses_folded_pr_url_without_gh_list(tmp_path) -> No
             return _cp(0, "task/42\n")
         if "rev-list" in argv:
             return _cp(0, "0\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(156))
         return _cp(0)
 
     gh = _FakeGh(responder)
@@ -452,7 +511,139 @@ def test_deliver_no_commits_reuses_folded_pr_url_without_gh_list(tmp_path) -> No
     out = res.structured_output
     assert out["pr_number"] == 156 and out.get("reused") is True
     assert not gh.ran("push") and not gh.ran("gh", "pr", "list")
+    assert gh.ran("gh", "pr", "view")  # a folded URL is a selector, not proof
     assert not gh.ran("gh", "pr", "comment") and not gh.ran("gh", "pr", "create")
+
+
+def test_deliver_merged_recorded_pr_opens_replacement_and_events_transition(tmp_path) -> None:
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77, state="MERGED"))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, "[]")
+        if argv[:3] == ["git", "fetch", "--prune"]:
+            return _cp(0)
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _cp(0)
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        if "push" in argv:
+            return _cp(0)
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _cp(0, "https://github.com/o/r/pull/78\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    assert res.structured_output["pr_number"] == 78
+    create = next(argv for argv, _cwd in gh.calls if argv[:3] == ["gh", "pr", "create"])
+    assert create[create.index("--base") + 1] == "main"
+    assert res.execution_notices == ({
+        "notice": "deliver_pr_transition",
+        "previous_pr_url": "https://github.com/o/r/pull/77",
+        "previous_pr_number": 77,
+        "previous_pr_state": "MERGED",
+        "previous_head_ref": "task/42",
+        "current_pr_url": "https://github.com/o/r/pull/78",
+        "current_pr_number": 78,
+        "current_pr_reused": False,
+    },)
+
+
+def test_deliver_stale_recorded_pr_reuses_alternate_open_pr_for_head(tmp_path) -> None:
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77, state="CLOSED"))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, f'[{_pr_json(88)}]')
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    assert res.structured_output["pr_number"] == 88
+    assert res.structured_output["reused"] is True
+    assert res.execution_notices[0]["previous_pr_state"] == "CLOSED"
+    assert not gh.ran("git", "fetch") and not gh.ran("gh", "pr", "create")
+
+
+def test_deliver_open_recorded_pr_for_another_head_is_not_reused(tmp_path) -> None:
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77, head="task/other"))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, f'[{_pr_json(88)}]')
+        if "rev-list" in argv:
+            return _cp(0, "1\n")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.SUCCESS
+    assert res.structured_output["pr_number"] == 88
+    assert res.execution_notices[0]["previous_pr_state"] == "OPEN"
+    assert res.execution_notices[0]["previous_head_ref"] == "task/other"
+
+
+def test_deliver_refuses_stale_base_before_push_or_replacement(tmp_path) -> None:
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(0, _pr_json(77, state="MERGED"))
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _cp(0, "[]")
+        if argv[:3] == ["git", "fetch", "--prune"]:
+            return _cp(0)
+        if argv[:3] == ["git", "merge-base", "--is-ancestor"]:
+            return _cp(1)
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.FAILURE
+    assert "does not contain current origin/main" in (res.error or "")
+    assert "rerun tests" in (res.error or "")
+    assert not gh.ran("push") and not gh.ran("gh", "pr", "create")
+
+
+def test_deliver_refuses_unverifiable_recorded_pr(tmp_path) -> None:
+    def responder(argv):
+        if argv[:2] == ["git", "rev-parse"]:
+            return _cp(0, "task/42\n")
+        if argv[:3] == ["gh", "pr", "view"]:
+            return _cp(1, err="API unavailable")
+        return _cp(0)
+
+    gh = _FakeGh(responder)
+    res = DeterministicDeliverRunner(FakeProject(), runner=gh).dispatch(
+        _deliver_wi(context={"pr_url": "https://github.com/o/r/pull/77", "pr_number": 77})
+    )
+
+    assert res.status is ResultStatus.FAILURE
+    assert "could not validate recorded PR" in (res.error or "")
+    assert not gh.ran("push")
 
 
 def test_deliver_fails_on_push_error(tmp_path) -> None:

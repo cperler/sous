@@ -670,6 +670,38 @@ def test_github_source_publish_note_and_file_followup() -> None:
     assert ref == "https://github.com/o/r/issues/99"
 
 
+def test_github_source_describe_pr_returns_live_delivery_evidence() -> None:
+    calls: list[list[str]] = []
+
+    def runner(argv: list[str]) -> str:
+        calls.append(argv)
+        return json.dumps({
+            "number": 23,
+            "url": "https://github.com/o/r/pull/23",
+            "state": "MERGED",
+            "headRefName": "task/10",
+            "headRefOid": "abc123",
+            "baseRefName": "main",
+        })
+
+    info = GitHubIssuesSource("o/r", runner=runner).describe_pr(
+        "https://github.com/o/r/pull/23"
+    )
+
+    assert calls == [[
+        "gh", "pr", "view", "https://github.com/o/r/pull/23", "--json",
+        "number,url,state,headRefName,headRefOid,baseRefName",
+    ]]
+    assert info == {
+        "number": 23,
+        "url": "https://github.com/o/r/pull/23",
+        "state": "MERGED",
+        "head_ref": "task/10",
+        "head_sha": "abc123",
+        "base_ref": "main",
+    }
+
+
 def test_github_source_keyed_followup_recovers_existing_issue() -> None:
     calls: list[list[str]] = []
     created_body: str | None = None
@@ -993,8 +1025,91 @@ def test_published_note_is_persisted_and_receipted(tmp_path, project) -> None:
     assert not any(e["type"] == "completion_note_failed" for e in events)
     assert eng.status("r1")["completion_notes"] == {
         "undelivered": 0, "undelivered_by_task": {}, "unfiled_findings": 0, "notes": [],
+        "delivery_invalid": 0, "delivery_invalid_by_task": {},
         "persist_failed": 0, "persist_failed_by_task": {}, "clean": True,
     }
+
+
+def test_closed_completion_pr_is_reported_as_undelivered(tmp_path, project) -> None:
+    project.task_source.pr_info.update({"state": "CLOSED", "head_ref": "issue-42"})
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False
+    assert audit["undelivered"] == 1
+    assert audit["delivery_invalid"] == 1
+    assert audit["delivery_invalid_by_task"] == {"t1": 1}
+    assert audit["notes"][0]["delivery"]["state"] == "CLOSED"
+    assert "not OPEN or delivered MERGED" in audit["notes"][0]["error"]
+    events = _events(tmp_path)
+    assert any(e["type"] == "completion_pr_invalid" for e in events)
+    assert any(e["type"] == "completion_note_published" for e in events)
+
+
+def test_matching_merged_pr_proves_this_runs_delivery(tmp_path, project) -> None:
+    project.task_source.pr_info.update({
+        "state": "MERGED", "head_ref": "issue-42", "head_sha": "fix-head",
+    })
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    while (work := eng.next_work("r1", "t1")) is not None:
+        output = _REVIEW_WITH_UNFILED if work.stage is Stage.REVIEW else None
+        checkpoint = (
+            {"tag": "checkpoint/r1/t1/deliver", "sha": "fix-head"}
+            if work.stage is Stage.DELIVER else None
+        )
+        eng.record("r1", make_result(work, structured_output=output, checkpoint=checkpoint))
+
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is True
+    validated = [e for e in _events(tmp_path) if e["type"] == "completion_pr_validated"]
+    assert len(validated) == 1
+    assert validated[0]["state"] == "MERGED"
+    assert validated[0]["head_sha"] == validated[0]["expected_head_sha"] == "fix-head"
+
+
+def test_merged_pr_for_an_older_head_is_undelivered(tmp_path, project) -> None:
+    project.task_source.pr_info.update({
+        "state": "MERGED", "head_ref": "issue-42", "head_sha": "old-head",
+    })
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    while (work := eng.next_work("r1", "t1")) is not None:
+        output = _REVIEW_WITH_UNFILED if work.stage is Stage.REVIEW else None
+        checkpoint = (
+            {"tag": "checkpoint/r1/t1/deliver", "sha": "fix-head"}
+            if work.stage is Stage.DELIVER else None
+        )
+        eng.record("r1", make_result(work, structured_output=output, checkpoint=checkpoint))
+
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False and audit["delivery_invalid"] == 1
+    assert "does not match delivered fix-head" in audit["notes"][0]["error"]
+
+
+def test_unverifiable_completion_pr_is_undelivered(tmp_path, project, monkeypatch) -> None:
+    def unavailable(_pr_url: str) -> dict:
+        raise RuntimeError("GitHub API unavailable")
+
+    monkeypatch.setattr(project.task_source, "describe_pr", unavailable)
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+
+    _drive(eng, review_output=_REVIEW_WITH_UNFILED)
+
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False and audit["delivery_invalid"] == 1
+    assert "GitHub API unavailable" in audit["notes"][0]["error"]
+    assert any(e["type"] == "completion_pr_unverified" for e in _events(tmp_path))
 
 
 def test_note_is_persisted_even_when_the_adapter_cannot_publish(tmp_path, project) -> None:
@@ -1010,10 +1125,16 @@ def test_note_is_persisted_even_when_the_adapter_cannot_publish(tmp_path, projec
     assert outcomes[-1]["outcome"] == "task_completed"
     body = (tmp_path / "stages" / "t1" / "completion-note.md").read_text()
     assert "Two dict entries over-indented" in body
-    # no hook -> nothing was delivered and nothing failed; the run still reads clean
+    # The note has no publication hook, and the recorded PR has no lifecycle hook either.
+    # The latter is unverifiable delivery evidence, so completion must not read as clean.
     events = _events(tmp_path)
     assert not any(e["type"].startswith("completion_note_") for e in events)
-    assert eng.status("r1")["completion_notes"]["clean"] is True
+    skipped = [e for e in events if e["type"] == "completion_pr_validation_skipped"]
+    assert len(skipped) == 1 and skipped[0]["level"] == "warning"
+    audit = eng.status("r1")["completion_notes"]
+    assert audit["clean"] is False
+    assert audit["undelivered"] == 1 and audit["delivery_invalid"] == 1
+    assert "no PR lifecycle hook" in audit["notes"][0]["error"]
 
 
 def test_note_survives_a_failure_in_the_filing_half(tmp_path, project) -> None:
