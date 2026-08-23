@@ -58,6 +58,7 @@ from .learnings_kb import (
 from .learnings_kb import (
     harvest_from_task,
     harvest_process_retrospective,
+    is_capacity_notice,
     relevant_learnings,
     resolve_kb_path,
 )
@@ -6977,9 +6978,15 @@ class Engine:
         """Harvest a finished task's learnings into the durable KB (best-effort). Only tasks
         that actually LEARNED something have non-empty learnings — a clean first-pass task
         harvests nothing (harvest_from_task returns []), so no noise and no event. NEVER
-        breaks finalize: a raising/corrupt KB is swallowed + evented."""
+        breaks finalize: a raising/corrupt KB is swallowed + evented.
+
+        #384: capacity/rate-limit notices are dropped at harvest rather than persisted as
+        learnings. That drop is not silent — the receipt carries ``skipped_capacity``, and it
+        is emitted even when EVERY learning was a notice (written empty), so "harvested
+        nothing" and "filtered everything" never read alike."""
         if not self._learnings_kb_enabled():
             return
+        skipped = sum(1 for text in task.learnings if is_capacity_notice(text))
         try:
             written = harvest_from_task(self._learnings_kb_path(), task, run_id)
         except Exception as exc:  # noqa: BLE001 - KB harvest must never break finalize
@@ -6989,11 +6996,12 @@ class Engine:
                  "task_id": task.task_id, "error": str(exc)},
             )
             return
-        if written:
+        if written or skipped:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "learnings_harvested", "run_id": run_id,
-                 "task_id": task.task_id, "count": len(written)},
+                 "task_id": task.task_id, "count": len(written),
+                 "skipped_capacity": skipped},
             )
 
     def _harvest_process_retrospective(self, run_id: str, task: Task) -> None:
@@ -7148,12 +7156,19 @@ class Engine:
                 continue
             stage = pat.get("stage")
             span = ", across tasks" if pat.get("cross_task") else ""
-            sample = (pat.get("sample_error") or "no sample error").strip()
+            # #384: a pattern with no sample error distils to "recurring failure at scope
+            # (2x): no sample error" — a row that teaches a later task nothing while still
+            # matching it on stage at recall. Persist only patterns that carry substance,
+            # and never a capacity/rate-limit notice (an infra event, not a lesson).
+            sample = str(pat.get("sample_error") or "").strip()
+            if not sample:
+                continue
+            text = f"recurring failure at {stage} ({pat.get('occurrences')}x{span}): {sample}"
+            if is_capacity_notice(text):
+                continue
             entries.append(
                 {"run_id": run_id, "task_id": None, "kind": "failure", "stage": stage,
-                 "failure_kind": None, "files": [],
-                 "text": f"recurring failure at {stage} "
-                         f"({pat.get('occurrences')}x{span}): {sample}"}
+                 "failure_kind": None, "files": [], "text": text}
             )
         if not entries:
             return
