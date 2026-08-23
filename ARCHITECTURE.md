@@ -256,6 +256,13 @@ never satisfy.
 - **Cross-provider fallthrough.** A `provider_unavailable` result (codex CLI missing / auth
   expired) can fall through to claude when the run opts in (`cross_provider_fallback`); off, it
   degrades to a normal retry-then-fail.
+- **A rejected invocation is terminal, not transient.** When the provider CLI refuses to PARSE
+  the argv the harness built (a removed/misspelled flag — clap's `error: unexpected argument`,
+  commander's `error: unknown option`), both lanes classify `invocation_error` and the engine
+  fails the task on the FIRST attempt: a retry re-sends a byte-identical command, so the whole
+  attempt budget would burn in milliseconds. No breaker signature, no salvage, no cooldown and
+  no cross-provider fallthrough — a bad argv is a harness bug to fix, not a provider to route
+  around — and it is evented error-grade as `stage_invocation_rejected`.
 - **Human approval gate.** A task parks in the non-terminal `BLOCKED_ON_HUMAN` state — via an
   explicit `hold`, a scope stage reporting `feasible=false`, or exhausted fix cycles — and the
   run cannot silently complete past it. The only exits are `Engine.approve()` (writes a durable

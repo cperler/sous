@@ -26,8 +26,15 @@ from .retry import error_signature
 from .schemas.enums import Stage, TaskState
 from .schemas.status import Run, Task
 
-# Terminal stage-record outcomes that mean the task itself failed.
-_TASK_FAILED_OUTCOMES = {"task_failed_breaker", "task_failed_max_attempts"}
+# Terminal stage-record outcomes that mean the task itself failed. ``invocation_rejected``
+# (#375) is terminal on its FIRST attempt — the CLI refused to parse the argv the harness
+# built — so a retrospective that only knew the retry-exhausting outcomes would read that
+# task as never having failed at all.
+_TASK_FAILED_OUTCOMES = {
+    "task_failed_breaker",
+    "task_failed_max_attempts",
+    "task_failed_invocation_rejected",
+}
 
 
 def _is_failure_status(status: str) -> bool:
