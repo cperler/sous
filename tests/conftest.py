@@ -53,6 +53,10 @@ class FakeTaskSource:
         self.spec_overrides: dict[str, dict] = {}
         # Raise this instead of resolving (#271): an unreachable/refusing task source.
         self.resolve_error: Exception | None = None
+        self.pr_info: dict = {
+            "state": "OPEN", "head_ref": "issue-42", "head_sha": None,
+            "base_ref": "main",
+        }
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
         pool = self.candidates
@@ -75,6 +79,9 @@ class FakeTaskSource:
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         self.completed.append((task_id, pr_url))
+
+    def describe_pr(self, pr_url: str) -> dict:
+        return {"url": pr_url, **self.pr_info}
 
     # Optional evidence-out hooks (duck-typed by the engine at finalize).
     def publish_note(self, task_id: str, body: str, *, pr_url: str | None = None) -> None:

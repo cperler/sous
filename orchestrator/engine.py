@@ -5539,24 +5539,35 @@ class Engine:
 
         Derived from the SAME single events read as the other audit blocks (no second source
         of truth). A task is undelivered when its last ``completion_note_*`` outcome is a
-        failure — a later successful publish (a re-run of finalize) clears it, so the audit
-        reports the current state rather than run-history. ``unfiled_findings`` counts only
-        the findings carried by notes that are STILL undelivered; ``notes`` is every
-        undelivered note's ``{task_id, error, note_file, unfiled}`` so a human polling the
-        run can recover the payload without opening the log tree, and ``persist_failed``
+        failure OR its completion PR is closed, mismatched, or unverifiable (#378). A later
+        successful receipt clears the corresponding failure, so the audit reports current
+        state rather than run-history. ``unfiled_findings`` counts only findings carried by
+        notes that are STILL undelivered; ``notes`` exposes each failure so a human polling
+        the run can recover the payload without opening the log tree, and ``persist_failed``
         flags the worse case where even the durable artifact could not be written."""
         events = self.store.read_events(run_id) if events is None else events
         latest: dict[str, dict] = {}
+        latest_delivery: dict[str, dict] = {}
+        completed_with_pr: dict[str, str] = {}
         persist_failed_by_task: dict[str, int] = {}
         for ev in events:
             kind = ev.get("type")
             task_id = str(ev.get("task_id") or "unknown")
             if kind in ("completion_note_failed", "completion_note_published"):
                 latest[task_id] = ev
+            elif kind in (
+                "completion_pr_validated",
+                "completion_pr_invalid",
+                "completion_pr_unverified",
+                "completion_pr_validation_skipped",
+            ):
+                latest_delivery[task_id] = ev
+            elif kind == "task_completed" and ev.get("pr_url"):
+                completed_with_pr[task_id] = str(ev["pr_url"])
             elif kind == "completion_note_persist_failed":
                 persist_failed_by_task[task_id] = persist_failed_by_task.get(task_id, 0) + 1
-        notes: list[dict] = [
-            {
+        notes_by_task: dict[str, dict] = {
+            task_id: {
                 "task_id": task_id,
                 "error": str(ev.get("error") or ""),
                 "note_file": ev.get("note_file"),
@@ -5566,12 +5577,50 @@ class Engine:
             }
             for task_id, ev in sorted(latest.items())
             if ev.get("type") == "completion_note_failed"
-        ]
+        }
+        delivery_invalid_by_task: dict[str, int] = {}
+        for task_id, pr_url in completed_with_pr.items():
+            evidence = latest_delivery.get(task_id)
+            if evidence is None:
+                evidence = {
+                    "type": "completion_pr_unverified",
+                    "pr_url": pr_url,
+                    "error": "completed task has no PR validation receipt",
+                }
+            if evidence.get("type") not in (
+                "completion_pr_invalid", "completion_pr_unverified"
+            ):
+                continue
+            delivery_invalid_by_task[task_id] = 1
+            detail = {
+                "pr_url": evidence.get("pr_url") or pr_url,
+                "state": evidence.get("state"),
+                "head_ref": evidence.get("head_ref"),
+                "head_sha": evidence.get("head_sha"),
+                "expected_head_ref": evidence.get("expected_head_ref"),
+                "expected_head_sha": evidence.get("expected_head_sha"),
+            }
+            error = str(evidence.get("error") or "completion PR evidence is invalid")
+            note = notes_by_task.get(task_id)
+            if note is None:
+                notes_by_task[task_id] = {
+                    "task_id": task_id,
+                    "error": error,
+                    "note_file": None,
+                    "unfiled": [],
+                    "delivery": detail,
+                }
+            else:
+                note["error"] = f"{note['error']}; {error}" if note["error"] else error
+                note["delivery"] = detail
+        notes = [notes_by_task[key] for key in sorted(notes_by_task)]
         return {
             "undelivered": len(notes),
             "undelivered_by_task": {n["task_id"]: 1 for n in notes},
             "unfiled_findings": sum(len(n["unfiled"]) for n in notes),
             "notes": notes,
+            "delivery_invalid": len(delivery_invalid_by_task),
+            "delivery_invalid_by_task": dict(sorted(delivery_invalid_by_task.items())),
             "persist_failed": sum(persist_failed_by_task.values()),
             "persist_failed_by_task": dict(sorted(persist_failed_by_task.items())),
             "clean": not (notes or persist_failed_by_task),
@@ -5949,6 +5998,7 @@ class Engine:
         improvement_ref: str | None = None
         note_md: str | None = None
         ts = self.project.task_source
+        self._record_completion_pr_evidence(run_id, task, ts)
         try:
             if task.pr_url or task.decomposition_children:
                 ts.mark_complete(task.task_id, task.pr_url)
@@ -6018,6 +6068,72 @@ class Engine:
              "improvement_ref": improvement_ref,
              "note_md": _bounded(note_md, NOTIFY_NOTE_MAX_CHARS)},
         )
+
+    def _record_completion_pr_evidence(
+        self, run_id: str, task: Task, task_source: object
+    ) -> None:
+        """Best-effort live proof that ``task.pr_url`` actually delivered this head (#378).
+
+        OPEN is valid only for the task branch (and, when a DELIVER checkpoint exists, its
+        exact head). MERGED is valid only when GitHub's preserved PR head SHA equals the
+        delivered checkpoint; a stale merged URL cannot prove later fix commits shipped.
+        Failures never undo the already-durable task transition, but they make the
+        completion audit non-clean instead of letting ``undelivered: 0`` lie.
+        """
+        if not task.pr_url:
+            return
+        describe_pr = getattr(task_source, "describe_pr", None)
+        if not callable(describe_pr):
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_pr_validation_skipped", "run_id": run_id,
+                 "task_id": task.task_id, "pr_url": task.pr_url,
+                 "reason": "task source has no PR lifecycle hook"},
+            )
+            return
+        expected_ref = str((task.context or {}).get("branch") or "")
+        checkpoint = task.last_checkpoint if isinstance(task.last_checkpoint, dict) else {}
+        expected_sha = str(checkpoint.get("sha") or "")
+        try:
+            info = describe_pr(task.pr_url) or {}
+        except Exception as exc:  # noqa: BLE001 - evidence-out must never break completion
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "completion_pr_unverified", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "pr_url": task.pr_url,
+                 "expected_head_ref": expected_ref or None,
+                 "expected_head_sha": expected_sha or None, "error": str(exc)},
+            )
+            return
+        state = str(info.get("state") or "").upper()
+        head_ref = str(info.get("head_ref") or "")
+        head_sha = str(info.get("head_sha") or "")
+        reasons: list[str] = []
+        if state not in ("OPEN", "MERGED"):
+            reasons.append(f"PR state is {state or 'unknown'}, not OPEN or delivered MERGED")
+        if expected_ref and head_ref != expected_ref:
+            reasons.append(f"PR head {head_ref or 'unknown'} does not match {expected_ref}")
+        if expected_sha and head_sha != expected_sha:
+            reasons.append(
+                f"PR head SHA {head_sha or 'unknown'} does not match delivered {expected_sha}"
+            )
+        if state == "MERGED" and not expected_sha:
+            reasons.append("MERGED PR cannot be tied to this run without a DELIVER checkpoint")
+        payload = {
+            "ts": _now(),
+            "type": "completion_pr_invalid" if reasons else "completion_pr_validated",
+            "run_id": run_id,
+            "task_id": task.task_id,
+            "pr_url": task.pr_url,
+            "state": state or None,
+            "head_ref": head_ref or None,
+            "head_sha": head_sha or None,
+            "expected_head_ref": expected_ref or None,
+            "expected_head_sha": expected_sha or None,
+        }
+        if reasons:
+            payload.update({"level": "warning", "error": "; ".join(reasons)})
+        self.store.append_event(run_id, payload)
 
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
         """File non-blocking review findings as UNLABELED follow-up issues — but only

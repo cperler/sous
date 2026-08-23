@@ -68,6 +68,12 @@ class TaskSource(Protocol):
     #       Unlike ``resolve`` it does NOT refuse a closed issue (conformance is about the
     #       closed ones). Best-effort: PR discovery from the issue thread. Both the shared
     #       GitHubIssuesSource and LocalFileTaskSource implement it.
+    #   describe_pr(pr_url) -> {"number", "url", "state", "head_ref", "head_sha",
+    #                              "base_ref"}
+    #       Validate completion delivery evidence (#378). ``state`` is OPEN/CLOSED/MERGED;
+    #       ``head_sha`` lets a MERGED PR prove that it contains this run's delivered head,
+    #       rather than merely sharing a stale recorded URL. The GitHub source implements
+    #       it; sources without PR lifecycle semantics may omit it.
 
     # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
     # them only via ``getattr`` at task finalize, so an older external adapter that omits

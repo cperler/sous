@@ -171,6 +171,27 @@ class GitHubIssuesSource:
             "pr": _find_pr_url(texts, self.repo),
         }
 
+    def describe_pr(self, pr_url: str) -> dict:
+        """Return live delivery evidence for completion auditing (#378).
+
+        ``headRefOid`` survives branch auto-deletion on merged PRs, allowing the engine to
+        distinguish "this run's delivered head was merged" from a stale merged URL whose
+        PR predates the run's fix commits.
+        """
+        raw = self._run(
+            ["gh", "pr", "view", pr_url, "--json",
+             "number,url,state,headRefName,headRefOid,baseRefName"]
+        )
+        data = json.loads(raw)
+        return {
+            "number": data.get("number"),
+            "url": data.get("url") or pr_url,
+            "state": str(data.get("state") or "").upper(),
+            "head_ref": data.get("headRefName"),
+            "head_sha": data.get("headRefOid"),
+            "base_ref": data.get("baseRefName"),
+        }
+
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         num = _issue_number(task_id)
         body = f"Implemented via {pr_url}" if pr_url else "Implemented."

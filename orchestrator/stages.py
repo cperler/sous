@@ -163,8 +163,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "Add/refresh docstrings for changed source, then open a pull request for "
             "the task branch. If the task is a GitHub issue (#N), include 'Closes #N' "
             "in the PR description so the merge closes the issue. If the context above "
-            "already shows a pr_url for this task (a review fix cycle), push the "
-            "branch and reuse that PR — never open a duplicate.\n"
+            "already shows a pr_url for this task (a review fix cycle), treat it only "
+            "as a selector: run `gh pr view <url> --json state,headRefName,baseRefName` "
+            "and reuse it only when it is OPEN and its head is the task branch. If it "
+            "is CLOSED/MERGED or names another head, look for another OPEN PR for the "
+            "task branch; otherwise open a replacement against the recorded current "
+            "base. Before opening a replacement, fetch that base and require it to be "
+            "an ancestor of HEAD. If it is not, refuse delivery and explain that the "
+            "branch must sync the base and rerun tests; do not merge/rebase after TEST. "
+            "Never open a duplicate.\n"
             "Return: pr_number, pr_url."
         ),
     ),

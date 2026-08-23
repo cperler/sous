@@ -43,6 +43,13 @@ def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
     assert "retrospective ({title, detail, target?}" in prompt
 
 
+def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> None:
+    prompt = STAGE_SPECS[Stage.DELIVER].template
+    assert "gh pr view <url> --json state,headRefName,baseRefName" in prompt
+    assert "reuse it only when it is OPEN and its head is the task branch" in prompt
+    assert "do not merge/rebase after TEST" in prompt
+
+
 def test_local_override_wins(tmp_path) -> None:
     (tmp_path / "test.json").write_text(json.dumps({"type": "object", "required": ["custom"]}))
     overridden = resolve_stage_schema("test", local_dir=tmp_path)
