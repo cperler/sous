@@ -233,13 +233,14 @@ def _bounded(text: str | None, limit: int) -> str | None:
     return text[:limit] + f"\n\n… [truncated at {limit} chars — full note in the run log]"
 
 
-def _in_future(iso: str | None) -> bool:
+def _in_future(iso: str | None, *, now: datetime | None = None) -> bool:
     """Is an ISO timestamp still ahead of now? Unparsable/absent => False (never
     let a corrupt cooldown stamp park a task forever)."""
     if not iso:
         return False
     try:
-        return datetime.fromisoformat(iso) > datetime.now(UTC)
+        current = now if now is not None else datetime.now(UTC)
+        return datetime.fromisoformat(iso) > current
     except ValueError:
         return False
 
@@ -886,9 +887,12 @@ class Engine:
         }
 
     # --- dispatchable (DAG + lease) ------------------------------------------
-    def dispatchable(self, run_id: str) -> list[str]:
+    def dispatchable(self, run_id: str, *, now: datetime | None = None) -> list[str]:
         """The canonical dispatch-eligibility set: every non-terminal task whose deps
         are all COMPLETED and which holds no outstanding dispatch lease.
+
+        ``now`` lets the scheduler use the same clock reading for eligibility and its
+        cooldown wait decision. Direct callers may omit it to read the current time here.
 
         This is the ONE eligibility predicate (the scheduler delegates here). It is
         deliberately NOT capacity-limited — the capacity cap (``dispatch_limit``) is a
@@ -939,7 +943,7 @@ class Engine:
                 continue
             # Parked in a rate-limit cooldown: not dispatchable until the stamp elapses
             # (the scheduler sleeps on the soonest cooldown instead of spinning).
-            if _in_future(doc.not_before):
+            if _in_future(doc.not_before, now=now):
                 continue
             out.append(ref.task_id)
         return out

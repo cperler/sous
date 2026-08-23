@@ -163,14 +163,14 @@ class Scheduler:
         # task's full retry budget. 0 disables.
         self.batch_failure_threshold = batch_failure_threshold
 
-    def dispatchable(self, run_id: str) -> list[str]:
+    def dispatchable(self, run_id: str, *, now: datetime | None = None) -> list[str]:
         """Non-terminal, dependency-satisfied, unleased tasks.
 
         Delegates to the engine's single eligibility predicate — the scheduler stays a
         thin loop and there is one source of truth for "what's dispatchable" (fixes the
         prior Engine.ready / Scheduler.dispatchable divergence).
         """
-        return self.engine.dispatchable(run_id)
+        return self.engine.dispatchable(run_id, now=now)
 
     def tick(self, run_id: str, runner: AnyRunner, *, util_pct: float = 0.0) -> dict:
         """Advance up to `dispatch_limit` ready tasks by one stage each.
@@ -192,7 +192,9 @@ class Scheduler:
         finally:
             pool.close()
 
-    def _plan(self, run_id: str, util_pct: float) -> tuple[list[str], int]:
+    def _plan(
+        self, run_id: str, util_pct: float, *, now: datetime | None = None,
+    ) -> tuple[list[str], int]:
         """What this pass COULD dispatch, and how many slots capacity allows.
 
         Split out of ``_dispatch`` so the driver heartbeat can report both BEFORE the
@@ -200,7 +202,7 @@ class Scheduler:
         mid-dispatch must leave a record of the pass it was in the middle of.
         """
         return (
-            self.dispatchable(run_id),
+            self.dispatchable(run_id, now=now),
             self.engine.capacity.dispatch_limit(util_pct, self.max_concurrent),
         )
 
@@ -397,7 +399,8 @@ class Scheduler:
                 # utilization and the limit it produced are the two numbers that explain a
                 # driver that then sits still for an hour.
                 util = util_provider() if util_provider is not None else util_pct
-                ready, limit = self._plan(run_id, util)
+                tick_now = datetime.now(UTC)
+                ready, limit = self._plan(run_id, util, now=tick_now)
                 # `dispatching` is claimed only when work is actually about to be handed to
                 # the lane — that is the state a mid-stage death must be readable as, so it
                 # must not be printed by a pass that was only ever going to wait or exit.
@@ -415,7 +418,7 @@ class Scheduler:
                 if not ready and not outstanding:
                     # Nothing dispatchable and nothing of ours in flight — but a rate-limit
                     # cooldown is a wait, not an end.
-                    wait = self._cooldown_wait(run_id)
+                    wait = self._cooldown_wait(run_id, now=tick_now)
                     if wait is not None and sleeper is not None:
                         self._sleep(
                             wait, sleeper, log, tick=tick, state=STATE_WAITING_COOLDOWN,
@@ -595,11 +598,11 @@ class Scheduler:
             self.engine.emit_notification(run_id, note["kind"], note)
         return sent
 
-    def _cooldown_wait(self, run_id: str) -> int | None:
+    def _cooldown_wait(self, run_id: str, *, now: datetime | None = None) -> int | None:
         """Seconds until the SOONEST rate-limit cooldown among non-terminal tasks
         expires (None when no task is cooling — the run is genuinely done/stalled)."""
         run = self.engine.store.load_run(run_id)
-        now = datetime.now(UTC)
+        current = now if now is not None else datetime.now(UTC)
         waits: list[int] = []
         for ref in run.task_refs:
             if ref.state in TERMINAL_TASK_STATES:
@@ -611,6 +614,6 @@ class Scheduler:
                 until = datetime.fromisoformat(doc.not_before)
             except ValueError:
                 continue
-            if until > now:
-                waits.append(int((until - now).total_seconds()) + 1)
+            if until > current:
+                waits.append(int((until - current).total_seconds()) + 1)
         return min(waits) if waits else None
