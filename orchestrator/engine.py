@@ -1135,6 +1135,11 @@ class Engine:
             deterministic = reroute_reason is not None
         review_origin_rerouted_from: LanePolicy | None = None
         review_origin_skip_reason: str | None = None
+        # #390: whether the REVIEW workspace's toolchain origin will go unproven. True only
+        # when the ADAPTER declares neither #391 hook — a lane's `verifies_worktree_origin`
+        # capability runs the probes, so with nothing declared it verifies nothing and the
+        # workspace is unverified on every lane. False for every other stage.
+        review_origin_unverified = False
         # Resolved to an Effort (from the task pin or stage spec) or downshifted via
         # effort_below below — always an Effort member or None (#161/#202 narrowed the
         # transitional ``str | Effort | None``). StrEnum, so it flows identically into the
@@ -1158,8 +1163,10 @@ class Engine:
                 )
         else:
             lane = requested_lane  # execution_mode × provider (§4)
+            if stage is Stage.REVIEW:
+                review_origin_unverified = not self._project_declares_worktree_origin()
             if stage is Stage.REVIEW and not self._lane_verifies_worktree_origin(lane):
-                if self._project_declares_worktree_origin():
+                if not review_origin_unverified:
                     contained = LanePolicy(
                         execution_mode=ExecutionMode.HEADLESS,
                         provider=lane.provider,
@@ -1339,6 +1346,12 @@ class Engine:
             context=task.context,
             project_commands=self._project_commands(),
             tool_posture_unenforced=unenforced_policy,
+            # #390: the reviewer runs commands in this workspace, so tell it in-band when
+            # nothing can prove the workspace's toolchain is its own. Stated on EVERY lane
+            # with no declared hooks, not only the lane that also fails the #391 capability
+            # check — the `worktree_origin_verification_skipped` notice is emitted from both
+            # places. False everywhere else, so no other prompt changes a byte.
+            worktree_origin_unverified=review_origin_unverified,
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
