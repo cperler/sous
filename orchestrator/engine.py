@@ -70,10 +70,14 @@ from .learnings_kb import (
 )
 from .meta_authoring import (
     append_filing,
+    evidence_watermark,
+    new_evidence,
     proposal_body,
     proposal_filing_guard,
     proposal_title,
+    proposal_update_body,
     recurring_proposals,
+    withheld_clusters,
 )
 from .model_table import (
     DEFAULT_MODEL_TABLE,
@@ -5525,16 +5529,28 @@ class Engine:
     def meta_proposals_audit(
         self, run_id: str, *, events: list[dict] | None = None
     ) -> dict:
-        """Current meta-authoring filing failures and successful filing count for a run.
+        """What the meta-authoring seam reported for a run, and what it could not.
 
         A later success for the same proposal clears its earlier failure, while repeated
         failures are counted in ``attempts``. Detection-level failures have no cluster key,
-        so they share the explicit ``detection`` bucket. Derived from the same events read as
-        the other status audits; status remains an offline poll with no tracker round trip.
+        so they share the explicit ``detection`` bucket. Alongside the filing count, the
+        quiet outcomes are counted too (#406): ``updated`` (new evidence commented onto the
+        tracked issue), ``refiled`` (recurred after that issue closed), ``skipped``
+        (already filed, nothing newer) and ``withheld`` (held under the recurrence floor).
+        Without those, a run that suppressed evidence and a run with nothing to say both
+        rendered as ``filed: 0``. Derived from the same events read as the other status
+        audits; status remains an offline poll with no tracker round trip.
         """
         events = self.store.read_events(run_id) if events is None else events
         failures: dict[str, dict] = {}
-        filed = 0
+        counts = {"filed": 0, "updated": 0, "refiled": 0, "skipped": 0, "withheld": 0}
+        outcomes = {
+            "meta_proposal_filed": "filed",
+            "meta_proposal_updated": "updated",
+            "meta_proposal_refiled": "refiled",
+            "meta_proposal_skipped": "skipped",
+            "meta_proposal_withheld": "withheld",
+        }
         for ev in events:
             kind = ev.get("type")
             key = str(ev.get("key") or "detection")
@@ -5546,14 +5562,15 @@ class Engine:
                     "error": str(ev.get("error") or ""),
                     "attempts": int(prior["attempts"]) + 1 if prior else 1,
                 }
-            elif kind == "meta_proposal_filed":
-                filed += 1
+            elif kind in outcomes:
+                counts[outcomes[kind]] += 1
+                # Any outcome for this cluster means the seam got through on a retry.
                 failures.pop(key, None)
         current = [failures[key] for key in sorted(failures)]
         return {
             "failed": len(current),
             "failures": current,
-            "filed": filed,
+            **counts,
             "clean": not current,
         }
 
@@ -7218,17 +7235,26 @@ class Engine:
         return self._learnings_kb_path().with_name("meta-proposals.jsonl")
 
     def _file_meta_proposals(self, run_id: str) -> None:
-        """File newly recurring process complaints through the engine's task source.
+        """Report recurring process complaints through the engine's task source.
 
-        Detection and filing are best-effort run-finalize effects. A successful tracker
+        A cluster is filed once, then KEPT CURRENT rather than going quiet (#406): later
+        evidence is appended as a comment to the tracked issue, and a recurrence after
+        that issue was CLOSED files a fresh one. Every decision leaves a receipt, because
+        the failure this replaces was silent — a run that suppressed a dozen accumulated
+        lessons and a run with genuinely nothing new produced identical (empty) logs. The
+        ledger row carries the evidence watermark that separates those two cases.
+
+        Detection and reporting are best-effort run-finalize effects. A successful tracker
         reference is ledgered; a missing/raising hook is non-fatal and leaves the cluster
-        eligible for a later run to retry. Each cluster's ledger recheck, external filing,
-        and ledger append share one guard so concurrent finalizers cannot file duplicates.
+        eligible for a later run to retry. Each cluster's ledger read, external call, and
+        ledger append share one guard so concurrent finalizers cannot file duplicates.
         """
         if not self._learnings_kb_enabled():
             return
         try:
-            proposals = recurring_proposals(read_kb_entries(self._learnings_kb_path()))
+            entries = read_kb_entries(self._learnings_kb_path())
+            proposals = recurring_proposals(entries)
+            withheld = withheld_clusters(entries)
             ledger_path = self._meta_proposals_path()
         except Exception as exc:  # noqa: BLE001 - detection is best-effort evidence-out
             self.store.append_event(
@@ -7238,6 +7264,16 @@ class Engine:
                  "error": str(exc)},
             )
             return
+        # The min_runs floor is a real suppression, so it gets a receipt too: a
+        # single-run cluster is invisible outside the KB JSONL without one.
+        for cluster in withheld:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "meta_proposal_withheld", "run_id": run_id,
+                 "key": cluster["key"], "title": proposal_title(cluster),
+                 "runs": cluster["runs"], "evidence": len(cluster["evidence"]),
+                 "reason": "below min_runs threshold"},
+            )
         file_followup = getattr(self.meta_task_source, "file_followup", None)
         if not callable(file_followup):
             for proposal in proposals:
@@ -7252,23 +7288,11 @@ class Engine:
         for proposal in proposals:
             title = proposal_title(proposal)
             try:
-                with proposal_filing_guard(ledger_path, proposal["key"]) as should_file:
-                    if not should_file:
-                        continue
-                    ref = file_followup(
-                        title=title,
-                        body=proposal_body(proposal),
-                        labels=["meta-authoring", "enhancement"],
+                with proposal_filing_guard(ledger_path, proposal["key"]) as filing:
+                    event = self._report_meta_proposal(
+                        proposal, filing, title=title, ledger_path=ledger_path,
+                        run_id=run_id, file_followup=file_followup,
                     )
-                    if not ref:
-                        raise RuntimeError("file_followup returned no reference")
-                    appended = append_filing(
-                        ledger_path,
-                        {"key": proposal["key"], "ref": str(ref), "filed_at": _now(),
-                         "run_id": run_id},
-                    )
-                    if not appended:
-                        raise RuntimeError("proposal filing claim was not recorded")
             except Exception as exc:  # noqa: BLE001 - filing must never break finalize
                 self.store.append_event(
                     run_id,
@@ -7277,11 +7301,120 @@ class Engine:
                      "key": proposal["key"], "title": title, "error": str(exc)},
                 )
                 continue
-            self.store.append_event(
-                run_id,
-                {"ts": _now(), "type": "meta_proposal_filed", "run_id": run_id,
-                 "key": proposal["key"], "title": title, "ref": str(ref)},
+            self.store.append_event(run_id, event)
+
+    def _report_meta_proposal(
+        self,
+        proposal: dict,
+        filing: dict | None,
+        *,
+        title: str,
+        ledger_path: Path,
+        run_id: str,
+        file_followup: Callable[..., str | None],
+    ) -> dict:
+        """Carry ONE cluster to the tracker and return the event describing what happened.
+
+        Called with the cluster's filing guard held, so the ledger row it was handed
+        cannot change underneath it. Raises on any failure — the caller turns that into
+        the warning-grade ``meta_proposal_failed`` receipt and leaves the cluster
+        eligible for a later run.
+        """
+        key = str(proposal["key"])
+        base = {"ts": _now(), "run_id": run_id, "key": key, "title": title}
+        watermark = evidence_watermark(proposal)
+        total = len(proposal["evidence"])
+
+        if filing is None:
+            ref = file_followup(
+                title=title,
+                body=proposal_body(proposal),
+                labels=["meta-authoring", "enhancement"],
             )
+            self._ledger_meta_filing(
+                ledger_path, key, ref, run_id=run_id, action="filed", watermark=watermark
+            )
+            return {**base, "type": "meta_proposal_filed", "ref": str(ref),
+                    "evidence": total}
+
+        prior_ref = str(filing.get("ref") or "")
+        fresh = new_evidence(proposal, filing)
+        if not fresh:
+            # Clean and never-looked must not read alike (#322): say the cluster was
+            # examined and how much evidence its filed issue already covers.
+            return {**base, "type": "meta_proposal_skipped", "ref": prior_ref,
+                    "evidence": total,
+                    "evidence_reported": int(filing.get("evidence_count") or 0),
+                    "reason": "no evidence newer than the last filing"}
+
+        if self._tracked_issue_state(prior_ref) == "closed":
+            # The lesson was addressed and recurred anyway: genuinely new work, not a
+            # duplicate of a resolved issue.
+            ref = file_followup(
+                title=title,
+                body=proposal_body(proposal, prior_ref=prior_ref),
+                labels=["meta-authoring", "enhancement"],
+            )
+            self._ledger_meta_filing(
+                ledger_path, key, ref, run_id=run_id, action="refiled",
+                watermark=watermark, prior_ref=prior_ref,
+            )
+            return {**base, "type": "meta_proposal_refiled", "ref": str(ref),
+                    "prior_ref": prior_ref, "new_evidence": len(fresh), "evidence": total}
+
+        comment_on_ref = getattr(self.meta_task_source, "comment_on_ref", None)
+        if not callable(comment_on_ref):
+            raise RuntimeError(
+                f"engine task source has no comment_on_ref hook; {len(fresh)} new "
+                f"evidence row(s) for {prior_ref} were not reported"
+            )
+        comment_on_ref(prior_ref, proposal_update_body(proposal, fresh, prior_ref=prior_ref))
+        self._ledger_meta_filing(
+            ledger_path, key, prior_ref, run_id=run_id, action="updated",
+            watermark=watermark,
+        )
+        return {**base, "type": "meta_proposal_updated", "ref": prior_ref,
+                "new_evidence": len(fresh), "evidence": total}
+
+    def _ledger_meta_filing(
+        self,
+        ledger_path: Path,
+        key: str,
+        ref: str | None,
+        *,
+        run_id: str,
+        action: str,
+        watermark: dict,
+        prior_ref: str | None = None,
+    ) -> None:
+        """Record one advanced watermark, refusing to leave an unreceipted side effect.
+
+        A tracker call that produced no ref, or an append the ledger declines (another
+        finalizer already recorded this exact evidence), is an error rather than a quiet
+        success: the caller re-reports the cluster on a later run instead.
+        """
+        if not ref:
+            raise RuntimeError("task source returned no reference")
+        row = {"key": key, "ref": str(ref), "filed_at": _now(), "run_id": run_id,
+               "action": action, **watermark}
+        if prior_ref:
+            row["prior_ref"] = prior_ref
+        if not append_filing(ledger_path, row):
+            raise RuntimeError("proposal filing claim was not recorded")
+
+    def _tracked_issue_state(self, ref: str) -> str | None:
+        """Return an engine-filed issue's state, or ``None`` when it cannot be determined.
+
+        Unknown deliberately behaves like OPEN at the call site: commenting on a possibly
+        closed issue is recoverable, while re-filing a still-open one creates a duplicate.
+        """
+        describe = getattr(self.meta_task_source, "describe_issue", None)
+        if not ref or not callable(describe):
+            return None
+        try:
+            return str((describe(ref) or {}).get("state") or "").strip().lower() or None
+        except Exception:  # noqa: BLE001 - a tracker lookup must not break finalize
+            return None
 
     def _emit_retrospective(self, run_id: str) -> None:
         """Write ``retrospective.md`` and harvest its distilled patterns — for EVERY
