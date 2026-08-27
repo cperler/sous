@@ -316,6 +316,33 @@ _DOCS_ONLY_DIRECTIVE = (
 )
 
 
+# #390: the trust posture for a revert/mutation check the REVIEWER runs itself. Six
+# retrospectives across four runs report one failure mode: a review workspace whose
+# environment was provisioned by COPY resolves the package to a SIBLING worktree's absolute
+# path (a copied venv's launcher shebang, a stale editable-install .pth), so a
+# revert-and-rerun there can falsely PASS (the reverted file was never the one imported) or
+# falsely FAIL, and identical invocations can disagree run-to-run — ff-v1-b24 #145 traced
+# that last one to pytest's rootdir deciding which install answers the import. The
+# structural half is already fixed for adapters declaring the #381/#391 hooks (a disposable
+# REVIEW checkout discards declared artifacts, installs fresh, and origin probes fail
+# closed); what the prompt still owed is the epistemics: the reviewer's own mutation check
+# CORROBORATES the TEST stage's result, it does not adjudicate it. Replaces the narrower
+# one-direction sentence it grew out of, and is shared with the panel's `find:tests` lens so
+# the single-reviewer and finder wordings cannot drift.
+_MUTATION_CHECK_TRUST = (
+    "A revert/mutation check YOU run in this workspace CORROBORATES the TEST stage's "
+    "reported result; it does not replace it. TEST ran in the one worktree whose install is "
+    "guaranteed to match its source, while a review workspace can resolve the package to a "
+    "SIBLING worktree, which fabricates a survived mutation and a spurious failure alike. "
+    "So before concluding anything from such a check, resolve the exercised module's "
+    "`__file__` inside the test process and confirm it lives under this workspace — probe it "
+    "the way the suite actually runs, since a different rootdir can resolve a different "
+    "install. If you cannot confirm that, or identical invocations disagree, the check is "
+    "INCONCLUSIVE: say so, fall back to reading the tests, and do not answer "
+    "`tests_meaningful: false` or raise a blocking issue on its strength alone."
+)
+
+
 # The #13/#168/#261 tests_meaningful directive for the single-reviewer REVIEW prompt.
 # Hoisted next to _DOCS_ONLY_DIRECTIVE for the same reason: one wording, one place.
 #
@@ -338,9 +365,24 @@ _TESTS_MEANINGFUL_DIRECTIVE = (
     "because a change has no tests to judge: a literal `false` reads as a rejection for "
     "having vacuous tests and drives a fix cycle. `false` means \"there ARE tests and they "
     "would NOT fail if this change regressed\".\n"
-    "If a revert-based check or deliberate mutation suspiciously fails to make any test "
-    "fail, resolve the exercised module's `__file__` inside the test process and confirm it "
-    "belongs to this review worktree before concluding the test is not meaningful."
+    + _MUTATION_CHECK_TRUST
+)
+
+
+# #390: the engine already knows at dispatch whether REVIEW's workspace will be
+# origin-verified — it events `worktree_origin_verification_skipped` when the project
+# declares neither #391 hook — but that fact reached only events.jsonl, never the reviewer
+# who is about to run commands in the unverified workspace. Conditional, so a verified
+# review's prompt stays byte-identical (the #302 ``tool_posture_unenforced`` precedent), and
+# it only ADDS caution, so a wrong flag cannot buy a thinner review.
+_WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE = (
+    "\n\n## This workspace's toolchain origin was NOT verified\n"
+    "This project declares no worktree-origin hooks, so nothing has proven that the test "
+    "runner and the imported source in this workspace come from THIS checkout rather than "
+    "another worktree's copied environment. Treat any command you run here as corroborating "
+    "evidence rather than proof: ground it by resolving an exercised module's `__file__` "
+    "under this workspace first, and where you cannot, prefer reading the diff and the tests "
+    "over a sandbox result you cannot attribute."
 )
 
 
@@ -612,6 +654,7 @@ def render_prompt(
     context: dict | None = None,
     project_commands: dict[str, str] | None = None,
     tool_posture_unenforced: bool = False,
+    worktree_origin_unverified: bool = False,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -646,6 +689,14 @@ def render_prompt(
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
 
+    - REVIEW on an unverified workspace (#390, ``worktree_origin_unverified``): tells the
+      reviewer that nothing proved this workspace's runner/imported source belong to it, so
+      a command run there is corroboration rather than proof. The caller passes what the
+      engine already resolved at dispatch (the project declares neither #391 origin hook) —
+      the same condition behind the ``worktree_origin_verification_skipped`` event; this
+      function knows nothing about lanes or adapters. Default False, so a verified review's
+      prompt is byte-identical to the pre-#390 one.
+
     - any stage + inherited uncommitted work (#385): when intake reported that the worktree
       already held uncommitted changes this run did not make, tells the stage to inspect them
       before editing or overwriting. Not stage-specific — any stage that touches the tree can
@@ -658,8 +709,8 @@ def render_prompt(
       function guessing — ``stages.py`` knows nothing about lanes. Default False, so every
       enforcing-lane prompt is byte-identical to the pre-#302 one.
 
-    The last two read model-influenced context rather than ENGINE-lane parameters (unlike
-    ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
+    The frontend and inherited-changes blocks read model-influenced context rather than
+    ENGINE-lane parameters (unlike ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
     ``render_review_plan`` for the same boundary stated over the finder set.
     """
     spec = STAGE_SPECS[stage]
@@ -694,6 +745,12 @@ def render_prompt(
     # wording; a project's own design tokens live in its adapter's design agent.
     if stage is Stage.REVIEW and _has_frontend_change((context or {}).get("files_changed")):
         instruction += _DESIGN_REVIEW_LENS
+    # #390: say in-band that this workspace's toolchain origin went unverified, so the
+    # reviewer weights its own command results accordingly instead of trusting a sandbox that
+    # may execute a sibling worktree's install. REVIEW-only: it is the stage that runs
+    # commands in a workspace the engine hands it without an origin proof.
+    if stage is Stage.REVIEW and worktree_origin_unverified:
+        instruction += _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE
     # #385: every prompt-reading stage is told when the worktree arrived carrying someone
     # else's uncommitted work — no stage list to hand-maintain, because any stage that reads
     # or writes the tree can be misled by it, and the block is empty unless it happened.
@@ -827,6 +884,11 @@ _LENS_TESTS = _Lens(
         "'not judged' and evented as a skipped verification — it is not a pass. Do not "
         "answer false merely because tests are absent: false means 'there ARE tests and they "
         "would NOT fail if this change regressed', and it reads as a rejection.\n"
+        # #390: the same mutation-check trust posture the single-reviewer prompt states, from
+        # ONE constant — a finder that runs a revert check in its own disposable copy faces
+        # the identical sibling-worktree aliasing.
+        + _MUTATION_CHECK_TRUST
+        + "\n"
         + _FINDER_RETURN
     ),
 )

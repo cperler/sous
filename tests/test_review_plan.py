@@ -331,6 +331,10 @@ def test_flag_off_dispatches_a_byte_identical_plan_less_review(tmp_path, project
         # the plan-less path — the equality being asserted is "the engine renders exactly
         # what render_prompt renders for THIS dispatch", which is what #73 was about.
         tool_posture_unenforced=True,
+        # #390: FakeProject declares neither worktree-origin hook, so this dispatch's REVIEW
+        # workspace cannot be verified and the engine states that in-band. Still the
+        # plan-less path — the equality being asserted is unchanged.
+        worktree_origin_unverified=True,
     )
     # The pre-#73 hash formula (no plan part in the blob).
     assert w.content_hash == compute_content_hash(

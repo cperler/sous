@@ -100,6 +100,13 @@ written.
   that disposable checkout Codex uses `workspace-write`, allowing pytest/build caches despite
   its coarse sandbox; Claude keeps its finer write-tool deny-list. Interactive REVIEW remains
   outside this in-process runner boundary and retains #302's explicit unenforced posture.
+  Isolation alone does not prove the workspace's toolchain is its OWN: a copied venv or a stale
+  editable-install path can execute a sibling worktree's package, which is why a project
+  declaring the #381/#391 hooks gets its declared artifacts rebuilt and probed fail-closed. When
+  it declares neither, the skip is now stated to the reviewer in-band (#390) alongside a standing
+  posture that a revert/mutation check the reviewer runs itself CORROBORATES the TEST stage's
+  reported result rather than adjudicating it — an unattributable sandbox result is inconclusive,
+  not a `tests_meaningful: false`.
 - **Permission gate: a lane decision, not a constant** (#304, superseding #272's "the flag
   stays"). `--dangerously-skip-permissions` used to be appended to *every* headless dispatch
   from `transport.py`. It is now derived: `CapabilityDescriptor.permission_posture` declares a
