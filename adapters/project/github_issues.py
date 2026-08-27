@@ -287,6 +287,23 @@ class GitHubIssuesSource:
             argv += ["--label", label]
         return self._run(argv).strip() or None
 
+    def comment_on_ref(self, ref: str, body: str) -> None:
+        """Append a comment to an issue this engine already filed (#406).
+
+        ``ref`` is whatever ``file_followup`` returned — a full issue URL or a ``#N``
+        ref. A URL locates its own repo (and pairing it with ``--repo`` is rejected), so
+        ``--repo`` is passed only for the bare form, where it keeps the number resolving
+        against this source's repo instead of the process CWD. Same routing choice as
+        ``publish_note``."""
+        target = ref.strip()
+        if "://" in target:
+            self._run(["gh", "issue", "comment", target, "--body", body])
+        else:
+            self._run(
+                ["gh", "issue", "comment", _issue_number(target), "--repo", self.repo,
+                 "--body", body]
+            )
+
     def file_followup_keyed(
         self,
         title: str,

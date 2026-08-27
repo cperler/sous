@@ -344,9 +344,19 @@ never satisfy.
   `SELFHOST_TASKS`; only `ORCHESTRATOR_ENGINE_PROJECT` changes engine-tracker resolution.
   `Engine` requires this source explicitly (or through a config's dedicated
   `engine_task_source`), so direct embedders cannot fall back to the run project's tracker.
-  `<runs-root>/meta-proposals.jsonl` prevents refiling across either self-hosted or
-  external-product runs. Best-effort filing failures remain non-fatal but are surfaced in
-  `status.meta_proposals` rather than living only in `events.jsonl`.
+  `<runs-root>/meta-proposals.jsonl` is the cross-run filing ledger for both self-hosted and
+  external-product runs. It records an evidence WATERMARK (row count + highest
+  timestamp/run/task cursor) beside each cluster's key and ref, so a filed cluster keeps
+  reporting instead of going silent after its first issue (#406): later evidence is appended
+  as a comment on the tracked issue through the optional `comment_on_ref` task-source hook,
+  and a recurrence after that issue CLOSED files a fresh one naming the prior ref. The ledger
+  stays append-only and a same-key row is accepted only when it strictly ADVANCES the
+  watermark, which is what still makes two concurrent finalizers file exactly one issue.
+  Every decision leaves a receipt — `meta_proposal_filed`/`_updated`/`_refiled`/`_skipped`
+  (filed, nothing newer) and `_withheld` (held under the two-run floor) — because a run that
+  suppressed a dozen accumulated lessons used to log exactly what a run with nothing to say
+  logged. Best-effort filing failures remain non-fatal but are surfaced, with those outcome
+  counts, in `status.meta_proposals` rather than living only in `events.jsonl`.
 - **Meta-authoring delivery gate.** Tasks sourced from issues labeled `meta-authoring`
   persist `hold_before=deliver`. They may scope, implement, test, and review normally, but
   `next_work` parks them `BLOCKED_ON_HUMAN` before DELIVER. Approval is keyed to the exact

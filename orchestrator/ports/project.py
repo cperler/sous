@@ -95,7 +95,16 @@ class TaskSource(Protocol):
     #   file_followup_keyed(title, body, labels=None, *, idempotency_key) -> str | None
     #       optional create-or-look-up variant for crash-safe external side effects. Kept
     #       distinct so adding keyed recovery does not break existing duck-typed adapters.
-    # The shared GitHubIssuesSource and LocalFileTaskSource implement all four.
+    #   comment_on_ref(ref, body) -> None
+    #       APPEND to an already-filed issue identified by the ref ``file_followup``
+    #       returned (#406). Distinct from ``publish_note``, which is keyed to a TASK id:
+    #       here the engine holds only a tracker ref for an issue it opened itself, and
+    #       needs to keep an accumulating cluster's issue current instead of going quiet
+    #       after the first filing. Append semantics, NOT the one-living-comment upsert of
+    #       ``publish_progress`` — each new batch of evidence is its own dated comment,
+    #       because the point is the history. Same duck-typed best-effort contract as the
+    #       hooks above: a missing or raising hook is evented, never fatal.
+    # The shared GitHubIssuesSource and LocalFileTaskSource implement all five.
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
     # itself rather than the task source):

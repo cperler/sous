@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import threading
 
 import pytest
@@ -139,7 +140,9 @@ def test_targetless_process_entries_cluster_by_normalized_text() -> None:
     assert proposals[0]["target"] is None
 
 
-def test_second_run_files_one_meta_task_and_ledger_prevents_refiling(tmp_path, project) -> None:
+def test_second_run_files_one_meta_task_and_a_repeat_leaves_a_skip_receipt(
+    tmp_path, project
+) -> None:
     eng = _engine(tmp_path, project)
     _review_run(eng, "r1", "t1", detail="First observation")
     assert project.task_source.followups == []
@@ -154,6 +157,170 @@ def test_second_run_files_one_meta_task_and_ledger_prevents_refiling(tmp_path, p
 
     eng._file_meta_proposals("r2")
     assert len(project.task_source.followups) == 1
+    assert project.task_source.comments == []
+    skipped = [e for e in eng.store.read_events("r2") if e["type"] == "meta_proposal_skipped"]
+    assert len(skipped) == 1
+    assert skipped[0]["ref"] == filed[0]["ref"]
+    assert skipped[0]["evidence"] == 2 and skipped[0]["evidence_reported"] == 2
+    assert eng.status("r2")["meta_proposals"]["skipped"] == 1
+
+
+def test_new_evidence_after_filing_is_commented_onto_the_open_issue(tmp_path, project) -> None:
+    """#406: a filed cluster keeps reporting instead of going quiet forever."""
+    eng = _engine(tmp_path, project)
+    _review_run(eng, "r1", "t1", detail="First observation")
+    _review_run(eng, "r2", "t2", detail="Independent observation")
+    ref = project.task_source.followups[0]["ref"]
+
+    _review_run(eng, "r3", "t3", detail="A newer lesson about the same template")
+
+    assert len(project.task_source.followups) == 1  # no duplicate issue
+    assert len(project.task_source.comments) == 1
+    comment = project.task_source.comments[0]
+    assert comment["ref"] == ref
+    assert "A newer lesson about the same template" in comment["body"]
+    # Only the NEW rows travel; the issue body already carries the earlier two.
+    assert "First observation" not in comment["body"]
+    updated = [e for e in eng.store.read_events("r3") if e["type"] == "meta_proposal_updated"]
+    assert len(updated) == 1
+    assert updated[0]["ref"] == ref and updated[0]["new_evidence"] == 1
+    assert updated[0]["evidence"] == 3
+    assert eng.status("r3")["meta_proposals"]["updated"] == 1
+
+    # The watermark advanced, so a repeat pass reports nothing rather than re-commenting.
+    eng._file_meta_proposals("r3")
+    assert len(project.task_source.comments) == 1
+    assert [e["type"] for e in eng.store.read_events("r3")].count("meta_proposal_skipped") == 1
+    ledger = meta.read_filing_ledger(eng._meta_proposals_path())
+    assert [row["action"] for row in ledger] == ["filed", "updated"]
+    assert ledger[-1]["evidence_count"] == 3
+
+
+def test_recurrence_after_the_tracked_issue_closed_files_a_new_one(tmp_path, project) -> None:
+    """A closed issue means the lesson was addressed; a recurrence is genuinely new work."""
+    eng = _engine(tmp_path, project)
+    _review_run(eng, "r1", "t1", detail="First observation")
+    _review_run(eng, "r2", "t2", detail="Independent observation")
+    first_ref = project.task_source.followups[0]["ref"]
+    project.task_source.describe_issue = lambda ref: {
+        "ref": ref, "state": "CLOSED", "body": "", "pr": None
+    }
+
+    _review_run(eng, "r3", "t3", detail="It came back after the fix shipped")
+
+    assert len(project.task_source.followups) == 2
+    assert project.task_source.comments == []
+    assert first_ref in project.task_source.followups[1]["body"]
+    refiled = [e for e in eng.store.read_events("r3") if e["type"] == "meta_proposal_refiled"]
+    assert len(refiled) == 1
+    assert refiled[0]["prior_ref"] == first_ref
+    assert refiled[0]["ref"] == project.task_source.followups[1]["ref"]
+    ledger = meta.read_filing_ledger(eng._meta_proposals_path())
+    assert ledger[-1]["ref"] == project.task_source.followups[1]["ref"]
+    assert ledger[-1]["prior_ref"] == first_ref
+
+
+def test_cluster_held_under_the_recurrence_floor_leaves_a_receipt(tmp_path, project) -> None:
+    """The min_runs floor is a suppression too — it must not be invisible (#406)."""
+    eng = _engine(tmp_path, project)
+    _review_run(eng, "r1", "t1", detail="Seen exactly once so far")
+
+    assert project.task_source.followups == []
+    withheld = [e for e in eng.store.read_events("r1") if e["type"] == "meta_proposal_withheld"]
+    assert len(withheld) == 1
+    assert withheld[0]["key"] == "stage-template:review"
+    assert withheld[0]["runs"] == 1 and withheld[0]["evidence"] == 1
+    assert eng.status("r1")["meta_proposals"]["withheld"] == 1
+
+
+def test_legacy_ledger_row_reports_its_whole_backlog_once(tmp_path, project) -> None:
+    """A pre-#406 row carries no watermark, so the accumulated backlog reports once."""
+    eng = _engine(tmp_path, project)
+    kb.append_learnings(eng._learnings_kb_path(), [
+        {"kind": "process", "run_id": f"r{n}", "text": f"lesson {n}", "target": TARGET,
+         "ts": f"2026-08-1{n}T00:00:00+00:00"}
+        for n in (1, 2, 3)
+    ])
+    eng._meta_proposals_path().write_text(
+        json.dumps({"key": "stage-template:review", "ref": "#390",
+                    "filed_at": "2026-08-13T00:00:00+00:00", "run_id": "b15"}) + "\n",
+        encoding="utf-8",
+    )
+
+    eng.create_run("r4")
+    eng._file_meta_proposals("r4")
+
+    assert project.task_source.followups == []  # the tracked issue is still the home
+    assert len(project.task_source.comments) == 1
+    body = project.task_source.comments[0]["body"]
+    assert project.task_source.comments[0]["ref"] == "#390"
+    assert all(f"lesson {n}" in body for n in (1, 2, 3))
+
+    eng._file_meta_proposals("r4")  # backlog now watermarked — no second comment
+    assert len(project.task_source.comments) == 1
+
+
+def test_missing_comment_hook_is_evented_and_stays_retryable(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    _review_run(eng, "r1", "t1", detail="First observation")
+    _review_run(eng, "r2", "t2", detail="Independent observation")
+    project.task_source.comment_on_ref = None  # an adapter without the optional hook
+
+    _review_run(eng, "r3", "t3", detail="A newer lesson the seam cannot deliver")
+
+    failures = [e for e in eng.store.read_events("r3") if e["type"] == "meta_proposal_failed"]
+    assert len(failures) == 1
+    assert "comment_on_ref" in failures[0]["error"]
+    assert "1 new evidence row(s)" in failures[0]["error"]
+    assert eng.status("r3")["meta_proposals"]["clean"] is False
+    assert len(meta.read_filing_ledger(eng._meta_proposals_path())) == 1  # watermark held
+
+    del project.task_source.comment_on_ref  # hook restored -> the run retries cleanly
+    eng._file_meta_proposals("r3")
+    assert len(project.task_source.comments) == 1
+    assert eng.status("r3")["meta_proposals"]["updated"] == 1
+
+
+def test_withheld_clusters_mirror_recurring_proposals() -> None:
+    entries = [
+        {"kind": "process", "run_id": "r1", "text": "one", "target": TARGET},
+        {"kind": "process", "run_id": "r2", "text": "two", "target": TARGET},
+        {"kind": "process", "run_id": "r1", "text": "only seen once"},
+    ]
+    held = meta.withheld_clusters(entries)
+    assert [cluster["key"] for cluster in meta.recurring_proposals(entries)] == [
+        "stage-template:review"
+    ]
+    assert len(held) == 1 and held[0]["runs"] == 1
+    assert held[0]["key"].startswith("text:")
+    assert held[0] == meta.withheld_clusters(list(reversed(entries)))[0]
+
+
+def test_append_filing_refuses_stale_rows_and_accepts_advancing_evidence(tmp_path) -> None:
+    ledger = tmp_path / "meta-proposals.jsonl"
+    proposal = meta.recurring_proposals([
+        {"kind": "process", "run_id": "r1", "text": "one", "target": TARGET, "ts": "2026-01-01"},
+        {"kind": "process", "run_id": "r2", "text": "two", "target": TARGET, "ts": "2026-01-02"},
+    ])[0]
+    first = {"key": proposal["key"], "ref": "#1", "filed_at": "t0", "run_id": "r2",
+             **meta.evidence_watermark(proposal)}
+    assert meta.append_filing(ledger, first) is True
+    assert meta.append_filing(ledger, dict(first, ref="#2")) is False  # same evidence
+    assert meta.latest_filing(ledger, proposal["key"])["ref"] == "#1"
+    assert meta.new_evidence(proposal, meta.latest_filing(ledger, proposal["key"])) == []
+
+    grown = meta.recurring_proposals([
+        {"kind": "process", "run_id": "r1", "text": "one", "target": TARGET, "ts": "2026-01-01"},
+        {"kind": "process", "run_id": "r2", "text": "two", "target": TARGET, "ts": "2026-01-02"},
+        {"kind": "process", "run_id": "r3", "text": "three", "target": TARGET, "ts": "2026-01-03"},
+    ])[0]
+    fresh = meta.new_evidence(grown, meta.latest_filing(ledger, grown["key"]))
+    assert [row["text"] for row in fresh] == ["three"]
+    assert meta.append_filing(
+        ledger, {"key": grown["key"], "ref": "#1", "filed_at": "t1", "run_id": "r3",
+                 "action": "updated", **meta.evidence_watermark(grown)}
+    ) is True
+    assert meta.latest_filing(ledger, grown["key"])["evidence_count"] == 3
 
 
 def test_external_run_files_meta_task_only_in_engine_tracker(tmp_path, project) -> None:
@@ -232,6 +399,10 @@ def test_filing_failure_is_evented_without_ledger_and_can_retry(tmp_path, projec
         "failed": 0,
         "failures": [],
         "filed": 1,
+        "updated": 0,
+        "refiled": 0,
+        "skipped": 0,
+        "withheld": 0,
         "clean": True,
     }
 

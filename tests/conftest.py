@@ -46,6 +46,7 @@ class FakeTaskSource:
         self.notes: list[dict] = []  # publish_note calls
         self.followups: list[dict] = []  # file_followup calls
         self.followups_by_key: dict[str, str] = {}
+        self.comments: list[dict] = []  # comment_on_ref calls (#406)
         self.progress: list[dict] = []  # publish_progress calls (mid-run, #64)
         self.candidates: list[TaskSpec] = []  # list_tasks output (batch-plan #57)
         # task_id -> field overrides applied to what resolve() returns (#271): how a test
@@ -103,6 +104,9 @@ class FakeTaskSource:
              "idempotency_key": None}
         )
         return ref
+
+    def comment_on_ref(self, ref: str, body: str) -> None:
+        self.comments.append({"ref": ref, "body": body})
 
     def file_followup_keyed(
         self,

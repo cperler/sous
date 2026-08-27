@@ -144,6 +144,14 @@ class LocalFileTaskSource:
             fh.write(f"{ref}\t{','.join(labels or [])}\t{title}\n{body}\n\n")
         return ref
 
+    def comment_on_ref(self, ref: str, body: str) -> None:
+        """Append a comment onto an already-filed follow-up in a sibling ``comments.log``
+        (#406) — the offline stand-in for the GitHub source's ``gh issue comment``.
+        Append, not upsert: the accumulating history is the point."""
+        log = self.tasks_path.with_name("comments.log")
+        with file_lock(log), open(log, "a", encoding="utf-8") as fh:
+            fh.write(f"# {ref}\n{body}\n\n")
+
     def file_followup_keyed(
         self,
         title: str,
