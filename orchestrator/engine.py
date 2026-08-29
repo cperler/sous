@@ -21,6 +21,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal
@@ -43,6 +44,17 @@ from .decomposition import (
     topological_order,
 )
 from .driver_log import liveness_from_log
+from .driver_log import read_records as read_driver_records
+from .engine_signals import (
+    RunFacts,
+    append_observations,
+    detect_observations,
+    read_observations,
+    signal_body,
+    signal_proposals,
+    signal_update_body,
+    withheld_signals,
+)
 from .errors import (
     CapacityExhausted,
     ContractError,
@@ -359,6 +371,43 @@ _SUPERVISOR_LIFECYCLE_EVENTS = frozenset({"supervisor_parked", "supervisor_resum
 # is too noisy to act on, so the band falls back to the flat downgrade_threshold (today's
 # behavior) — an empty ledger and sparse early runs are unaffected.
 ADAPTIVE_BAND_MIN_SAMPLE = 5
+
+
+@dataclass(frozen=True)
+class _ProposalStyle:
+    """How ONE meta-authoring input renders itself to the tracker (#400).
+
+    The seam now has two inputs — a model's process retrospective and the engine's own
+    run-log signals — that make different claims, deserve different labels, and must be
+    told apart in the event log. Everything ELSE about filing (the per-cluster guard, the
+    evidence watermark, comment-on-recurrence, re-file after close) is identical, so the
+    difference is isolated to this record instead of forking the code path.
+    """
+
+    source: str
+    labels: tuple[str, ...]
+    body: Callable[..., str]
+    update_body: Callable[..., str]
+
+
+# A recurring complaint a stage model wrote in its REVIEW retrospective (#71). Files as an
+# `enhancement`: a process gripe asks for a better prompt/skill/persona, not a bug fix.
+_MODEL_PROPOSAL_STYLE = _ProposalStyle(
+    source="model",
+    labels=("meta-authoring", "enhancement"),
+    body=proposal_body,
+    update_body=proposal_update_body,
+)
+
+# A deterministic signal the engine read out of its own `events.jsonl`/`driver.jsonl`
+# (#400). Files as a `bug`: nobody authored it, and what it names is broken harness
+# behavior. The per-signal label set on the proposal still wins over this default.
+_SIGNAL_PROPOSAL_STYLE = _ProposalStyle(
+    source="engine",
+    labels=("meta-authoring", "bug"),
+    body=signal_body,
+    update_body=signal_update_body,
+)
 
 
 def _ref_safe(s: str) -> str:
@@ -923,6 +972,18 @@ class Engine:
         ):
             self._maybe_finalize_run(run_id)
             run = self.store.load_run(run_id)
+        return self._eligible_tasks(run, now=now)
+
+    def _eligible_tasks(self, run: Run, *, now: datetime | None = None) -> list[str]:
+        """The eligibility RULE itself, with no reconciliation and no side effects.
+
+        Split out of :meth:`dispatchable` so a read-only caller can ask "what should this
+        run have been able to dispatch?" without triggering the decomposition/umbrella/
+        finalize reconciliation that method performs first (#400: the engine-signal scan
+        is called FROM finalize, so re-entering it there would recurse). Every exclusion
+        below is a legitimate reason for the loop to find nothing to do, which is exactly
+        why the #399 signal has to consult this list rather than approximate it.
+        """
         if run.state in (RunState.PAUSED, RunState.PARKED):
             return []
         states = {ref.task_id: ref.state for ref in run.task_refs}
@@ -937,7 +998,7 @@ class Engine:
                 continue
             if dag.unmet_deps(ref.task_id, states):
                 continue
-            doc = self.store.load_task(run_id, ref.task_id)
+            doc = self.store.load_task(run.run_id, ref.task_id)
             if doc.decomposition_children:
                 continue
             # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
@@ -5557,6 +5618,7 @@ class Engine:
         events = self.store.read_events(run_id) if events is None else events
         failures: dict[str, dict] = {}
         counts = {"filed": 0, "updated": 0, "refiled": 0, "skipped": 0, "withheld": 0}
+        by_source = {"model": 0, "engine": 0}
         outcomes = {
             "meta_proposal_filed": "filed",
             "meta_proposal_updated": "updated",
@@ -5564,19 +5626,29 @@ class Engine:
             "meta_proposal_skipped": "skipped",
             "meta_proposal_withheld": "withheld",
         }
+        scanned = 0
         for ev in events:
             kind = ev.get("type")
             key = str(ev.get("key") or "detection")
+            if kind == "engine_signals_scanned":
+                scanned += 1
+                continue
             if kind == "meta_proposal_failed":
                 prior = failures.get(key)
                 failures[key] = {
                     "key": ev.get("key"),
                     "title": ev.get("title"),
+                    # #400: which INPUT failed. A pre-#400 event carries no source; it can
+                    # only have been the model-authored one, so that is what absence means.
+                    "source": str(ev.get("source") or "model"),
                     "error": str(ev.get("error") or ""),
                     "attempts": int(prior["attempts"]) + 1 if prior else 1,
                 }
             elif kind in outcomes:
                 counts[outcomes[kind]] += 1
+                by_source[str(ev.get("source") or "model")] = (
+                    by_source.get(str(ev.get("source") or "model"), 0) + 1
+                )
                 # Any outcome for this cluster means the seam got through on a retry.
                 failures.pop(key, None)
         current = [failures[key] for key in sorted(failures)]
@@ -5584,6 +5656,12 @@ class Engine:
             "failed": len(current),
             "failures": current,
             **counts,
+            # #400: the seam has two inputs now, and "which one produced this" is the
+            # question a reader asks first — a model gripe and a harness defect are not
+            # interchangeable. `engine_scans` separates "scanned, nothing to say" from
+            # "the engine-authored pass never ran on this run".
+            "by_source": by_source,
+            "engine_scans": scanned,
             "clean": not current,
         }
 
@@ -7273,7 +7351,7 @@ class Engine:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
-                 "run_id": run_id,
+                 "run_id": run_id, "source": "model",
                  "error": str(exc)},
             )
             return
@@ -7283,7 +7361,7 @@ class Engine:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "meta_proposal_withheld", "run_id": run_id,
-                 "key": cluster["key"], "title": proposal_title(cluster),
+                 "source": "model", "key": cluster["key"], "title": proposal_title(cluster),
                  "runs": cluster["runs"], "evidence": len(cluster["evidence"]),
                  "reason": "below min_runs threshold"},
             )
@@ -7293,7 +7371,7 @@ class Engine:
                 self.store.append_event(
                     run_id,
                     {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
-                     "run_id": run_id, "key": proposal["key"],
+                     "run_id": run_id, "source": "model", "key": proposal["key"],
                      "title": proposal_title(proposal),
                      "error": "engine task source has no file_followup hook"},
                 )
@@ -7310,7 +7388,7 @@ class Engine:
                 self.store.append_event(
                     run_id,
                     {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
-                     "run_id": run_id,
+                     "run_id": run_id, "source": "model",
                      "key": proposal["key"], "title": title, "error": str(exc)},
                 )
                 continue
@@ -7325,6 +7403,7 @@ class Engine:
         ledger_path: Path,
         run_id: str,
         file_followup: Callable[..., str | None],
+        style: _ProposalStyle = _MODEL_PROPOSAL_STYLE,
     ) -> dict:
         """Carry ONE cluster to the tracker and return the event describing what happened.
 
@@ -7332,17 +7411,25 @@ class Engine:
         cannot change underneath it. Raises on any failure — the caller turns that into
         the warning-grade ``meta_proposal_failed`` receipt and leaves the cluster
         eligible for a later run.
+
+        ``style`` supplies the tracker rendering and labels for the INPUT this cluster came
+        from (#400): a model-authored process retrospective and an engine-authored run-log
+        signal make different claims and file under different labels, but the decision
+        logic below — file / comment new evidence / re-file after close, and the watermark
+        that separates those — is one implementation, not two.
         """
         key = str(proposal["key"])
-        base = {"ts": _now(), "run_id": run_id, "key": key, "title": title}
+        base = {"ts": _now(), "run_id": run_id, "key": key, "title": title,
+                "source": style.source}
         watermark = evidence_watermark(proposal)
         total = len(proposal["evidence"])
+        labels = list(proposal.get("labels") or style.labels)
 
         if filing is None:
             ref = file_followup(
                 title=title,
-                body=proposal_body(proposal),
-                labels=["meta-authoring", "enhancement"],
+                body=style.body(proposal),
+                labels=labels,
             )
             self._ledger_meta_filing(
                 ledger_path, key, ref, run_id=run_id, action="filed", watermark=watermark
@@ -7365,8 +7452,8 @@ class Engine:
             # duplicate of a resolved issue.
             ref = file_followup(
                 title=title,
-                body=proposal_body(proposal, prior_ref=prior_ref),
-                labels=["meta-authoring", "enhancement"],
+                body=style.body(proposal, prior_ref=prior_ref),
+                labels=labels,
             )
             self._ledger_meta_filing(
                 ledger_path, key, ref, run_id=run_id, action="refiled",
@@ -7381,7 +7468,7 @@ class Engine:
                 f"engine task source has no comment_on_ref hook; {len(fresh)} new "
                 f"evidence row(s) for {prior_ref} were not reported"
             )
-        comment_on_ref(prior_ref, proposal_update_body(proposal, fresh, prior_ref=prior_ref))
+        comment_on_ref(prior_ref, style.update_body(proposal, fresh, prior_ref=prior_ref))
         self._ledger_meta_filing(
             ledger_path, key, prior_ref, run_id=run_id, action="updated",
             watermark=watermark,
@@ -7428,6 +7515,178 @@ class Engine:
             return str((describe(ref) or {}).get("state") or "").strip().lower() or None
         except Exception:  # noqa: BLE001 - a tracker lookup must not break finalize
             return None
+
+    # --- engine-authored meta-authoring input (#400) ---------------------------------
+
+    def _engine_signals_path(self) -> Path:
+        """The cross-run observation store, beside the KB and the meta-filing ledger."""
+        return self._learnings_kb_path().with_name("engine-signals.jsonl")
+
+    def _engine_signals_enabled(self) -> bool:
+        """Feature gate for the engine-authored input.
+
+        Deliberately NOT ``_learnings_kb_enabled``. That switch turns off the KNOWLEDGE
+        BASE — the model-authored learnings plane — and the whole point of #400 is that a
+        driver-level defect has no model author and no KB row. Gating this on the KB flag
+        would mean an operator who turned off learnings recall also silently turned off
+        harness-bug reporting, which is the failure this seam exists to end. Ops still get
+        an off switch, just its own one.
+        """
+        return os.environ.get("ORCHESTRATOR_NO_ENGINE_SIGNALS", "").strip().lower() not in (
+            "1", "true", "yes", "on",
+        )
+
+    def _run_facts(self, run_id: str, *, events: list[dict] | None = None) -> RunFacts:
+        """Gather the run state the signal predicates need, so detection stays pure.
+
+        ``unfinished_tasks`` is the careful half, and it defers to the engine's OWN
+        eligibility rule (``_eligible_tasks``) rather than approximating it: a task blocked
+        on an unmet dependency, parked at a human gate, sitting out a rate-limit cooldown,
+        or holding a dispatch lease is undispatchable for a legitimate reason, and a
+        hand-rolled predicate that missed any of those would make the #399 signal accuse
+        healthy runs. What remains — work the loop could have dispatched and didn't — is
+        the anomaly, filtered once more for the retry budget the rule does not consider.
+        """
+        run = self.store.load_run(run_id)
+        unfinished: list[str] = []
+        for task_id in self._eligible_tasks(run):
+            doc = self.store.load_task(run_id, task_id)
+            # The one exclusion the eligibility rule does not make: a task with no
+            # attempts left is undispatchable by design, not by defect.
+            if doc.attempt < doc.max_attempts:
+                unfinished.append(task_id)
+        audit = self.events_audit(run_id, events=events)
+        return RunFacts(
+            run_id=run_id,
+            run_state=run.state.value,
+            run_terminal=run.state in TERMINAL_RUN_STATES,
+            unfinished_tasks=tuple(unfinished),
+            dispatch_orphans=tuple(
+                str(o.get("work_item_id")) for o in audit.get("orphans") or []
+            ),
+        )
+
+    def scan_engine_signals(self, run_id: str, *, file_proposals: bool = True) -> dict:
+        """Turn this run's OWN warning-grade log records into meta-authoring proposals (#400).
+
+        The seam's second input. ``_file_meta_proposals`` can only report what a stage
+        model volunteered in a retrospective, so anything the driver or scheduler did
+        BETWEEN stages had no author and reached the tracker only if a human read
+        ``events.jsonl`` by hand (#399 sat idle for nine hours that way). This reads the
+        allowlisted signals out of ``events.jsonl`` and ``driver.jsonl``, records them in a
+        cross-run store, and files the ones that have met their OWN ``min_runs`` threshold
+        through the SAME ``proposal_filing_guard``/``append_filing`` ledger path the
+        model-authored clusters use — so the two inputs cannot duplicate each other's
+        issues and both stay idempotent under replay.
+
+        Filed against ``meta_task_source`` (the ENGINE's tracker, injected by the
+        composition root) and never the run project's own task source: a harness bug found
+        during a product run belongs here, not in that product's backlog (#380).
+
+        Safe to call more than once for a run — and it is, from all three triggers
+        (finalize, the driver's exit path, and the standalone CLI check). Observations
+        dedupe on content and the ledger dedupes on the evidence watermark.
+
+        With ``file_proposals=False`` it detects, records and reports without any tracker
+        call — the standalone CLI check's dry-run, for reading a run that ended badly
+        without adding to the backlog.
+
+        NEVER raises: it runs on paths that must not be broken by a best-effort audit
+        (run finalization and the driver's own exit). A failure is reported as a
+        warning-grade ``meta_proposal_failed`` event and an ``error`` on the rollup.
+        """
+        rollup: dict = {"run_id": run_id, "scanned": False, "observed": 0, "new": 0,
+                        "signals": [], "filed": 0, "withheld": 0, "error": None}
+        if not self._engine_signals_enabled():
+            rollup["error"] = "disabled by ORCHESTRATOR_NO_ENGINE_SIGNALS"
+            return rollup
+        try:
+            events = self.store.read_events(run_id)
+            observations, notices = detect_observations(
+                events,
+                read_driver_records(self.store.root, run_id=run_id),
+                self._run_facts(run_id, events=events),
+                now=_now(),
+            )
+            store_path = self._engine_signals_path()
+            written = append_observations(store_path, observations)
+            rows = read_observations(store_path)
+            proposals = signal_proposals(rows)
+            withheld = withheld_signals(rows)
+        except Exception as exc:  # noqa: BLE001 - detection is best-effort evidence-out
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                 "run_id": run_id, "source": "engine", "error": str(exc)},
+            )
+            rollup["error"] = str(exc)
+            return rollup
+
+        rollup.update(scanned=True, observed=len(observations), new=len(written),
+                      signals=sorted({obs.signal for obs in observations}))
+        # A receipt on EVERY scan, clean or not: "we looked and the run was clean" and "no
+        # scan ever ran" must not read alike (the #322 rule). ``declined`` is the pure
+        # layer's returned notice — allowlisted rows a predicate judged normal operation.
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "engine_signals_scanned", "run_id": run_id,
+             "observed": len(observations), "new": len(written),
+             "signals": rollup["signals"], "declined": notices.declined},
+        )
+        for signal in rollup["signals"]:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "engine_signal_observed", "severity": "warning",
+                 "run_id": run_id, "signal": signal,
+                 "count": sum(1 for obs in observations if obs.signal == signal)},
+            )
+        for cluster in withheld:
+            rollup["withheld"] += 1
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "meta_proposal_withheld", "run_id": run_id,
+                 "source": "engine", "key": cluster["key"], "title": cluster["title"],
+                 "runs": cluster["runs"], "evidence": len(cluster["evidence"]),
+                 "reason": f"below this signal's min_runs threshold ({cluster['min_runs']})"},
+            )
+
+        if not file_proposals:
+            rollup["reportable"] = [p["key"] for p in proposals]
+            return rollup
+        file_followup = getattr(self.meta_task_source, "file_followup", None)
+        if not callable(file_followup):
+            for proposal in proposals:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                     "run_id": run_id, "source": "engine", "key": proposal["key"],
+                     "title": proposal["title"],
+                     "error": "engine task source has no file_followup hook"},
+                )
+            return rollup
+        ledger_path = self._meta_proposals_path()
+        for proposal in proposals:
+            title = str(proposal["title"])
+            try:
+                with proposal_filing_guard(ledger_path, proposal["key"]) as filing:
+                    event = self._report_meta_proposal(
+                        proposal, filing, title=title, ledger_path=ledger_path,
+                        run_id=run_id, file_followup=file_followup,
+                        style=_SIGNAL_PROPOSAL_STYLE,
+                    )
+            except Exception as exc:  # noqa: BLE001 - filing must never break the caller
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "meta_proposal_failed", "severity": "warning",
+                     "run_id": run_id, "source": "engine", "key": proposal["key"],
+                     "title": title, "error": str(exc)},
+                )
+                continue
+            event["signal"] = proposal["signal"]
+            self.store.append_event(run_id, event)
+            if event["type"] != "meta_proposal_skipped":
+                rollup["filed"] += 1
+        return rollup
 
     def _emit_retrospective(self, run_id: str) -> None:
         """Write ``retrospective.md`` and harvest its distilled patterns — for EVERY
@@ -7664,6 +7923,10 @@ class Engine:
         # Process observations from every terminal task are now durable. Detect recurrence
         # only at the run boundary, and ledger successful filings so replay is idempotent.
         self._file_meta_proposals(run_id)
+        # The seam's OTHER input (#400): what the driver and scheduler did between stages,
+        # which no model was present to observe. Same ledger, same idempotency; runs here
+        # AND on the driver's exit path, because a run that ends early never gets here.
+        self.scan_engine_signals(run_id)
         # Every task is terminal → no more writers → sweep the now-idle lock sentinels
         # (done LAST, after the final artifact writes that recreate their own locks).
         self.store.sweep_locks()

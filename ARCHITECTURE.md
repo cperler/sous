@@ -364,6 +364,33 @@ never satisfy.
   suppressed a dozen accumulated lessons used to log exactly what a run with nothing to say
   logged. Best-effort filing failures remain non-fatal but are surfaced, with those outcome
   counts, in `status.meta_proposals` rather than living only in `events.jsonl`.
+- **Engine-authored meta-authoring input.** The seam above can only report what a stage
+  model volunteered in a retrospective, so a driver- or scheduler-level defect — which has
+  no model author, and often happens with no stage running at all — used to reach the
+  tracker only if a human read `events.jsonl` by hand (#399 sat idle nine hours that way).
+  `orchestrator/engine_signals.py` is the second input: a pure pass over the run's OWN
+  `events.jsonl` and `driver.jsonl` that turns an explicit ALLOWLIST of warning-grade
+  records into proposals — a `driver_exit`/`nothing_dispatchable` while the engine's own
+  eligibility rule still reports dispatchable work, `blocked_on_orphaned_dispatches`, a
+  `meta_proposal_failed` (the seam's own silence), `result_rejected`, an undesigned
+  `stage_rerouted_to_engine_lane`, and an `events_audit` whose dispatch balance does not
+  close. Allowlist plus PREDICATE, never "every warning": a rate-limit cooldown is normal
+  operation, and DELIVER rerouted onto the deterministic lane is the documented #364 veto,
+  so both are declined and counted rather than filed. The recurrence threshold is a
+  property of the SIGNAL (`min_runs`), not a module constant — a deterministic engine bug
+  is believable on its first sighting, while a stray attribution trailer waits for a
+  second run. Observations accumulate in `<runs-root>/engine-signals.jsonl`, idempotent on
+  `(signal, run, content)`; the proposals then file through the SAME
+  `proposal_filing_guard`/`meta-proposals.jsonl` path and the same engine task source, so
+  the two inputs cannot duplicate each other and neither can file harness work into a
+  product's tracker. Cluster keys are namespaced `signal:<id>` so they never collide with
+  the model-authored `text:`/`<target-kind>:` keys, and every event carries `source`
+  (`model` or `engine`), reported as `status.meta_proposals.by_source`. It runs at three
+  boundaries because finalize alone is not enough: at run finalize, on the driver's exit
+  path (after `log.exit` writes the record it reads — a run that ends early never reaches
+  finalize), and as the standalone `orchestrator engine-signals` check over a finished
+  `runs/<run>/`. The scan never raises into those callers and leaves an
+  `engine_signals_scanned` receipt every time, so clean and never-looked do not read alike.
 - **Meta-authoring delivery gate.** Tasks sourced from issues labeled `meta-authoring`
   persist `hold_before=deliver`. They may scope, implement, test, and review normally, but
   `next_work` parks them `BLOCKED_ON_HUMAN` before DELIVER. Approval is keyed to the exact

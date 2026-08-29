@@ -270,10 +270,17 @@ def test_missing_comment_hook_is_evented_and_stays_retryable(tmp_path, project) 
 
     failures = [e for e in eng.store.read_events("r3") if e["type"] == "meta_proposal_failed"]
     assert len(failures) == 1
+    assert failures[0]["source"] == "model"
     assert "comment_on_ref" in failures[0]["error"]
     assert "1 new evidence row(s)" in failures[0]["error"]
     assert eng.status("r3")["meta_proposals"]["clean"] is False
-    assert len(meta.read_filing_ledger(eng._meta_proposals_path())) == 1  # watermark held
+    # The MODEL cluster's watermark held. (The engine-authored input files its own row for
+    # the `meta_proposal_failed` signal — #400 — so the ledger is scoped by key here.)
+    model_rows = [
+        row for row in meta.read_filing_ledger(eng._meta_proposals_path())
+        if not str(row["key"]).startswith("signal:")
+    ]
+    assert len(model_rows) == 1
 
     del project.task_source.comment_on_ref  # hook restored -> the run retries cleanly
     eng._file_meta_proposals("r3")
@@ -389,22 +396,22 @@ def test_filing_failure_is_evented_without_ledger_and_can_retry(tmp_path, projec
     assert any(e["type"] == "meta_proposal_failed" for e in eng.store.read_events("r2"))
     audit = eng.status("r2")["meta_proposals"]
     assert audit["clean"] is False
-    assert audit["failed"] == 1
-    assert audit["failures"][0]["error"] == "tracker unavailable"
+    # Both inputs are blocked by the same dead tracker: the model cluster, and the
+    # engine-authored `meta_proposal_failed` signal that noticed it fail (#400).
+    model_failures = [f for f in audit["failures"] if f["source"] == "model"]
+    assert len(model_failures) == 1
+    assert model_failures[0]["error"] == "tracker unavailable"
 
     project.task_source.file_followup = real_file
     eng._file_meta_proposals("r2")
-    assert len(meta.read_filing_ledger(eng._meta_proposals_path())) == 1
-    assert eng.status("r2")["meta_proposals"] == {
-        "failed": 0,
-        "failures": [],
-        "filed": 1,
-        "updated": 0,
-        "refiled": 0,
-        "skipped": 0,
-        "withheld": 0,
-        "clean": True,
-    }
+    model_rows = [
+        row for row in meta.read_filing_ledger(eng._meta_proposals_path())
+        if not str(row["key"]).startswith("signal:")
+    ]
+    assert len(model_rows) == 1
+    retried = eng.status("r2")["meta_proposals"]
+    assert [f for f in retried["failures"] if f["source"] == "model"] == []
+    assert retried["by_source"]["model"] == 1
 
 
 def test_meta_authoring_label_holds_before_delivery_until_exact_gate_approved(

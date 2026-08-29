@@ -486,6 +486,25 @@ process's own tree.
 Deliberately narrow: it does not orchestrate merges, does not block pre-merge, and does not
 auto-remediate. It reports and files; something external invokes it after the PRs land.
 
+### Engine-signal scan (a run that ended badly)
+
+```bash
+uv run orchestrator --root runs --shared-root --run RUN --project PROJECT engine-signals
+```
+
+The meta-authoring seam files recurring *model* complaints at run finalize. It cannot see
+what the driver and scheduler did between stages — and a run that died early never reaches
+finalize at all. This scans that run's own `events.jsonl` and `driver.jsonl` for an
+allowlist of harness defects (a driver that quit with work still dispatchable, leases it
+could not reclaim, a stage that silently lost its model lane, a dispatch/record imbalance)
+and files them as `meta-authoring`/`bug` issues against the **engine's** tracker — never
+your project's.
+
+It also runs automatically at finalize and on the driver's way out, so you rarely need it
+by hand. Reach for it on a run you had to kill, or from CI over a finished `runs/<run>/`.
+Exits non-zero when any signal fired; `--no-file` reports without touching the tracker.
+Re-running is safe — observations and filings are both idempotent.
+
 ### Acceptance pass (spec-originated batches)
 
 ```bash

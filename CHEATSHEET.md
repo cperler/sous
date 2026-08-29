@@ -132,6 +132,7 @@ $O status
 
 ```bash
 $O trunk-gate -C /path/to/merged-trunk        # exits non-zero on red; files one remediation task
+$O engine-signals                             # harness defects from this run's own logs; --no-file to peek
 uv run orchestrator --project "$PROJECT" spec conformance ./specs/<slug>.json
 $O retrospective
 $O cost-report                                 # --by-effort splits by stage/effort/model

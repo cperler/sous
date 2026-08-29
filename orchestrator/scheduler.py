@@ -503,6 +503,12 @@ class Scheduler:
             traps.close()
             pool.close()
         log.exit(exit_reason, in_flight=self.engine.in_flight(run_id))
+        # #400: scan the run's own logs for engine-authored harness defects HERE, after
+        # `log.exit` has written the `driver_exit` record the scan needs to read, and
+        # before the status dump. Finalize runs the same scan, but a driver that stops on
+        # an unfinished run — the #399 case, and the one most worth reporting — never
+        # reaches finalize at all. The scan is idempotent and never raises.
+        self.engine.scan_engine_signals(run_id)
         return self._final_status(run_id, exit_reason, reclaim)
 
     def _sleep(

@@ -167,7 +167,7 @@ _ENGINE_COMMANDS = frozenset({
     "init-run", "add-task", "next", "record", "dispatchable", "run-headless",
     "hold", "approve", "unpause", "park-supervisor", "resume-supervisor", "reject",
     "abandon", "retire", "resume", "status", "refresh-spec",
-    "watch", "cost-report", "retrospective", "trunk-gate",
+    "watch", "cost-report", "retrospective", "trunk-gate", "engine-signals",
 })
 
 
@@ -503,6 +503,13 @@ def main(argv: list[str] | None = None) -> int:
     tg.add_argument("--no-file-fix", dest="file_fix", action="store_false",
                     help="report only — do NOT auto-file a remediation task on red")
     tg.set_defaults(file_fix=True)
+    es = sub.add_parser("engine-signals",
+                        help="scan a finished run's own events.jsonl/driver.jsonl for "
+                             "harness defects and file them as meta-authoring proposals "
+                             "(#400); non-zero exit when any signal fired")
+    es.add_argument("--no-file", dest="file_signals", action="store_false",
+                    help="report only — detect and record observations, file nothing")
+    es.set_defaults(file_signals=True)
     sub.add_parser("resume")
     st = sub.add_parser("status")
     st.add_argument("--check-spec", action="store_true",
@@ -1447,6 +1454,14 @@ def main(argv: list[str] | None = None) -> int:
         _emit(result)
         # Non-zero on red so a human or CI wrapper can branch on the exit code.
         return 0 if result["green"] else 1
+    elif args.cmd == "engine-signals":
+        result = eng.scan_engine_signals(args.run, file_proposals=args.file_signals)
+        _emit(result)
+        # Non-zero when the run's own logs accuse the harness, so a human or CI wrapper
+        # can branch on it for a run that ended badly and never reached finalize. A scan
+        # that could not RUN (disabled, or it failed) also exits non-zero: unverified must
+        # never read as green.
+        return 1 if result["observed"] or result["error"] else 0
     elif args.cmd == "resume":
         _emit(eng.resume(args.run))
     elif args.cmd == "status":
