@@ -454,3 +454,103 @@ def test_retrospective_pattern_without_a_sample_error_is_not_harvested(tmp_path,
     )
     entries = kb.read_entries(eng._learnings_kb_path())
     assert not any(e["text"].startswith("recurring failure at") for e in entries)
+
+
+# --- #401: text cap by KIND, and boundary-aware truncation --------------------------
+
+
+def test_text_cap_is_chosen_by_kind() -> None:
+    """Prose kinds get the larger cap; terse rows and unknown kinds get the default."""
+    assert kb.text_cap("review") == kb.MAX_TEXT_PROSE
+    assert kb.text_cap("process") == kb.MAX_TEXT_PROSE
+    assert kb.text_cap("failure") == kb.MAX_TEXT
+    assert kb.text_cap("infra") == kb.MAX_TEXT
+    assert kb.text_cap(None) == kb.MAX_TEXT
+    assert kb.text_cap("not-a-kind") == kb.MAX_TEXT
+    assert kb.MAX_TEXT_PROSE > kb.MAX_TEXT
+
+
+def test_review_prose_survives_whole_where_the_old_global_cap_cut_it(tmp_path) -> None:
+    """The motivating regression (#401): a real rejection detail is ~600 chars, so the old
+    500-char global cap truncated it mid-sentence and it recalled as a fragment."""
+    path = tmp_path / "kb.jsonl"
+    review = (
+        "review rejected (cycle 1) — blocking issues: important — orchestrator/engine.py:5281 "
+        "— Proposal filing is not concurrency-safe. Two runs can both read an empty ledger and "
+        "call file_followup before either reaches the locked append_filing; the second append "
+        "is suppressed, but two tracker issues already exist. important — "
+        "orchestrator/learnings_kb.py:182 — Process deduplication keys only on normalized text "
+        "and run_id, omitting the target, so identical observations about different artifacts "
+        "collapse into one row."
+    )
+    assert kb.MAX_TEXT < len(review) <= kb.MAX_TEXT_PROSE  # guards the fixture's premise
+    written = kb.append_learnings(path, [{"kind": "review", "text": review}])
+    assert written[0]["text"] == review  # whole, untruncated
+    assert "[truncated]" not in written[0]["text"]
+
+    # Same text harvested as a terse failure row still gets the default cap.
+    terse = kb.append_learnings(path, [{"kind": "failure", "text": review}])
+    assert len(terse[0]["text"]) <= kb.MAX_TEXT
+    assert terse[0]["text"].endswith(" … [truncated]")
+
+
+def test_truncation_prefers_a_sentence_boundary() -> None:
+    """Over the cap, the cut lands after a sentence terminator — not mid-token."""
+    tail = " The final clause that must be cut away entirely." * 20
+    text = "First sentence stands. Second sentence also stands." + tail
+    out = kb.bound_text(text, "failure")
+    assert len(out) <= kb.MAX_TEXT
+    body = out[: -len(" … [truncated]")]
+    assert out.endswith(" … [truncated]")
+    assert body.endswith(".")  # a whole sentence, not a fragment
+    assert text.startswith(body)  # nothing invented, only cut
+
+
+def test_truncation_falls_back_to_a_word_boundary_then_a_hard_cut() -> None:
+    """No sentence end in range → cut on whitespace; no whitespace either → hard cut."""
+    words = kb.bound_text("word " * 400, "failure")
+    assert len(words) <= kb.MAX_TEXT
+    assert words.endswith("word … [truncated]")  # a whole word, never "wo"
+
+    unbroken = kb.bound_text("x" * 900, "failure")
+    assert len(unbroken) <= kb.MAX_TEXT
+    assert unbroken.endswith(" … [truncated]")
+    assert set(unbroken[: -len(" … [truncated]")]) == {"x"}
+
+
+def test_a_boundary_is_ignored_when_it_would_discard_most_of_the_budget() -> None:
+    """An early-only sentence end must not shrink the row to a stub — the hard cut wins."""
+    text = "Tiny. " + "z" * 900
+    out = kb.bound_text(text, "failure")
+    assert len(out) > int((kb.MAX_TEXT - len(" … [truncated]")) * 0.6)
+    assert out.startswith("Tiny. zzz")
+
+
+def test_bounded_text_never_exceeds_its_cap_for_any_kind() -> None:
+    """Invariant across every valid kind, including the prose ones."""
+    long_prose = ("A sentence of moderate length that keeps going on. " * 200).strip()
+    for kind in sorted(kb.VALID_KINDS):
+        out = kb.bound_text(long_prose, kind)
+        assert len(out) <= kb.text_cap(kind), kind
+        assert out.endswith(" … [truncated]"), kind
+
+
+def test_process_retrospective_prose_gets_the_larger_cap(tmp_path) -> None:
+    """A REVIEW retrospective is prose too, so it rides the same cap through harvest."""
+    path = tmp_path / "kb.jsonl"
+    detail = ("The stage template asks for a retrospective but never says what a subtractive "
+              "lesson looks like, so every run returns an additive one. " * 4).strip()
+    written = kb.append_learnings(path, [{"kind": "process", "text": f"Retro title: {detail}"}])
+    assert kb.MAX_TEXT < len(written[0]["text"]) <= kb.MAX_TEXT_PROSE
+
+
+def test_prose_recall_stays_within_the_context_ceiling(tmp_path) -> None:
+    """The larger cap must not push a full recall past the context plane's ceiling."""
+    path = tmp_path / "kb.jsonl"
+    filler = "The reviewer explained the defect in careful prose about widgets. " * 40
+    for i in range(8):
+        kb.append_learnings(path, [{"kind": "review", "text": f"widgets case {i}. {filler}"}])
+    hits = kb.relevant_learnings(path, {"title_tokens": ["widgets", "case"]}, limit=5)
+    assert len(hits) == 5
+    assert all(len(h) <= kb.MAX_TEXT_PROSE for h in hits)
+    assert _context_bytes({"prior_learnings": hits}) < _MAX_CONTEXT_BYTES
