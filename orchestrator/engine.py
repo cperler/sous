@@ -51,7 +51,7 @@ from .errors import (
     StatusNotFoundError,
     SupervisorParkDeferred,
 )
-from .file_contention import ClaimEntry, Deferral, describe, plan_deferrals
+from .file_contention import ClaimEntry, ContentionPlan, Deferral, describe, plan_deferrals
 from .gitcmd import run_git
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
@@ -969,11 +969,26 @@ class Engine:
                 continue
             out.append(ref.task_id)
         if run.serialize_file_contention:
-            out = self._apply_file_contention_gate(run_id, live, out)
+            live_ids = [doc.task_id for doc in live]
+            out = self._apply_file_contention_gate(
+                run_id, lambda: self._reload_claim_tasks(run_id, live_ids), out
+            )
         return out
 
+    def _reload_claim_tasks(self, run_id: str, task_ids: list[str]) -> list[Task]:
+        """Re-read the contention-relevant task docs, in run order, for a gate pass.
+
+        ``dispatchable`` selected ``task_ids`` from a snapshot it read BEFORE taking the
+        dispatch lock, so the claim state in that snapshot may already be stale; the gate
+        decides on these fresh reads instead. Membership is deliberately not re-derived:
+        a task that went terminal in the meantime is still read here and, if it holds,
+        still defers its waiters for this pass — the conservative direction, released on
+        the next tick rather than risking a claim handed to two tasks at once.
+        """
+        return [self.store.load_task(run_id, task_id) for task_id in task_ids]
+
     def _apply_file_contention_gate(
-        self, run_id: str, live: list[Task], eligible: list[str]
+        self, run_id: str, load_live: Callable[[], list[Task]], eligible: list[str]
     ) -> list[str]:
         """Hold back a task whose approved SCOPE names a file another live task claimed
         (#377) — the enforced version of the advisory "fold convergent fixes" guidance.
@@ -986,9 +1001,20 @@ class Engine:
         callers never consult ``dispatchable`` and the gate must not be absent for them;
         that is a self-safety backstop for the same decision, not a second one.
 
-        The claim is stamped on the admitted task (``file_claim_acquired_at``) under the
-        run's dispatch lock, so two processes cannot both acquire the same path, and it is
-        never cleared: a review fix cycle wipes the post-SCOPE stage records, so any
+        The WHOLE read-decide-stamp sequence runs under the run's dispatch lock, and the
+        live docs are re-read by ``load_live`` INSIDE it — not merely the final stamp.
+        Locking only the stamp would leave the decision itself racy, and the two callers
+        race differently: ``dispatchable`` decides over the full symmetric set of live
+        tasks, so two concurrent passes on consistent state pick the same winner, but
+        ``next_work`` reduces the set to one candidate plus existing holders and so cannot
+        see a rival waiter that has not stamped yet. Under one lock the loser's read
+        happens after the winner's write, so it sees a holder and defers. Events are
+        emitted after the lock is released — the critical section covers the decision, not
+        the audit trail.
+
+        The claim is stamped on the admitted task (``file_claim_acquired_at``) so two
+        processes cannot both acquire the same path, and it is never cleared: a review fix
+        cycle wipes the post-SCOPE stage records, so any
         DERIVED "already implementing" signal would hand the claim back mid-task. Release
         is by reaching a terminal state — including FAILED, so a waiter is never starved
         behind a task that will never finish.
@@ -1005,75 +1031,90 @@ class Engine:
         had been dispatched.
         """
         ready = set(eligible)
-        entries = [
-            ClaimEntry(
-                task_id=doc.task_id,
-                claims=tuple(doc.scope_files),
-                holding=doc.file_claim_acquired_at is not None,
-            )
-            for doc in live
-            if doc.scope_files
-            and (doc.file_claim_acquired_at is not None or doc.task_id in ready)
-        ]
-        if not entries:
+        plan: ContentionPlan | None = None
+        by_id: dict[str, Task] = {}
+        acquired: list[Task] = []
+        with self.store.with_dispatch_lock(run_id):
+            live = load_live()
+            entries = [
+                ClaimEntry(
+                    task_id=doc.task_id,
+                    claims=tuple(doc.scope_files),
+                    holding=doc.file_claim_acquired_at is not None,
+                )
+                for doc in live
+                if doc.scope_files
+                and (doc.file_claim_acquired_at is not None or doc.task_id in ready)
+            ]
+            if entries:
+                plan = plan_deferrals(entries)
+                by_id = {doc.task_id: doc for doc in live}
+                for task_id in plan.admitted:
+                    if task_id in ready and self._stamp_file_claim(run_id, by_id[task_id]):
+                        acquired.append(by_id[task_id])
+        if plan is None:
             return eligible
-        plan = plan_deferrals(entries)
-        by_id = {doc.task_id: doc for doc in live}
-        for task_id in plan.admitted:
-            if task_id in ready:
-                self._acquire_file_claim(run_id, by_id[task_id])
+        for doc in acquired:
+            self.store.append_event(run_id, {
+                "ts": _now(), "type": "file_claim_acquired", "run_id": run_id,
+                "task_id": doc.task_id, "files": list(doc.scope_files),
+            })
         for task_id in ready:
             self._record_contention_wait(run_id, by_id[task_id], plan.deferrals.get(task_id))
         return [task_id for task_id in eligible if task_id not in plan.deferrals]
 
-    def _live_claim_tasks(self, run_id: str, run: Run, task: Task) -> list[Task]:
+    def _live_claim_tasks(self, run_id: str, task: Task) -> list[Task]:
         """The ``live`` argument for a SINGLE-task contention pass (``next_work``'s
         self-safety check), in run order.
 
         Only claim HOLDERS constrain one candidate, so every other live task is loaded
         just to ask whether it holds and dropped otherwise — which is exactly the subset
         ``_apply_file_contention_gate`` would keep anyway, since it admits and defers only
-        tasks in ``eligible``. ``task`` itself is carried by IDENTITY rather than reloaded,
-        so an admission stamps the claim onto the caller's own doc and the dispatch that
-        follows sees it.
+        tasks in ``eligible``. A rival waiter that has not stamped yet is therefore
+        invisible here, and that is only safe because the gate calls this INSIDE the
+        dispatch lock: a rival can only become a holder under that same lock, so it is
+        either already visible as one or cannot stamp until this pass has finished.
+
+        The run doc is re-read for the same reason — the caller's copy predates the lock —
+        and ``task`` is carried by IDENTITY, refreshed from its fresh read, so an admission
+        stamps the claim onto the caller's own doc and the dispatch that follows sees it.
 
         A terminal task is left out — that omission IS the release (#377).
         """
         live: list[Task] = []
-        for ref in run.task_refs:
-            if ref.task_id == task.task_id:
-                live.append(task)
-                continue
-            if ref.state in TERMINAL_TASK_STATES:
+        for ref in self.store.load_run(run_id).task_refs:
+            if ref.task_id != task.task_id and ref.state in TERMINAL_TASK_STATES:
                 continue
             doc = self.store.load_task(run_id, ref.task_id)
-            if doc.file_claim_acquired_at is not None:
+            if ref.task_id == task.task_id:
+                task.scope_files = list(doc.scope_files)
+                task.file_claim_acquired_at = doc.file_claim_acquired_at
+                task.file_contention_deferred_on = list(doc.file_contention_deferred_on)
+                live.append(task)
+            elif doc.file_claim_acquired_at is not None:
                 live.append(doc)
         return live
 
-    def _acquire_file_claim(self, run_id: str, task: Task) -> None:
-        """Stamp the gate-winner's claim and event the receipt (idempotent, once per task).
+    def _stamp_file_claim(self, run_id: str, task: Task) -> bool:
+        """Stamp the gate-winner's claim; True when THIS call is the one that took it.
 
-        Serialized on the run's dispatch lock and re-read inside it, so a concurrent
-        scheduler cannot hand the same path to two tasks; a claim already stamped there is
-        left alone rather than refreshed (the stamp is monotonic).
+        The CALLER must already hold the run's dispatch lock (the locks are not
+        re-entrant, so this must not take it again) — that is what makes the admission
+        decision above and this write one transaction. The in-lock re-read still matters
+        for the one doc the gate carries by identity rather than reloading: a claim
+        already stamped is left alone rather than refreshed, because the stamp is
+        monotonic and its receipt is emitted once per claim, not once per tick.
         """
         def _stamp(doc: Task) -> None:
             if doc.file_claim_acquired_at is None:
                 doc.file_claim_acquired_at = _now()
                 doc.file_contention_deferred_on = []
 
-        with self.store.with_dispatch_lock(run_id):
-            already = self.store.load_task(run_id, task.task_id).file_claim_acquired_at
-            doc = self.store.update_task(run_id, task.task_id, _stamp)
+        already = self.store.load_task(run_id, task.task_id).file_claim_acquired_at
+        doc = self.store.update_task(run_id, task.task_id, _stamp)
         task.file_claim_acquired_at = doc.file_claim_acquired_at
         task.file_contention_deferred_on = list(doc.file_contention_deferred_on)
-        if already is not None:
-            return  # someone else stamped it first — one receipt per claim, not per tick
-        self.store.append_event(run_id, {
-            "ts": _now(), "type": "file_claim_acquired", "run_id": run_id,
-            "task_id": doc.task_id, "files": list(doc.scope_files),
-        })
+        return already is None
 
     def _record_contention_wait(
         self, run_id: str, task: Task, deferral: Deferral | None
@@ -1278,7 +1319,7 @@ class Engine:
             and task.scope_files
             and task.file_claim_acquired_at is None  # a holder never re-enters the gate
             and not self._apply_file_contention_gate(
-                run_id, self._live_claim_tasks(run_id, run, task), [task_id]
+                run_id, lambda: self._live_claim_tasks(run_id, task), [task_id]
             )
         ):
             # Quiet like the BLOCKED_ON_HUMAN refusal (both callers read None as "nothing

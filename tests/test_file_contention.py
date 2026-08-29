@@ -13,6 +13,9 @@ blocker goes terminal — completed OR failed — and stays quiet across ticks.
 
 from __future__ import annotations
 
+import threading
+from contextlib import contextmanager
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.file_contention import (
@@ -389,3 +392,69 @@ def test_next_work_ignores_contention_when_the_run_setting_is_off(tmp_path, proj
     assert eng.next_work("r1", "t1") is not None
     assert eng.next_work("r1", "t2") is not None
     assert eng.store.load_task("r1", "t2").file_claim_acquired_at is None
+
+
+# --- the gate under genuine concurrency ---------------------------------------
+# `next_work`'s single-candidate reduction cannot see a rival waiter that has not stamped
+# yet, so — unlike `dispatchable`, which decides over the full symmetric set — locking
+# only the stamp would let two direct CLI dispatches each self-select as the sole winner.
+# The whole read-decide-stamp sequence therefore runs under the run's dispatch lock.
+
+
+class _BarrierStore(StatusStore):
+    """A store whose FIRST dispatch-lock acquisition per instance waits for its rival.
+
+    This pins the interleaving the gate has to survive: both racers are poised at the
+    contention decision, having completed every preflight check, before EITHER can take
+    the lock. If the live-claim read happened outside the critical section, both reads
+    would already have returned "nobody holds this file" by the time the barrier trips.
+    """
+
+    def __init__(self, root, barrier: threading.Barrier) -> None:
+        super().__init__(root)
+        self._barrier = barrier
+        self._tripped = False
+
+    @contextmanager
+    def with_dispatch_lock(self, run_id: str):
+        if not self._tripped:
+            self._tripped = True
+            self._barrier.wait(timeout=20)
+        with super().with_dispatch_lock(run_id):
+            yield
+
+
+def test_two_concurrent_direct_dispatches_cannot_both_claim_the_file(
+    tmp_path, project
+) -> None:
+    _two_scoped_tasks(tmp_path, project, ["schema.py"], ["schema.py"])
+    # Separate Engine instances over the same store dir: the `orchestrator next --task t1`
+    # / `--task t2` shape, which shares nothing but the files on disk.
+    barrier = threading.Barrier(2)
+    engines = {
+        task_id: Engine(
+            _BarrierStore(tmp_path, barrier), CostLedger(tmp_path / "c.jsonl"), project
+        )
+        for task_id in ("t1", "t2")
+    }
+    results: dict[str, object] = {}
+
+    def _dispatch(task_id: str) -> None:
+        results[task_id] = engines[task_id].next_work("r1", task_id)
+
+    threads = [
+        threading.Thread(target=_dispatch, args=(task_id,)) for task_id in ("t1", "t2")
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+        assert not thread.is_alive()  # the gate must not deadlock on its own lock
+
+    store = StatusStore(tmp_path)
+    dispatched = sorted(t for t, work in results.items() if work is not None)
+    holders = sorted(
+        t for t in ("t1", "t2") if store.load_task("r1", t).file_claim_acquired_at
+    )
+    assert len(holders) == 1  # only one racer may believe it owns schema.py
+    assert dispatched == holders  # ...and whoever dispatched is exactly who holds it

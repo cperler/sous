@@ -389,11 +389,15 @@ never satisfy.
   (`orchestrator next --task <id>`, the interactive supervisor over it) never consult
   `dispatchable`, so the same self-safety rule as its terminal and BLOCKED_ON_HUMAN guards
   applies; it is a backstop for one decision, not a second one. A claim is acquired once,
-  under the run's dispatch lock,
   when the gate first admits the task, and released only by that task reaching a TERMINAL
   state — a failed blocker therefore cannot starve its waiter, and a review fix cycle (which
   wipes the post-SCOPE stage records) cannot hand the claim back mid-task. Holders never
-  wait and waiters are ordered, so the wait graph is acyclic by construction. The gate keys
+  wait and waiters are ordered, so the wait graph is acyclic by construction. The whole
+  read-decide-stamp sequence — including the re-read of the live claim state — runs under
+  the run's dispatch lock, so two concurrent direct dispatches cannot both self-select as
+  the winner for one path: locking only the stamp would leave `next_work` racy, because its
+  single-candidate view (that task plus existing holders) cannot see a rival waiter that
+  has not stamped yet, where `dispatchable` decides over the full symmetric set. The gate keys
   on every declared path with no file-kind heuristic: two tasks appending independent tests
   to one file ARE serialized, the deliberate safe default (false serialization costs
   parallelism; the collision it prevents costs a remediation cycle). A task whose lane has no
