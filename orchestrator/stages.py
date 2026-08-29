@@ -88,9 +88,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "plan. If genuinely blocked, say so. For a task too large to survive as one "
             "all-or-nothing change, also emit a child-task DAG; do not decompose routine "
             "work. Child ids are local to this plan and dependencies must be acyclic.\n"
-            "Return: feasible, blocked_reason, plan (list of prose subtasks), and optional "
-            "subtasks (list of {id, description, agent, quality_tier: full|light|none, "
-            "implementation_budget: standard|short, depends_on: [local ids]})."
+            "Also declare `files`: the repo-relative paths you expect the implementation "
+            "to MODIFY (not the ones you merely read). The engine serializes tasks whose "
+            "declared files collide instead of fanning them out into a merge conflict "
+            "(#377), so name the real edit surface — a file you omit is a file another "
+            "task may rewrite underneath you.\n"
+            "Return: feasible, blocked_reason, plan (list of prose subtasks), files (list "
+            "of repo-relative paths), and optional subtasks (list of {id, description, "
+            "agent, quality_tier: full|light|none, implementation_budget: standard|short, "
+            "depends_on: [local ids]})."
         ),
     ),
     Stage.IMPLEMENT: StageSpec(
