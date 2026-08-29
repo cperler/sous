@@ -163,6 +163,29 @@ def _load_entry_point(ep: EntryPoint) -> ProjectConfig:
     return _build_config(ep.name, factory, external=True)
 
 
+def normalize_project_ref(spec: str | None) -> str | None:
+    """The stable, storable spelling of a ``--project`` spec (#386).
+
+    A run doc records the adapter it was created with so a later process — the cross-root
+    dashboard above all — can re-resolve it. A DIRECTORY spec is relative to the caller's
+    cwd, so ``../ff/.orchestration`` names different adapters from different directories and
+    the same adapter under different spellings; resolve it to an absolute path. Module paths
+    and entry-point names are already cwd-independent and are kept verbatim. A spec that
+    looks like a path but does not exist is also kept verbatim: refusing to normalize is
+    strictly better than inventing an absolute path for a directory that isn't there, and
+    ``load_project`` is the one place that gets to reject it.
+    """
+    if spec is None:
+        return None
+    spec = spec.strip()
+    if not spec:
+        return None
+    path = Path(spec)
+    if ("/" in spec or path.is_dir()) and path.is_dir():
+        return str(path.resolve())
+    return spec
+
+
 def load_project(spec: str) -> ProjectConfig:
     """Load a project adapter by directory path, importable module, or entry-point name."""
     path = Path(spec)

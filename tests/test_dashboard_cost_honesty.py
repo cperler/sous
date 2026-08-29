@@ -49,7 +49,7 @@ def _run_with_rows(tmp_path, run_id: str, rows: list[dict]):
 
 
 def _snapshot(root, **kw):
-    kw.setdefault("engine_factory", lambda run_root: _engine(run_root))
+    kw.setdefault("engine_factory", lambda run_root, project_ref=None: _engine(run_root))
     kw.setdefault("clock", lambda: 1_000_000.0)
     return dashboard_snapshot(root, **kw)
 

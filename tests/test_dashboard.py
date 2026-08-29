@@ -20,6 +20,7 @@ import pytest
 
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.dashboard import (
+    AdapterUnresolved,
     dashboard_snapshot,
     default_engine_factory,
     discover_runs,
@@ -43,7 +44,9 @@ def _engine(run_root, **kw) -> Engine:
 
 
 def _factory(**kw):
-    return lambda run_root: _engine(run_root, **kw)
+    # #386: the factory is handed the run's own persisted project ref, so one board can
+    # resolve a different adapter per row. The fake ignores it and always builds FakeProject.
+    return lambda run_root, project_ref=None: _engine(run_root, **kw)
 
 
 def _drive_intake(eng, run_id, task_id="t1"):
@@ -417,7 +420,7 @@ def test_usage_probe_failure_still_renders(tmp_path) -> None:
     snap = _snapshot(tmp_path, usage_reader=boom)
     assert snap["header"]["usage"] is None
     out = render_dashboard(snap)
-    assert "usage: unavailable" in out
+    assert "usage (account): unavailable" in out
 
 
 # --- the production factory ------------------------------------------------------------
@@ -441,6 +444,22 @@ def test_default_engine_factory_builds_a_working_engine(tmp_path) -> None:
     assert not any(mode is ExecutionMode.INTERACTIVE for mode, _ in sanctioned)
 
 
-def test_default_engine_factory_requires_a_project() -> None:
-    with pytest.raises(SystemExit, match="--project"):
-        default_engine_factory(None)
+def test_default_engine_factory_without_project_still_serves_runs_that_name_their_own(
+    tmp_path,
+) -> None:
+    """#386: `--project` is now the FALLBACK, not a requirement. A run doc that names its own
+    adapter resolves with no `--project` at all; a run with neither raises AdapterUnresolved
+    (a per-ROW failure the board degrades) rather than exiting the process."""
+    factory = default_engine_factory(None)
+    assert isinstance(factory(tmp_path / "runs" / "r1", "selfhost"), Engine)
+
+    with pytest.raises(AdapterUnresolved, match="predates"):
+        factory(tmp_path / "runs" / "r2", None)
+
+
+def test_default_engine_factory_degrades_an_unloadable_ref_instead_of_exiting(tmp_path) -> None:
+    """A stale/bad ref must not kill the board: `load_project` exits the process on an
+    unknown spec (right for `--project`, fatal for a board), so the factory converts it."""
+    factory = default_engine_factory(None)
+    with pytest.raises(AdapterUnresolved, match="did not load"):
+        factory(tmp_path / "runs" / "r1", "no.such.adapter.module")

@@ -329,7 +329,8 @@ def test_cli_dashboard_serve_wires_web_dashboard(tmp_path, capsys, monkeypatch) 
         "dashboard", "--serve", "--port", "9191", "--host", "0.0.0.0",
     ])
     assert rc == 0
-    assert captured["root"] == str(tmp_path)
+    # #386: the board takes a LIST of runs-roots, so --serve covers the same set.
+    assert captured["root"] == [str(tmp_path)]
     assert captured["kw"]["port"] == 9191 and captured["kw"]["host"] == "0.0.0.0"
     assert "stale_after_s" in captured["kw"]["snap_kwargs"]
     assert callable(captured["kw"]["usage_reader"])
@@ -366,5 +367,5 @@ def test_cli_dashboard_watch_alone_still_parses(tmp_path, capsys, monkeypatch) -
         "dashboard", "--watch", "--interval", "1",
     ])
     assert rc == 0
-    assert captured["root"] == str(tmp_path)
+    assert captured["root"] == [str(tmp_path)]
     assert captured["interval"] == 1
