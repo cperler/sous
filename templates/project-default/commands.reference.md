@@ -1,10 +1,17 @@
 # Stack → adapter commands (cheat-sheet)
 
 The bootstrap interview maps a project's stack to the project-config adapter's command
-methods (`install_cmd`, `test_unit_cmd`, `test_e2e_cmd`, `lint_cmd`, `typecheck_cmd`,
-`infra_reset`). The generated adapter runs lint and typecheck as deterministic REVIEW gates.
+methods (`install_cmd`, `test_unit_cmd`, `test_e2e_cmd`, `typecheck_cmd`, `types_cmd`,
+`infra_reset`). The generated adapter runs lint and typecheck as deterministic REVIEW gates,
+and both merge gates (batch integration + trunk) run the same pair.
 The machine-readable version is the `[commands.*]` tables in `manifest.toml`; this is the
 human reference. Commands are a `list[str]` (argv), never a shell string.
+
+**Method names are the ENGINE's legs, not the tools' (#412).** The `lint` column below
+generates `typecheck_cmd` (the engine's LINT leg) and the `typecheck` column generates
+`types_cmd` (its STATIC-TYPING leg, #243). A stack with only one static-analysis command
+puts it on `typecheck_cmd` and leaves `types_cmd` a no-op. Mapping `typecheck` →
+`typecheck_cmd` looks right and is not: it hides the linter from both merge gates.
 
 | Stack | install | test (unit) | lint | typecheck | e2e |
 |---|---|---|---|---|---|

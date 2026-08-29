@@ -76,6 +76,27 @@ def validate_config(config: object) -> list[str]:
     return [m for m in _REQUIRED_MEMBERS if not hasattr(config, m)]
 
 
+def stale_gate_mapping(config: object) -> str | None:
+    """Warn about the pre-#412 scaffold shape: a ``lint_cmd`` no engine leg ever calls.
+
+    ``orchestrator-scaffold`` used to map profile.toml's ``lint`` onto a ``lint_cmd`` the
+    engine does not know and its ``typecheck`` onto ``typecheck_cmd`` — which is the
+    engine's LINT leg. Such an adapter runs its type checker under the label "typecheck",
+    never runs its linter in either merge gate, and records the ``types`` leg as absent, so
+    a batch can pass both gates and leave trunk red on the linter CI enforces. Existing
+    adapters do not self-heal on an engine upgrade, so say so at load rather than let it
+    read as green. Advisory only — an adapter in this shape still runs.
+    """
+    if not hasattr(config, "lint_cmd") or hasattr(config, "types_cmd"):
+        return None
+    return (
+        "project adapter defines lint_cmd but no types_cmd — the engine's merge gates call "
+        "typecheck_cmd (LINT leg) and types_cmd (STATIC-TYPING leg), so lint_cmd is never "
+        "run by them and the linter is unverified at merge. Re-run orchestrator-scaffold to "
+        "regenerate the adapter (#412)."
+    )
+
+
 def _import_adapter_dir(path: Path) -> ModuleType:
     """Import ``<path>/__init__.py`` as a standalone package (relative imports work)."""
     init = path / "__init__.py"
@@ -132,6 +153,8 @@ def _build_config(
                 f"external adapter {spec} does not satisfy ProjectConfig — "
                 f"missing: {', '.join(missing)}"
             )
+    if warning := stale_gate_mapping(config):
+        print(f"orchestrator: warning: {spec}: {warning}", file=sys.stderr)
     return config
 
 

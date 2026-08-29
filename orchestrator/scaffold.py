@@ -49,16 +49,39 @@ def _kit_dir() -> Path:
 KIT_DIR = _kit_dir()
 
 # Command method <-> profile key. Order is the order they appear in the generated config.
+#
+# The two static-analysis rows are NOT a straight name match, and #412 is why. A profile
+# names its commands by TOOL ROLE (``lint`` = ruff, ``typecheck`` = mypy), but the engine
+# names its two legs ``typecheck_cmd`` (the LINT leg) and ``types_cmd`` (the STATIC-TYPING
+# leg, #243) — see ``Engine._run_verification_commands``. Mapping ``typecheck`` ->
+# ``typecheck_cmd`` reads correct and is not: it puts the type checker in the lint slot and
+# leaves ``types_cmd`` absent, so both merge gates ran mypy under the label "typecheck" and
+# never ran the linter at all. Map by LEG, not by name.
 _COMMAND_METHODS: list[tuple[str, str, bool]] = [
-    # (method_name, profile_key, takes_files_arg)
+    # (method_name, primary_profile_key, takes_files_arg)
     ("install_cmd", "install", False),
     ("test_unit_cmd", "test_unit", True),
     ("test_e2e_cmd", "test_e2e", True),
     ("test_shell_cmd", "test_shell", True),
-    ("lint_cmd", "lint", False),
-    ("typecheck_cmd", "typecheck", False),
+    ("typecheck_cmd", "lint", False),
+    ("types_cmd", "typecheck", False),
     ("infra_reset", "infra_reset", False),
 ]
+
+# Comments rendered above a generated method, so the leg/name mismatch above is explained
+# in the adapter a project actually reads — mirroring adapters/project/selfhost/config.py.
+_METHOD_NOTES: dict[str, str] = {
+    "typecheck_cmd": (
+        "    # The engine's LINT leg (#412): profile.toml's `lint` command. The METHOD name is\n"
+        "    # the engine's, the TOOL is the linter. Run by the REVIEW gate below and by both\n"
+        "    # merge gates (batch integration + trunk).\n"
+    ),
+    "types_cmd": (
+        "    # The engine's STATIC-TYPING leg (#243): profile.toml's `typecheck` command, kept\n"
+        "    # distinct from the linter above so a merge gate runs BOTH. A project with only one\n"
+        "    # static-analysis tool puts it on typecheck_cmd and leaves this a no-op.\n"
+    ),
+}
 
 # The generic roster used when no stack-specific agents are selected (no-profile default).
 _DEFAULT_ROSTER: dict[str, str] = {
@@ -563,9 +586,30 @@ class LocalTaskSource:
 '''
 
 
+def _resolve_command(method: str, key: str, commands: dict[str, list[str]]) -> list[str] | None:
+    """The argv a generated method returns, after mapping profile keys onto engine legs.
+
+    Straight ``commands[key]`` for everything except the two static-analysis legs (#412),
+    which are mapped by LEG rather than by name (see ``_COMMAND_METHODS``): the linter goes
+    to ``typecheck_cmd`` and the type checker to ``types_cmd``.
+
+    A profile declaring only ONE static-analysis command puts it on the primary leg
+    (``typecheck_cmd``) and leaves ``types_cmd`` a no-op — the shape
+    ``orchestrator/ports/project.py`` documents for a TS project whose ``typecheck_cmd``
+    IS ``tsc --noEmit``. Without that fallback such a project would leave its only gate on
+    the duck-typed optional leg.
+    """
+    if method == "typecheck_cmd":
+        return commands.get("lint") or commands.get("typecheck")
+    if method == "types_cmd":
+        return commands.get("typecheck") if commands.get("lint") else None
+    return commands.get(key)
+
+
 def _command_method(method: str, key: str, takes_files: bool, profile: Profile, name: str) -> str:
     sig_arg = "self, files: list[str] | None = None" if takes_files else "self"
-    argv = profile.commands.get(key)
+    argv = _resolve_command(method, key, profile.commands)
+    note = _METHOD_NOTES.get(method, "")
     if argv:
         body = f"        return {_argv_literal(argv)}"
     elif key == "test_unit":
@@ -574,7 +618,7 @@ def _command_method(method: str, key: str, takes_files: bool, profile: Profile, 
                 f"\"echo 'orchestrator: set {name} test_unit_cmd' >&2; exit 1\"]")
     else:
         body = "        return _NOOP"
-    return f"    def {method}({sig_arg}) -> list[str]:\n{body}"
+    return f"{note}    def {method}({sig_arg}) -> list[str]:\n{body}"
 
 
 _WORKTREE_HELPERS = """
@@ -756,12 +800,16 @@ class {cls}:
 
         A red command blocks REVIEW. A command that cannot run is advisory instead: the
         gate is visibly UNVERIFIED without deadlocking a task on a missing tool or timeout.
+
+        The methods are the ENGINE's leg names, not the tools' (#412): ``typecheck_cmd`` is
+        the lint leg, ``types_cmd`` the static-typing leg. Calling exactly the pair both
+        merge gates call is what keeps REVIEW and merge from checking different things.
         """
         if not worktree or not os.path.isdir(worktree):
             return []
         findings: list[dict] = []
-        for label, argv in (("lint", self.lint_cmd()),
-                            ("typecheck", self.typecheck_cmd())):
+        for label, argv in (("lint", self.typecheck_cmd()),
+                            ("typecheck", self.types_cmd())):
             if (finding := self._gate(worktree, label, argv)) is not None:
                 findings.append(finding)
         return findings

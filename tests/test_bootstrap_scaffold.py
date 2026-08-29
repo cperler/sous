@@ -128,7 +128,11 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     cfg = mod.get_config()
     assert cfg.agent_for(Stage.IMPLEMENT, "implement") == "python-backend-developer"
     assert cfg.test_unit_cmd() == ["uv", "run", "python", "-m", "pytest", "-q"]
-    assert cfg.lint_cmd() == ["uv", "run", "python", "-m", "ruff", "check", "."]
+    # #412: profile `lint` lands on the engine's LINT leg (typecheck_cmd) and profile
+    # `typecheck` on its STATIC-TYPING leg (types_cmd) — the pair both merge gates call.
+    assert cfg.typecheck_cmd() == ["uv", "run", "python", "-m", "ruff", "check", "."]
+    assert cfg.types_cmd() == ["uv", "run", "python", "-m", "mypy", "."]
+    assert not hasattr(cfg, "lint_cmd")  # exactly one method name per engine leg
     assert cfg.schema_for("test")["title"] == "test"  # schema_for inherits canonical
     # profile.toml round-trips
     rp = read_profile(tmp_path / "py_svc" / "profile.toml")
@@ -584,3 +588,49 @@ def test_gate_claimed_by_another_toolchain_is_skipped_not_mis_sliced(tmp_path) -
     # The single-language case still probes the runner it really uses.
     pure = profile_from_languages("svc", ["python"], MANIFEST)
     assert pure.worktree["interpreter_probe"] == ["uv", "run", "python"]
+
+
+# --- the merge gates run the SAME legs the REVIEW gate does (#412) -------------------
+
+def test_generated_adapter_feeds_both_merge_gate_legs(tmp_path, monkeypatch) -> None:
+    """#412: a scaffolded adapter must put its linter on the engine's LINT leg and its type
+    checker on the STATIC-TYPING leg.
+
+    The old mapping (`typecheck` -> `typecheck_cmd`, no `types_cmd`) made both merge gates
+    run mypy under the label "typecheck", never run ruff at all, and record `types` as
+    absent — so a batch could pass its integration gate, merge, pass its trunk gate, and
+    leave trunk red on the linter CI enforces.
+    """
+    prof = profile_from_languages("gate-legs", ["python"], MANIFEST)
+    scaffold_adapter("gate-legs", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "gate-legs").get_config()
+    eng = Engine(
+        StatusStore(tmp_path / "run"), CostLedger(tmp_path / "costs.jsonl"), cfg,
+        meta_task_source=cfg.task_source,
+        registry=_origin_verifying_registry(),
+    )
+
+    def fake_run(argv, **kwargs):  # noqa: ANN001 - the engine's subprocess seam
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr("orchestrator.engine.subprocess.run", fake_run)
+    commands, skipped = eng._run_verification_commands(tmp_path, timeout_s=5)
+
+    by_name = {c["name"]: c["argv"] for c in commands}
+    assert by_name["typecheck"] == ["uv", "run", "python", "-m", "ruff", "check", "."]
+    assert by_name["types"] == ["uv", "run", "python", "-m", "mypy", "."]
+    # The static-typing leg is RUN, not recorded absent (the pre-#412 symptom).
+    assert "types" not in [s["name"] for s in skipped]
+
+
+def test_single_static_analysis_command_stays_on_the_primary_leg(tmp_path) -> None:
+    """A stack declaring only `typecheck` (typescript: tsc) keeps it on `typecheck_cmd`,
+    the leg every adapter must have, rather than moving its only gate onto the optional
+    duck-typed one."""
+    prof = profile_from_languages("ts-svc", ["typescript"], MANIFEST)
+    assert "lint" not in prof.commands  # premise: the typescript stack declares no linter
+    scaffold_adapter("ts-svc", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "ts-svc").get_config()
+
+    assert cfg.typecheck_cmd() == ["pnpm", "exec", "tsc", "--noEmit"]
+    assert cfg.types_cmd() == ["true"]  # no-op sentinel; the gate records it as skipped
