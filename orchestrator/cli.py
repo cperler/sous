@@ -31,6 +31,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, cast
@@ -171,6 +172,39 @@ _ENGINE_COMMANDS = frozenset({
 })
 
 
+#: Extra runs-roots for the cross-project board, ``os.pathsep``-separated (#386). Same shape
+#: as ``PATH``, and the same "name it once in the environment" habit as
+#: ``ORCHESTRATOR_ENGINE_PROJECT`` — so the everyday command is a bare
+#: ``orchestrator dashboard --watch`` instead of repeating every project's root each time.
+#: Deliberately an env var and NOT a new machine-level config file: a config file is a whole
+#: new format, discovery order, and precedence story for a list of directories, and nothing
+#: else in the harness reads one. If the env var proves awkward in daily use, a config file
+#: can be added later behind exactly this same resolution point.
+DASHBOARD_ROOTS_ENV = "ORCHESTRATOR_DASHBOARD_ROOTS"
+
+
+def _dashboard_roots(args: argparse.Namespace) -> list[str]:
+    """Every runs-root the board should cover, in order, de-duplicated (#386).
+
+    Sources, all additive: the global ``--root``, each repeated ``--also-root``, and the
+    ``os.pathsep``-separated ``ORCHESTRATOR_DASHBOARD_ROOTS``. ``--also-root`` rather than a
+    repeatable ``--root`` on the subparser is forced by argparse: a subparser copies its own
+    namespace over the parent's, so re-declaring ``--root`` there would clobber a global
+    ``--root`` given BEFORE the subcommand with the subparser's default.
+    """
+    raw = [args.root, *(getattr(args, "also_root", None) or [])]
+    raw += os.environ.get(DASHBOARD_ROOTS_ENV, "").split(os.pathsep)
+    seen: set[str] = set()
+    roots: list[str] = []
+    for item in raw:
+        item = (item or "").strip()
+        if not item or item in seen:
+            continue
+        seen.add(item)
+        roots.append(item)
+    return roots
+
+
 def _consumes_shared_root(args: argparse.Namespace) -> bool:
     """True when the parsed command actually routes through ``_engine()`` and so
     honors ``--shared-root``. Only the per-run engine commands and ``batch-plan
@@ -259,6 +293,10 @@ def main(argv: list[str] | None = None) -> int:
       ``--watch`` (clear-screen polling loop) and ``--serve`` (HTTP server mode added by #94).
       ``--serve`` binds ``web_dashboard.serve`` on ``--host``/``--port`` and forwards
       ``--limit``/``--all``/``--stale-after`` as ``snap_kwargs``; the call blocks until Ctrl-C.
+      Since #386 ``dashboard`` also spans several runs-roots (``--also-root``, repeatable, and
+      ``$ORCHESTRATOR_DASHBOARD_ROOTS``) and several project adapters: each row's adapter is
+      resolved from the ``project_ref`` on its own run doc, so ``--project`` is only the
+      fallback for run docs written before that field existed. Both modes cover the same roots.
     * **Cross-run learnings KB** (``kb show``/``kb add``) — reads/appends
       ``<runs-root>/learnings-kb.jsonl``.
     """
@@ -691,6 +729,13 @@ def main(argv: list[str] | None = None) -> int:
                     help="show every run (default: non-terminal + the 5 most-recent terminal)")
     db.add_argument("--stale-after", type=int, default=1800,
                     help="a task with no update for this many seconds is flagged stale")
+    # #386: extra runs-roots so concurrent batches across PROJECTS share one board. Named
+    # --also-root, not a repeatable --root: a subparser --root would clobber the global one.
+    db.add_argument("--also-root", action="append", metavar="RUNS_ROOT",
+                    help="an ADDITIONAL runs-root to include (repeatable). Each run resolves "
+                         "its own project adapter from its run doc, so roots from different "
+                         f"projects mix freely. ${DASHBOARD_ROOTS_ENV} (os.pathsep-separated) "
+                         "adds roots too, so the everyday command can be a bare `dashboard`")
 
     kb = sub.add_parser("kb", help="cross-run learnings KB (#72): show relevant prior "
                                    "learnings, or teach the system a lesson (--root = runs/)")
@@ -805,8 +850,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.cmd == "dashboard":
-        # Cross-session board (#6): reads every runs/<id>/ store under --root. Needs --project
-        # to build the per-run read-only engine (like `status`), but NOT --run (it spans runs).
+        # Cross-session board (#6): reads every runs/<id>/ store under the runs-root(s). Never
+        # needs --run (it spans runs), and since #386 it spans ROOTS and PROJECTS too: extra
+        # roots come from --also-root / ORCHESTRATOR_DASHBOARD_ROOTS, and each row's adapter is
+        # resolved from the `project_ref` on its own run doc. --project is now only the
+        # FALLBACK for run docs written before that field existed.
         from .dashboard import (
             DashboardSnapshotKwargs,
             dashboard_snapshot,
@@ -816,8 +864,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         from .usage_probe import read_usage
 
-        if not args.root or not args.project:
-            p.error("--root and --project are required for dashboard")
+        roots = _dashboard_roots(args)
+        if not roots:
+            p.error(
+                "dashboard needs at least one runs-root: --root, --also-root, or "
+                f"${DASHBOARD_ROOTS_ENV}"
+            )
         factory = default_engine_factory(args.project, mode=args.mode, provider=args.provider)
         snap_kw: DashboardSnapshotKwargs = {
             "stale_after_s": args.stale_after,
@@ -828,11 +880,11 @@ def main(argv: list[str] | None = None) -> int:
         }
         if args.serve:
             # Read-only web skin (#94): serve dashboard_snapshot()/stream_probe as JSON + a
-            # self-contained polling page. Same runs-root + read-only engine as the text board.
+            # self-contained polling page. Same runs-roots + read-only engine as the text board.
             from .web_dashboard import serve as serve_web
 
             serve_web(
-                args.root, factory, host=args.host, port=args.port, usage_reader=read_usage,
+                roots, factory, host=args.host, port=args.port, usage_reader=read_usage,
                 snap_kwargs=dict(
                     stale_after_s=args.stale_after, limit=args.limit, show_all=args.all,
                 ),
@@ -845,10 +897,10 @@ def main(argv: list[str] | None = None) -> int:
 
             # Ctrl-C ends the loop cleanly (render_watch also swallows KeyboardInterrupt).
             with contextlib.suppress(KeyboardInterrupt):
-                render_watch(args.root, emit=print, sleeper=time.sleep,
+                render_watch(roots, emit=print, sleeper=time.sleep,
                              interval=args.interval, **snap_kw)
             return 0
-        print(render_dashboard(dashboard_snapshot(args.root, **snap_kw)))
+        print(render_dashboard(dashboard_snapshot(roots, **snap_kw)))
         return 0
 
     if args.cmd == "panel-report":
@@ -1207,6 +1259,7 @@ def main(argv: list[str] | None = None) -> int:
                 sleeper=time.sleep if args.wait else None,
                 max_concurrent=args.max_concurrent,
                 idle_timeout_s=args.idle_timeout, poll_interval_s=args.poll_interval,
+                project_ref=args.project,  # #386: stamp the adapter on each derived run
             )
         except QueueError as exc:
             _emit({"ok": False, "error": str(exc)})
@@ -1239,6 +1292,10 @@ def main(argv: list[str] | None = None) -> int:
                                  progress_comments=args.progress_comments,
                                  max_filed_followups=args.max_filed_followups,
                                  review_workflow=args.review_workflow,
+                                 # #386: remember WHICH adapter made this run, so a later
+                                 # process (the cross-root dashboard) can re-resolve it from
+                                 # the doc instead of assuming one --project for every run.
+                                 project_ref=args.project,
                                  serialize_file_contention=(
                                      not args.no_serialize_file_contention))
         except RunExistsError as exc:
@@ -1255,6 +1312,7 @@ def main(argv: list[str] | None = None) -> int:
                "progress_comments": run.progress_comments,
                "max_filed_followups": run.max_filed_followups,
                "review_workflow": run.review_workflow,
+               "project_ref": run.project_ref,
                "serialize_file_contention": run.serialize_file_contention})
     elif args.cmd == "add-task":
         pipeline = (

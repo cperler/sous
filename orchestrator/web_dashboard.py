@@ -10,6 +10,8 @@ still project-agnostic (the engine is never touched for model work; the board on
 The routing is factored into a PURE ``route_request`` so the whole surface is unit-testable
 without a socket: it serves the inlined static page for ``/``, ``dashboard_snapshot`` as JSON for
 ``/api/snapshot``, and ``probe_current_stream`` (over ``root/<run>``) as JSON for ``/api/stream``.
+Like the terminal board, it covers one runs-root or SEVERAL (#386), so one local page is the
+whole machine's view of what is in flight across projects.
 The server wrapper (``build_server`` / ``serve``) is a tiny GET-only handler around it; only the
 final ``serve_forever`` loop is not exercised by a unit test.
 """
@@ -20,15 +22,10 @@ import json
 import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import TYPE_CHECKING
 from urllib.parse import parse_qs, urlsplit
 
-from .dashboard import dashboard_snapshot
+from .dashboard import EngineFactory, Roots, dashboard_snapshot, resolve_run_root
 from .stream_probe import probe_current_stream
-
-if TYPE_CHECKING:  # pragma: no cover - typing only
-    from .engine import Engine
 
 _JSON_CT = "application/json; charset=utf-8"
 _HTML_CT = "text/html; charset=utf-8"
@@ -50,8 +47,8 @@ def route_request(
     path: str,
     query: dict[str, list[str]],
     *,
-    root: str | Path,
-    engine_factory: Callable[[Path], Engine],
+    root: Roots,
+    engine_factory: EngineFactory,
     usage_reader: Callable[[], object] | None = None,
     clock: Callable[[], float] = time.time,
     snap_kwargs: dict | None = None,
@@ -62,9 +59,12 @@ def route_request(
     Routes:
       - ``/`` (and ``/index.html``) → the inlined, self-contained static page.
       - ``/api/snapshot`` → ``dashboard_snapshot(root, ...)`` as JSON.
-      - ``/api/stream?run=&task=&stage=`` → ``probe_current_stream(root/<run>, task, stage)`` as
+      - ``/api/stream?run=&task=&stage=[&root=]`` → ``probe_current_stream`` for that run as
         JSON, or ``404`` when there is no stream to probe (interactive/ENGINE lane, or nothing
-        dispatched yet). Missing ``run``/``task`` → ``400``.
+        dispatched yet). The run's root is resolved by discovery across every configured
+        runs-root (#386); ``root=`` disambiguates when two roots hold the same run id, and an
+        unknown/ambiguous run is a ``404`` rather than a guessed path. Missing ``run``/``task``
+        → ``400``.
       - anything else → ``404``.
 
     ``snap_kwargs`` is forwarded verbatim to ``dashboard_snapshot``; the same keys the CLI
@@ -90,7 +90,10 @@ def route_request(
         stage = _first(query, "stage")
         if not run or not task:
             return _json(400, {"error": "run and task query params are required"})
-        probe = probe_current_stream(Path(root) / run, task, stage)
+        run_root = resolve_run_root(root, run, prefer_root=_first(query, "root"))
+        if run_root is None:
+            return _json(404, {"error": "unknown or ambiguous run", "run": run, "task": task})
+        probe = probe_current_stream(run_root, task, stage)
         if probe is None:
             return _json(404, {"error": "no stream", "run": run, "task": task, "stage": stage})
         return _json(200, {"run": run, "task": task, "stage": stage, **probe})
@@ -102,8 +105,8 @@ def route_request(
 
 def _make_handler(
     *,
-    root: str | Path,
-    engine_factory: Callable[[Path], Engine],
+    root: Roots,
+    engine_factory: EngineFactory,
     usage_reader: Callable[[], object] | None,
     clock: Callable[[], float],
     snap_kwargs: dict | None,
@@ -142,8 +145,8 @@ def _make_handler(
 
 
 def build_server(
-    root: str | Path,
-    engine_factory: Callable[[Path], Engine],
+    root: Roots,
+    engine_factory: EngineFactory,
     *,
     host: str = "127.0.0.1",
     port: int = 0,
@@ -165,8 +168,8 @@ def build_server(
 
 
 def serve(
-    root: str | Path,
-    engine_factory: Callable[[Path], Engine],
+    root: Roots,
+    engine_factory: EngineFactory,
     *,
     port: int,
     host: str = "127.0.0.1",
@@ -247,6 +250,9 @@ INDEX_HTML = """<!doctype html>
   .run-head { display: flex; flex-wrap: wrap; gap: 10px; align-items: baseline;
     cursor: pointer; }
   .run-id { font-weight: 600; }
+  /* #386: which project a row belongs to, now that one board spans several. */
+  .project { font-size: 11px; color: var(--muted); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 6px; }
   .badge { font-size: 11px; padding: 1px 7px; border-radius: 20px; border: 1px solid var(--line);
     color: var(--muted); }
   .badge.running { color: var(--run); border-color: var(--run); }
@@ -341,9 +347,12 @@ INDEX_HTML = """<!doctype html>
     items.forEach(function (it) { box.appendChild(h("div", "attn", attnLine(it))); });
   }
 
-  function drillStream(runId, inf, container) {
+  function drillStream(runId, inf, container, runRoot) {
     var q = "run=" + encodeURIComponent(runId) + "&task=" + encodeURIComponent(inf.task_id);
     if (inf.stage) q += "&stage=" + encodeURIComponent(inf.stage);
+    // #386: the board spans runs-roots, so send this row's own root — the server refuses to
+    // guess when two roots hold the same run id.
+    if (runRoot) q += "&root=" + encodeURIComponent(runRoot);
     container.innerHTML = "";
     container.appendChild(h("div", "muted", "live stream — " + inf.task_id
       + (inf.stage ? " · " + inf.stage : "")));
@@ -385,6 +394,8 @@ INDEX_HTML = """<!doctype html>
       var card = h("div", "run" + (row.attention ? " needs" : ""));
       var head = h("div", "run-head");
       head.appendChild(h("span", "run-id", row.run_id));
+      // #386: with several projects' runs on one board the run id alone is ambiguous.
+      head.appendChild(h("span", "project", row.project || "?"));
       head.appendChild(h("span", "badge " + (row.state || ""), row.state));
       var prog = row.progress || {};
       var done = (prog.completed || 0) + (prog.closed_infeasible || 0) + (prog.superseded || 0);
@@ -424,7 +435,7 @@ INDEX_HTML = """<!doctype html>
             } else {
               open[row.run_id] = { task: inf.task_id, stage: inf.stage };
               drill.style.display = "block"; btn.textContent = "hide stream";
-              drillStream(row.run_id, inf, drill);
+              drillStream(row.run_id, inf, drill, row.root);
             }
           });
         } else {
@@ -440,7 +451,7 @@ INDEX_HTML = """<!doctype html>
         var match = infs.filter(function (i) {
           return i.task_id === open[row.run_id].task && i.stream_available;
         })[0];
-        if (match) drillStream(row.run_id, match, drill);
+        if (match) drillStream(row.run_id, match, drill, row.root);
         else { drill.appendChild(h("div", "muted", "(stream ended)")); stopStream(row.run_id); }
       }
       card.appendChild(drill);
@@ -454,9 +465,10 @@ INDEX_HTML = """<!doctype html>
     var bits = Object.keys(counts).sort().map(function (k) { return k + "=" + counts[k]; });
     var usage = hd.usage;
     var usageStr = (usage && usage.five_hour_pct != null)
-      ? ("usage 5h " + Math.round(usage.five_hour_pct) + "% / 7d "
+      // #386: the probe reads the ACCOUNT's window, shared by every project on this board.
+      ? ("usage (account) 5h " + Math.round(usage.five_hour_pct) + "% / 7d "
          + Math.round(usage.seven_day_pct || 0) + "%")
-      : "usage unavailable";
+      : "usage (account) unavailable";
     // #331: qualify the board-wide spend the same way the text board does — unmetered calls
     // add $0 to total_spend_usd, so an unqualified total silently understates real spend.
     var unmetered = hd.unmetered_calls || 0;

@@ -446,7 +446,8 @@ def run_id_for(entry: dict, *, prefix: str = "queue") -> str:
 
 
 def _ingest_batch(
-    engine: Engine, entry: dict, run_id: str, *, lane: ExecutionLane
+    engine: Engine, entry: dict, run_id: str, *, lane: ExecutionLane,
+    project_ref: str | None = None,
 ) -> tuple[list[str], bool]:
     """Create-or-reuse ``run_id`` and add each of the batch's tasks in listed order,
     returning ``(added_task_ids, run_was_created)``. Fully idempotent so a restarted
@@ -461,7 +462,11 @@ def _ingest_batch(
     its status document is verified to exist and to agree with the ref's identity (#278).
     Skipping on the bare ref would make a crash between ``add_task``'s ref write and its
     doc write permanent: the half-registered task could never be rebuilt."""
-    _run, created = engine.create_or_reuse_run(run_id, lane)
+    # ``project_ref`` (#386) records the adapter this drain was launched with, so a
+    # queue-derived run is no more anonymous to the cross-root dashboard than an
+    # init-run one. It participates in the reuse comparison like every other immutable
+    # setting: the same run id ingested under a DIFFERENT adapter is a different run.
+    _run, created = engine.create_or_reuse_run(run_id, lane, project_ref=project_ref)
     already = engine.registered_task_ids(run_id)
     added: list[str] = []
     for task_id in entry["tasks"]:
@@ -492,6 +497,7 @@ def drive_queue(
     idle_timeout_s: int = 300,
     poll_interval_s: int = 15,
     run_id_prefix: str = "queue",
+    project_ref: str | None = None,
 ) -> dict:
     """Drain the queue under a process-lifetime owner guard.
 
@@ -517,6 +523,7 @@ def drive_queue(
             idle_timeout_s=idle_timeout_s,
             poll_interval_s=poll_interval_s,
             run_id_prefix=run_id_prefix,
+            project_ref=project_ref,
         )
 
 
@@ -534,6 +541,7 @@ def _drive_queue_held(
     idle_timeout_s: int,
     poll_interval_s: int,
     run_id_prefix: str,
+    project_ref: str | None = None,
 ) -> dict:
     """Implementation of ``drive_queue`` while its consumer guard is held.
 
@@ -607,7 +615,9 @@ def _drive_queue_held(
         # the claim fixed the run id, once per claimed entry.
         engine, runner = engine_factory(run_id)
         try:
-            added, created_now = _ingest_batch(engine, head, run_id, lane=lane)
+            added, created_now = _ingest_batch(
+                engine, head, run_id, lane=lane, project_ref=project_ref
+            )
         except Exception as exc:
             # Ingest failed — strip the claim so the entry (still at the head) is retried
             # next launch, then surface the failure (looping on the same bad head would spin).

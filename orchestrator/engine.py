@@ -94,6 +94,7 @@ from .port_registry import (
 )
 from .ports.execution import Registry, default_registry
 from .ports.project import ProjectConfig, TaskSource
+from .project_loader import normalize_project_ref
 from .render import (
     format_review_issue,
     render_completion_note,
@@ -501,6 +502,7 @@ class Engine:
         progress_comments: bool = False,
         max_filed_followups: int | None = None,
         review_workflow: bool = False,
+        project_ref: str | None = None,
         serialize_file_contention: bool = True,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
@@ -517,6 +519,10 @@ class Engine:
         default off). ``max_filed_followups`` (#196) sets a run-wide default cap on filed
         review follow-ups so every task in the run shares a non-default baseline without
         repeating it per add_task; None inherits the engine constructor default.
+        ``project_ref`` (#386) records WHICH project adapter this run was created with (the
+        ``--project`` spec, directory forms resolved to an absolute path) so a later process
+        can re-resolve it from the doc alone — the cross-root dashboard renders each run
+        through its own adapter rather than through whichever ``--project`` it was handed.
         ``review_workflow`` (#73) opts REVIEW into the multi-agent find→verify panel on lanes
         that can execute a plan — off by default, and cost/capacity policy can still veto it
         per dispatch. ``serialize_file_contention`` (#377) holds a task at the post-SCOPE
@@ -545,6 +551,7 @@ class Engine:
             progress_comments=progress_comments,
             max_filed_followups=max_filed_followups,
             review_workflow=review_workflow,
+            project_ref=normalize_project_ref(project_ref),
             serialize_file_contention=serialize_file_contention,
         )
         self.store.create_run_doc(run)
@@ -552,12 +559,14 @@ class Engine:
 
     #: The run-level settings ``create_or_reuse_run`` treats as IMMUTABLE — a reuse that
     #: asks for different values is a different run, so it raises instead of silently
-    #: handing back a run configured some other way. Kept in sync with ``create_run``'s
+    #: handing back a run configured some other way. (``project_ref`` is immutable once
+    #: SET; an absent one is adopted rather than refused — see ``create_or_reuse_run``.) Kept in sync with ``create_run``'s
     #: parameters by the #206 persistence guard test.
     _REUSE_IMMUTABLE_SETTINGS = (
         "lane", "budget_usd", "route_by_cost", "route_by_capacity",
         "cross_provider_fallback", "warm_retry", "progress_comments",
-        "max_filed_followups", "review_workflow", "serialize_file_contention",
+        "max_filed_followups", "review_workflow", "project_ref",
+        "serialize_file_contention",
     )
 
     def create_or_reuse_run(
@@ -573,6 +582,7 @@ class Engine:
         progress_comments: bool = False,
         max_filed_followups: int | None = None,
         review_workflow: bool = False,
+        project_ref: str | None = None,
         serialize_file_contention: bool = True,
     ) -> tuple[Run, bool]:
         """The EXPLICIT idempotent create (#280). Returns ``(run, created)``: the freshly
@@ -583,7 +593,11 @@ class Engine:
         Reuse is only idempotent when it asks for the SAME run: the requested immutable
         settings are compared against the persisted ones and a mismatch raises
         ``ContractError`` listing the diffs, rather than handing back a run configured
-        differently from what the caller asked for. A corrupt/unreadable run doc
+        differently from what the caller asked for. The one exception is a MISSING
+        ``project_ref`` (#386): a run created before that field existed is not disagreeing
+        with a caller that now supplies one, so the ref is adopted onto the doc instead of
+        refusing the reuse — otherwise upgrading a queue driver would strand every
+        in-flight run it re-ingests. A corrupt/unreadable run doc
         propagates as ``StatusStoreError`` — it is never treated as "absent" (#112)."""
         requested: dict[str, object] = dict(
             lane=lane, budget_usd=budget_usd, route_by_cost=route_by_cost,
@@ -591,6 +605,9 @@ class Engine:
             cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
             progress_comments=progress_comments,
             max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+            # Compared in the PERSISTED spelling: create_run normalizes a directory spec, so
+            # a raw request string would read as a mismatch against its own stored form.
+            project_ref=normalize_project_ref(project_ref),
             serialize_file_contention=serialize_file_contention,
         )
         try:
@@ -600,6 +617,7 @@ class Engine:
                 cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
                 progress_comments=progress_comments,
                 max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+                project_ref=project_ref,
                 serialize_file_contention=serialize_file_contention,
             )
         except RunExistsError:
@@ -609,16 +627,32 @@ class Engine:
         # Existing doc — load it (a corrupt doc raises here, as it must) and verify the
         # caller is asking for the run that is actually on disk.
         existing = self.store.load_run(run_id)
+        # A run created BEFORE #386 carries no project_ref, so an upgraded caller that now
+        # supplies one is not disagreeing with it — it is filling in a blank. Treating that
+        # as a mismatch would refuse to resume every in-flight pre-#386 queue run (the drain
+        # re-ingests on every restart), so adopt the ref instead of raising, and only compare
+        # once the doc actually names an adapter.
+        adopt_ref = (
+            existing.project_ref is None and requested["project_ref"] is not None
+        )
         diffs = [
             f"{name}: requested {requested[name]!r} != persisted {getattr(existing, name)!r}"
             for name in self._REUSE_IMMUTABLE_SETTINGS
             if requested[name] != getattr(existing, name)
+            and not (name == "project_ref" and adopt_ref)
         ]
         if diffs:
             raise ContractError(
                 f"run {run_id} already exists with different settings; "
                 f"refusing to reuse it: {'; '.join(diffs)}"
             )
+        if adopt_ref:
+            ref = requested["project_ref"]
+
+            def _stamp(run: Run) -> None:
+                run.project_ref = ref  # type: ignore[assignment]  # str|None by construction
+
+            return self.store.update_run(run_id, _stamp), False
         return existing, False
 
     def add_task(

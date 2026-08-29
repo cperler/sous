@@ -18,6 +18,15 @@ The engine is never touched for model work: the dashboard only *reads*. The ``En
 per run is built by an injected ``engine_factory`` (the CLI supplies a real one; tests supply
 a FakeProject one) so the assembly is drivable off tmp runs, and the clock / usage probe are
 injected too so a snapshot is deterministic and a probe failure can never break the board.
+
+The board spans ROOTS and PROJECTS, not just runs (#386). Two projects running batches at
+once keep their runs under their own ``<project>/runs/`` and drive them through different
+project adapters, so every entry point here accepts several runs-roots and the engine
+factory resolves each row's adapter from the ``project_ref`` persisted on that run's own
+doc. Selection, the attention-first sort and the header stay GLOBAL across roots — a run
+needing a human outranks a healthy run in another project — and the utilization probe is
+labelled as the account-wide figure it has always been, now that several projects visibly
+share it. A run whose adapter will not resolve degrades to one marked row.
 """
 
 from __future__ import annotations
@@ -25,11 +34,11 @@ from __future__ import annotations
 import contextlib
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING, TypedDict, Unpack
+from typing import TYPE_CHECKING, TypeAlias, TypedDict, Unpack
 
 from .alerting import _fmt_activity
 from .render import aggregate_cost_cell
@@ -38,6 +47,16 @@ from .stream_probe import find_current_stream
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from .engine import Engine
+
+#: One runs-root, or several (#386). Every public entry point here takes either, so a
+#: single-root caller reads exactly as it did before.
+Roots: TypeAlias = "str | Path | Sequence[str | Path]"
+
+#: Builds the read-only ``Engine`` for ONE run: given that run's StatusStore root and the
+#: project adapter ref persisted on its own run doc (``Run.project_ref``, None for a
+#: pre-#386 doc), return an Engine wired to it. Taking the ref as an argument is what lets
+#: one board render runs from several projects — the resolution is per run, not per board.
+EngineFactory = Callable[[Path, "str | None"], "Engine"]
 
 # Terminal run states as bare strings (this module works off the JSON snapshot, not enums).
 _TERMINAL = {s.value for s in TERMINAL_RUN_STATES}
@@ -50,7 +69,10 @@ _ATTENTION_RANK = {
     "paused": 2,
     "budget_exhausted": 3,
     "unreadable": 4,
-    "stale": 5,
+    # #386: a run whose project adapter will not load is as unreadable as a corrupt doc —
+    # the board can name it but can say nothing about its state.
+    "adapter_unresolved": 5,
+    "stale": 6,
 }
 
 
@@ -60,12 +82,16 @@ _ATTENTION_RANK = {
 @dataclass(frozen=True)
 class _RunLoc:
     """Where a run lives on disk: its id, its StatusStore root (the ``runs/<id>/`` subdir),
-    the run-doc mtime (recency key), and whether its status doc is unreadable/corrupt."""
+    the run-doc mtime (recency key), whether its status doc is unreadable/corrupt, and the
+    project adapter it was created with (#386 — ``Run.project_ref``, None for a run doc
+    written before that field existed or an unreadable one). The ref is lifted here, from
+    the parse discovery already does, so resolving a row's adapter costs no second read."""
 
     run_id: str
     root: Path
     mtime: float
     unreadable: bool
+    project_ref: str | None = None
 
 
 def _discover(root: str | Path) -> list[_RunLoc]:
@@ -83,6 +109,7 @@ def _discover(root: str | Path) -> list[_RunLoc]:
         if not candidates:
             continue  # not a run dir
         run_id: str | None = None
+        project_ref: str | None = None
         mtime = child.stat().st_mtime
         for c in candidates:
             try:
@@ -91,11 +118,13 @@ def _discover(root: str | Path) -> list[_RunLoc]:
                 continue
             if isinstance(data, dict) and data.get("document_type") == "run":
                 run_id = str(data.get("run_id") or child.name)
+                ref = data.get("project_ref")
+                project_ref = str(ref) if ref else None
                 with contextlib.suppress(OSError):  # pragma: no cover - defensive
                     mtime = c.stat().st_mtime
                 break
         if run_id is not None:
-            locs.append(_RunLoc(run_id, child, mtime, unreadable=False))
+            locs.append(_RunLoc(run_id, child, mtime, unreadable=False, project_ref=project_ref))
         else:
             # Status files present but no readable run doc → unreadable run (best-effort id
             # = the subdir name, which is the run id by the runs/<id>/ convention).
@@ -104,13 +133,69 @@ def _discover(root: str | Path) -> list[_RunLoc]:
     return locs
 
 
-def discover_runs(root: str | Path) -> list[str]:
+def normalize_roots(root: Roots) -> list[Path]:
+    """One or many runs-roots as an ordered, de-duplicated list of paths (#386).
+
+    The board spans ROOTS as well as runs: two projects running batches at once keep their
+    runs under their own ``<project>/runs/``. A bare path stays a one-element list, so every
+    single-root caller is unchanged. De-duplication is by RESOLVED path, so passing the same
+    root twice (or by two spellings) does not double every row."""
+    raw = [root] if isinstance(root, (str, Path)) else list(root)
+    seen: set[Path] = set()
+    out: list[Path] = []
+    for item in raw:
+        path = Path(item)
+        try:
+            key = path.resolve()
+        except OSError:  # pragma: no cover - defensive (unresolvable path)
+            key = path
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(path)
+    return out
+
+
+def _discover_all(root: Roots) -> list[_RunLoc]:
+    """Every run under EVERY given runs-root, merged into one recency-ordered list. The
+    merge is global on purpose: the board's attention-first ordering must not be grouped by
+    root, because a run needing a human outranks a healthy run in another project."""
+    locs: list[_RunLoc] = []
+    for one in normalize_roots(root):
+        locs.extend(_discover(one))
+    locs.sort(key=lambda loc: loc.mtime, reverse=True)
+    return locs
+
+
+def resolve_run_root(root: Roots, run_id: str, *, prefer_root: str | None = None) -> Path | None:
+    """The StatusStore root for ``run_id``, or None when the board cannot name exactly one.
+
+    With several runs-roots (#386), ``<root>/<run_id>`` is no longer a safe join: the run may
+    live under any of them, and two roots may even hold the same run id. Resolve by the same
+    discovery the board uses, and when more than one root matches let the caller disambiguate
+    with ``prefer_root`` (the web page sends the row's own ``root``, which it already has).
+    Returning None instead of a guessed path is what makes a wrong-root read impossible."""
+    matches = [loc for loc in _discover_all(root) if loc.run_id == run_id]
+    if prefer_root is not None:
+        matches = [loc for loc in matches if str(loc.root) == prefer_root]
+    return matches[0].root if len(matches) == 1 else None
+
+
+def discover_runs(root: Roots) -> list[str]:
     """All run ids under the runs ``root`` (active and terminal), most-recently-active first
-    (run-doc status-file mtime). Unreadable run dirs are included."""
-    return [loc.run_id for loc in _discover(root)]
+    (run-doc status-file mtime). Unreadable run dirs are included. Accepts several roots."""
+    return [loc.run_id for loc in _discover_all(root)]
 
 
 # --- default engine factory (production) ------------------------------------------------
+
+
+class AdapterUnresolved(Exception):
+    """No project adapter could be resolved for a run (#386): its ``project_ref`` names an
+    adapter that will not load, or the doc predates the field and no ``--project`` fallback
+    was given. Raised by the engine factory and caught by ``dashboard_snapshot``, which
+    degrades that one run to a clearly-marked reduced row — one unreadable run must never
+    blank a board that is now the whole machine's view."""
 
 
 def default_engine_factory(
@@ -118,34 +203,62 @@ def default_engine_factory(
     *,
     mode: str = "interactive",
     provider: str | None = None,
-) -> Callable[[Path], Engine]:
-    """A per-run ``Engine`` builder for the CLI: given a run's StatusStore root, wire an
-    Engine on it exactly like ``orchestrator status`` would. The dashboard only calls
-    ``engine.status``, so no interactive/model wiring runs — but the registry is built so the
-    lane audit inside ``status`` still resolves. Imported lazily to avoid an import cycle."""
+) -> EngineFactory:
+    """A per-run ``Engine`` builder for the CLI: given a run's StatusStore root and the
+    project adapter ref persisted on its run doc, wire an Engine on it exactly like
+    ``orchestrator status`` would. The dashboard only calls ``engine.status``, so no
+    interactive/model wiring runs — but the registry is built so the lane audit inside
+    ``status`` still resolves. Imported lazily to avoid an import cycle.
+
+    The adapter is resolved PER RUN (#386): a board spanning several runs-roots holds runs
+    from several projects, and rendering them all through one ``--project`` would attribute
+    every row to whichever adapter happened to be passed. A run doc with no ref (written
+    before the field existed) falls back to ``project_spec``; with neither, resolution
+    raises and the caller degrades that ONE row rather than the board. Adapters are cached
+    per spec, so N runs of one project load it once.
+
+    Resolution goes through ``project_loader`` by name/path only — the engine never imports
+    ``adapters`` (#273); this is the same seam ``--project`` already uses.
+    """
     from .cost_ledger import CostLedger
     from .engine import Engine
     from .lane_loader import build_registry
-    from .project_loader import load_engine_task_source, load_project
+    from .ports.project import ProjectConfig
+    from .project_loader import load_engine_task_source, load_project, normalize_project_ref
     from .routing import Router
     from .schemas.enums import ExecutionMode, Provider
     from .status_store import StatusStore
 
-    if project_spec is None:
-        raise SystemExit("dashboard needs --project to build the per-run lane registry")
-    project = load_project(project_spec)
+    fallback = normalize_project_ref(project_spec)
     exec_mode = ExecutionMode(mode)
     prov = Provider(provider) if provider else None
-    schema_provider = getattr(project, "schema_for", None)
     meta_task_source = load_engine_task_source()
+    cache: dict[str, ProjectConfig] = {}
 
-    def factory(run_root: Path) -> Engine:
+    def resolve(project_ref: str | None) -> ProjectConfig:
+        spec = normalize_project_ref(project_ref) or fallback
+        if spec is None:
+            raise AdapterUnresolved(
+                "no project adapter for this run: its run doc predates `project_ref` "
+                "(#386) and no --project fallback was given"
+            )
+        if spec not in cache:
+            try:
+                cache[spec] = load_project(spec)
+            # load_project exits the process on an unknown/broken spec, which is right for
+            # `--project` but fatal for a board where ONE stale ref must not blank the view.
+            except (Exception, SystemExit) as exc:
+                raise AdapterUnresolved(f"project adapter {spec!r} did not load: {exc}") from exc
+        return cache[spec]
+
+    def factory(run_root: Path, project_ref: str | None = None) -> Engine:
+        project = resolve(project_ref)
         store = StatusStore(run_root)
         ledger = CostLedger(run_root / "stage-costs.jsonl")
         registry = build_registry(
             include_interactive=False,  # read-only board: never build interactive lanes
-            headless_schema_provider=schema_provider,
-            codex_schema_provider=schema_provider,
+            headless_schema_provider=getattr(project, "schema_for", None),
+            codex_schema_provider=getattr(project, "schema_for", None),
             setup_project=project,
             run_log_root=run_root,
         )
@@ -203,6 +316,67 @@ def _last_event_age_s(events: list[dict], *, now_epoch: float) -> float | None:
     return None
 
 
+def _project_label(project_ref: str | None, project_name: str | None) -> str:
+    """What to show in the row's project column (#386). The adapter's own ``name`` when the
+    adapter loaded (``sous``, ``family-finance``) — that is what a human calls the project.
+    Otherwise the persisted ref, shortened so a long directory spec does not eat the line —
+    and shortened to the PROJECT dir, not the adapter dir, since every project's adapter is
+    called ``.orchestration``. ``?`` when the run doc names no adapter at all."""
+    if project_name:
+        return project_name
+    if not project_ref:
+        return "?"
+    if "/" not in project_ref:
+        return project_ref  # module path or entry-point name — already short and meaningful
+    path = Path(project_ref)
+    # ``…/family-finance/.orchestration`` → ``family-finance``: the dotted adapter dir is the
+    # same name in every project, so it identifies nothing on a cross-project board.
+    return path.parent.name or path.name if path.name.startswith(".") else path.name
+
+
+def _reduced_row(base: dict, *, flag: str, kind: str, detail: str | None = None) -> dict:
+    """A row for a run the board could not read or could not resolve an adapter for: the
+    run stays VISIBLE (id, project, recency) with its state replaced by a marker, and it is
+    lifted into the attention band. Never a crash and never a silent drop — with the board
+    spanning every project on the machine, one bad run must cost one row, not the view."""
+    item: dict = {"kind": kind, "run_id": base["run_id"]}
+    if detail:
+        item["reason"] = detail
+    return {
+        **base,
+        "unreadable": True,
+        "state": "<unreadable>",
+        "attention": True,
+        "flags": [flag],
+        "progress": {},
+        "cost_usd": None,
+        "unmetered_calls": None,
+        "total_invocations": None,
+        "budget": None,
+        "last_event_age_s": None,
+        "attention_items": [item],
+    }
+
+
+def _base_row(loc: _RunLoc, *, project: str | None = None) -> dict:
+    """The identity fields every row carries, readable or not."""
+    return {
+        "run_id": loc.run_id,
+        "root": str(loc.root),
+        "mtime": loc.mtime,
+        # #386: which project this run belongs to. With rows from several projects on one
+        # board the run id alone is ambiguous, so every row — including a degraded one —
+        # answers "whose run is this?".
+        "project": project if project is not None else _project_label(loc.project_ref, None),
+        "project_ref": loc.project_ref,
+        "unreadable": False,
+        "attention": False,
+        "flags": [],
+        "inflight": [],
+        "attention_items": [],
+    }
+
+
 def _run_row(
     engine: Engine,
     loc: _RunLoc,
@@ -213,50 +387,17 @@ def _run_row(
 ) -> dict:
     """Fold one run's ``status()`` into a compact dashboard row. An unreadable run (or one
     whose ``status()`` raises on a partial doc) yields an ``<unreadable>`` row — never a crash."""
-    base = {
-        "run_id": loc.run_id,
-        "root": str(loc.root),
-        "mtime": loc.mtime,
-        "unreadable": False,
-        "attention": False,
-        "flags": [],
-        "inflight": [],
-        "attention_items": [],
-    }
+    base = _base_row(
+        loc, project=_project_label(loc.project_ref, getattr(engine.project, "name", None))
+    )
     if loc.unreadable:
-        return {
-            **base,
-            "unreadable": True,
-            "state": "<unreadable>",
-            "attention": True,
-            "flags": ["unreadable status"],
-            "progress": {},
-            "cost_usd": None,
-            "unmetered_calls": None,
-            "total_invocations": None,
-            "budget": None,
-            "last_event_age_s": None,
-            "attention_items": [{"kind": "unreadable", "run_id": loc.run_id}],
-        }
+        return _reduced_row(base, flag="unreadable status", kind="unreadable")
     try:
         status = engine.status(
             loc.run_id, stale_after_s=stale_after_s, include_activity=include_activity
         )
     except Exception:  # noqa: BLE001 - a partial/corrupt task doc becomes an unreadable row
-        return {
-            **base,
-            "unreadable": True,
-            "state": "<unreadable>",
-            "attention": True,
-            "flags": ["unreadable status"],
-            "progress": {},
-            "cost_usd": None,
-            "unmetered_calls": None,
-            "total_invocations": None,
-            "budget": None,
-            "last_event_age_s": None,
-            "attention_items": [{"kind": "unreadable", "run_id": loc.run_id}],
-        }
+        return _reduced_row(base, flag="unreadable status", kind="unreadable")
 
     state = str(status.get("run_state"))
     progress = status.get("progress") or {}
@@ -382,7 +523,7 @@ class DashboardSnapshotKwargs(TypedDict, total=False):
     limit: int
     show_all: bool
     recent_terminal: int
-    engine_factory: Callable[[Path], Engine] | None
+    engine_factory: EngineFactory | None
     usage_reader: Callable[[], object] | None
     clock: Callable[[], float]
 
@@ -408,14 +549,14 @@ def _read_usage(usage_reader: Callable[[], object] | None) -> dict | None:
 
 
 def dashboard_snapshot(
-    root: str | Path,
+    root: Roots,
     *,
     stale_after_s: int = 1800,
     include_activity: bool = True,
     limit: int = 20,
     show_all: bool = False,
     recent_terminal: int = 5,
-    engine_factory: Callable[[Path], Engine] | None = None,
+    engine_factory: EngineFactory | None = None,
     usage_reader: Callable[[], object] | None = None,
     clock: Callable[[], float] = time.time,
 ) -> dict:
@@ -427,17 +568,37 @@ def dashboard_snapshot(
     ``show_all`` it shows everything. The kept rows are then sorted attention-first (anything
     needing a human above healthy runs, ties by recency) and truncated to ``limit``.
 
-    ``engine_factory(run_root) -> Engine`` builds the read-only engine per run (required —
-    the CLI passes ``default_engine_factory``). ``usage_reader`` / ``clock`` are injected so a
-    probe failure can't break the board and the snapshot is deterministic in tests.
+    ``root`` is one runs-root or several (#386): rows from every root are merged into ONE
+    board before selection, so the attention-first ordering stays global — a run needing a
+    human outranks a healthy run in another project rather than sorting below its own root.
+
+    ``engine_factory(run_root, project_ref) -> Engine`` builds the read-only engine per run
+    (required — the CLI passes ``default_engine_factory``). It is handed the adapter ref off
+    that run's OWN doc, which is what lets one board render several projects; a factory that
+    cannot resolve an adapter raises ``AdapterUnresolved`` and costs exactly one row.
+    ``usage_reader`` / ``clock`` are injected so a probe failure can't break the board and
+    the snapshot is deterministic in tests.
     """
     if engine_factory is None:
         raise ValueError("dashboard_snapshot requires an engine_factory")
     now_epoch = clock()
-    locs = _discover(root)
+    locs = _discover_all(root)
     rows: list[dict] = []
     for loc in locs:
-        engine = engine_factory(loc.root)
+        try:
+            engine = engine_factory(loc.root, loc.project_ref)
+        # The factory resolves this run's adapter, so it is the first thing that can fail
+        # per-row. Degrade THIS run (a marked, still-visible row) rather than the board.
+        except AdapterUnresolved as exc:
+            rows.append(
+                _reduced_row(
+                    _base_row(loc),
+                    flag=f"adapter unresolved: {loc.project_ref or 'no project_ref'}",
+                    kind="adapter_unresolved",
+                    detail=str(exc),
+                )
+            )
+            continue
         rows.append(
             _run_row(
                 engine,
@@ -577,6 +738,8 @@ def _render_attention_item(item: dict) -> str:
         return f"  ! [{run}] {item.get('task_id')} STALE — no update for {ago} (stage {item.get('stage')})"
     if kind == "unreadable":
         return f"  ! [{run}] UNREADABLE status — inspect runs/{run}/ by hand"
+    if kind == "adapter_unresolved":
+        return f"  ! [{run}] PROJECT ADAPTER UNRESOLVED — {item.get('reason')}"
     return f"  ! [{run}] {kind}"  # pragma: no cover - defensive
 
 
@@ -602,12 +765,14 @@ def render_dashboard(snapshot: dict) -> str:
 
     usage = header.get("usage")
     if usage and usage.get("five_hour_pct") is not None:
+        # #386: the probe reads the ACCOUNT's window, and the board now spans projects that
+        # share it. Say "account" so the number is not misread as this root's own capacity.
         lines.append(
-            f"usage: 5h {usage['five_hour_pct']:.0f}% / 7d "
+            f"usage (account): 5h {usage['five_hour_pct']:.0f}% / 7d "
             f"{usage.get('seven_day_pct') or 0:.0f}%"
         )
     else:
-        lines.append("usage: unavailable")
+        lines.append("usage (account): unavailable")
 
     state_bits = " ".join(f"{s}={n}" for s, n in sorted(counts.items()))
     # #331: unmetered calls sum into total_spend_usd at $0, so an unqualified figure would
@@ -646,10 +811,17 @@ def render_dashboard(snapshot: dict) -> str:
     lines.append("── runs ──")
     if not runs:
         lines.append("  (no runs found)")
+    # #386: the project column is what disambiguates a board holding several projects'
+    # runs. Sized to the widest label present so a single-project board stays narrow.
+    proj_w = min(max((len(str(r.get("project") or "?")) for r in runs), default=1), 18)
     for row in runs:
         icon = _state_icon(row["state"])
+        project = str(row.get("project") or "?")[:proj_w]
         if row.get("unreadable"):
-            lines.append(f"  {icon} {row['run_id']:<24} <unreadable status>")
+            flags = f"  [{', '.join(row['flags'])}]" if row["flags"] else ""
+            lines.append(
+                f"  {icon} {row['run_id']:<24} {project:<{proj_w}} <unreadable status>{flags}"
+            )
             continue
         # #331: `≥$X` / `n/a (unmetered)` rather than a bare figure when this run's spend is
         # partly or wholly unknown; `$?` stays the marker for "no cost data at all".
@@ -664,7 +836,7 @@ def render_dashboard(snapshot: dict) -> str:
         flags = f"  [{', '.join(row['flags'])}]" if row["flags"] else ""
         age = _fmt_age(row.get("last_event_age_s"))
         lines.append(
-            f"  {icon} {row['run_id']:<24} {row['state']:<26} "
+            f"  {icon} {row['run_id']:<24} {project:<{proj_w}} {row['state']:<26} "
             f"{_progress_str(row['progress']):>7}  {cost_str:>10}{flags}  (last {age} ago)"
         )
         for inf in row["inflight"]:
@@ -676,7 +848,7 @@ def render_dashboard(snapshot: dict) -> str:
 
 
 def render_watch(
-    root: str | Path,
+    root: Roots,
     *,
     emit: Callable[[str], None],
     sleeper: Callable[[float], None],

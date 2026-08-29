@@ -463,7 +463,12 @@ cross-run `learnings-kb.jsonl` share one parent:
   `watch` (poll one run to terminal, alerting on stalls), `tail` (live tail of a running
   stage's stream via `stream_probe.py`), `dashboard` (`dashboard.py` — cross-session board of
   all runs, "what needs a human" lifted to an attention band; `--watch` polls in the
-  terminal and `--serve` binds `web_dashboard.py` as a local HTTP server), `cost-report`, `retrospective`,
+  terminal and `--serve` binds `web_dashboard.py` as a local HTTP server. It spans runs-roots
+  and PROJECTS, not just runs (#386): extra roots come from repeatable `--also-root` or
+  `$ORCHESTRATOR_DASHBOARD_ROOTS`, each row resolves its own adapter from the `project_ref`
+  persisted on its run doc — `--project` is only the fallback for pre-#386 docs — and
+  selection, attention-first ordering and the account-wide utilization header stay global
+  across roots. A run whose adapter will not resolve degrades to one marked row), `cost-report`, `retrospective`,
   `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
   utilization plus context-window capture for the Claude Code status bar),
   `supervisor-context` (read that fresh payload), and `resume-supervisor` (release a

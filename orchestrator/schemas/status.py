@@ -493,6 +493,21 @@ class Run(_StatusModel):
     # Cost/capacity policy may still veto it per dispatch. Additive field: pre-#73 run docs
     # load with the default, no SCHEMA_VERSION bump.
     review_workflow: bool = False
+    # Which project adapter this run was created with (#386): the ``--project`` spec as
+    # ``project_loader`` accepts it — a module path (``adapters.project.selfhost``), an
+    # entry-point name (``selfhost``), or a directory (``<repo>/.orchestration``, stored
+    # RESOLVED to an absolute path so the same adapter reached from two working directories
+    # is not read as two different ones). None = a run created before this field existed,
+    # or one whose creator did not know its own spec.
+    #
+    # This is the "run-level settings persist on the Run doc" norm (#206) applied to the
+    # adapter identity itself: every subcommand rebuilds the Engine from constructor
+    # defaults, so the adapter chosen at init-run time is gone by the next subcommand
+    # unless it is written down here. The cross-run dashboard is the first consumer — it
+    # spans runs-roots, so it resolves EACH row's adapter from that row's own run doc
+    # instead of rendering every run through whichever ``--project`` was passed. Additive
+    # field: pre-#386 run docs load with the default, no SCHEMA_VERSION bump.
+    project_ref: str | None = None
     # Interactive supervisor context park (#259). These fields make the current park
     # self-describing from the run doc without replaying events.jsonl. They are cleared
     # when a fresh supervisor resumes; archived events retain the full history. Additive

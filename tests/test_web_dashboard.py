@@ -31,7 +31,7 @@ def _engine(run_root, **kw) -> Engine:
 
 
 def _factory(**kw):
-    return lambda run_root: _engine(run_root, **kw)
+    return lambda run_root, project_ref=None: _engine(run_root, **kw)
 
 
 def _drive_intake(eng, run_id, task_id="t1"):
