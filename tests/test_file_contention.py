@@ -301,3 +301,91 @@ def test_status_explains_why_a_waiting_task_is_sitting_still(tmp_path, project) 
     tasks = eng.status("r1")["tasks"]
     assert tasks["t2"]["file_contention"] == {"blocked_by": ["t1"], "files": ["schema.py"]}
     assert tasks["t1"]["file_claim"]["files"] == ["schema.py"]
+
+
+# --- the same gate at next_work, for direct per-task callers ------------------
+#
+# `orchestrator next --task <id>` (and the per-task interactive supervisor over it) never
+# calls dispatchable(), so a gate enforced only in the eligibility predicate would be
+# silently absent from a real, supported lane. next_work is self-safe for the same reason
+# its terminal and BLOCKED_ON_HUMAN guards are.
+
+
+def test_next_work_defers_a_collision_it_was_asked_for_directly(tmp_path, project) -> None:
+    eng = _two_scoped_tasks(tmp_path, project, ["schema.py"], ["schema.py", "cli.py"])
+
+    # Deliberately NOT routed through dispatchable() — this is the direct CLI path.
+    first = eng.next_work("r1", "t1")
+    assert first is not None and first.stage is Stage.IMPLEMENT
+    assert eng.next_work("r1", "t2") is None  # would have raced t1 to schema.py
+
+    t2 = eng.store.load_task("r1", "t2")
+    assert t2.file_claim_acquired_at is None  # refused, so it took no claim
+    assert t2.state is not TaskState.BLOCKED_ON_HUMAN  # a wait, not a human gate
+    deferred = [
+        e for e in eng.store.read_events("r1")
+        if e["type"] == "dispatch_deferred_file_contention"
+    ]
+    assert len(deferred) == 1  # quiet to the caller, never silent in the timeline
+    assert deferred[0]["task_id"] == "t2"
+    assert deferred[0]["blocked_by"] == ["t1"]
+    assert deferred[0]["files"] == ["schema.py"]  # only the CONTENDED path
+
+
+def test_next_work_acquires_the_claim_when_the_files_are_free(tmp_path, project) -> None:
+    # The other half of the backstop: a direct caller must also TAKE the claim, or a
+    # later dispatchable() pass would hand the same file to a second task.
+    eng = _two_scoped_tasks(tmp_path, project, ["schema.py"], ["schema.py"])
+
+    assert eng.next_work("r1", "t1") is not None
+    assert eng.store.load_task("r1", "t1").file_claim_acquired_at is not None
+    assert eng.dispatchable("r1") == []  # t2 is held by the claim next_work took
+
+
+def test_next_work_releases_a_waiter_once_the_blocker_is_terminal(tmp_path, project) -> None:
+    eng = _two_scoped_tasks(tmp_path, project, ["schema.py"], ["schema.py"])
+    # With no holder yet the FIRST caller to ask wins the file, so t1 must take it before
+    # t2 can be a waiter at all.
+    first = eng.next_work("r1", "t1")
+    assert first is not None
+    assert eng.next_work("r1", "t2") is None
+
+    eng.record("r1", make_result(first))
+    while (work := eng.next_work("r1", "t1")) is not None:
+        eng.record("r1", make_result(work))
+    assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
+
+    freed = eng.next_work("r1", "t2")
+    assert freed is not None and freed.stage is Stage.IMPLEMENT
+    assert eng.store.load_task("r1", "t2").file_claim_acquired_at is not None
+
+
+def test_a_holder_keeps_dispatching_its_own_later_stages(tmp_path, project) -> None:
+    # The claim must not gate the task that owns it — otherwise a holder would deadlock
+    # against itself at the stage after the one that acquired it.
+    eng = _two_scoped_tasks(tmp_path, project, ["schema.py"], ["schema.py"])
+    work = eng.next_work("r1", "t1")
+    assert work is not None
+    eng.record("r1", make_result(work))
+
+    nxt = eng.next_work("r1", "t1")
+    assert nxt is not None and nxt.stage is not Stage.IMPLEMENT
+
+
+def test_next_work_leaves_undeclared_and_disjoint_tasks_alone(tmp_path, project) -> None:
+    eng = _two_scoped_tasks(tmp_path, project, ["schema.py"], None)
+    assert eng.next_work("r1", "t1") is not None
+    assert eng.next_work("r1", "t2") is not None  # declared nothing: never gated
+
+    other = _two_scoped_tasks(tmp_path / "b", project, ["a.py"], ["b.py"])
+    assert other.next_work("r1", "t1") is not None
+    assert other.next_work("r1", "t2") is not None
+
+
+def test_next_work_ignores_contention_when_the_run_setting_is_off(tmp_path, project) -> None:
+    eng = _two_scoped_tasks(
+        tmp_path, project, ["schema.py"], ["schema.py"], serialize_file_contention=False
+    )
+    assert eng.next_work("r1", "t1") is not None
+    assert eng.next_work("r1", "t2") is not None
+    assert eng.store.load_task("r1", "t2").file_claim_acquired_at is None

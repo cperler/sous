@@ -978,10 +978,13 @@ class Engine:
         """Hold back a task whose approved SCOPE names a file another live task claimed
         (#377) — the enforced version of the advisory "fold convergent fixes" guidance.
 
-        WHY here: this is the ONE eligibility predicate, and a deferred task has to drop
-        out of the ready set rather than refuse later at ``next_work``. A blocker parked at
-        a human gate would otherwise leave the driver loop with a permanently non-empty
+        WHY here: this is the ONE eligibility predicate, so a deferred task has to drop
+        out of the READY SET and not merely be refused at dispatch. A blocker parked at a
+        human gate would otherwise leave the driver loop with a permanently non-empty
         ready list it can never dispatch — spinning instead of exiting on the gate.
+        ``next_work`` calls this too, over a single candidate, because direct per-task
+        callers never consult ``dispatchable`` and the gate must not be absent for them;
+        that is a self-safety backstop for the same decision, not a second one.
 
         The claim is stamped on the admitted task (``file_claim_acquired_at``) under the
         run's dispatch lock, so two processes cannot both acquire the same path, and it is
@@ -1022,6 +1025,31 @@ class Engine:
         for task_id in ready:
             self._record_contention_wait(run_id, by_id[task_id], plan.deferrals.get(task_id))
         return [task_id for task_id in eligible if task_id not in plan.deferrals]
+
+    def _live_claim_tasks(self, run_id: str, run: Run, task: Task) -> list[Task]:
+        """The ``live`` argument for a SINGLE-task contention pass (``next_work``'s
+        self-safety check), in run order.
+
+        Only claim HOLDERS constrain one candidate, so every other live task is loaded
+        just to ask whether it holds and dropped otherwise — which is exactly the subset
+        ``_apply_file_contention_gate`` would keep anyway, since it admits and defers only
+        tasks in ``eligible``. ``task`` itself is carried by IDENTITY rather than reloaded,
+        so an admission stamps the claim onto the caller's own doc and the dispatch that
+        follows sees it.
+
+        A terminal task is left out — that omission IS the release (#377).
+        """
+        live: list[Task] = []
+        for ref in run.task_refs:
+            if ref.task_id == task.task_id:
+                live.append(task)
+                continue
+            if ref.state in TERMINAL_TASK_STATES:
+                continue
+            doc = self.store.load_task(run_id, ref.task_id)
+            if doc.file_claim_acquired_at is not None:
+                live.append(doc)
+        return live
 
     def _acquire_file_claim(self, run_id: str, task: Task) -> None:
         """Stamp the gate-winner's claim and event the receipt (idempotent, once per task).
@@ -1234,6 +1262,29 @@ class Engine:
                      "stage": stage.value, "reason": gate},
                 )
                 return None
+        # Declared-file contention (#377). `dispatchable` already filters a deferred
+        # waiter out of the ready set, but — as with the terminal and BLOCKED_ON_HUMAN
+        # guards above — next_work must be self-safe for direct callers: `orchestrator
+        # next --task <id>` (and the per-task interactive supervisor over it) never
+        # consults `dispatchable`, so without this the gate would be silently absent from
+        # a real, supported lane and both colliding tasks would walk into IMPLEMENT.
+        # Placed LAST among the preflight refusals so a task that would not dispatch
+        # anyway (terminal, parked, leased, cooling down, pipeline-exhausted, held at an
+        # unapproved gate) never takes a claim it is not about to use.
+        if (
+            not resume  # a resume recovers an ALREADY-dispatched lease; it never waits
+            and run.serialize_file_contention
+            and task.scope_files
+            and task.file_claim_acquired_at is None  # a holder never re-enters the gate
+            and not self._apply_file_contention_gate(
+                run_id, self._live_claim_tasks(run_id, run, task), [task_id]
+            )
+        ):
+            # Quiet like the BLOCKED_ON_HUMAN refusal (both callers read None as "nothing
+            # to dispatch"), but not silent: the gate evented the wait and named its
+            # blocker. Admission stamped the claim onto `task` in place, so the dispatch
+            # below carries the same doc the gate just wrote.
+            return None
 
         spec = STAGE_SPECS[stage]
         rec = task.stages[stage]

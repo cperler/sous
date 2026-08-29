@@ -384,7 +384,12 @@ never satisfy.
   schema module are serialized instead of meeting at merge. `orchestrator/file_contention.py`
   is the pure half (normalization + the deferral plan; no clock, no I/O, no event sink); the
   engine owns the writes and the `dispatch_deferred_file_contention` /`file_claim_acquired` /
-  `scope_file_claim_dropped` events. A claim is acquired once, under the run's dispatch lock,
+  `scope_file_claim_dropped` events. `next_work` applies the same gate to the single task it
+  was asked for and returns `None` when it is contended — direct per-task callers
+  (`orchestrator next --task <id>`, the interactive supervisor over it) never consult
+  `dispatchable`, so the same self-safety rule as its terminal and BLOCKED_ON_HUMAN guards
+  applies; it is a backstop for one decision, not a second one. A claim is acquired once,
+  under the run's dispatch lock,
   when the gate first admits the task, and released only by that task reaching a TERMINAL
   state — a failed blocker therefore cannot starve its waiter, and a review fix cycle (which
   wipes the post-SCOPE stage records) cannot hand the claim back mid-task. Holders never

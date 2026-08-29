@@ -114,7 +114,8 @@ tracker or fix-forward.
   Those are the durable audit trail (`runs/` is gitignored — local, not committed). Do not
   `rm -rf runs/...` as part of cleanup; leave it for the human to prune explicitly.
 - **Tasks that declare the same file are serialized, not fanned out** (#377). SCOPE names
-  the files a task will modify and `dispatchable` holds a task whose declaration collides
+  the files a task will modify and `dispatchable` (and `next_work`, so the direct per-task
+  CLI path is gated too) holds a task whose declaration collides
   with a live task's claim — the enforced sibling of the advisory "fold convergent fixes"
   guidance, which the scheduler could not read. The gate keys on EVERY declared path, so it
   serializes some pairs that would not actually have collided; that is the chosen default,
