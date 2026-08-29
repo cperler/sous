@@ -51,6 +51,7 @@ from .errors import (
     StatusNotFoundError,
     SupervisorParkDeferred,
 )
+from .file_contention import ClaimEntry, Deferral, describe, plan_deferrals
 from .gitcmd import run_git
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
@@ -500,6 +501,7 @@ class Engine:
         progress_comments: bool = False,
         max_filed_followups: int | None = None,
         review_workflow: bool = False,
+        serialize_file_contention: bool = True,
     ) -> Run:
         """Create a run. ``budget_usd`` caps metered spend (soft warning at
         ``budget_soft_fraction``, hard PAUSE at/after the budget — #34; must be a finite
@@ -517,8 +519,11 @@ class Engine:
         repeating it per add_task; None inherits the engine constructor default.
         ``review_workflow`` (#73) opts REVIEW into the multi-agent find→verify panel on lanes
         that can execute a plan — off by default, and cost/capacity policy can still veto it
-        per dispatch. All default off; the routers are DISTINCT levers (USD vs rate-limit
-        headroom vs provider outage vs failed-session reuse).
+        per dispatch. ``serialize_file_contention`` (#377) holds a task at the post-SCOPE
+        gate while another live task claims a file it declared — the one setting here that
+        defaults ON, because the collision it prevents (#370) costs a remediation cycle
+        while its false positives cost only parallelism. The routers are DISTINCT levers
+        (USD vs rate-limit headroom vs provider outage vs failed-session reuse).
 
         Re-initializing an EXISTING run id is refused with ``RunExistsError`` (#280):
         replacing the run doc would orphan the run's task documents (they stay on disk
@@ -540,6 +545,7 @@ class Engine:
             progress_comments=progress_comments,
             max_filed_followups=max_filed_followups,
             review_workflow=review_workflow,
+            serialize_file_contention=serialize_file_contention,
         )
         self.store.create_run_doc(run)
         return run
@@ -551,7 +557,7 @@ class Engine:
     _REUSE_IMMUTABLE_SETTINGS = (
         "lane", "budget_usd", "route_by_cost", "route_by_capacity",
         "cross_provider_fallback", "warm_retry", "progress_comments",
-        "max_filed_followups", "review_workflow",
+        "max_filed_followups", "review_workflow", "serialize_file_contention",
     )
 
     def create_or_reuse_run(
@@ -567,6 +573,7 @@ class Engine:
         progress_comments: bool = False,
         max_filed_followups: int | None = None,
         review_workflow: bool = False,
+        serialize_file_contention: bool = True,
     ) -> tuple[Run, bool]:
         """The EXPLICIT idempotent create (#280). Returns ``(run, created)``: the freshly
         created run with ``created=True``, or the already-persisted run with
@@ -584,6 +591,7 @@ class Engine:
             cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
             progress_comments=progress_comments,
             max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+            serialize_file_contention=serialize_file_contention,
         )
         try:
             created = self.create_run(
@@ -592,6 +600,7 @@ class Engine:
                 cross_provider_fallback=cross_provider_fallback, warm_retry=warm_retry,
                 progress_comments=progress_comments,
                 max_filed_followups=max_filed_followups, review_workflow=review_workflow,
+                serialize_file_contention=serialize_file_contention,
             )
         except RunExistsError:
             pass
@@ -928,17 +937,26 @@ class Engine:
         states = {ref.task_id: ref.state for ref in run.task_refs}
         dag = Dag(run.dependency_graph)
         out: list[str] = []
+        # Every LIVE, claim-capable task in run order — the contention gate below needs the
+        # ones this loop rejects too, because a task parked at a human gate or in flight on
+        # its own stage still OWNS the files it claimed (#377).
+        live: list[Task] = []
         for ref in run.task_refs:
             if states[ref.task_id] in TERMINAL_TASK_STATES:
                 continue
-            # Held at a human gate: non-terminal (keeps the run open) but never
-            # dispatched until Engine.approve() releases it (design pass §4).
-            if states[ref.task_id] is TaskState.BLOCKED_ON_HUMAN:
-                continue
             if dag.unmet_deps(ref.task_id, states):
+                # Nothing has run for this task, so it can hold no file claim either.
                 continue
             doc = self.store.load_task(run_id, ref.task_id)
+            # A decomposition umbrella never implements anything — its children do — so it
+            # neither dispatches nor holds a file claim on their behalf.
             if doc.decomposition_children:
+                continue
+            live.append(doc)
+            # Held at a human gate: non-terminal (keeps the run open) but never
+            # dispatched until Engine.approve() releases it (design pass §4). It is
+            # already in ``live`` above: parked or not, it still owns what it claimed.
+            if states[ref.task_id] is TaskState.BLOCKED_ON_HUMAN:
                 continue
             # A task holding a dispatch lease (in-flight, or crashed mid-stage) is not
             # re-dispatchable on the normal path — it needs explicit resume, never a
@@ -950,7 +968,111 @@ class Engine:
             if _in_future(doc.not_before, now=now):
                 continue
             out.append(ref.task_id)
+        if run.serialize_file_contention:
+            out = self._apply_file_contention_gate(run_id, live, out)
         return out
+
+    def _apply_file_contention_gate(
+        self, run_id: str, live: list[Task], eligible: list[str]
+    ) -> list[str]:
+        """Hold back a task whose approved SCOPE names a file another live task claimed
+        (#377) — the enforced version of the advisory "fold convergent fixes" guidance.
+
+        WHY here: this is the ONE eligibility predicate, and a deferred task has to drop
+        out of the ready set rather than refuse later at ``next_work``. A blocker parked at
+        a human gate would otherwise leave the driver loop with a permanently non-empty
+        ready list it can never dispatch — spinning instead of exiting on the gate.
+
+        The claim is stamped on the admitted task (``file_claim_acquired_at``) under the
+        run's dispatch lock, so two processes cannot both acquire the same path, and it is
+        never cleared: a review fix cycle wipes the post-SCOPE stage records, so any
+        DERIVED "already implementing" signal would hand the claim back mid-task. Release
+        is by reaching a terminal state — including FAILED, so a waiter is never starved
+        behind a task that will never finish.
+
+        Only tasks in ``eligible`` are considered as waiters. An admitted task that this
+        pass would not dispatch anyway (leased, parked, cooling down) must not take a
+        claim it is not about to use, or it would block a waiter for free.
+
+        Note the side effect: asking what is dispatchable ACQUIRES claims for the answer,
+        including from the read-only-looking ``orchestrator dispatchable`` subcommand. That
+        is the intended reading — both callers of this predicate mean "these are the tasks
+        to run next" — and the cost of a claim taken by a caller that then dispatches
+        nothing is bounded: it is released when that task goes terminal, exactly as if it
+        had been dispatched.
+        """
+        ready = set(eligible)
+        entries = [
+            ClaimEntry(
+                task_id=doc.task_id,
+                claims=tuple(doc.scope_files),
+                holding=doc.file_claim_acquired_at is not None,
+            )
+            for doc in live
+            if doc.scope_files
+            and (doc.file_claim_acquired_at is not None or doc.task_id in ready)
+        ]
+        if not entries:
+            return eligible
+        plan = plan_deferrals(entries)
+        by_id = {doc.task_id: doc for doc in live}
+        for task_id in plan.admitted:
+            if task_id in ready:
+                self._acquire_file_claim(run_id, by_id[task_id])
+        for task_id in ready:
+            self._record_contention_wait(run_id, by_id[task_id], plan.deferrals.get(task_id))
+        return [task_id for task_id in eligible if task_id not in plan.deferrals]
+
+    def _acquire_file_claim(self, run_id: str, task: Task) -> None:
+        """Stamp the gate-winner's claim and event the receipt (idempotent, once per task).
+
+        Serialized on the run's dispatch lock and re-read inside it, so a concurrent
+        scheduler cannot hand the same path to two tasks; a claim already stamped there is
+        left alone rather than refreshed (the stamp is monotonic).
+        """
+        def _stamp(doc: Task) -> None:
+            if doc.file_claim_acquired_at is None:
+                doc.file_claim_acquired_at = _now()
+                doc.file_contention_deferred_on = []
+
+        with self.store.with_dispatch_lock(run_id):
+            already = self.store.load_task(run_id, task.task_id).file_claim_acquired_at
+            doc = self.store.update_task(run_id, task.task_id, _stamp)
+        task.file_claim_acquired_at = doc.file_claim_acquired_at
+        task.file_contention_deferred_on = list(doc.file_contention_deferred_on)
+        if already is not None:
+            return  # someone else stamped it first — one receipt per claim, not per tick
+        self.store.append_event(run_id, {
+            "ts": _now(), "type": "file_claim_acquired", "run_id": run_id,
+            "task_id": doc.task_id, "files": list(doc.scope_files),
+        })
+
+    def _record_contention_wait(
+        self, run_id: str, task: Task, deferral: Deferral | None
+    ) -> None:
+        """Event a wait, but only when it CHANGES.
+
+        ``dispatchable`` runs every scheduler tick, so an unconditional emit would write a
+        line per waiting task per tick and bury the timeline it exists to explain. The
+        blocker set last evented is kept on the task doc; clearing it when the wait ends
+        means a later re-defer is evented again rather than swallowed.
+        """
+        blockers = list(deferral.blocked_by) if deferral else []
+        if blockers == list(task.file_contention_deferred_on):
+            return
+
+        def _note(doc: Task) -> None:
+            doc.file_contention_deferred_on = blockers
+
+        self.store.update_task(run_id, task.task_id, _note)
+        task.file_contention_deferred_on = blockers
+        if deferral is None:
+            return  # the wait ENDED: cleared so a later re-defer is evented again
+        self.store.append_event(run_id, {
+            "ts": _now(), "type": "dispatch_deferred_file_contention", "run_id": run_id,
+            "task_id": task.task_id, "blocked_by": list(deferral.blocked_by),
+            "files": list(deferral.paths), "detail": describe(deferral),
+        })
 
     def in_flight(self, run_id: str) -> list[str]:
         """Tasks with an outstanding dispatch lease (RUNNING, ``pending_work_item_id``
@@ -2384,6 +2506,15 @@ class Engine:
                     {"ts": _now(), "type": "context_key_evicted", "run_id": run_id,
                      "task_id": effective.task_id, "stage": effective.stage.value, **notice}
                     for notice in fold_notices.evictions
+                )
+                # #377: a declared file the engine could not use is a file the contention
+                # gate will not serialize on. Silence there reads as "this task touches
+                # nothing", which is exactly the reading that lets it fan out into the
+                # collision the gate exists to prevent.
+                events.extend(
+                    {"ts": _now(), "type": "scope_file_claim_dropped", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value, **notice}
+                    for notice in fold_notices.file_claims
                 )
                 if effective.status is ResultStatus.SUCCESS:
                     t.error_signatures = []  # streak resets on a clean stage
@@ -5429,6 +5560,21 @@ class Engine:
                 task_status["decomposition"] = {
                     "mapping": task.decomposition_mapping,
                     "children": task.decomposition_children,
+                }
+            # #377: a task held at the file-contention gate is idle for a REASON. Without
+            # this the only symptom is a non-terminal task that never moves, which reads as
+            # a stall; the blocker and the contended files say what it is actually waiting
+            # for. ``scope_files`` rides along on a claim holder too, so the other half of
+            # the picture (who owns what) is answerable from the same document.
+            if task.file_contention_deferred_on and task.state not in TERMINAL_TASK_STATES:
+                task_status["file_contention"] = {
+                    "blocked_by": list(task.file_contention_deferred_on),
+                    "files": list(task.scope_files),
+                }
+            elif task.scope_files and task.file_claim_acquired_at is not None:
+                task_status["file_claim"] = {
+                    "acquired_at": task.file_claim_acquired_at,
+                    "files": list(task.scope_files),
                 }
             # A human-closed-infeasible task surfaces WHY it was closed — read back from the
             # durable rejection artifact (#52), so status output is self-explanatory.

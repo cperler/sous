@@ -376,6 +376,26 @@ never satisfy.
   count — a human `reject` doesn't), and a paused run refuses to schedule until
   `orchestrator unpause`. All state is persisted by the engine, so a fresh scheduler on the
   same run dir resumes where a kill left off.
+- **Declared-file contention gate.** Dispatch eligibility also consults what a task is
+  going to *touch*, not just whether its deps are met. SCOPE declares `files` — the
+  repo-relative paths the implementation expects to MODIFY — which fold onto the task doc
+  (`scope_files`, deliberately not the evictable context plane). `dispatchable` then holds a
+  task whose declared files collide with a live task's claim, so two tasks rewriting the same
+  schema module are serialized instead of meeting at merge. `orchestrator/file_contention.py`
+  is the pure half (normalization + the deferral plan; no clock, no I/O, no event sink); the
+  engine owns the writes and the `dispatch_deferred_file_contention` /`file_claim_acquired` /
+  `scope_file_claim_dropped` events. A claim is acquired once, under the run's dispatch lock,
+  when the gate first admits the task, and released only by that task reaching a TERMINAL
+  state — a failed blocker therefore cannot starve its waiter, and a review fix cycle (which
+  wipes the post-SCOPE stage records) cannot hand the claim back mid-task. Holders never
+  wait and waiters are ordered, so the wait graph is acyclic by construction. The gate keys
+  on every declared path with no file-kind heuristic: two tasks appending independent tests
+  to one file ARE serialized, the deliberate safe default (false serialization costs
+  parallelism; the collision it prevents costs a remediation cycle). A task whose lane has no
+  SCOPE stage, or whose SCOPE declares nothing, neither defers nor blocks. Run-level and on
+  by default (`Run.serialize_file_contention`, `init-run --no-serialize-file-contention`).
+  Complement to the integration gate below: that one DETECTS the collision late, this
+  prevents it.
 - **Pre-merge batch integration gate.** At the all-tasks-terminal boundary, the engine
   resolves completed leaf-task branches in stable dependency order and merges them over
   current trunk in a disposable detached worktree. Merge conflicts are red immediately;

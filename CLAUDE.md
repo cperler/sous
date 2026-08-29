@@ -113,6 +113,13 @@ tracker or fix-forward.
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).
   Those are the durable audit trail (`runs/` is gitignored — local, not committed). Do not
   `rm -rf runs/...` as part of cleanup; leave it for the human to prune explicitly.
+- **Tasks that declare the same file are serialized, not fanned out** (#377). SCOPE names
+  the files a task will modify and `dispatchable` holds a task whose declaration collides
+  with a live task's claim — the enforced sibling of the advisory "fold convergent fixes"
+  guidance, which the scheduler could not read. The gate keys on EVERY declared path, so it
+  serializes some pairs that would not actually have collided; that is the chosen default,
+  because the collision it prevents (#370's silent auto-merge into a runtime break) costs a
+  remediation cycle while the false positive costs only parallelism.
 - **Batch integration is verified both before and after merge** (#370, #229, #216).
   When every task reaches a terminal state, `Engine.batch_integration_gate` gathers the
   completed leaf-task branches in dependency order, merges them over current trunk in a

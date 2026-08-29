@@ -327,6 +327,15 @@ def main(argv: list[str] | None = None) -> int:
                          "mega-prompt reviewer. Only on lanes that can execute a plan (not "
                          "codex); micro/lite presets, a loaded API, and a thinning budget all "
                          "fall back to the single reviewer. Default off")
+    ir.add_argument("--no-serialize-file-contention", action="store_true",
+                    help="fan tasks out on DAG readiness alone, ignoring declared file "
+                         "contention (#377). By DEFAULT the engine holds a task at the "
+                         "post-SCOPE gate while another live task claims a file its "
+                         "approved SCOPE named, so two tasks rewriting the same schema "
+                         "module are serialized instead of meeting at merge. The gate keys "
+                         "on every declared path with no file-kind heuristic, so it can "
+                         "serialize tasks that would not actually have collided; pass this "
+                         "to trade that safety for parallelism")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
@@ -1229,7 +1238,9 @@ def main(argv: list[str] | None = None) -> int:
                                  warm_retry=args.warm_retry,
                                  progress_comments=args.progress_comments,
                                  max_filed_followups=args.max_filed_followups,
-                                 review_workflow=args.review_workflow)
+                                 review_workflow=args.review_workflow,
+                                 serialize_file_contention=(
+                                     not args.no_serialize_file_contention))
         except RunExistsError as exc:
             # Refuse loudly and write NOTHING (#280): re-initializing an existing run id
             # would orphan its task docs and erase its refs/DAG/state/settings.
@@ -1243,7 +1254,8 @@ def main(argv: list[str] | None = None) -> int:
                "warm_retry": run.warm_retry,
                "progress_comments": run.progress_comments,
                "max_filed_followups": run.max_filed_followups,
-               "review_workflow": run.review_workflow})
+               "review_workflow": run.review_workflow,
+               "serialize_file_contention": run.serialize_file_contention})
     elif args.cmd == "add-task":
         pipeline = (
             [Stage(s.strip()) for s in args.pipeline.split(",") if s.strip()]
