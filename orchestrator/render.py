@@ -9,7 +9,7 @@ so they are trivially testable and the engine just writes their output.
 from __future__ import annotations
 
 from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
-from .schemas.status import StageRecord, Task
+from .schemas.status import ReviewFixup, StageRecord, Task
 from .stream_probe import looks_like_event_stream, readable_text_from_stream
 
 # Effort rows read high→low (then the effort-less '(default)' bucket, then any unknown
@@ -624,41 +624,72 @@ def render_task_index(task: Task, rejection_reason: str | None = None) -> str:
 
 # Why a non-blocking finding was NOT filed as an issue, keyed by its disposition. The
 # completion note renders these as prose; `unfiled_findings` returns them as data.
+#
+# Every string here is a statement of fact a human will act on, so none of them may claim
+# work the engine did not do (#414). `fix_now` used to read "fixed in place (boy-scout)"
+# while NOTHING read the disposition but this table — on run ff-v1-b29 two correct findings
+# were reported fixed, shipped unfixed to main, and were caught only by a hand-audit. A
+# human told a finding is handled stops looking, which is strictly worse than silence.
 _UNFILED_REASON = {
-    "fix_now": "fixed in place (boy-scout)",
+    "fix_now": "noted for in-place handling, not applied",
     "drop": "noted, not tracked",
 }
+# A `fixup` finding (#414) IS acted on, so its reason depends on evidence rather than on
+# the disposition alone: applied only when a durable `ReviewFixup` record says a later
+# review approved the re-implement pass. Mirrors the improvement side's wording.
+#
+# Matched by TITLE, the same way the improvement fixup below is: `review_workflow` imports
+# this module, so importing `issue_fingerprint` back would be a cycle. The engine caps a
+# request title at 200 chars when it builds the record, so the comparison caps too.
+_FIXUP_APPLIED_REASON = "applied in place, not filed"
+_FIXUP_UNAPPLIED_REASON = "requested in-place fixup — not applied"
+_FIXUP_TITLE_CAP = 200  # keep in sync with Engine._review_fixups' title bound
 
 
 def unfiled_findings(
-    review: dict | None, followups: list[dict] | None = None
+    review: dict | None,
+    followups: list[dict] | None = None,
+    fixups: list[ReviewFixup] | None = None,
 ) -> list[dict]:
     """The review's non-blocking findings the engine did NOT file, as structured data (#357).
 
-    ``fix_now``/``drop`` findings, findings with an absent/unrecognized disposition, and
-    ``file`` findings past the per-task cap (#188) are deliberately not filed as issues, so
-    the completion note is their ONLY channel to a human — and publishing that note is a
-    best-effort external call. Returning the drop-list as data lets the engine put the
-    payload in ``completion_note_failed`` and in the ``status`` audit, so a note that never
-    reached anyone is a delivery problem with a recoverable payload rather than data loss.
+    ``fix_now``/``drop``/``fixup`` findings, findings with an absent/unrecognized
+    disposition, and ``file`` findings past the per-task cap (#188) are deliberately not
+    filed as issues, so the completion note is their ONLY channel to a human — and
+    publishing that note is a best-effort external call. Returning the drop-list as data
+    lets the engine put the payload in ``completion_note_failed`` and in the ``status``
+    audit, so a note that never reached anyone is a delivery problem with a recoverable
+    payload rather than data loss.
 
     Pure (the fold/state-machine convention): computes and returns what was dropped; the
     engine call site is what emits events. ``render_completion_note`` consumes this same
     helper, so the Markdown section and the machine-readable list can never disagree.
 
     Each item is ``{"title", "disposition", "reason"}``; ``followups`` is the engine's
-    ``[{"title", "ref"}]`` list of findings it DID file (those are excluded)."""
+    ``[{"title", "ref"}]`` list of findings it DID file (those are excluded). ``fixups`` is
+    the task's durable ``review_fixups`` — the ONLY evidence that a ``fixup`` finding was
+    actually applied; without it such a finding is reported as requested-not-applied, which
+    fails toward honesty (#414)."""
     filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
+    applied_titles = {f.title for f in (fixups or []) if f.applied}
     out: list[dict] = []
+    seen: set[str] = set()
     for finding in (review or {}).get("non_blocking") or []:
         if not isinstance(finding, dict):
             continue
         title = str(finding.get("title") or "").strip()  # coerce: a model may emit non-strings
         if not title or title in filed_titles:
             continue
+        seen.add(title)
         disposition = str(finding.get("disposition") or "").strip().casefold()
-        if disposition == "file":
+        if title[:_FIXUP_TITLE_CAP] in applied_titles:
+            # Evidence first (#414): a durable record that the re-implement pass landed
+            # outranks whatever the final review restated this finding as.
+            reason = _FIXUP_APPLIED_REASON
+        elif disposition == "file":
             reason = "over per-task cap"
+        elif disposition == "fixup":
+            reason = _FIXUP_UNAPPLIED_REASON
         elif disposition in _UNFILED_REASON:
             reason = _UNFILED_REASON[disposition]
         elif disposition:
@@ -666,6 +697,18 @@ def unfiled_findings(
         else:
             reason = "no disposition given — not filed"
         out.append({"title": title, "disposition": disposition, "reason": reason})
+    # A scheduled fixup's request lived in the REVIEW record the fix cycle reset, so the
+    # approving review usually no longer restates it (#414 — the same reason #227 gave the
+    # improvement fixup a durable record). Report it from that record instead, or its
+    # application would be invisible in the note that is supposed to prove it happened.
+    for fixup in fixups or []:
+        if fixup.source != "finding" or fixup.title in seen or fixup.title in filed_titles:
+            continue
+        out.append({
+            "title": fixup.title,
+            "disposition": "fixup",
+            "reason": _FIXUP_APPLIED_REASON if fixup.applied else _FIXUP_UNAPPLIED_REASON,
+        })
     return out
 
 
@@ -682,14 +725,16 @@ def render_completion_note(
     Nothing silently dropped (#188/#223):
 
     * Non-blocking findings the engine did NOT file (absent/unrecognized dispositions,
-      ``fix_now``/``drop``, or ``file`` findings past the per-task cap) appear in a
-      "Noted, not filed" section with a short reason.
+      ``fixup``/``fix_now``/``drop``, or ``file`` findings past the per-task cap) appear
+      in a "Noted, not filed" section with a short reason — and a ``fixup`` one reports
+      whether it actually landed, from the durable record rather than the disposition.
     * An improvement idea without an explicit ``file`` disposition is surfaced with its
       reason instead of an issue link, keeping the idea durable in the note even though
       no enhancement issue was opened.
-    * A ``fixup`` is called applied only from ``task.review_fixups`` after its subsequent
-      IMPLEMENT→…→REVIEW pass approved; disposition text alone is never treated as
-      evidence that code changed."""
+    * A ``fixup`` — whether it came from the improvement idea or from a non-blocking
+      finding (#414) — is called applied only from ``task.review_fixups`` after its
+      subsequent IMPLEMENT→…→REVIEW pass approved; disposition text alone is never treated
+      as evidence that code changed."""
     from .schemas.enums import Stage  # local: avoid widening the module import surface
 
     review = (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {}
@@ -727,11 +772,14 @@ def render_completion_note(
             lines.append(f"- {f.get('title', '(untitled)')}{suffix}")
 
     # #188: the "noted, moving on" destination. A non-blocking finding the engine did NOT
-    # file — absent/unrecognized, dispositioned `fix_now`/`drop`, or an explicit `file`
-    # finding past the per-task cap — is surfaced here so the drop bucket is durable in
-    # the PR/issue note. Computed by `unfiled_findings` (#357), the same helper the engine
-    # reads for the failure event and the status audit, so note and data cannot disagree.
-    noted = unfiled_findings(review, followups)
+    # file — absent/unrecognized, dispositioned `fix_now`/`fixup`/`drop`, or an explicit
+    # `file` finding past the per-task cap — is surfaced here so the drop bucket is durable
+    # in the PR/issue note. Computed by `unfiled_findings` (#357), the same helper the
+    # engine reads for the failure event and the status audit, so note and data cannot
+    # disagree. A `fixup` finding reports applied/not-applied from the durable
+    # `review_fixups` records rather than from its disposition (#414) — the disposition
+    # says what was ASKED for, only the record says what LANDED.
+    noted = unfiled_findings(review, followups, task.review_fixups)
     if noted:
         lines += ["", "### Noted, not filed"]
         lines += [f"- {n['title']} — {n['reason']}" for n in noted]
@@ -739,7 +787,13 @@ def render_completion_note(
     # Self-improvement loop: the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.
     improvement = review.get("improvement") if isinstance(review.get("improvement"), dict) else None
-    applied_fixups = [fixup for fixup in task.review_fixups if fixup.applied]
+    # Improvement-sourced only (#414): a fixup that came from a non-blocking FINDING is
+    # already reported in "Noted, not filed" above, and rendering it here would both
+    # duplicate it and label a trivial nit an "Improvement idea".
+    applied_fixups = [
+        fixup for fixup in task.review_fixups
+        if fixup.applied and fixup.source == "improvement"
+    ]
     improvement_title = str((improvement or {}).get("title", "")).strip()
     improvement_disp = str((improvement or {}).get("disposition", "")).strip().casefold()
     # Normally the final approving review has no fixup (the request lived in the prior

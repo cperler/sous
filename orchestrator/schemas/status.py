@@ -13,6 +13,8 @@ ones at the write site. See its docstring for the migration recipe.
 
 from __future__ import annotations
 
+from typing import Literal
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .enums import (
@@ -131,19 +133,27 @@ class ResumeCursor(_StatusModel):
 
 
 class ReviewFixup(_StatusModel):
-    """One review-emitted improvement the engine sent through an in-place rework pass.
+    """One review-emitted request the engine sent through an in-place rework pass.
 
     REVIEW's working ``StageRecord`` is replaced when the engine re-opens
-    IMPLEMENT→…→REVIEW, so the original improvement would otherwise survive only in
+    IMPLEMENT→…→REVIEW, so the original request would otherwise survive only in
     the stage log and disappear from completion evidence.  This small durable record is
     also the loop key: seeing the same fingerprint again means the attempted fixup did not
     satisfy review and must be held for a human rather than silently cycled forever.
+
+    ``source`` names which review field asked for it (#414).  It defaults to
+    ``improvement`` so task docs persisted before non-blocking findings could request a
+    fixup keep loading, and it is what lets an unschedulable request be disposed of by
+    origin: a held ``improvement`` parks the task at the human gate (unchanged), while a
+    held ``finding`` — a trivial nit — degrades to a loud not-applied record instead of
+    stalling an otherwise-complete task.
     """
 
     title: str
     detail: str = ""
     fingerprint: str
     applied: bool = False
+    source: Literal["improvement", "finding"] = "improvement"
 
 
 def _new_stage_map() -> dict[Stage, StageRecord]:

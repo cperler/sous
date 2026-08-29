@@ -37,7 +37,7 @@
     },
     "non_blocking": {
       "type": "array",
-      "description": "findings that do NOT block approval; each may carry a `disposition` that gates what the engine does with it at finalize. Only an explicit `file`, chosen deliberately with justification, becomes a follow-up issue — and only up to a small per-task cap. An absent disposition and `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed, so nothing is silently dropped (empty if none)",
+      "description": "findings that do NOT block approval; each may carry a `disposition` that gates what the engine does with it at finalize. An explicit `file`, chosen deliberately with justification, becomes a follow-up issue (up to a small per-task cap). An explicit `fixup` is APPLIED in this PR — the engine re-opens IMPLEMENT→…→REVIEW once for the whole batch of them. An absent disposition and `fix_now`/`drop` findings are surfaced in the completion note ('Noted, not filed') but never filed and never applied, so nothing is silently dropped (empty if none)",
       "items": {
         "type": "object",
         "required": ["title"],
@@ -46,8 +46,8 @@
           "detail": {"type": "string", "description": "what/why/where — the follow-up issue body"},
           "disposition": {
             "type": "string",
-            "enum": ["fix_now", "file", "drop"],
-            "description": "filing threshold. Choose `file` deliberately, with justification, only when a maintainer would put this on the backlog independently — out-of-scope (different subsystem / needs its own design) OR non-trivial (real work/risk). NEVER `file` these — they are `drop` (or `fix_now` if trivial-in-blast-radius): cosmetic consistency ('move X to match Y', rename for symmetry), speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards/metrics for a feature not yet exercised), redundant convenience (a wrapper for already-exposed capability). `fix_now`: a trivial nit WITHIN the blast radius of this change (a docstring the edit made stale, a guard/type on a touched line) the implementer should have absorbed in place — not worth a ticket. `drop`: a real-but-untracked observation, noted and moved on. An absent disposition is noted, not filed; filing requires explicit `file`."
+            "enum": ["fixup", "fix_now", "file", "drop"],
+            "description": "filing threshold. Choose `file` deliberately, with justification, only when a maintainer would put this on the backlog independently — out-of-scope (different subsystem / needs its own design) OR non-trivial (real work/risk). NEVER `file` these — they are `drop` (or `fixup` if trivial-in-blast-radius): cosmetic consistency ('move X to match Y', rename for symmetry), speculative tunability (expose N knobs nobody asked for), premature instrumentation (dashboards/metrics for a feature not yet exercised), redundant convenience (a wrapper for already-exposed capability). `fixup`: a trivial nit WITHIN the blast radius of this change (a docstring the edit made stale, a guard/type on a touched line) — not worth a ticket, so the engine APPLIES it in place via one bounded re-implement cycle rather than filing it. `fix_now`: noted in the completion note only — the engine does NOT apply it; prefer `fixup` when you want the nit actually fixed. `drop`: a real-but-untracked observation, noted and moved on. An absent disposition is noted, not filed; filing requires explicit `file`."
           }
         },
         "additionalProperties": true
@@ -63,7 +63,7 @@
         "disposition": {
           "type": "string",
           "enum": ["fix_now", "file", "drop", "fixup"],
-          "description": "same filing threshold as a non_blocking finding, plus `fixup`. Choose `file` deliberately, with justification, to file an enhancement issue. `fixup`: apply as a trivial in-place change in THIS PR — do not file. `fix_now`/`drop`: surfaced in the completion note, not filed. An absent disposition is noted, not filed; filing requires explicit `file`."
+          "description": "same filing threshold as a non_blocking finding. Choose `file` deliberately, with justification, to file an enhancement issue. `fixup`: apply as a trivial in-place change in THIS PR — do not file. `fix_now`/`drop`: surfaced in the completion note, neither filed nor applied. An absent disposition is noted, not filed; filing requires explicit `file`."
         }
       },
       "additionalProperties": true

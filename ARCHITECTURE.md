@@ -235,10 +235,16 @@ never satisfy.
   `max_review_cycles`). Convergence auto-approval (`_review_verdict`): a re-review whose
   blocking issues are a subset of the prior rejection's — no net-new findings — ends the
   loop. Deterministic project policy findings merge in via the `review_findings` hook (#65)
-  and force `approved=false`. An improvement dispositioned `fixup` uses the same bounded
-  tail reset after REVIEW, carrying the request into IMPLEMENT and re-running delivery on
-  the existing PR. The task retains the request outside the reset REVIEW record; only a
-  later approving review marks it applied, while a repeated/unapplicable fixup parks.
+  and force `approved=false`. An improvement — or a non-blocking finding (#414) —
+  dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
+  requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
+  whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains
+  the requests outside the reset REVIEW record; only a later approving review marks them
+  applied. A repeated/unapplicable IMPROVEMENT fixup parks at the human gate; a FINDING one
+  degrades instead — a warning-grade `review_fixup_held` plus a completion note reading
+  "requested in-place fixup — not applied", because stalling an approved task over a
+  trivial nit would block a headless batch. No disposition text is ever treated as evidence
+  that code changed.
 - **Failure taxonomy → recovery.** `orchestrator/retry.py` does retry-with-learnings
   (learnings appended, newest last) behind a *structured* circuit breaker (a hash over the
   normalized failure set — timestamps/paths/numbers scrubbed — so the breaker actually trips).
