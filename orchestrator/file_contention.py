@@ -83,6 +83,8 @@ class ContentionPlan(NamedTuple):
 
 
 def _bound(value: object) -> str:
+    """A rejected claim's repr, capped so an adversarial/oversized value can't bloat the
+    drop notice (mirrors the fold layer's ``_bound_dropped_value``)."""
     text = repr(value)
     if len(text) > _MAX_NOTICE_VALUE:
         return text[:_MAX_NOTICE_VALUE] + " … [truncated]"
