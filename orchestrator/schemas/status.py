@@ -244,6 +244,20 @@ class Task(_StatusModel):
     # Checkpoint identities released for this task. Dispatch additionally requires the
     # matching durable approval artifact, so an earlier approval cannot release a new gate.
     approved_holds: list[str] = Field(default_factory=list)
+    # Declared-file contention (#377). ``scope_files`` is the repo-relative edit surface
+    # this task's approved SCOPE named, normalized at the fold; ``file_claim_acquired_at``
+    # is the MONOTONIC stamp written when ``dispatchable`` first admitted the task past the
+    # contention gate, and is never cleared — a review fix cycle resets the post-SCOPE
+    # stage records, so a derived "has run implement" signal would hand the claim back
+    # mid-task. The claim is released by the task reaching a terminal state, so a failed
+    # blocker cannot starve a waiter. ``file_contention_deferred_on`` is the blocker set
+    # last evented for this task, kept only so a per-tick eligibility check emits when the
+    # wait CHANGES rather than on every pass. Deliberately NOT the ``context`` plane: the
+    # whole-context ceiling can evict a key, which would silently un-serialize a run.
+    # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
+    scope_files: list[str] = Field(default_factory=list)
+    file_claim_acquired_at: str | None = None
+    file_contention_deferred_on: list[str] = Field(default_factory=list)
     pr_number: int | None = None
     pr_url: str | None = None
     # Engine-owned task context plane: well-known fields folded out of each stage's
@@ -498,6 +512,17 @@ class Run(_StatusModel):
     # self-describing from the run doc without replaying events.jsonl. They are cleared
     # when a fresh supervisor resumes; archived events retain the full history. Additive
     # defaults keep pre-#259 run documents loadable without a schema-version bump.
+    # Declared-file serialization (#377): when True, a task whose approved SCOPE names a
+    # file another live task has already claimed WAITS at the gate instead of being
+    # dispatched into a collision. Default ON — the failure it prevents (a silent
+    # auto-merge into a runtime break, #370) costs a remediation cycle, while the false
+    # serialization it can cause costs only some parallelism. MUST live here rather than on
+    # the Engine: every CLI subcommand rebuilds the Engine from constructor defaults, so a
+    # create-time-only setting would be gone by the next subcommand — ``dispatchable``
+    # re-reads it off this doc at the eligibility boundary (#206). Additive field: pre-#377
+    # run docs load with the default (gate on, but inert until a SCOPE declares files), so
+    # no SCHEMA_VERSION bump.
+    serialize_file_contention: bool = True
     supervisor_parked_at: str | None = None
     supervisor_park_reason: str | None = None
     supervisor_resume_command: str | None = None

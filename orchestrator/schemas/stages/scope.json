@@ -12,6 +12,11 @@
       "items": {"type": "string"},
       "description": "ordered subtasks for the implement stage"
     },
+    "files": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "repo-relative paths this task expects to MODIFY (not merely read); the engine serializes tasks whose declared files collide (#377). Optional: a task that declares nothing neither defers nor blocks."
+    },
     "subtasks": {
       "type": "array",
       "minItems": 1,

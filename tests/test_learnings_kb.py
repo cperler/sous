@@ -11,7 +11,7 @@ from orchestrator import learnings_kb as kb
 from orchestrator.cli import main as cli_main
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import ResultStatus
+from orchestrator.schemas.enums import ResultStatus, TaskState
 from orchestrator.schemas.status import Task
 from orchestrator.state_machine import (
     _MAX_CONTEXT_BYTES,
@@ -454,3 +454,214 @@ def test_retrospective_pattern_without_a_sample_error_is_not_harvested(tmp_path,
     )
     entries = kb.read_entries(eng._learnings_kb_path())
     assert not any(e["text"].startswith("recurring failure at") for e in entries)
+
+
+# --- #401: text cap by KIND, and boundary-aware truncation --------------------------
+
+
+def test_text_cap_is_chosen_by_kind() -> None:
+    """Prose kinds get the larger cap; terse rows and unknown kinds get the default."""
+    assert kb.text_cap("review") == kb.MAX_TEXT_PROSE
+    assert kb.text_cap("process") == kb.MAX_TEXT_PROSE
+    assert kb.text_cap("failure") == kb.MAX_TEXT
+    assert kb.text_cap("infra") == kb.MAX_TEXT
+    assert kb.text_cap(None) == kb.MAX_TEXT
+    assert kb.text_cap("not-a-kind") == kb.MAX_TEXT
+    assert kb.MAX_TEXT_PROSE > kb.MAX_TEXT
+
+
+def test_review_prose_survives_whole_where_the_old_global_cap_cut_it(tmp_path) -> None:
+    """The motivating regression (#401): a real rejection detail is ~600 chars, so the old
+    500-char global cap truncated it mid-sentence and it recalled as a fragment."""
+    path = tmp_path / "kb.jsonl"
+    review = (
+        "review rejected (cycle 1) — blocking issues: important — orchestrator/engine.py:5281 "
+        "— Proposal filing is not concurrency-safe. Two runs can both read an empty ledger and "
+        "call file_followup before either reaches the locked append_filing; the second append "
+        "is suppressed, but two tracker issues already exist. important — "
+        "orchestrator/learnings_kb.py:182 — Process deduplication keys only on normalized text "
+        "and run_id, omitting the target, so identical observations about different artifacts "
+        "collapse into one row."
+    )
+    assert kb.MAX_TEXT < len(review) <= kb.MAX_TEXT_PROSE  # guards the fixture's premise
+    written = kb.append_learnings(path, [{"kind": "review", "text": review}])
+    assert written[0]["text"] == review  # whole, untruncated
+    assert "[truncated]" not in written[0]["text"]
+
+    # Same text harvested as a terse failure row still gets the default cap.
+    terse = kb.append_learnings(path, [{"kind": "failure", "text": review}])
+    assert len(terse[0]["text"]) <= kb.MAX_TEXT
+    assert terse[0]["text"].endswith(" … [truncated]")
+
+
+def test_truncation_prefers_a_sentence_boundary() -> None:
+    """Over the cap, the cut lands after a sentence terminator — not mid-token."""
+    tail = " The final clause that must be cut away entirely." * 20
+    text = "First sentence stands. Second sentence also stands." + tail
+    out = kb.bound_text(text, "failure")
+    assert len(out) <= kb.MAX_TEXT
+    body = out[: -len(" … [truncated]")]
+    assert out.endswith(" … [truncated]")
+    assert body.endswith(".")  # a whole sentence, not a fragment
+    assert text.startswith(body)  # nothing invented, only cut
+
+
+def test_truncation_falls_back_to_a_word_boundary_then_a_hard_cut() -> None:
+    """No sentence end in range → cut on whitespace; no whitespace either → hard cut."""
+    words = kb.bound_text("word " * 400, "failure")
+    assert len(words) <= kb.MAX_TEXT
+    assert words.endswith("word … [truncated]")  # a whole word, never "wo"
+
+    unbroken = kb.bound_text("x" * 900, "failure")
+    assert len(unbroken) <= kb.MAX_TEXT
+    assert unbroken.endswith(" … [truncated]")
+    assert set(unbroken[: -len(" … [truncated]")]) == {"x"}
+
+
+def test_a_boundary_is_ignored_when_it_would_discard_most_of_the_budget() -> None:
+    """An early-only sentence end must not shrink the row to a stub — the hard cut wins."""
+    text = "Tiny. " + "z" * 900
+    out = kb.bound_text(text, "failure")
+    assert len(out) > int((kb.MAX_TEXT - len(" … [truncated]")) * 0.6)
+    assert out.startswith("Tiny. zzz")
+
+
+def test_bounded_text_never_exceeds_its_cap_for_any_kind() -> None:
+    """Invariant across every valid kind, including the prose ones."""
+    long_prose = ("A sentence of moderate length that keeps going on. " * 200).strip()
+    for kind in sorted(kb.VALID_KINDS):
+        out = kb.bound_text(long_prose, kind)
+        assert len(out) <= kb.text_cap(kind), kind
+        assert out.endswith(" … [truncated]"), kind
+
+
+def test_process_retrospective_prose_gets_the_larger_cap(tmp_path) -> None:
+    """A REVIEW retrospective is prose too, so it rides the same cap through harvest."""
+    path = tmp_path / "kb.jsonl"
+    detail = ("The stage template asks for a retrospective but never says what a subtractive "
+              "lesson looks like, so every run returns an additive one. " * 4).strip()
+    written = kb.append_learnings(path, [{"kind": "process", "text": f"Retro title: {detail}"}])
+    assert kb.MAX_TEXT < len(written[0]["text"]) <= kb.MAX_TEXT_PROSE
+
+
+def test_prose_recall_stays_within_the_context_ceiling(tmp_path) -> None:
+    """The larger cap must not push a full recall past the context plane's ceiling."""
+    path = tmp_path / "kb.jsonl"
+    filler = "The reviewer explained the defect in careful prose about widgets. " * 40
+    for i in range(8):
+        kb.append_learnings(path, [{"kind": "review", "text": f"widgets case {i}. {filler}"}])
+    hits = kb.relevant_learnings(path, {"title_tokens": ["widgets", "case"]}, limit=5)
+    assert len(hits) == 5
+    assert all(len(h) <= kb.MAX_TEXT_PROSE for h in hits)
+    assert _context_bytes({"prior_learnings": hits}) < _MAX_CONTEXT_BYTES
+
+
+# --- resolved review findings age out of recall (#393) ------------------------------
+
+
+def _review_task(task_id: str, state: TaskState, text: str) -> Task:
+    task = Task(task_id=task_id, run_id="r1", created_at="x", updated_at="x")
+    task.state = state
+    task.learnings = [text]
+    return task
+
+
+def test_harvest_stamps_the_tasks_terminal_outcome(tmp_path) -> None:
+    """Harvest runs at finalize, so the outcome is a fact by the time the row is written."""
+    path = tmp_path / "kb.jsonl"
+    done = kb.harvest_from_task(
+        path, _review_task("t1", TaskState.COMPLETED, "review rejected (cycle 1): leaky lock"), "r1"
+    )
+    failed = kb.harvest_from_task(
+        path, _review_task("t2", TaskState.FAILED, "review rejected (cycle 1): bad guard"), "r1"
+    )
+    assert done[0]["task_outcome"] == "completed"
+    assert failed[0]["task_outcome"] == "failed"
+    assert kb.resolved_defect(done[0]) is True
+    assert kb.resolved_defect(failed[0]) is False
+
+
+def test_only_review_findings_can_be_resolved(tmp_path) -> None:
+    """A failure/infra/salvage lesson generalizes past the instance that produced it, so
+    completing the task does not make it stale the way a fixed rejection does."""
+    path = tmp_path / "kb.jsonl"
+    task = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
+    task.state = TaskState.COMPLETED
+    task.learnings = [
+        "review rejected (cycle 1): the widget lock is re-entrant",
+        "implement (attempt 0): the widget suite needs a live socket [infra]",
+    ]
+    review, failure = kb.harvest_from_task(path, task, "r1")
+    assert kb.resolved_defect(review) is True
+    assert kb.resolved_defect(failure) is False
+
+
+def test_a_resolved_finding_loses_to_a_live_one_on_equal_signal(tmp_path) -> None:
+    """The #393 demotion: same file overlap, so the still-live lesson takes the top slot
+    even though the resolved one is newer (which would win the old recency tiebreak)."""
+    path = tmp_path / "kb.jsonl"
+    common = {"kind": "review", "files": ["src/pkg/mod.py"], "stage": "review"}
+    kb.append_learnings(path, [
+        {**common, "text": "live widget finding in src/pkg/mod.py",
+         "task_outcome": "failed", "ts": "2026-07-01T00:00:00+00:00"},
+        {**common, "text": "fixed widget finding in src/pkg/mod.py",
+         "task_outcome": "completed", "ts": "2026-07-09T00:00:00+00:00"},
+    ])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"], "title_tokens": ["widget"]})
+    assert hits == ["live widget finding in src/pkg/mod.py",
+                    "fixed widget finding in src/pkg/mod.py"]
+
+
+def test_a_resolved_finding_is_demoted_not_excluded(tmp_path) -> None:
+    """Unlike a capacity notice or a process row, it still names a real hazard in a file —
+    so when it is the only match it keeps its slot rather than dropping out of recall."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [{
+        "kind": "review", "text": "fixed widget finding in src/pkg/mod.py",
+        "files": ["src/pkg/mod.py"], "task_outcome": "completed",
+    }])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"]})
+    assert hits == ["fixed widget finding in src/pkg/mod.py"]
+
+
+def test_demotion_still_ranks_a_resolved_file_hit_over_a_weaker_live_match(tmp_path) -> None:
+    """The bit sits BELOW file-overlap, so it reorders same-file entries without letting a
+    live stage-only match leapfrog a resolved finding about the file actually in play."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "fixed finding in src/pkg/mod.py",
+         "files": ["src/pkg/mod.py"], "task_outcome": "completed"},
+        {"kind": "failure", "text": "unrelated stage note", "stage": "review"},
+    ])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"], "stage": "review"})
+    assert hits == ["fixed finding in src/pkg/mod.py", "unrelated stage note"]
+
+
+def test_a_legacy_row_without_an_outcome_counts_as_unresolved(tmp_path) -> None:
+    """Every row predating #393 lacks the stamp; unknown must not read as fixed, or adding
+    the field would silently demote the whole existing KB."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "legacy widget finding", "files": ["src/pkg/mod.py"],
+         "ts": "2026-07-01T00:00:00+00:00"},
+        {"kind": "review", "text": "fixed widget finding", "files": ["src/pkg/mod.py"],
+         "task_outcome": "completed", "ts": "2026-07-09T00:00:00+00:00"},
+    ])
+    stored = kb.read_entries(path)
+    assert "task_outcome" not in stored[0]  # absent, not null
+    assert kb.resolved_defect(stored[0]) is False
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"]})
+    assert hits == ["legacy widget finding", "fixed widget finding"]
+
+
+def test_resolution_bit_does_not_weaken_the_no_signal_floor(tmp_path) -> None:
+    """The guard on the #393 splice: the demotion lives in the sort key, never in _score's
+    signal tuple, so `sum(score) == 0` still means 'matched nothing' for every entry."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "utterly unrelated content here", "task_outcome": "failed"},
+        {"kind": "review", "text": "utterly unrelated content too", "task_outcome": "completed"},
+    ])
+    assert kb.relevant_learnings(path, {"title_tokens": ["something", "else"]}) == []
+    for entry in kb.read_entries(path):
+        assert len(kb._score(entry, {"title_tokens": ["nope"]})) == 4

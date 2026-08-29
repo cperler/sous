@@ -14,6 +14,7 @@ from typing import NamedTuple
 
 from pydantic import ValidationError
 
+from .file_contention import normalize_claims
 from .schemas.enums import (
     STAGE_ORDER,
     Effort,
@@ -107,18 +108,20 @@ class FoldNotices(NamedTuple):
     * ``pr_fields``   → ``pr_field_dropped``      (a malformed pr_* value, #201)
     * ``truncations`` → ``context_value_truncated`` (a capped context value, #289)
     * ``evictions``   → ``context_key_evicted``     (a ceiling-shed context key, #289)
+    * ``file_claims`` → ``scope_file_claim_dropped`` (an unusable declared path, #377)
 
-    Kept as three lists rather than one, so the call site needs no per-notice branching
+    Kept as separate lists rather than one, so the call site needs no per-notice branching
     and each event's payload stays a flat, self-describing shape."""
 
     pr_fields: list[dict[str, str]]
     truncations: list[dict[str, object]]
     evictions: list[dict[str, object]]
+    file_claims: list[dict[str, object]]
 
 
 def _no_notices() -> FoldNotices:
     """An empty FoldNotices (fresh lists — never a shared mutable default)."""
-    return FoldNotices(pr_fields=[], truncations=[], evictions=[])
+    return FoldNotices(pr_fields=[], truncations=[], evictions=[], file_claims=[])
 
 
 def apply_result(
@@ -408,8 +411,20 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
         bounded, cap_notices = _cap_value(key, out[key])
         task.context[key] = bounded
         truncations.extend(cap_notices)
+    # #377: the SCOPE-declared edit surface is a SCHEDULING input, so it folds onto its own
+    # durable task field rather than into the context plane — a context key can be evicted
+    # by the whole-context ceiling, and an evicted claim would silently un-serialize the
+    # run. Normalization is total (a malformed declaration yields no claims, never an
+    # exception into record()) and every rejected path comes back as a notice.
+    file_claims: list[dict[str, object]] = []
+    if result.stage is Stage.SCOPE and "files" in out:
+        claims, file_claims = normalize_claims(out["files"])
+        task.scope_files = list(claims)
     evictions = _enforce_context_ceiling(task)
-    return FoldNotices(pr_fields=dropped, truncations=truncations, evictions=evictions)
+    return FoldNotices(
+        pr_fields=dropped, truncations=truncations, evictions=evictions,
+        file_claims=file_claims,
+    )
 
 
 _PR_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)/?$")

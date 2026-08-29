@@ -14,8 +14,10 @@ is NOT committed because ``runs/`` is gitignored).
 Entry shape::
 
     {id, ts, run_id, task_id, kind (failure|review|infra|salvage|manual|process),
-     text (bounded ~500 chars), files (list), failure_kind (classifier kind|null),
-     stage (stage value|null), target ({kind, ref}|null)}
+     text (bounded by KIND — see ``text_cap``), files (list),
+     failure_kind (classifier kind|null), stage (stage value|null),
+     target ({kind, ref}|null), task_outcome (terminal TaskState value; absent when
+     unknown — see ``resolved_defect``)}
 
 Pure functions over the file (the engine wires the path in), so they are trivially
 testable and never depend on the engine's working directory.
@@ -30,11 +32,37 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .schemas.enums import FailureKind, Stage
+from .schemas.enums import FailureKind, Stage, TaskState
 
-# One entry's ``text`` ceiling — mirrors the context-plane per-item bound so a KB hit
-# folded into a prompt is already the right size.
+# One entry's ``text`` ceiling. The DEFAULT mirrors the context-plane per-item bound so a
+# KB hit folded into a prompt is already the right size.
 MAX_TEXT = 500
+
+# #401: the cap is chosen by what an entry's KIND MEANS, not by one global number — the
+# same reasoning #289 applied to the context plane's ``_ITEM_CAP_BY_KEY``. A ``failure``
+# row is a terse head line plus a failing-test list; 500 chars is the right size for it.
+# A ``review`` row is a reviewer's rejection PROSE and a ``process`` row a REVIEW
+# retrospective's title+detail, and 500 chars routinely lands mid-sentence there — so the
+# lesson recalls into a later task as a fragment and reads as noise even when it is still
+# true. Prose kinds get a cap sized to hold a whole rejection detail instead.
+#
+# Budget: recall folds at most 5 hits (``relevant_learnings(limit=5)``) into
+# ``task.context["prior_learnings"]``, so the worst case is ~7.5KB against the context
+# plane's 16KB ceiling — and ``prior_learnings`` is the FIRST key that ceiling sheds
+# (``ENGINE_INJECTED_KEYS``), so a fat recall can never evict durable stage context.
+MAX_TEXT_PROSE = 1500
+_MAX_TEXT_BY_KIND: dict[str, int] = {"review": MAX_TEXT_PROSE, "process": MAX_TEXT_PROSE}
+
+# Appended in place of what was cut, so a truncated row is never mistaken for a whole one.
+_TRUNC_SUFFIX = " … [truncated]"
+
+# A sentence terminator (with any trailing quote/bracket) followed by whitespace or EOS.
+_SENTENCE_END_RE = re.compile(r"[.!?][\"')\]]*(?=\s|$)")
+
+# How much of the budget a boundary cut must retain to be preferred over a hard cut. Below
+# this, backing up to the last sentence/word would throw away more meaning than the ragged
+# edge costs, so the hard cut wins.
+_MIN_BOUNDARY_FRACTION = 0.6
 
 VALID_KINDS = frozenset({"failure", "review", "infra", "salvage", "manual", "process"})
 
@@ -44,6 +72,7 @@ VALID_PROCESS_TARGET_KINDS = frozenset(
 
 _STAGE_VALUES = frozenset(s.value for s in Stage)
 _FAILURE_KIND_VALUES = frozenset(k.value for k in FailureKind)
+_TASK_STATE_VALUES = frozenset(s.value for s in TaskState)
 
 # Cheap English/boilerplate stopwords dropped from title-token matching so overlap is
 # driven by the substantive terms (module names, feature nouns), not glue words.
@@ -96,10 +125,46 @@ def _new_id() -> str:
     return f"lk-{uuid.uuid4().hex[:12]}"
 
 
-def bound_text(text: str) -> str:
-    """Bound one entry's text to ``MAX_TEXT`` chars (mirrors the context-plane item cap)."""
+def text_cap(kind: str | None = None) -> int:
+    """The write-time ``text`` cap for one entry, by its KIND (#401).
+
+    Prose kinds (``review``, ``process``) get ``MAX_TEXT_PROSE``; everything else — and any
+    unrecognized kind — gets the default ``MAX_TEXT``. Pure and total."""
+    return _MAX_TEXT_BY_KIND.get(str(kind or ""), MAX_TEXT)
+
+
+def bound_text(text: str, kind: str | None = None) -> str:
+    """Bound one entry's text to its kind's cap, cutting on a SENTENCE or WORD boundary.
+
+    Deterministic and pure — no wall-clock, no randomness — so a replayed harvest writes
+    byte-identical rows.
+
+    Over the cap, the text is cut to the last sentence end that still retains
+    ``_MIN_BOUNDARY_FRACTION`` of the budget; failing that, the last word boundary meeting
+    the same floor; failing that, a hard cut (a single unbroken token has no boundary to
+    find). The result always ends in ``_TRUNC_SUFFIX`` and never exceeds the cap, so a
+    truncated row still reads as truncated (#401 — a mid-sentence fragment recalls as noise
+    even when the lesson it carries is true)."""
     text = str(text or "").strip()
-    return text if len(text) <= MAX_TEXT else text[: MAX_TEXT - len(" … [truncated]")] + " … [truncated]"
+    cap = text_cap(kind)
+    if len(text) <= cap:
+        return text
+    budget = cap - len(_TRUNC_SUFFIX)
+    if budget <= 0:  # pathological cap; degrade to a hard cut rather than over-run it
+        return text[:cap]
+    head = text[:budget]
+    floor = int(budget * _MIN_BOUNDARY_FRACTION)
+
+    cut = -1
+    for m in _SENTENCE_END_RE.finditer(head):
+        if m.end() >= floor:
+            cut = m.end()  # ascending scan, so the LAST qualifying end wins
+    if cut < 0:
+        ws = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
+        if ws >= floor:
+            cut = ws
+    kept = (head[:cut] if cut > 0 else head).rstrip()
+    return kept + _TRUNC_SUFFIX
 
 
 def tokenize(text: str) -> list[str]:
@@ -157,6 +222,63 @@ def is_capacity_notice(text: str) -> bool:
     if not m:
         return False  # no engine-authored prefix — never guess from a task's own prose
     return head[m.end():].lstrip("\"'").startswith(_HEAD_LIMIT_PREFIXES)
+
+
+# --- resolved review findings (#393) -------------------------------------------------
+#
+# #384 asked whether a ``review`` entry describing a defect that was subsequently FIXED
+# should age out, and deliberately left it alone: nothing in the KB recorded resolution, so
+# a TTL, an "N runs later" decay, or a recency weight in ``_score`` would all have been a
+# guess about relevance rather than a fact about the finding.
+#
+# It turns out resolution IS a fact available at write time. A rejection learning is not
+# harvested when the reviewer rejects — it is harvested at task FINALIZE, and every
+# ``Engine._harvest_task_learnings`` call site fires only once the task is terminal. So the
+# task's outcome is already known when the row is written: a ``review`` learning harvested
+# from a task that reached COMPLETED describes a defect that the SAME task's fix cycle
+# closed on its way to completing. ``harvest_from_task`` stamps ``task_outcome``, and no
+# tombstone-append convention over the append-only JSONL is needed.
+#
+# Two deliberate narrowings:
+#
+# - Only ``review`` counts. A ``failure``/``infra``/``salvage`` lesson (a flaky harness, a
+#   tricky module, an environment quirk) generalizes past the instance that produced it and
+#   stays true after the task completes; a rejection about a specific line does not.
+# - An absent ``task_outcome`` is UNRESOLVED, never resolved. Every row written before this
+#   change lacks the field, so unknown must not be read as fixed — no legacy row is silently
+#   dropped from recall by the mere addition of the stamp.
+#
+# Recency was rejected as the mechanism: it is a proxy for relevance, whereas resolution is
+# the thing the proxy was standing in for, and ``relevant_learnings`` already orders
+# equal-signal entries by ``ts``.
+_COMPLETED_OUTCOME = TaskState.COMPLETED.value
+
+
+def resolved_defect(entry: dict) -> bool:
+    """True if one KB entry describes a defect that has since been FIXED (#393).
+
+    Pure and total. True only for a ``review`` entry stamped with a COMPLETED
+    ``task_outcome`` — the reviewer's finding was blocking, and the task nonetheless reached
+    completion, so the fix cycle that followed the rejection closed it. Any other kind, any
+    non-completed outcome, and any entry missing the stamp (every row predating #393) is
+    False, so 'unknown' reads as still-live rather than as resolved.
+    """
+    if not isinstance(entry, dict) or entry.get("kind") != "review":
+        return False
+    return str(entry.get("task_outcome") or "") == _COMPLETED_OUTCOME
+
+
+def _terminal_outcome(task: object) -> str | None:
+    """The terminal-state VALUE of a finished task, for the ``task_outcome`` stamp.
+
+    Duck-typed and tolerant in the same style as ``_task_files``: a task doc without a
+    usable ``state`` yields None and the field is simply omitted, which ``resolved_defect``
+    reads as unresolved."""
+    state = getattr(task, "state", None)
+    value = getattr(state, "value", state)
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value if value in _TASK_STATE_VALUES else None
 
 
 def mentioned_files(text: str, files: list[str]) -> list[str]:
@@ -247,7 +369,9 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     """Append ``entries`` to the JSONL KB, returning the entries actually written.
 
     Each input dict supplies ``text`` (required) + optional ``run_id, task_id, kind, files,
-    failure_kind, stage, target, ts, id``; missing ``id``/``ts`` are minted here. With
+    failure_kind, stage, target, task_outcome, ts, id``; missing ``id``/``ts`` are minted
+    here, and ``target``/``task_outcome`` are written only when present so a row that knows
+    neither stays clean. With
     ``dedupe`` enabled, ordinary learnings use a global normalized-text fingerprint, while
     ``process`` observations include ``run_id`` and normalized target identity in that key.
     The latter keeps replay within one run idempotent without erasing either cross-run
@@ -280,7 +404,11 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     written: list[dict] = []
     lines: list[str] = []
     for raw in entries:
-        text = bound_text(raw.get("text", ""))
+        # Normalize the kind FIRST: it selects the text cap (#401), so an unrecognized kind
+        # must fall back to "manual"'s default bound rather than miss the table both ways.
+        kind = raw.get("kind") or "manual"
+        kind = kind if kind in VALID_KINDS else "manual"
+        text = bound_text(raw.get("text", ""), kind)
         if not text:
             continue
         raw_with_text = {**raw, "text": text}
@@ -288,13 +416,12 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
         if dedupe and key in seen:
             continue
         seen.add(key)
-        kind = raw.get("kind") or "manual"
         entry = {
             "id": raw.get("id") or _new_id(),
             "ts": raw.get("ts") or _now(),
             "run_id": raw.get("run_id"),
             "task_id": raw.get("task_id"),
-            "kind": kind if kind in VALID_KINDS else "manual",
+            "kind": kind,
             "text": text,
             "files": [str(f) for f in (raw.get("files") or [])],
             "failure_kind": raw.get("failure_kind"),
@@ -302,6 +429,8 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
         }
         if raw.get("target") is not None:
             entry["target"] = raw["target"]
+        if raw.get("task_outcome") is not None:
+            entry["task_outcome"] = str(raw["task_outcome"])
         lines.append(json.dumps(entry, separators=(",", ":"), ensure_ascii=False))
         written.append(entry)
     if lines:
@@ -324,12 +453,18 @@ def harvest_from_task(path: str | Path, task: object, run_id: str, *, now: str |
     - Each entry is tagged with only the task files its own text NAMES (``mentioned_files``),
       not the task's whole ``files_changed`` list. File overlap strictly dominates recall, so
       an inherited path list let an entry with no file locus outrank every real lesson.
+
+    Every row is also stamped with the task's terminal state as ``task_outcome`` (#393).
+    This function only ever runs at task FINALIZE, so the outcome is a fact by the time the
+    row is written — which is what lets ``resolved_defect`` tell a still-live rejection from
+    one the same task's fix cycle already closed, with no update path on the append-only log.
     """
     learnings = list(getattr(task, "learnings", None) or [])
     if not learnings:
         return []
     files = _task_files(task)
     task_id = getattr(task, "task_id", None)
+    outcome = _terminal_outcome(task)
     entries = [
         {
             "run_id": run_id,
@@ -339,6 +474,7 @@ def harvest_from_task(path: str | Path, task: object, run_id: str, *, now: str |
             "files": mentioned_files(text, files),
             "failure_kind": extract_failure_kind(text),
             "stage": extract_stage(text),
+            "task_outcome": outcome,
             "ts": now,
         }
         for text in learnings
@@ -418,7 +554,12 @@ def _score(entry: dict, query: dict) -> tuple[int, int, int, int]:
     """Deterministic relevance tiers, most→least significant: file-overlap, failure-kind,
     stage, title-token overlap. Lexicographic tuple ordering makes each tier strictly
     dominate the next (any file overlap beats any kind/stage/token match), which is exactly
-    'file-overlap > same failure_kind > same stage > title-token overlap'."""
+    'file-overlap > same failure_kind > same stage > title-token overlap'.
+
+    These are the SIGNAL tiers only, and deliberately so: ``relevant_learnings`` uses
+    ``sum(...) == 0`` as its relevance floor, so anything that is not evidence of a match
+    (the #393 resolution demotion) must be spliced into the sort key there rather than
+    added here, or every entry would clear the floor and nothing would be filtered."""
     efiles = [str(f) for f in (entry.get("files") or [])]
     qfiles = [str(f) for f in (query.get("files") or [])]
     file_overlap = sum(1 for q in qfiles if any(_file_match(q, e) for e in efiles))
@@ -435,15 +576,25 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
     """The ``limit`` most-relevant prior-learning TEXTS for a task, by deterministic score.
 
     ``query``: ``{files, stage, failure_kind, title_tokens}``. Ordering is file-overlap >
-    failure-kind > stage > title-token overlap, recency (ts) as the tiebreak. Only entries
-    with at least ONE positive signal are returned — a task matching nothing gets nothing
-    (the fold is advisory 'may or may not apply', never random noise). Texts are already
-    bounded at write time. ``process`` entries are excluded unconditionally because they
-    are harness-maintainer evidence, not advice for a product task; capacity/rate-limit
-    notices are excluded for the same reason they are no longer harvested (#384) — the
-    filter is applied at READ time too because the KB is append-only, so rows written
-    before the harvest filter existed would otherwise keep winning slots forever."""
-    scored: list[tuple[tuple[int, int, int, int], str, dict]] = []
+    NOT-resolved > failure-kind > stage > title-token overlap, recency (ts) as the tiebreak.
+    Only entries with at least ONE positive signal are returned — a task matching nothing
+    gets nothing (the fold is advisory 'may or may not apply', never random noise). Texts
+    are already bounded at write time. ``process`` entries are excluded unconditionally
+    because they are harness-maintainer evidence, not advice for a product task;
+    capacity/rate-limit notices are excluded for the same reason they are no longer
+    harvested (#384) — the filter is applied at READ time too because the KB is
+    append-only, so rows written before the harvest filter existed would otherwise keep
+    winning slots forever.
+
+    A RESOLVED review finding (#393, ``resolved_defect``) is DEMOTED rather than excluded,
+    unlike those two. A capacity notice and a process observation teach a product task
+    nothing at all, so they take no slot; a rejection that was fixed is at worst stale about
+    its own code but still names a real hazard in a file, so it earns a low slot instead of
+    losing outright. Slotting the bit directly below file-overlap gives it exactly that
+    force: among entries touching the same files, every still-live lesson outranks every
+    resolved one, but a resolved finding about the file actually in play still beats a
+    stranger matching on a stage or a token."""
+    scored: list[tuple[tuple[int, int, int, int, int], str, dict]] = []
     for entry in read_entries(path):
         if entry.get("kind") == "process":
             continue  # detector fuel, never advice for an unrelated product task
@@ -452,7 +603,9 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
         s = _score(entry, query)
         if sum(s) == 0:
             continue  # no signal at all — not relevant
-        scored.append((s, str(entry.get("ts") or ""), entry))
+        live = 0 if resolved_defect(entry) else 1
+        key = (s[0], live, s[1], s[2], s[3])
+        scored.append((key, str(entry.get("ts") or ""), entry))
     # score desc, then recency desc; stable for exact ties (file order preserved).
     scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
     return [entry["text"] for _, _, entry in scored[:limit]]
