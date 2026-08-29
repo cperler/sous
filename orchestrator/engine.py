@@ -1137,10 +1137,11 @@ class Engine:
         supervisor_resume_command: str | None = None,
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
-        dispatch (terminal/parked task, decomposition umbrella, budget pause, or pipeline
-        exhausted). Before selecting a stage, a normal dispatch resumes any approved,
-        partially-filed SCOPE decomposition so its parent cannot advance into IMPLEMENT;
-        completed umbrellas leave execution to their children on the run DAG.
+        dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
+        exhausted, or a declared-file claim held by another live task). Before selecting
+        a stage, a normal dispatch resumes any approved, partially-filed SCOPE
+        decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
+        leave execution to their children on the run DAG.
 
         The single dispatch-resolution point: picks the stage, routes the lane
         (deterministic stages -> the in-process ENGINE lane), and resolves BOTH routing
