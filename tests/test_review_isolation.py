@@ -168,6 +168,36 @@ def test_codex_review_is_writable_only_inside_disposable_workspace(tmp_path) -> 
     assert not (live / ".pytest_cache").exists()
 
 
+def test_bytecode_caches_are_not_copied_into_the_disposable_review_copy(tmp_path) -> None:
+    """#410: a copied cache names the ORIGINAL worktree in tracebacks raised from the copy."""
+    live = _repo(tmp_path / "live")
+    (live / "__pycache__").mkdir()
+    (live / "__pycache__" / "top.cpython-313.pyc").write_bytes(b"stale")
+    (live / "pkg").mkdir()
+    (live / "pkg" / "mod.py").write_text("value = 1\n", encoding="utf-8")
+    (live / "pkg" / "__pycache__").mkdir()
+    (live / "pkg" / "__pycache__" / "mod.cpython-313.pyc").write_bytes(b"stale")
+    (live / "pkg" / "loose.pyc").write_bytes(b"stale")
+    seen: list[Path] = []
+
+    def transport(work: WorkItem) -> RawResult:
+        cwd = Path(work.cwd or "")
+        seen.append(cwd)
+        assert not (cwd / "__pycache__").exists()
+        assert not (cwd / "pkg" / "__pycache__").exists()
+        assert not (cwd / "pkg" / "loose.pyc").exists()
+        assert (cwd / "pkg" / "mod.py").read_text() == "value = 1\n"  # sources still copied
+        assert (cwd / ".deps" / "ready").is_file()  # unrelated ignored payload untouched
+        return RawResult({"approved": True, "issues": [], "tests_meaningful": True})
+
+    work = _work(live).model_copy(update={"env": None})  # no inherited ports to isolate
+    result = HeadlessClaudeRunner(transport).dispatch(work)
+
+    assert result.status is ResultStatus.SUCCESS
+    assert seen and not seen[0].exists()
+    assert (live / "__pycache__" / "top.cpython-313.pyc").is_file()  # live tree unchanged
+
+
 def test_port_exhaustion_fails_closed_without_calling_reviewer(tmp_path, monkeypatch) -> None:
     live = _repo(tmp_path / "live")
     project = PortProject(tmp_path / "ports.json")
