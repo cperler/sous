@@ -11,7 +11,7 @@ from orchestrator import learnings_kb as kb
 from orchestrator.cli import main as cli_main
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
-from orchestrator.schemas.enums import ResultStatus
+from orchestrator.schemas.enums import ResultStatus, TaskState
 from orchestrator.schemas.status import Task
 from orchestrator.state_machine import (
     _MAX_CONTEXT_BYTES,
@@ -554,3 +554,114 @@ def test_prose_recall_stays_within_the_context_ceiling(tmp_path) -> None:
     assert len(hits) == 5
     assert all(len(h) <= kb.MAX_TEXT_PROSE for h in hits)
     assert _context_bytes({"prior_learnings": hits}) < _MAX_CONTEXT_BYTES
+
+
+# --- resolved review findings age out of recall (#393) ------------------------------
+
+
+def _review_task(task_id: str, state: TaskState, text: str) -> Task:
+    task = Task(task_id=task_id, run_id="r1", created_at="x", updated_at="x")
+    task.state = state
+    task.learnings = [text]
+    return task
+
+
+def test_harvest_stamps_the_tasks_terminal_outcome(tmp_path) -> None:
+    """Harvest runs at finalize, so the outcome is a fact by the time the row is written."""
+    path = tmp_path / "kb.jsonl"
+    done = kb.harvest_from_task(
+        path, _review_task("t1", TaskState.COMPLETED, "review rejected (cycle 1): leaky lock"), "r1"
+    )
+    failed = kb.harvest_from_task(
+        path, _review_task("t2", TaskState.FAILED, "review rejected (cycle 1): bad guard"), "r1"
+    )
+    assert done[0]["task_outcome"] == "completed"
+    assert failed[0]["task_outcome"] == "failed"
+    assert kb.resolved_defect(done[0]) is True
+    assert kb.resolved_defect(failed[0]) is False
+
+
+def test_only_review_findings_can_be_resolved(tmp_path) -> None:
+    """A failure/infra/salvage lesson generalizes past the instance that produced it, so
+    completing the task does not make it stale the way a fixed rejection does."""
+    path = tmp_path / "kb.jsonl"
+    task = Task(task_id="t1", run_id="r1", created_at="x", updated_at="x")
+    task.state = TaskState.COMPLETED
+    task.learnings = [
+        "review rejected (cycle 1): the widget lock is re-entrant",
+        "implement (attempt 0): the widget suite needs a live socket [infra]",
+    ]
+    review, failure = kb.harvest_from_task(path, task, "r1")
+    assert kb.resolved_defect(review) is True
+    assert kb.resolved_defect(failure) is False
+
+
+def test_a_resolved_finding_loses_to_a_live_one_on_equal_signal(tmp_path) -> None:
+    """The #393 demotion: same file overlap, so the still-live lesson takes the top slot
+    even though the resolved one is newer (which would win the old recency tiebreak)."""
+    path = tmp_path / "kb.jsonl"
+    common = {"kind": "review", "files": ["src/pkg/mod.py"], "stage": "review"}
+    kb.append_learnings(path, [
+        {**common, "text": "live widget finding in src/pkg/mod.py",
+         "task_outcome": "failed", "ts": "2026-07-01T00:00:00+00:00"},
+        {**common, "text": "fixed widget finding in src/pkg/mod.py",
+         "task_outcome": "completed", "ts": "2026-07-09T00:00:00+00:00"},
+    ])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"], "title_tokens": ["widget"]})
+    assert hits == ["live widget finding in src/pkg/mod.py",
+                    "fixed widget finding in src/pkg/mod.py"]
+
+
+def test_a_resolved_finding_is_demoted_not_excluded(tmp_path) -> None:
+    """Unlike a capacity notice or a process row, it still names a real hazard in a file —
+    so when it is the only match it keeps its slot rather than dropping out of recall."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [{
+        "kind": "review", "text": "fixed widget finding in src/pkg/mod.py",
+        "files": ["src/pkg/mod.py"], "task_outcome": "completed",
+    }])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"]})
+    assert hits == ["fixed widget finding in src/pkg/mod.py"]
+
+
+def test_demotion_still_ranks_a_resolved_file_hit_over_a_weaker_live_match(tmp_path) -> None:
+    """The bit sits BELOW file-overlap, so it reorders same-file entries without letting a
+    live stage-only match leapfrog a resolved finding about the file actually in play."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "fixed finding in src/pkg/mod.py",
+         "files": ["src/pkg/mod.py"], "task_outcome": "completed"},
+        {"kind": "failure", "text": "unrelated stage note", "stage": "review"},
+    ])
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"], "stage": "review"})
+    assert hits == ["fixed finding in src/pkg/mod.py", "unrelated stage note"]
+
+
+def test_a_legacy_row_without_an_outcome_counts_as_unresolved(tmp_path) -> None:
+    """Every row predating #393 lacks the stamp; unknown must not read as fixed, or adding
+    the field would silently demote the whole existing KB."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "legacy widget finding", "files": ["src/pkg/mod.py"],
+         "ts": "2026-07-01T00:00:00+00:00"},
+        {"kind": "review", "text": "fixed widget finding", "files": ["src/pkg/mod.py"],
+         "task_outcome": "completed", "ts": "2026-07-09T00:00:00+00:00"},
+    ])
+    stored = kb.read_entries(path)
+    assert "task_outcome" not in stored[0]  # absent, not null
+    assert kb.resolved_defect(stored[0]) is False
+    hits = kb.relevant_learnings(path, {"files": ["src/pkg/mod.py"]})
+    assert hits == ["legacy widget finding", "fixed widget finding"]
+
+
+def test_resolution_bit_does_not_weaken_the_no_signal_floor(tmp_path) -> None:
+    """The guard on the #393 splice: the demotion lives in the sort key, never in _score's
+    signal tuple, so `sum(score) == 0` still means 'matched nothing' for every entry."""
+    path = tmp_path / "kb.jsonl"
+    kb.append_learnings(path, [
+        {"kind": "review", "text": "utterly unrelated content here", "task_outcome": "failed"},
+        {"kind": "review", "text": "utterly unrelated content too", "task_outcome": "completed"},
+    ])
+    assert kb.relevant_learnings(path, {"title_tokens": ["something", "else"]}) == []
+    for entry in kb.read_entries(path):
+        assert len(kb._score(entry, {"title_tokens": ["nope"]})) == 4
