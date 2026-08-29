@@ -329,8 +329,8 @@ never satisfy.
   `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
   entries into the `prior_learnings` context key — read-only advisory text, folded once per
-  task, rendered (hedged) into every stage prompt. `orchestrator kb capture|apply|show|gc`
-  is the manual surface. Two filters keep the recall pool honest (#384): a provider
+  task, rendered (hedged) into every stage prompt. `orchestrator kb show|add` is the manual
+  surface. Two filters keep the recall pool honest (#384): a provider
   capacity/rate-limit notice is not a learning — it is an infra event already durable in
   `events.jsonl`/`stage-costs.jsonl`, so `is_capacity_notice` drops it at harvest AND at
   recall (the KB is append-only, so pre-filter rows can only be neutralised at read time),
@@ -338,8 +338,17 @@ never satisfy.
   silent; and an entry is tagged with only the changed files its own text NAMES
   (`mentioned_files`), never the task's whole `files_changed` list, because file overlap
   strictly dominates `_score` and an inherited path list let a contentless failure outrank
-  every real lesson in that package. A distilled retrospective pattern with no sample error
-  is likewise not persisted. REVIEW process retrospectives use a detector-only `process` kind:
+  every real lesson in that package. A third signal DEMOTES rather than filters (#393):
+  harvest runs at task finalize, so the task's terminal state is a fact by the time a row is
+  written and is stamped on it as `task_outcome`. A `review` entry from a COMPLETED task
+  therefore describes a defect that the same task's fix cycle closed (`resolved_defect`),
+  and `relevant_learnings` ranks it below a still-live lesson at equal file overlap — below,
+  not out, because a fixed rejection is stale about its own code but still names a real
+  hazard in a file. That is a fact about the finding rather than the TTL/recency guess #384
+  declined to make, and it needs no update path on the append-only log; an entry missing the
+  stamp (every row predating #393) counts as unresolved, so no legacy row is silently
+  demoted. A distilled retrospective pattern with no sample error is likewise not
+  persisted. REVIEW process retrospectives use a detector-only `process` kind:
   they never enter task prompts. `orchestrator/meta_authoring.py` groups those observations
   by their optional stage-template/agent/skill/schema/kit target and, after the same target
   appears in two distinct runs, files one evidence-backed `meta-authoring` task through a
