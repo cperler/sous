@@ -46,6 +46,7 @@ from .decomposition import (
 from .driver_log import liveness_from_log
 from .driver_log import read_records as read_driver_records
 from .engine_signals import (
+    DispatchOrphan,
     RunFacts,
     append_observations,
     detect_observations,
@@ -5896,9 +5897,15 @@ class Engine:
                 else:
                     continuity_unknown += 1
                 if wid:
+                    # `ts` is the moment the unclosed lease was OPENED. Carried on the
+                    # orphan record because it is the only stable date an orphan has: the
+                    # imbalance is a property of the whole log, so anything reporting it
+                    # (#400's engine-signal scan) would otherwise have to stamp its own
+                    # clock and lose replay-identity.
                     dispatched[wid] = {"task_id": ev.get("task_id"),
                                        "stage": ev.get("stage"),
-                                       "attempt": ev.get("attempt")}
+                                       "attempt": ev.get("attempt"),
+                                       "ts": str(ev.get("ts") or "")}
             elif etype in ("stage_recorded", "lease_superseded", "dispatch_abandoned",
                            "dispatch_reclaimed"):
                 if wid:
@@ -7561,8 +7568,11 @@ class Engine:
             run_state=run.state.value,
             run_terminal=run.state in TERMINAL_RUN_STATES,
             unfinished_tasks=tuple(unfinished),
+            # Carry each orphan's OPENING timestamp, not just its id: it is the only
+            # replay-stable date a whole-log imbalance has (see `DispatchOrphan`).
             dispatch_orphans=tuple(
-                str(o.get("work_item_id")) for o in audit.get("orphans") or []
+                DispatchOrphan(str(o.get("work_item_id")), ts=str(o.get("ts") or ""))
+                for o in audit.get("orphans") or []
             ),
         )
 
@@ -7606,7 +7616,6 @@ class Engine:
                 events,
                 read_driver_records(self.store.root, run_id=run_id),
                 self._run_facts(run_id, events=events),
-                now=_now(),
             )
             store_path = self._engine_signals_path()
             written = append_observations(store_path, observations)

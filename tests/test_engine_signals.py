@@ -43,7 +43,7 @@ def _facts(**kw) -> sig.RunFacts:
 
 def _detect(events=(), driver=(), facts=None):
     observations, notices = sig.detect_observations(
-        list(events), list(driver), facts or _facts(), now="2026-08-28T00:00:00+00:00"
+        list(events), list(driver), facts or _facts()
     )
     return observations, notices
 
@@ -166,11 +166,36 @@ def test_non_deliver_reroute_is_an_undesigned_capability_loss() -> None:
 
 
 def test_orphaned_leases_come_from_the_events_audit_balance() -> None:
-    obs, _ = _detect(facts=_facts(dispatch_orphans=("w-1", "w-2")))
+    obs, _ = _detect(facts=_facts(dispatch_orphans=(
+        sig.DispatchOrphan("w-1", ts="2026-08-28T02:00:00+00:00"),
+        sig.DispatchOrphan("w-2", ts="2026-08-28T01:00:00+00:00"),
+    )))
     assert [o.signal for o in obs] == ["orphaned_dispatch_leases"]
     assert "w-1, w-2" in obs[0].text
-    # No single record dates a whole-log imbalance, so the caller's clock stamps it.
-    assert obs[0].ts == "2026-08-28T00:00:00+00:00"
+    # No single record dates a whole-log imbalance, so the sighting takes the EARLIEST
+    # orphaned dispatch's own timestamp — data-derived, and therefore identical on a
+    # re-scan. Stamping the scanner's clock here would re-identify an unchanged orphan on
+    # every pass and defeat the store's dedupe.
+    assert obs[0].ts == "2026-08-28T01:00:00+00:00"
+
+
+def test_orphan_sighting_identity_does_not_move_between_scans() -> None:
+    """The regression behind the clock-stamped date: two scans of ONE unchanged log must
+    produce the same fingerprint, or the observation store counts one orphan twice."""
+    facts = _facts(dispatch_orphans=(sig.DispatchOrphan("w-1", ts="2026-08-28T01:00:00+00:00"),))
+    first, _ = _detect(facts=facts)
+    second, _ = _detect(facts=facts)
+    assert [o.fingerprint() for o in first] == [o.fingerprint() for o in second]
+
+
+def test_an_undated_orphan_is_left_undated_rather_than_invented() -> None:
+    """A pre-#175 log carries no dispatch ts. Empty renders as "timestamp unavailable" —
+    still stable, still never the scanner's clock."""
+    obs, _ = _detect(facts=_facts(dispatch_orphans=(sig.DispatchOrphan("w-1"),)))
+    assert obs[0].ts == ""
+    assert "timestamp unavailable" in sig.signal_body(
+        {"signal": "orphaned_dispatch_leases", "evidence": [obs[0].as_row()]}
+    )
 
 
 def test_a_clean_run_produces_nothing() -> None:
@@ -291,6 +316,33 @@ def test_scan_is_idempotent_across_repeat_invocations(tmp_path, project) -> None
     skipped = [e for e in eng.store.read_events("r1")
                if e["type"] == "meta_proposal_skipped"]
     assert skipped and skipped[0]["source"] == "engine"
+
+
+def test_repeat_scan_of_an_orphaned_lease_adds_no_evidence(tmp_path, project) -> None:
+    """The one signal no single event dates. Every OTHER signal takes its timestamp from a
+    real record, so a scan-time stamp only broke this one — and it broke it on the most
+    ordinary path there is, since a completed run scans twice (finalize, then the driver's
+    exit). A second scan of an UNCHANGED orphan must add no row and, above all, must not
+    comment "recurred" on the issue the first scan just filed."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1", pipeline=[Stage.REVIEW])
+    # A lease opened and never closed by recorded/superseded/abandoned/reclaimed, held by
+    # no live task — the #142 imbalance.
+    eng.store.append_event("r1", {"ts": "2026-08-28T01:00:00+00:00",
+                                  "type": "stage_dispatched", "run_id": "r1",
+                                  "task_id": "t1", "stage": "review", "attempt": 0,
+                                  "work_item_id": "w-orphan"})
+
+    first = eng.scan_engine_signals("r1")
+    second = eng.scan_engine_signals("r1")
+
+    assert first["signals"] == ["orphaned_dispatch_leases"] and first["new"] == 1
+    assert second["new"] == 0
+    rows = sig.read_observations(eng._engine_signals_path())
+    assert len(rows) == 1 and rows[0]["ts"] == "2026-08-28T01:00:00+00:00"
+    assert len(project.task_source.followups) == 1
+    assert project.task_source.comments == []  # nothing "recurred"
 
 
 def test_concurrent_scanners_file_one_issue(tmp_path, project, monkeypatch) -> None:

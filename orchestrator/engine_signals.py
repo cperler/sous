@@ -69,6 +69,23 @@ def _bound(text: str) -> str:
 
 
 @dataclass(frozen=True)
+class DispatchOrphan:
+    """One dispatch lease no terminal event ever closed, with the time it was OPENED.
+
+    The ``ts`` is why this is a record rather than a bare id. The dispatch/record
+    imbalance is a property of the whole log, so no single event dates it — and a sighting
+    dated by the SCANNER's clock would get a fresh identity on every re-scan, which
+    silently breaks the store's replay dedupe (the same run's unchanged orphan would file
+    twice and comment "recurred" on itself). The opening dispatch's own timestamp is
+    data-derived and therefore stable, and it is also the date a human diagnosing the
+    orphan actually wants.
+    """
+
+    work_item_id: str
+    ts: str = ""
+
+
+@dataclass(frozen=True)
 class RunFacts:
     """Run state a predicate needs beyond the raw log records.
 
@@ -86,7 +103,7 @@ class RunFacts:
     run_state: str = ""
     run_terminal: bool = False
     unfinished_tasks: tuple[str, ...] = ()
-    dispatch_orphans: tuple[str, ...] = ()
+    dispatch_orphans: tuple[DispatchOrphan, ...] = ()
 
 
 # Run states in which "the driver stopped with work outstanding" is a DECISION, not a
@@ -327,15 +344,24 @@ def _detect_orphaned_dispatch_leases(
 
     The balance itself comes from ``Engine.events_audit`` (one implementation of the join,
     not two); the caller hands the resulting orphan list over in ``facts``.
+
+    Dated by the EARLIEST orphaned dispatch rather than by the scan, because the whole-log
+    imbalance owns no event of its own and a scan-time date would give the same unchanged
+    condition a new identity on every re-scan — and this scan runs at least twice for an
+    ordinary run (finalize and the driver's exit path), plus whenever a human re-runs the
+    standalone check.
     """
-    if not facts.dispatch_orphans:
+    orphans = facts.dispatch_orphans
+    if not orphans:
         return []
+    dates = sorted(o.ts for o in orphans if o.ts)
+    listed = ", ".join(o.work_item_id for o in orphans[:10])
     return [
         (
-            "",  # no single event owns the imbalance; the caller stamps the scan time
+            dates[0] if dates else "",
             None,
-            f"dispatch/record balance does not close: {len(facts.dispatch_orphans)} "
-            f"dispatch lease(s) — {', '.join(facts.dispatch_orphans[:10])} — were opened "
+            f"dispatch/record balance does not close: {len(orphans)} "
+            f"dispatch lease(s) — {listed} — were opened "
             f"and never closed by a recorded/superseded/abandoned/reclaimed event.",
         )
     ]
@@ -433,15 +459,18 @@ def detect_observations(
     events: Sequence[dict],
     driver_records: Sequence[dict],
     facts: RunFacts,
-    *,
-    now: str,
 ) -> tuple[list[Observation], ScanNotices]:
     """Run every allowlisted detector over one run's logs. Pure.
 
-    ``now`` is passed IN rather than read, so a scan is a deterministic function of its
-    inputs and a replay produces byte-identical observations (which is what makes the
-    store's fingerprint dedupe exact). It is used only for a sighting no single record
-    can date — the dispatch-balance imbalance, which is a property of the whole log.
+    There is deliberately no clock here — not even one passed in. Every observation's
+    timestamp is read out of the records themselves, so a scan is a total function of its
+    inputs and a replay re-derives BYTE-IDENTICAL observations, which is exactly what
+    makes the store's fingerprint dedupe exact. A scan-time stamp would break that for any
+    sighting whose own record lacks a date: the same unchanged condition would take a
+    fresh identity every scan, and since this runs at least twice per run (finalize and
+    the driver's exit path) a single orphan would file once and then immediately comment
+    "recurred" on the issue it had just filed. A date that cannot be derived from the log
+    is left EMPTY and rendered as "timestamp unavailable" rather than invented.
     """
     observations: list[Observation] = []
     declined: dict[str, int] = {}
@@ -452,7 +481,7 @@ def detect_observations(
             obs = Observation(
                 signal=spec.id,
                 run_id=facts.run_id,
-                ts=str(ts or now),
+                ts=str(ts or ""),
                 text=_bound(text),
                 task_id=task_id,
             )
