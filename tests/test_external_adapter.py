@@ -72,6 +72,33 @@ def test_incomplete_external_adapter_names_missing_members(tmp_path) -> None:
         load_project(str(pkg))
 
 
+def test_stale_lint_cmd_mapping_warns_without_blocking(tmp_path, capsys) -> None:
+    """#412: an adapter scaffolded before the leg remap keeps a `lint_cmd` no merge gate
+    calls and no `types_cmd` at all, so its linter is unverified at merge — and it does not
+    self-heal on an engine upgrade. Say so at load. Advisory: the adapter still loads."""
+    _, pkg = _scaffold_external(tmp_path, "stale-project")
+    cfg_py = pkg / "config.py"
+    cfg_py.write_text(
+        cfg_py.read_text()
+        .replace("def types_cmd(self)", "def lint_cmd(self)")
+        .replace("self.types_cmd()", "self.lint_cmd()")
+    )
+
+    cfg = load_project(str(pkg))
+
+    assert cfg.name == "stale-project"  # advisory only
+    err = capsys.readouterr().err
+    assert "lint_cmd" in err and "types_cmd" in err and "orchestrator-scaffold" in err
+
+
+def test_regenerated_adapter_does_not_warn(tmp_path, capsys) -> None:
+    """The control for the warning above: a current adapter is silent, so the warning is a
+    signal rather than noise every load prints."""
+    _, pkg = _scaffold_external(tmp_path, "fresh-project")
+    load_project(str(pkg))
+    assert "lint_cmd" not in capsys.readouterr().err
+
+
 def test_nonexistent_adapter_dir_fails_loudly(tmp_path) -> None:
     with pytest.raises(SystemExit, match="not found"):
         load_project(str(tmp_path / "nope" / ".orchestration"))
