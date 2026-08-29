@@ -27,7 +27,7 @@ from adapters.project.email_sink import (
     render_subject,
 )
 from adapters.project.selfhost.config import SelfHostConfig
-from orchestrator.alerting import NOTIFY_TASK_COMPLETED
+from orchestrator.alerting import NOTIFY_TASK_BLOCKED, NOTIFY_TASK_COMPLETED
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import ExecutionLane, ResultStatus, Stage, TaskState
@@ -292,6 +292,42 @@ def test_message_carries_the_actionable_facts() -> None:
     assert "implement: completed" in body
     assert "/runs/r1" in body  # pointer to the full trail
     assert "added the sink" in body  # the "what was done" prose
+
+
+def test_park_mail_leads_with_the_release_commands() -> None:
+    """#409: a park alert is a REQUEST, not a digest line — the subject says so and the
+    body carries the gate, the issue link, and the commands, above the cost/stage detail."""
+    payload = {
+        "run_id": "batch-390-406", "task_id": "#390", "kind": NOTIFY_TASK_BLOCKED,
+        "summary": "task #390 BLOCKED_ON_HUMAN at deliver (before:deliver)",
+        "title": "Meta-authoring change", "stage": "deliver", "hold_before": "deliver",
+        "gate": "before:deliver", "reason": "held at the before:deliver checkpoint",
+        "issue_url": "https://github.com/cperler/sous/issues/390",
+        "cost": {"usd": 0.5, "invocations": 2, "unmetered_calls": 0},
+        "actions": [
+            {"label": "approve — release the gate", "command": "orchestrator approve --task #390"},
+            {"label": "reject — close it", "command": "orchestrator reject --task #390"},
+        ],
+    }
+    subject = render_subject(NOTIFY_TASK_BLOCKED, payload)
+    assert subject.startswith("[orchestrator] ACTION NEEDED task_blocked")
+
+    body = render_body(NOTIFY_TASK_BLOCKED, payload)
+    assert "Gate: before:deliver" in body
+    assert "Held before: deliver" in body
+    assert "https://github.com/cperler/sous/issues/390" in body
+    assert "orchestrator approve --task #390" in body
+    assert "orchestrator reject --task #390" in body
+    # The command block comes BEFORE the context a recipient reads only if they care.
+    assert body.index("orchestrator approve") < body.index("Cost:")
+
+
+def test_other_kinds_keep_their_plain_subject_and_no_action_block() -> None:
+    """The new fields are additive: a kind without them renders exactly as before."""
+    subject = render_subject("task_completed", {"task_id": "t1"})
+    assert subject.startswith("[orchestrator] task_completed")
+    body = render_body("task_completed", {"summary": "task t1 COMPLETED", "actions": "oops"})
+    assert "ACTION NEEDED" not in body
 
 
 def test_unmetered_cost_is_labelled_a_floor() -> None:

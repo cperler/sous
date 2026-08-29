@@ -149,6 +149,20 @@ class GitHubIssuesSource:
             )
         return out
 
+    def issue_url(self, task_id: str) -> str | None:
+        """Web address of the issue behind a task id (#409) — what a human-gate alert links
+        to so the recipient can read the task without a terminal.
+
+        Optional, duck-typed hook (no CONTRACT_VERSION bump), and deliberately offline: it
+        is derived from the repo slug and the ``#N`` task id rather than fetched, because
+        it is called from inside an alerting path that must not shell out to ``gh``.
+        Returns None for a task id that is not an issue number, so a non-issue task links
+        to nothing instead of to a 404."""
+        num = _issue_number(task_id)
+        if not num.isdigit():
+            return None
+        return f"https://github.com/{self.repo}/issues/{num}"
+
     def describe_issue(self, ref: str) -> dict:
         """Look up a filed issue's state + PR for the conformance gate (#18 bullet 2).
 

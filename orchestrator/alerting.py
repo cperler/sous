@@ -18,6 +18,7 @@ hang an emit on.
 
 from __future__ import annotations
 
+import shlex
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,11 @@ NOTIFY_TASK_FAILED = "task_failed"
 # failed/rejected dispositions), so it fires exactly once per completed task and covers the
 # decomposition-parent path too.
 NOTIFY_TASK_COMPLETED = "task_completed"
+# #409: a task parked at the human gate stalls the whole run until someone acts, so this
+# kind carries an ACTIONABLE payload — the stage it parked before, the gate identity and
+# reason, a link to the source issue, and the exact approve/reject/abandon commands
+# (``release_commands`` below) — and is deduped per park episode on the task doc, so a
+# re-invoked driver re-reading the same parked state does not re-mail.
 NOTIFY_TASK_BLOCKED = "task_blocked"
 NOTIFY_RUN_PAUSED = "run_paused"
 NOTIFY_RUN_FINALIZED = "run_finalized"
@@ -56,6 +62,50 @@ NOTIFY_RUN_BLOCKED = "run_blocked"
 # completed_with_rejections (#67) and superseded (#257) by construction.
 _TERMINAL_RUN_STATES = frozenset(s.value for s in TERMINAL_RUN_STATES)
 _WATCH_STOP_STATES = _TERMINAL_RUN_STATES | {RunState.PARKED.value}
+
+
+# The free-text argument a human must fill in before running a reject/abandon command.
+# Single-quoted in the rendered line so a careless paste runs with a literal placeholder
+# reason rather than a shell-expanded surprise.
+_REASON_PLACEHOLDER = "<why>"
+
+
+def release_commands(
+    *, root: str, run_id: str, task_id: str, gate: str | None = None
+) -> list[dict[str, str]]:
+    """The exact CLI commands that resolve a task parked at the human gate (#409).
+
+    A ``task_blocked`` alert whose recipient still has to reconstruct the invocation is
+    only half an alert — the whole point is that the mail is actionable without opening a
+    terminal and re-deriving the run's store path. So the engine renders the three
+    dispositions the gate actually has, in the order a human considers them: approve
+    (release and continue), reject (close as infeasible), abandon (the dispatch is dead).
+
+    ``root`` is the run's RESOLVED store dir (``Engine.store.root``), which the CLI's
+    flat-established guard keeps stable — a ``--root <that dir> --run <id>`` pair resolves
+    back to the same store, so the line is runnable verbatim. Every interpolated value is
+    ``shlex``-quoted; ``$USER`` is left unquoted on purpose so the shell fills in who
+    approved. Pure string rendering: no I/O, no clock, unit-testable off strings.
+    """
+    base = f"orchestrator --root {shlex.quote(str(root))} --run {shlex.quote(run_id)}"
+    task = f"--task {shlex.quote(task_id)}"
+    approve = f'{base} approve {task} --by "$USER"'
+    if gate:
+        approve += f" --note {shlex.quote(gate)}"
+    return [
+        {
+            "label": "approve — release the gate and let the run continue",
+            "command": approve,
+        },
+        {
+            "label": "reject — close the task as infeasible (fill in the reason)",
+            "command": f'{base} reject {task} --by "$USER" --reason \'{_REASON_PLACEHOLDER}\'',
+        },
+        {
+            "label": "abandon — the dispatch is dead; finalize the task (fill in the reason)",
+            "command": f"{base} abandon {task} --reason '{_REASON_PLACEHOLDER}'",
+        },
+    ]
 
 
 def stale_notifications(

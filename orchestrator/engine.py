@@ -27,8 +27,10 @@ from typing import Literal, cast
 
 from .alerting import (
     NOTIFY_RUN_FINALIZED,
+    NOTIFY_TASK_BLOCKED,
     NOTIFY_TASK_COMPLETED,
     NOTIFY_TASK_FAILED,
+    release_commands,
 )
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .commit_attribution import scan_commits
@@ -1330,12 +1332,13 @@ class Engine:
                 and approval.get("what") == gate
             )
             if not gate_is_approved:
-                self.hold_for_approval(run_id, task_id, what=gate)
-                self.emit_notification(
-                    run_id, "task_blocked",
-                    {"run_id": run_id, "task_id": task_id, "kind": "task_blocked",
-                     "summary": f"task {task_id} is held before {stage.value}",
-                     "stage": stage.value, "reason": gate},
+                held = self.hold_for_approval(run_id, task_id, what=gate)
+                # #409: the park is what stalls the run, so the alert carries everything
+                # needed to release it (gate, issue link, the approve/reject/abandon
+                # commands) and fires once per episode.
+                self._notify_blocked(
+                    run_id, held, stage=stage, gate=gate,
+                    reason=f"held at the {gate} checkpoint",
                 )
                 return None
         # Declared-file contention (#377). `dispatchable` already filters a deferred
@@ -3038,13 +3041,9 @@ class Engine:
             # NOT the human-initiated hold_for_approval, which the human already knows about)
             # is exactly the unattended-run event the old monitor alerted on.
             if task.state is TaskState.BLOCKED_ON_HUMAN:
-                self.emit_notification(
-                    run_id, "task_blocked",
-                    {"run_id": run_id, "task_id": result.task_id, "kind": "task_blocked",
-                     "summary": f"task {result.task_id} BLOCKED_ON_HUMAN at "
-                                f"{result.stage.value} ({outcome}) — needs a human decision",
-                     "stage": result.stage.value,
-                     "reason": scope_blocked_reason or task.last_error or outcome},
+                task = self._notify_blocked(
+                    run_id, task, stage=result.stage, gate=outcome,
+                    reason=scope_blocked_reason or task.last_error or outcome,
                 )
             # #5: audit the port block intake just allocated (it folded port_base into the
             # context plane via CONTEXT_KEYS[INTAKE]); the engine is the event authority, the
@@ -3285,6 +3284,11 @@ class Engine:
 
         Any already persisted local-id mapping is retained, the run-level task ref is
         synchronized, and a warning event records why automatic filing could not continue.
+
+        #409: this park is as run-stalling as the other two, but until now it was the one
+        that alerted NOBODY — a half-filed decomposition parked the umbrella with only a
+        warning event in ``events.jsonl``. It now emits the same ``task_blocked``
+        notification as the feasibility and review-gate parks.
         """
 
         def _hold(task: Task) -> None:
@@ -3299,7 +3303,10 @@ class Engine:
              "run_id": run_id, "task_id": task_id, "reason": reason,
              "mapping": task.decomposition_mapping},
         )
-        return task
+        return self._notify_blocked(
+            run_id, task, stage=Stage.SCOPE, gate="scope_decomposition_held",
+            reason=task.last_error,
+        )
 
     def _complete_ready_umbrellas(self, run_id: str) -> None:
         """Complete umbrella parents whose leaf children all completed successfully.
@@ -4273,6 +4280,12 @@ class Engine:
             if t.pending_approval_what and t.pending_approval_what not in t.approved_holds:
                 t.approved_holds.append(t.pending_approval_what)
             t.pending_approval_what = None
+            # #409: the park episode is over, so the human-gate alert re-arms. A LATER park
+            # (a re-review that rejects again, a second checkpoint) must alert even when it
+            # lands on the same stage — the once-per-EPISODE contract, not once per run.
+            # A terminal disposition (reject/abandon) deliberately doesn't clear: that task
+            # can never park again, so there is nothing to re-arm.
+            t.notified_blocks.clear()
             t.state = TaskState.PENDING
 
         def _approval_events(_t: Task) -> list[dict]:
@@ -4398,6 +4411,106 @@ class Engine:
                 {"ts": _now(), "type": "notification_facts_degraded", "run_id": run_id,
                  "task_id": task.task_id, "part": part, "error": str(exc)},
             )
+
+    # --- human gate alerting (#409) ---------------------------------------------
+    def _issue_url(self, task_id: str) -> str | None:
+        """Best-effort link to the task's source issue, via the optional duck-typed
+        ``issue_url(task_id)`` task-source hook (#409).
+
+        The engine must not learn what a tracker URL looks like — that is the adapter's
+        business — so this is getattr-called like every other optional source hook, needs
+        no ADAPTER_CONTRACT_VERSION bump, and degrades to ``None`` for a source that has
+        no web address (or one whose hook raises). A missing link thins the alert; it
+        never breaks the transition that produced it."""
+        hook = getattr(getattr(self.project, "task_source", None), "issue_url", None)
+        if not callable(hook):
+            return None
+        try:
+            url = hook(task_id)
+        except Exception:  # noqa: BLE001 - enrichment must never break the transition
+            return None
+        return str(url) if url else None
+
+    def _blocked_notification(
+        self, run_id: str, task: Task, *, stage: Stage | None, gate: str, reason: str | None
+    ) -> dict:
+        """The ``task_blocked`` payload every park site shares (#409).
+
+        A park stalls the whole run until a human acts, so the alert has to be actionable
+        on its own: the shared ``_notification_facts`` enrichment (title, issue number,
+        run_dir, per-stage outcomes, cost) plus the gate-specific facts — which stage the
+        task parked at, the gate identity, why — a link to the source issue, and the exact
+        approve/reject/abandon commands. Built here rather than at each site so the three
+        park paths cannot drift apart.
+
+        ``stage`` is the stage the task stopped AT: the one it is held BEFORE for a
+        ``hold_before`` checkpoint, the one whose result parked it otherwise. The
+        distinction is carried explicitly in ``hold_before`` so a sink need not guess.
+        ``release_commands`` is pure and cannot raise; the facts block is already
+        self-guarding (a failed part is evented ``notification_facts_degraded``)."""
+        stage_value = stage.value if stage is not None else None
+        held_before = task.hold_before.value if task.hold_before is not None else None
+        return {
+            **self._notification_facts(run_id, task),
+            "run_id": run_id,
+            "kind": NOTIFY_TASK_BLOCKED,
+            "summary": (
+                f"task {task.task_id} BLOCKED_ON_HUMAN at {stage_value or 'the human gate'}"
+                f" ({gate}) — needs a human decision"
+            ),
+            "stage": stage_value,
+            "hold_before": held_before,
+            "gate": gate,
+            "reason": reason,
+            "issue_url": self._issue_url(task.task_id),
+            "actions": release_commands(
+                root=str(self.store.root), run_id=run_id, task_id=task.task_id, gate=gate
+            ),
+        }
+
+    def _notify_blocked(
+        self, run_id: str, task: Task, *, stage: Stage | None, gate: str, reason: str | None
+    ) -> Task:
+        """Alert ONCE per park episode that this task needs a human, and return the task
+        (with the dedupe marker persisted when it was written).
+
+        The marker is persisted BEFORE the emit: a duplicate mail is the failure mode this
+        exists to prevent, so the ordering favors the marker landing. The authoritative
+        "have we already alerted" test runs INSIDE the store mutation, against the task doc
+        on disk — a caller holding a stale in-hand copy (the decomposition hold hands its
+        task back up through ``record``, which then re-checks the parked state) must not be
+        able to produce a second alert for one park. A marker write that fails still alerts
+        — silence is worse than a possible repeat — and says so in the trail
+        (``blocked_notification_marker_failed``) rather than dropping the fact."""
+        key = f"{stage.value if stage is not None else '-'}:{gate}"
+        if key in task.notified_blocks:
+            return task
+        already = False
+
+        def _mark(t: Task) -> None:
+            nonlocal already
+            already = key in t.notified_blocks
+            if not already:
+                t.notified_blocks.append(key)
+
+        try:
+            task = self.store.update_task(run_id, task.task_id, _mark)
+        except Exception as exc:  # noqa: BLE001 - alerting must never break a transition
+            with contextlib.suppress(Exception):
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "blocked_notification_marker_failed",
+                     "level": "warning", "run_id": run_id, "task_id": task.task_id,
+                     "key": key, "error": str(exc)},
+                )
+        if already:
+            return task
+        self.emit_notification(
+            run_id,
+            NOTIFY_TASK_BLOCKED,
+            self._blocked_notification(run_id, task, stage=stage, gate=gate, reason=reason),
+        )
+        return task
 
     # --- run pause (batch-wide circuit breaker, #58) ----------------------------
     def pause_run(self, run_id: str, reason: str) -> None:

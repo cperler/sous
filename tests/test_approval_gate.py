@@ -161,3 +161,39 @@ def test_reject_cascade_blocks_a_dependent_task(tmp_path, project) -> None:
     assert eng.store.load_task("r1", "t1").state is TaskState.CLOSED_INFEASIBLE
     assert eng.store.load_task("r1", "t2").state is TaskState.CASCADE_BLOCKED
     assert eng.store.load_run("r1").state is RunState.FAILED
+
+
+def test_the_alerted_approve_command_actually_releases_the_task(tmp_path, project, capsys) -> None:
+    """#409: the park alert's whole value is that the command in it works. Pin the rendered
+    line against the REAL parser — a renamed flag or a moved store root would otherwise ship
+    a mail full of commands that error, and nothing in the suite would notice."""
+    import shlex
+
+    from orchestrator.cli import main
+    from orchestrator.schemas.enums import Stage
+
+    calls: list[tuple[str, dict]] = []
+    project.notify = lambda kind, payload: calls.append((kind, payload))
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", hold_before=Stage.SCOPE)
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
+    assert eng.next_work("r1", "t1") is None  # parked at the checkpoint
+    assert eng.store.load_task("r1", "t1").state is TaskState.BLOCKED_ON_HUMAN
+
+    payload = next(p for k, p in calls if k == "task_blocked")
+    assert payload["stage"] == "scope" and payload["hold_before"] == "scope"
+    approve = next(a["command"] for a in payload["actions"] if a["label"].startswith("approve"))
+
+    argv = shlex.split(approve)
+    assert argv[0] == "orchestrator"  # the console-script name; the rest is real argv
+    # --project is the one thing the mail cannot know: a human runs this in the repo whose
+    # adapter is already the default. Tests must name the fake one explicitly.
+    assert main([*argv[1:3], "--project", "tests.fakeproject", *argv[3:]]) == 0
+    capsys.readouterr()
+
+    task = eng.store.load_task("r1", "t1")
+    assert task.state is TaskState.PENDING
+    assert task.approved_holds == ["before:scope"]
+    assert task.notified_blocks == []  # the episode closed, so a later park re-alerts
+    assert eng.next_work("r1", "t1").stage is Stage.SCOPE  # the gate really opened

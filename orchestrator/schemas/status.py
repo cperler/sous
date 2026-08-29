@@ -254,6 +254,14 @@ class Task(_StatusModel):
     # Checkpoint identities released for this task. Dispatch additionally requires the
     # matching durable approval artifact, so an earlier approval cannot release a new gate.
     approved_holds: list[str] = Field(default_factory=list)
+    # Park episodes already alerted on (#409), keyed ``<stage>:<gate>``. The human-gate
+    # notification must fire ONCE per park, and the dedupe cannot live in engine memory:
+    # every CLI subcommand rebuilds the Engine from constructor defaults, so a re-invoked
+    # driver re-reading the same parked state would re-mail. Cleared by ``approve`` (the
+    # episode ended), so a later re-park at the same stage alerts again — the same
+    # once-per-episode contract ``alerting.stale_notifications`` uses for stalls. Additive
+    # field: pre-#409 task docs load with the empty default, so no SCHEMA_VERSION bump.
+    notified_blocks: list[str] = Field(default_factory=list)
     # Declared-file contention (#377). ``scope_files`` is the repo-relative edit surface
     # this task's approved SCOPE named, normalized at the fold; ``file_claim_acquired_at``
     # is the MONOTONIC stamp written when ``dispatchable`` first admitted the task past the

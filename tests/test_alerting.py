@@ -128,6 +128,102 @@ def test_blocked_on_human_emitted(tmp_path) -> None:
     assert "run_finalized" not in [k for k, _ in calls]
 
 
+# --- the human-gate alert is ACTIONABLE and fires once per park episode (#409) ------
+
+def _park_at_scope(eng, reason="needs an API that does not exist"):
+    """Drive a task to an autonomous park: SCOPE reports the work infeasible."""
+    _drive_intake(eng)
+    w = eng.next_work("r1", "t1")
+    assert w.stage is Stage.SCOPE
+    eng.record("r1", make_result(
+        w, structured_output={"feasible": False, "blocked_reason": reason, "plan": []}))
+
+
+def test_blocked_payload_carries_release_commands_and_issue_link(tmp_path) -> None:
+    project, calls = _recording_project()
+    project.task_source.issue_url = lambda tid: f"https://example.test/issues/{tid}"
+    eng = _engine(tmp_path, project)
+    _park_at_scope(eng)
+
+    payload = next(p for k, p in calls if k == "task_blocked")
+    assert payload["stage"] == "scope"
+    assert payload["gate"] == "scope_not_feasible_held"
+    assert payload["reason"] == "needs an API that does not exist"
+    assert payload["task_state"] == "blocked_on_human"
+    assert payload["issue_url"] == "https://example.test/issues/t1"
+    assert payload["run_dir"] == str(tmp_path)  # where the retained trail lives
+    assert "stages" in payload and "cost" in payload  # the shared enrichment block
+
+    # The three dispositions, each a command the recipient can paste as-is: it names this
+    # run's own store root, so no re-derivation from a terminal is needed.
+    commands = {a["label"].split(" ")[0]: a["command"] for a in payload["actions"]}
+    assert set(commands) == {"approve", "reject", "abandon"}
+    for command in commands.values():
+        assert command.startswith(f"orchestrator --root {tmp_path} --run r1 ")
+        assert "--task t1" in command
+    assert "approve --task t1" in commands["approve"]
+
+
+def test_blocked_alert_fires_once_when_two_park_sites_agree(tmp_path) -> None:
+    """A half-filed decomposition parks through ``_hold_decomposition`` AND then trips
+    ``record``'s parked-state branch. Both name the same episode, so exactly one alert
+    goes out — the dedupe key, not emit-site ordering, is what makes that true."""
+    project, calls = _recording_project()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1", pipeline=[Stage.SCOPE, Stage.IMPLEMENT])
+    out = eng.record("r1", make_result(eng.next_work("r1", "t1"), structured_output={
+        "feasible": True, "plan": ["split"], "subtasks": [{"id": "a", "description": "A"}]}))
+
+    assert out["outcome"] == "scope_decomposition_held"  # the source cannot file children
+    blocked = [p for k, p in calls if k == "task_blocked"]
+    assert len(blocked) == 1
+    assert blocked[0]["gate"] == "scope_decomposition_held"
+    assert eng.store.load_task("r1", "t1").notified_blocks == ["scope:scope_decomposition_held"]
+
+
+def test_blocked_dedupe_survives_an_engine_rebuild(tmp_path) -> None:
+    """The resumed-driver case: every CLI subcommand rebuilds the Engine, so in-memory
+    dedupe would re-mail an already-parked task on the next invocation. The marker is on
+    the task doc, so a brand-new Engine over the same store stays quiet."""
+    project, calls = _recording_project()
+    eng = _engine(tmp_path, project)
+    _park_at_scope(eng)
+    assert len([k for k, _ in calls if k == "task_blocked"]) == 1
+
+    fresh_project, fresh_calls = _recording_project()
+    fresh = _engine(tmp_path, fresh_project)
+    task = fresh.store.load_task("r1", "t1")
+    fresh._notify_blocked(
+        "r1", task, stage=Stage.SCOPE, gate="scope_not_feasible_held", reason="same park"
+    )
+    assert [k for k, _ in fresh_calls if k == "task_blocked"] == []
+
+
+def test_blocked_alert_re_arms_after_approval(tmp_path) -> None:
+    """Once per EPISODE, not once per run: a task released by ``approve`` and parked again
+    at the same gate must alert again, or the second stall is silent."""
+    project, calls = _recording_project()
+    eng = _engine(tmp_path, project, max_review_cycles=0)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    rejection = {"approved": False, "issues": [
+        {"severity": "critical", "file": "a.py", "description": "breaks the invariant"}]}
+    for _ in range(5):  # intake, scope, implement, test, deliver
+        eng.record("r1", make_result(eng.next_work("r1", "t1")))
+
+    w = eng.next_work("r1", "t1")
+    assert w.stage is Stage.REVIEW
+    eng.record("r1", make_result(w, structured_output=rejection))
+    assert len([k for k, _ in calls if k == "task_blocked"]) == 1
+    assert eng.store.load_task("r1", "t1").notified_blocks == ["review:review_rejected_held"]
+
+    eng.approve("r1", "t1", approved_by="craig")
+    assert eng.store.load_task("r1", "t1").notified_blocks == []  # episode over, re-armed
+    eng.record("r1", make_result(eng.next_work("r1", "t1"), structured_output=rejection))
+    assert len([k for k, _ in calls if k == "task_blocked"]) == 2
+
+
 def test_run_finalized_emitted_once_on_clean_run(tmp_path) -> None:
     project, calls = _recording_project()
     eng = _engine(tmp_path, project)
