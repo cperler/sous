@@ -78,7 +78,7 @@ Build each brief from three sources — this is the "under the hood" the human i
      `runs/<RUN>/stages/<task>/NN-review.json` (highest attempt) and find the matching
      entry: the `non_blocking[]` element whose `title` equals the issue title, or the
      `improvement` object. Show its full `detail` and, for a non-blocking finding, its
-     `disposition` (`file`/`fix_now`/`drop`) — the reviewer's own words are far richer than
+     `disposition` (`file`/`fixup`/`fix_now`/`drop`) — the reviewer's own words are far richer than
      the issue body.
    - **Scope-ledger deferral** — there is no review entry; the source IS the issue body's
      own `Source:` / why-deferred / trigger-to-revisit rationale (the implement agent
@@ -128,11 +128,16 @@ them without a gate in the first place.
 ## Notes
 - **Scope: actually-filed issues — plus any completion note that never reached a human.**
   Findings the reviewer marked `fix_now`/`drop`, and findings over the per-task filing cap,
-  were **noted in the completion note, never filed** (#188). They are not GitHub issues, so
-  they are out of the issue-by-issue queue above: triage gates what was filed, not what was
-  suppressed. But that reasoning assumes the note actually reached someone, and publishing
-  it is a best-effort external call — on `batch-codex-3` every note failed and three valid
-  `fix_now` findings reached nobody (#357). So **before** the queue, check
+  were **noted in the completion note, never filed** (#188). A `fixup` finding is also not
+  filed, but for the opposite reason — the engine re-opened implement→…→review and APPLIED
+  it (#414); the note reports whether it actually landed, so read that line rather than
+  assuming either way. None of them are GitHub issues, so they are out of the
+  issue-by-issue queue above: triage gates what was filed, not what was suppressed. But
+  that reasoning assumes the note actually reached someone, and publishing it is a
+  best-effort external call — on `batch-codex-3` every note failed and three valid
+  `fix_now` findings reached nobody (#357) — findings that, at the time, the note also
+  claimed had been "fixed in place" when nothing had applied them (#414). So **before**
+  the queue, check
   `orchestrator status --run <RUN>`'s `completion_notes` block: if `clean` is false, read
   each undelivered note's `unfiled` findings (also inline in the `completion_note_failed`
   event, and the full note is at `runs/<RUN>/stages/<TASK>/completion-note.md`) and walk

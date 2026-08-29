@@ -195,7 +195,7 @@ def test_disposition_gate_files_only_explicit_file(tmp_path, project) -> None:
     assert "Finding without a disposition — no disposition given — not filed" in note
     assert "Finding with an empty disposition — no disposition given — not filed" in note
     assert "Finding with an unknown disposition — unrecognized disposition — not filed" in note
-    assert "Stale docstring after #133 — fixed in place (boy-scout)" in note
+    assert "Stale docstring after #133 — noted for in-place handling, not applied" in note
     assert "Cosmetic wording nit — noted, not tracked" in note
     assert "Dispositionless improvement — no disposition given — not filed" in note
 
@@ -800,9 +800,13 @@ def test_review_schema_accepts_non_blocking() -> None:
     schema = resolve_stage_schema("review")
     assert "non_blocking" in schema["properties"]
     non_blocking_schema = schema["properties"]["non_blocking"]
-    assert "Only an explicit `file`" in non_blocking_schema["description"]
+    assert "An explicit `file`" in non_blocking_schema["description"]
     disposition_schema = non_blocking_schema["items"]["properties"]["disposition"]
     assert "absent disposition is noted, not filed" in disposition_schema["description"]
+    # #414: the schema must not describe a behavior the engine does not have. `fixup` is
+    # the disposition that gets APPLIED; `fix_now` must say plainly that it is not.
+    assert "APPLIED in this PR" in non_blocking_schema["description"]
+    assert "the engine does NOT apply it" in disposition_schema["description"]
     improvement_schema = schema["properties"]["improvement"]
     assert "only when it carries an explicit `file`" in improvement_schema["description"]
     assert (
@@ -821,22 +825,23 @@ def test_review_schema_accepts_non_blocking() -> None:
             "approved": True, "issues": [], "non_blocking": [{"detail": "no title"}],
         })
 
-    # #188: the optional per-finding disposition enum is accepted...
+    # #188/#414: the optional per-finding disposition enum is accepted...
     validator.validate({
         "approved": True, "issues": [],
         "non_blocking": [
             {"title": "a", "disposition": "file"},
             {"title": "b", "disposition": "fix_now"},
             {"title": "c", "disposition": "drop"},
+            {"title": "d", "disposition": "fixup"},
         ],
     })
     # ...a missing disposition still validates (and degrades safely to note-only)...
-    validator.validate({"approved": True, "issues": [], "non_blocking": [{"title": "d"}]})
+    validator.validate({"approved": True, "issues": [], "non_blocking": [{"title": "e"}]})
     # ...and an out-of-enum disposition is rejected
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
             "approved": True, "issues": [],
-            "non_blocking": [{"title": "e", "disposition": "maybe"}],
+            "non_blocking": [{"title": "f", "disposition": "maybe"}],
         })
 
     # self-improvement loop fields are optional objects with a required title
@@ -951,7 +956,7 @@ def test_unfiled_findings_matches_the_rendered_noted_section() -> None:
     unfiled = unfiled_findings(review, followups)
 
     assert [(u["title"], u["reason"]) for u in unfiled] == [
-        ("fixed inline", "fixed in place (boy-scout)"),
+        ("fixed inline", "noted for in-place handling, not applied"),
         ("dropped", "noted, not tracked"),
         ("capped", "over per-task cap"),
         ("no disp", "no disposition given — not filed"),

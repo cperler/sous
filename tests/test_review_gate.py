@@ -551,3 +551,243 @@ def test_format_review_issue_shapes() -> None:
     })
     assert rich == "critical — a.py:12 — breaks it (suggested fix: guard None)"
     assert format_review_issue({"description": "just a description"}) == "just a description"
+
+
+# --- #414: a non-blocking finding may ask to be fixed in place, and be believed ----------
+#
+# Before #414 a `non_blocking` finding dispositioned `fix_now` was read by NOTHING but the
+# renderer, which reported it "fixed in place (boy-scout)". On run ff-v1-b29 two correct
+# findings were reported fixed, shipped unfixed to main, and surfaced only in a hand-audit.
+# So: `fixup` is the disposition that acts, `fix_now` says plainly that it does not, and
+# the note reports application from the durable record rather than from the ask.
+
+FINDING_FIXUP = {
+    "title": "Comment names the wrong confidence tier",
+    "detail": "The comment says medium three lines above an assertion checking low.",
+    "disposition": "fixup",
+}
+FINDING_FIXUP_2 = {
+    "title": "Recovery note documents one command where two are needed",
+    "detail": "`ingest map` resolves an existing institution rather than creating one.",
+    "disposition": "fixup",
+}
+
+
+def test_finding_fixup_reimplements_and_reports_application_from_evidence(
+    tmp_path, project
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    out = eng.record("r1", make_result(
+        _advance_to_review(eng),
+        structured_output={
+            "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+        },
+    ))
+
+    # the nit earns a real re-implement pass — the thing `fix_now` never did
+    assert out["outcome"] == "review_fixup_cycle"
+    assert out["next_stage"] == "implement"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1
+    assert len(task.review_fixups) == 1
+    assert task.review_fixups[0].source == "finding"
+    assert task.review_fixups[0].applied is False
+    # ...and the implementer is told what to fix
+    assert FINDING_FIXUP["title"] in task.learnings[-1]
+    assert FINDING_FIXUP["detail"] in task.learnings[-1]
+    assert "review finding fixup" in task.learnings[-1]
+    scheduled = next(e for e in eng.store.read_events("r1")
+                     if e["type"] == "review_fixup_scheduled")
+    assert scheduled["source"] == "finding"
+
+    final = _drive_fixup_tail(eng)
+    out = eng.record("r1", make_result(
+        final, structured_output={"approved": True, "issues": []}
+    ))
+
+    assert out["outcome"] == "task_completed"
+    assert eng.store.load_task("r1", "t1").review_fixups[0].applied is True
+    applied = [e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_applied"]
+    assert len(applied) == 1 and applied[0]["source"] == "finding"
+    # It never became a backlog issue, and the note does not mislabel a nit an improvement.
+    assert not project.task_source.followups
+    note = project.task_source.notes[0]["body"]
+    assert "Improvement fixup" not in note
+    # The approving review no longer restates the finding (its record was reset with the
+    # REVIEW stage), so the note must report it from the durable record — otherwise the
+    # application is invisible in the very note that is supposed to prove it happened.
+    assert f"{FINDING_FIXUP['title']} — applied in place, not filed" in note
+
+
+def test_finding_fixup_note_reports_application_not_the_ask(tmp_path, project) -> None:
+    # The evidence half: the FINAL review still carries the finding (a reviewer may restate
+    # it), so the note must read the durable record, not the disposition.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+    }))
+    eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{**FINDING_FIXUP, "disposition": "drop"}],
+    }))
+
+    note = project.task_source.notes[0]["body"]
+    assert f"{FINDING_FIXUP['title']} — applied in place, not filed" in note
+    assert "fixed in place (boy-scout)" not in note
+
+
+def test_two_finding_fixups_share_one_cycle(tmp_path, project) -> None:
+    # A cycle per nit would exhaust the default two-cycle budget and park the task.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [],
+        "non_blocking": [FINDING_FIXUP, FINDING_FIXUP_2],
+    }))
+
+    assert out["outcome"] == "review_fixup_cycle"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1  # ONE cycle for both
+    assert [f.title for f in task.review_fixups] == [
+        FINDING_FIXUP["title"], FINDING_FIXUP_2["title"]
+    ]
+    scheduled = [e for e in eng.store.read_events("r1")
+                 if e["type"] == "review_fixup_scheduled"]
+    assert len(scheduled) == 2  # both are individually auditable
+
+    out = eng.record("r1", make_result(
+        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
+    ))
+    assert out["outcome"] == "task_completed"
+    assert all(f.applied for f in eng.store.load_task("r1", "t1").review_fixups)
+
+
+def test_improvement_and_finding_fixups_share_one_cycle(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [],
+        "improvement": FIXUP, "non_blocking": [FINDING_FIXUP],
+    }))
+
+    assert out["outcome"] == "review_fixup_cycle"
+    task = eng.store.load_task("r1", "t1")
+    assert task.review_cycles == 1
+    assert [f.source for f in task.review_fixups] == ["improvement", "finding"]
+
+    eng.record("r1", make_result(
+        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
+    ))
+    note = project.task_source.notes[0]["body"]
+    # the improvement is reported in its own section, the finding in the findings section
+    assert f"Improvement fixup:** {FIXUP['title']}" in note
+    assert f"{FINDING_FIXUP['title']} — applied in place, not filed" in note
+
+
+def test_unschedulable_finding_fixup_completes_instead_of_parking(tmp_path, project) -> None:
+    # A nit the engine cannot schedule must not park an approved task at the human gate —
+    # that would stall a headless batch over a stale comment. It degrades, loudly.
+    eng = _engine(tmp_path, project, max_review_cycles=0)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+    }))
+
+    assert out["outcome"] == "task_completed"
+    task = eng.store.load_task("r1", "t1")
+    assert task.state is TaskState.COMPLETED
+    assert task.last_error is None  # a completed task carries no error
+    # No durable record: an unapplied one would be swept applied by the next review.
+    assert task.review_fixups == []
+    held = next(e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held")
+    assert held["source"] == "finding" and held["level"] == "warning"
+    assert "budget exhausted" in held["reason"]
+    # ...and the note says it was asked for and NOT applied.
+    note = project.task_source.notes[0]["body"]
+    assert f"{FINDING_FIXUP['title']} — requested in-place fixup — not applied" in note
+
+
+def test_held_finding_fixup_is_not_swept_applied_by_its_own_review(tmp_path, project) -> None:
+    # The regression that makes the degrade path safe: a fixup scheduled, re-asked, and
+    # held must NOT be marked applied by the same approving transaction.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    output = {"approved": True, "issues": [], "non_blocking": [FINDING_FIXUP]}
+    eng.record("r1", make_result(_advance_to_review(eng), structured_output=output))
+
+    out = eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output=output))
+
+    assert out["outcome"] == "task_completed"  # degrades, does not park
+    task = eng.store.load_task("r1", "t1")
+    assert task.state is TaskState.COMPLETED
+    assert len(task.review_fixups) == 1
+    assert task.review_fixups[0].applied is False  # never applied, never claimed applied
+    held = [e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held"]
+    assert len(held) == 1 and "requested again" in held[0]["reason"]
+    assert not [e for e in eng.store.read_events("r1")
+                if e["type"] == "review_fixup_applied"]
+    note = project.task_source.notes[0]["body"]
+    assert f"{FINDING_FIXUP['title']} — requested in-place fixup — not applied" in note
+
+
+def test_improvement_fixup_still_parks_when_a_finding_rides_along(tmp_path, project) -> None:
+    # The improvement side's human gate is unchanged by #414: when it must be held, the
+    # whole batch holds with it rather than half-scheduling.
+    eng = _engine(tmp_path, project, max_review_cycles=0)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [],
+        "improvement": FIXUP, "non_blocking": [FINDING_FIXUP],
+    }))
+
+    assert out["outcome"] == "review_fixup_held"
+    assert out["task_state"] == "blocked_on_human"
+    task = eng.store.load_task("r1", "t1")
+    assert task.stages[Stage.REVIEW].status is StageStatus.FAILED
+    held = [e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held"]
+    assert {e["source"] for e in held} == {"improvement", "finding"}
+
+
+def test_fix_now_finding_is_noted_but_never_claimed_fixed(tmp_path, project) -> None:
+    # `fix_now` keeps working (persisted reviews carry it) but claims nothing.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+
+    out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [],
+        "non_blocking": [{**FINDING_FIXUP, "disposition": "fix_now"}],
+    }))
+
+    assert out["outcome"] == "task_completed"  # no cycle: fix_now does not act
+    assert eng.store.load_task("r1", "t1").review_fixups == []
+    note = project.task_source.notes[0]["body"]
+    assert f"{FINDING_FIXUP['title']} — noted for in-place handling, not applied" in note
+    assert "fixed in place" not in note
+
+
+def test_one_nit_stated_twice_earns_one_fixup(tmp_path, project) -> None:
+    # A reviewer that puts the same nit in both fields must not get two records.
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+
+    eng.record("r1", make_result(_advance_to_review(eng), structured_output={
+        "approved": True, "issues": [],
+        "improvement": FINDING_FIXUP, "non_blocking": [FINDING_FIXUP],
+    }))
+
+    task = eng.store.load_task("r1", "t1")
+    assert len(task.review_fixups) == 1
+    assert task.review_fixups[0].source == "improvement"  # improvement wins the tie
