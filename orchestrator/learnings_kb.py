@@ -14,8 +14,9 @@ is NOT committed because ``runs/`` is gitignored).
 Entry shape::
 
     {id, ts, run_id, task_id, kind (failure|review|infra|salvage|manual|process),
-     text (bounded ~500 chars), files (list), failure_kind (classifier kind|null),
-     stage (stage value|null), target ({kind, ref}|null)}
+     text (bounded by KIND — see ``text_cap``), files (list),
+     failure_kind (classifier kind|null), stage (stage value|null),
+     target ({kind, ref}|null)}
 
 Pure functions over the file (the engine wires the path in), so they are trivially
 testable and never depend on the engine's working directory.
@@ -32,9 +33,35 @@ from pathlib import Path
 
 from .schemas.enums import FailureKind, Stage
 
-# One entry's ``text`` ceiling — mirrors the context-plane per-item bound so a KB hit
-# folded into a prompt is already the right size.
+# One entry's ``text`` ceiling. The DEFAULT mirrors the context-plane per-item bound so a
+# KB hit folded into a prompt is already the right size.
 MAX_TEXT = 500
+
+# #401: the cap is chosen by what an entry's KIND MEANS, not by one global number — the
+# same reasoning #289 applied to the context plane's ``_ITEM_CAP_BY_KEY``. A ``failure``
+# row is a terse head line plus a failing-test list; 500 chars is the right size for it.
+# A ``review`` row is a reviewer's rejection PROSE and a ``process`` row a REVIEW
+# retrospective's title+detail, and 500 chars routinely lands mid-sentence there — so the
+# lesson recalls into a later task as a fragment and reads as noise even when it is still
+# true. Prose kinds get a cap sized to hold a whole rejection detail instead.
+#
+# Budget: recall folds at most 5 hits (``relevant_learnings(limit=5)``) into
+# ``task.context["prior_learnings"]``, so the worst case is ~7.5KB against the context
+# plane's 16KB ceiling — and ``prior_learnings`` is the FIRST key that ceiling sheds
+# (``ENGINE_INJECTED_KEYS``), so a fat recall can never evict durable stage context.
+MAX_TEXT_PROSE = 1500
+_MAX_TEXT_BY_KIND: dict[str, int] = {"review": MAX_TEXT_PROSE, "process": MAX_TEXT_PROSE}
+
+# Appended in place of what was cut, so a truncated row is never mistaken for a whole one.
+_TRUNC_SUFFIX = " … [truncated]"
+
+# A sentence terminator (with any trailing quote/bracket) followed by whitespace or EOS.
+_SENTENCE_END_RE = re.compile(r"[.!?][\"')\]]*(?=\s|$)")
+
+# How much of the budget a boundary cut must retain to be preferred over a hard cut. Below
+# this, backing up to the last sentence/word would throw away more meaning than the ragged
+# edge costs, so the hard cut wins.
+_MIN_BOUNDARY_FRACTION = 0.6
 
 VALID_KINDS = frozenset({"failure", "review", "infra", "salvage", "manual", "process"})
 
@@ -96,10 +123,46 @@ def _new_id() -> str:
     return f"lk-{uuid.uuid4().hex[:12]}"
 
 
-def bound_text(text: str) -> str:
-    """Bound one entry's text to ``MAX_TEXT`` chars (mirrors the context-plane item cap)."""
+def text_cap(kind: str | None = None) -> int:
+    """The write-time ``text`` cap for one entry, by its KIND (#401).
+
+    Prose kinds (``review``, ``process``) get ``MAX_TEXT_PROSE``; everything else — and any
+    unrecognized kind — gets the default ``MAX_TEXT``. Pure and total."""
+    return _MAX_TEXT_BY_KIND.get(str(kind or ""), MAX_TEXT)
+
+
+def bound_text(text: str, kind: str | None = None) -> str:
+    """Bound one entry's text to its kind's cap, cutting on a SENTENCE or WORD boundary.
+
+    Deterministic and pure — no wall-clock, no randomness — so a replayed harvest writes
+    byte-identical rows.
+
+    Over the cap, the text is cut to the last sentence end that still retains
+    ``_MIN_BOUNDARY_FRACTION`` of the budget; failing that, the last word boundary meeting
+    the same floor; failing that, a hard cut (a single unbroken token has no boundary to
+    find). The result always ends in ``_TRUNC_SUFFIX`` and never exceeds the cap, so a
+    truncated row still reads as truncated (#401 — a mid-sentence fragment recalls as noise
+    even when the lesson it carries is true)."""
     text = str(text or "").strip()
-    return text if len(text) <= MAX_TEXT else text[: MAX_TEXT - len(" … [truncated]")] + " … [truncated]"
+    cap = text_cap(kind)
+    if len(text) <= cap:
+        return text
+    budget = cap - len(_TRUNC_SUFFIX)
+    if budget <= 0:  # pathological cap; degrade to a hard cut rather than over-run it
+        return text[:cap]
+    head = text[:budget]
+    floor = int(budget * _MIN_BOUNDARY_FRACTION)
+
+    cut = -1
+    for m in _SENTENCE_END_RE.finditer(head):
+        if m.end() >= floor:
+            cut = m.end()  # ascending scan, so the LAST qualifying end wins
+    if cut < 0:
+        ws = max(head.rfind(" "), head.rfind("\n"), head.rfind("\t"))
+        if ws >= floor:
+            cut = ws
+    kept = (head[:cut] if cut > 0 else head).rstrip()
+    return kept + _TRUNC_SUFFIX
 
 
 def tokenize(text: str) -> list[str]:
@@ -280,7 +343,11 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
     written: list[dict] = []
     lines: list[str] = []
     for raw in entries:
-        text = bound_text(raw.get("text", ""))
+        # Normalize the kind FIRST: it selects the text cap (#401), so an unrecognized kind
+        # must fall back to "manual"'s default bound rather than miss the table both ways.
+        kind = raw.get("kind") or "manual"
+        kind = kind if kind in VALID_KINDS else "manual"
+        text = bound_text(raw.get("text", ""), kind)
         if not text:
             continue
         raw_with_text = {**raw, "text": text}
@@ -288,13 +355,12 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
         if dedupe and key in seen:
             continue
         seen.add(key)
-        kind = raw.get("kind") or "manual"
         entry = {
             "id": raw.get("id") or _new_id(),
             "ts": raw.get("ts") or _now(),
             "run_id": raw.get("run_id"),
             "task_id": raw.get("task_id"),
-            "kind": kind if kind in VALID_KINDS else "manual",
+            "kind": kind,
             "text": text,
             "files": [str(f) for f in (raw.get("files") or [])],
             "failure_kind": raw.get("failure_kind"),
