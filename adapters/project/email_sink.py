@@ -231,12 +231,14 @@ def render_body(kind: str, payload: Mapping[str, object]) -> str:
         ("Task", payload.get("task_id")),
         ("Title", payload.get("title")),
         ("Issue", payload.get("issue_number")),
+        # Distinct from "Issue" above: a park payload carries BOTH the number and the
+        # link, and two lines labelled the same are unreadable without already knowing.
+        ("Issue link", payload.get("issue_url")),
         ("State", payload.get("task_state") or payload.get("state")),
         ("Stage", payload.get("stage")),
         ("Held before", payload.get("hold_before")),
         ("Gate", payload.get("gate")),
         ("Reason", payload.get("reason")),
-        ("Issue", payload.get("issue_url")),
         ("PR", payload.get("pr_url")),
         ("Review approved", payload.get("review_approved")),
         ("Review cycles", payload.get("review_cycles")),

@@ -322,6 +322,18 @@ def test_park_mail_leads_with_the_release_commands() -> None:
     assert body.index("orchestrator approve") < body.index("Cost:")
 
 
+def test_issue_number_and_issue_link_are_labelled_distinctly() -> None:
+    """A real park payload carries BOTH issue_number (from the shared facts merge) and
+    issue_url, so the two lines must not both read `Issue:` — that is unreadable."""
+    body = render_body(NOTIFY_TASK_BLOCKED, {
+        "summary": "s", "issue_number": 390,
+        "issue_url": "https://github.com/cperler/sous/issues/390"})
+    labels = [line.split(":", 1)[0] for line in body.splitlines() if ":" in line]
+    assert len(labels) == len(set(labels)), f"duplicate fact labels in body:\n{body}"
+    assert "Issue: 390" in body
+    assert "Issue link: https://github.com/cperler/sous/issues/390" in body
+
+
 def test_other_kinds_keep_their_plain_subject_and_no_action_block() -> None:
     """The new fields are additive: a kind without them renders exactly as before."""
     subject = render_subject("task_completed", {"task_id": "t1"})
