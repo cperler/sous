@@ -8,8 +8,9 @@ sub-call in a panel — receives its own independent Git checkout and port alloc
 
 The checkout is an independent local clone (no shared object hardlinks or writable remote),
 then the live worktree payload is copied over it.  That preserves ignored dependencies and
-any dirty state the reviewer was asked to judge while keeping Git reads useful.  Both the
-checkout and all temporary port records are discarded when the parent REVIEW dispatch ends.
+any dirty state the reviewer was asked to judge while keeping Git reads useful; compiled
+bytecode caches are the one exception, because they name the ORIGINAL worktree's path.
+Both the checkout and all temporary port records are discarded when the parent REVIEW dispatch ends.
 """
 
 from __future__ import annotations
@@ -42,6 +43,24 @@ from .worktree_origin import (
 )
 
 _GIT_TIMEOUT_S = 120
+
+# Python's assertion-rewrite bytecode embeds the ABSOLUTE source path at compile time, so a
+# cache compiled in the task worktree makes a traceback raised in the disposable copy print
+# the ORIGINAL worktree's path.  A reviewer who reads that path at face value draws a wrong
+# conclusion about where a failure came from, and nothing about a review needs the cache:
+# the interpreter recompiles from the copied sources.  Never copy it (#410).
+_BYTECODE_CACHE_DIR = "__pycache__"
+_BYTECODE_SUFFIXES = (".pyc", ".pyo")
+
+
+def _is_bytecode_cache(name: str) -> bool:
+    """True for a compiled-bytecode cache directory or file, at any depth."""
+    return name == _BYTECODE_CACHE_DIR or name.endswith(_BYTECODE_SUFFIXES)
+
+
+def _ignore_bytecode_cache(_directory: str, names: list[str]) -> set[str]:
+    """``shutil.copytree`` filter dropping bytecode caches nested under a copied directory."""
+    return {name for name in names if _is_bytecode_cache(name)}
 
 
 class _IsolationError(RuntimeError):
@@ -198,11 +217,15 @@ class ReviewIsolation:
                     continue
                 if entry.name in excluded:
                     continue
+                if _is_bytecode_cache(entry.name):
+                    continue
                 target = destination / entry.name
                 if entry.is_symlink():
                     target.symlink_to(os.readlink(entry), target_is_directory=entry.is_dir())
                 elif entry.is_dir():
-                    shutil.copytree(entry, target, symlinks=True)
+                    shutil.copytree(
+                        entry, target, symlinks=True, ignore=_ignore_bytecode_cache
+                    )
                 else:
                     shutil.copy2(entry, target, follow_symlinks=False)
         except (OSError, shutil.Error) as exc:
