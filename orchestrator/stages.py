@@ -93,10 +93,19 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "declared files collide instead of fanning them out into a merge conflict "
             "(#377), so name the real edit surface — a file you omit is a file another "
             "task may rewrite underneath you.\n"
+            "A path may instead be given as {\"path\": \"...\", \"mode\": "
+            "\"append\"|\"rewrite\"} to say what KIND of edit it is. Use `append` ONLY "
+            "when your edit purely ADDS a self-contained block — a new test case, a new "
+            "doc section, a new entry at the end — and touches no existing line, shared "
+            "constant, signature or import in that file. Anything else is `rewrite`, which "
+            "is also the default and what a bare string means. Two tasks that both declare "
+            "`append` on a file run in parallel; any `rewrite` on a path serializes "
+            "everything else on it. When in doubt, say `rewrite`: over-serializing costs "
+            "some parallelism, while a wrong `append` costs a broken merge.\n"
             "Return: feasible, blocked_reason, plan (list of prose subtasks), files (list "
-            "of repo-relative paths), and optional subtasks (list of {id, description, "
-            "agent, quality_tier: full|light|none, implementation_budget: standard|short, "
-            "depends_on: [local ids]})."
+            "of repo-relative paths, or {path, mode} objects), and optional subtasks (list "
+            "of {id, description, agent, quality_tier: full|light|none, "
+            "implementation_budget: standard|short, depends_on: [local ids]})."
         ),
     ),
     Stage.IMPLEMENT: StageSpec(

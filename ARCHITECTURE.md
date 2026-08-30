@@ -413,13 +413,27 @@ never satisfy.
   the winner for one path: locking only the stamp would leave `next_work` racy, because its
   single-candidate view (that task plus existing holders) cannot see a rival waiter that
   has not stamped yet, where `dispatchable` decides over the full symmetric set. The gate keys
-  on every declared path with no file-kind heuristic: two tasks appending independent tests
-  to one file ARE serialized, the deliberate safe default (false serialization costs
-  parallelism; the collision it prevents costs a remediation cycle). A task whose lane has no
-  SCOPE stage, or whose SCOPE declares nothing, neither defers nor blocks. Run-level and on
-  by default (`Run.serialize_file_contention`, `init-run --no-serialize-file-contention`).
-  Complement to the integration gate below: that one DETECTS the collision late, this
-  prevents it.
+  on the declared path AND the declared **edit mode** (#426): SCOPE may return
+  `{"path": ..., "mode": "append"|"rewrite"}` instead of a bare path, and two `append`
+  declarers on one file both run, while any `rewrite` on a path serializes everything else
+  on it. Only a rewrite can produce the silent breakage the gate exists for — two
+  independent additions to one file can at worst conflict textually, which is loud and
+  cheap. "Append-only" is a claim about the EDIT, not the file, so the classification comes
+  from SCOPE and never from a path glob the engine owns: a glob list would be
+  project-specific policy inside a project-agnostic engine, and belongs to the project
+  adapter if anywhere. `rewrite` is the default in every direction — a bare string, an
+  absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
+  `rewrite` — so the rule can only ever be relaxed by an explicit, well-formed claim, and
+  `scope_file_modes` stores only the non-default entries. `events_audit`'s `contention`
+  block reports what the gate actually cost a run (deferrals, distinct tasks deferred, the
+  most-contended paths, and how many deferrals held an append-only waiter), so the
+  strictness stays re-judgeable from any finished run instead of by hand-grepping
+  `events.jsonl` — #377 shipped deliberately over-strict pending exactly that data, and
+  `docs/reviews/2026-08-29-file-contention-measurement.md` records the first read of it. A
+  task whose lane has no SCOPE stage, or whose SCOPE declares nothing, neither defers nor
+  blocks. Run-level and on by default (`Run.serialize_file_contention`,
+  `init-run --no-serialize-file-contention`). Complement to the integration gate below:
+  that one DETECTS the collision late, this prevents it.
 - **Pre-merge batch integration gate.** At the all-tasks-terminal boundary, the engine
   resolves completed leaf-task branches in stable dependency order and merges them over
   current trunk in a disposable detached worktree. Merge conflicts are red immediately;

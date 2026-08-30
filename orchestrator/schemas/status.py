@@ -264,8 +264,12 @@ class Task(_StatusModel):
     # last evented for this task, kept only so a per-tick eligibility check emits when the
     # wait CHANGES rather than on every pass. Deliberately NOT the ``context`` plane: the
     # whole-context ceiling can evict a key, which would silently un-serialize a run.
+    # ``scope_file_modes`` (#426) is the per-path edit mode SCOPE declared, stored ONLY for
+    # the non-default (append) paths: an absent entry means ``rewrite``, so a pre-#426 doc
+    # and a task that declared no modes both contend on every path exactly as before.
     # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
     scope_files: list[str] = Field(default_factory=list)
+    scope_file_modes: dict[str, str] = Field(default_factory=dict)
     file_claim_acquired_at: str | None = None
     file_contention_deferred_on: list[str] = Field(default_factory=list)
     pr_number: int | None = None

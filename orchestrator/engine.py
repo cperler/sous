@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
@@ -51,7 +51,16 @@ from .errors import (
     StatusNotFoundError,
     SupervisorParkDeferred,
 )
-from .file_contention import ClaimEntry, ContentionPlan, Deferral, describe, plan_deferrals
+from .file_contention import (
+    MODE_APPEND,
+    MODE_REWRITE,
+    ClaimEntry,
+    ContentionPlan,
+    Deferral,
+    describe,
+    plan_deferrals,
+    summarize_contention,
+)
 from .gitcmd import run_git
 from .learnings_kb import (
     append_learnings as append_kb_learnings,
@@ -249,6 +258,18 @@ def _in_future(iso: str | None, *, now: datetime | None = None) -> bool:
         return datetime.fromisoformat(iso) > current
     except ValueError:
         return False
+
+
+def _claim_modes(task: Task, paths: Sequence[str]) -> dict[str, str]:
+    """The declared edit mode for each of ``paths``, for a contention event payload (#426).
+
+    Written out in FULL — every path gets an explicit ``append``/``rewrite`` — rather than
+    mirroring the doc's sparse storage. An event is read later, by a human or by
+    ``events_audit``, with no access to the defaulting rule; a missing key there would be
+    ambiguous between "rewrite" and "this log predates modes", and telling those two apart
+    is exactly what the audit needs to do.
+    """
+    return {path: task.scope_file_modes.get(path, MODE_REWRITE) for path in paths}
 
 
 def _validated_budget(value: float | None, *, field: str, run_id: str) -> float | None:
@@ -1075,6 +1096,11 @@ class Engine:
                     task_id=doc.task_id,
                     claims=tuple(doc.scope_files),
                     holding=doc.file_claim_acquired_at is not None,
+                    # #426: a path absent from the stored map is a REWRITE, so a doc
+                    # written before #426 yields the pre-#426 all-paths-contend entry.
+                    append_paths=frozenset(
+                        p for p, m in doc.scope_file_modes.items() if m == MODE_APPEND
+                    ),
                 )
                 for doc in live
                 if doc.scope_files
@@ -1092,6 +1118,10 @@ class Engine:
             self.store.append_event(run_id, {
                 "ts": _now(), "type": "file_claim_acquired", "run_id": run_id,
                 "task_id": doc.task_id, "files": list(doc.scope_files),
+                # #426: the modes are what decided who this claim excludes, so they are
+                # part of the receipt — a log that records only the paths cannot explain
+                # why a later task was, or was not, serialized behind it.
+                "modes": _claim_modes(doc, doc.scope_files),
             })
         for task_id in ready:
             self._record_contention_wait(run_id, by_id[task_id], plan.deferrals.get(task_id))
@@ -1122,6 +1152,7 @@ class Engine:
             doc = self.store.load_task(run_id, ref.task_id)
             if ref.task_id == task.task_id:
                 task.scope_files = list(doc.scope_files)
+                task.scope_file_modes = dict(doc.scope_file_modes)
                 task.file_claim_acquired_at = doc.file_claim_acquired_at
                 task.file_contention_deferred_on = list(doc.file_contention_deferred_on)
                 live.append(task)
@@ -1175,6 +1206,11 @@ class Engine:
             "ts": _now(), "type": "dispatch_deferred_file_contention", "run_id": run_id,
             "task_id": task.task_id, "blocked_by": list(deferral.blocked_by),
             "files": list(deferral.paths), "detail": describe(deferral),
+            # #426: the WAITER's declared mode for each contended path. This is what makes
+            # the deferral rate measurable after the fact (`events_audit`'s contention
+            # block): an append-declaring waiter that is still deferred was held by a
+            # rewriter, which is a deferral the mode rule deliberately keeps.
+            "modes": _claim_modes(task, deferral.paths),
         })
 
     def in_flight(self, run_id: str) -> list[str]:
@@ -5806,11 +5842,15 @@ class Engine:
                 task_status["file_contention"] = {
                     "blocked_by": list(task.file_contention_deferred_on),
                     "files": list(task.scope_files),
+                    # #426: the mode is half the answer to "why is this one waiting" — an
+                    # append-only waiter is being held by a rewriter, not by another appender.
+                    "modes": _claim_modes(task, task.scope_files),
                 }
             elif task.scope_files and task.file_claim_acquired_at is not None:
                 task_status["file_claim"] = {
                     "acquired_at": task.file_claim_acquired_at,
                     "files": list(task.scope_files),
+                    "modes": _claim_modes(task, task.scope_files),
                 }
             # A human-closed-infeasible task surfaces WHY it was closed — read back from the
             # durable rejection artifact (#52), so status output is self-explanatory.
@@ -6172,6 +6212,12 @@ class Engine:
         resumed a provider session (``session_ref`` set) vs. started fresh, over just the
         dispatches that carry the field at all (pre-#314 events are ``unknown`` and excluded
         from ``rate``, so old logs read as "no data" rather than a false 0%).
+
+        ... and a ``contention`` block (#426): how many times the declared-file gate deferred
+        a task, over which paths, and how many of those deferrals held an append-only waiter.
+        #377 shipped that gate deliberately over-strict pending real batch data; this is the
+        readout that makes the strictness re-judgeable from any finished run instead of by
+        hand-grepping ``events.jsonl``.
         """
         events = self.store.read_events(run_id) if events is None else events
         dispatched: dict[str, dict] = {}  # work_item_id -> opening dispatch info
@@ -6260,6 +6306,9 @@ class Engine:
                 "unknown": continuity_unknown,
                 "rate": (resumed / continuity_known) if continuity_known else None,
             },
+            # #426: how much parallelism the file-contention gate actually cost this run,
+            # and how much of that the append/rewrite rule deliberately kept.
+            "contention": summarize_contention(events),
         }
 
     # --- helpers --------------------------------------------------------------

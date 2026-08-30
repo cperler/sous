@@ -371,9 +371,12 @@ def main(argv: list[str] | None = None) -> int:
                          "post-SCOPE gate while another live task claims a file its "
                          "approved SCOPE named, so two tasks rewriting the same schema "
                          "module are serialized instead of meeting at merge. The gate keys "
-                         "on every declared path with no file-kind heuristic, so it can "
-                         "serialize tasks that would not actually have collided; pass this "
-                         "to trade that safety for parallelism")
+                         "on the declared path AND the edit mode SCOPE declared for it "
+                         "(#426): two tasks that both declare `append` on a file still run "
+                         "in parallel, while any `rewrite` — the default — serializes "
+                         "everything else on that path. It can still serialize tasks that "
+                         "would not actually have collided; pass this to trade that safety "
+                         "for parallelism")
     at = sub.add_parser("add-task")
     at.add_argument("--task", required=True)
     at.add_argument("--pipeline", default=None,
