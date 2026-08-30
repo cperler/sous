@@ -386,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
                     help="per-task provider routing tag (the old '82:codex' tag)")
     at.add_argument("--deterministic-stages", default=None,
                     help="comma-separated stages to run on the $0 ENGINE lane instead of a "
-                         "model (e.g. 'test,deliver'); intake is always deterministic (#33)")
+                         "model (e.g. 'test,deliver'); intake and publish are always "
+                         "deterministic (#33/#389)")
     at.add_argument("--estimate", default=None,
                     help="rough size hint (small/medium/large or a USD number) — feeds "
                          "cost-aware lane routing on a route-by-cost run (#34)")

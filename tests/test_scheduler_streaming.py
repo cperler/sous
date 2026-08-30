@@ -183,7 +183,7 @@ def test_early_finisher_is_recorded_before_its_slower_siblings(tmp_path) -> None
     # Completion ORDER does not change the final DAG state or the work done.
     assert status["run_state"] == "completed"
     assert all(status["tasks"][t]["state"] == "completed" for t in ("A", "B", "C"))
-    assert status["lane_audit"]["total_calls"] == 18  # 3 tasks x 6 stages, none re-run
+    assert status["lane_audit"]["total_calls"] == 21  # 3 tasks x 7 stages, none re-run
     assert pool.max_in_flight <= 3  # the concurrency cap still binds
 
 
@@ -248,7 +248,7 @@ def test_plain_list_runner_still_drives_a_full_batch(tmp_path) -> None:
 
     assert status["run_state"] == "completed"
     assert all(status["tasks"][t]["state"] == "completed" for t in ("A", "B", "C"))
-    assert status["lane_audit"]["total_calls"] == 18
+    assert status["lane_audit"]["total_calls"] == 21
     assert seen  # it really was the list runner that did the work
 
 

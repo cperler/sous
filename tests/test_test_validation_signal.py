@@ -25,7 +25,7 @@ from orchestrator.schemas.enums import ExecutionLane, ResultStatus, Stage
 from orchestrator.schemas.status import Task
 from orchestrator.state_machine import no_model_test_surface, unjudged_tests_notice
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import finish_after_review, make_result
 
 # What the deterministic ENGINE-lane TEST runner now returns (#261): a real suite run with
 # NO meaningfulness claim. `change_class` folds because the lane is ENGINE.
@@ -69,7 +69,7 @@ def test_lite_lane_nobody_judged_emits_a_warning_and_still_completes(tmp_path, p
     w = _lite_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
 
-    assert out["outcome"] == "task_completed"  # fail-OPEN is unchanged: never blocking
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # fail-OPEN is unchanged: never blocking
     events = _skipped_events(eng)
     assert len(events) == 1
     ev = events[0]
@@ -93,7 +93,7 @@ def test_review_judging_it_emits_nothing(tmp_path, project) -> None:
         out = eng.record("r1", make_result(w, structured_output={
             "approved": True, "issues": [], "tests_meaningful": verdict,
         }))
-        assert out["outcome"] == expected
+        assert finish_after_review(eng, out)["outcome"] == expected
         # `false` on the lite lane is suppressed by the #168 exemption — that suppression IS
         # evented (below); a `true` is a real judgment and is silent.
         assert _skipped_events(eng) if verdict is False else not _skipped_events(eng)
@@ -111,7 +111,7 @@ def test_model_test_stage_judging_it_emits_nothing(tmp_path, project) -> None:
     assert w.stage is Stage.REVIEW
     assert eng.store.load_task("r1", "t1").context["tests_meaningful"] is True
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert _skipped_events(eng) == []
 
 
@@ -126,7 +126,7 @@ def test_docs_only_change_emits_nothing(tmp_path, project) -> None:
         "change_class": "docs-only", "skipped": "docs-only",
     })
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert _skipped_events(eng) == []
 
 
@@ -142,7 +142,7 @@ def test_micro_lane_without_a_test_stage_emits_nothing(tmp_path, project) -> Non
     w = eng.next_work("r1", "t1")
     assert w.stage is Stage.REVIEW
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert _skipped_events(eng) == []
 
 
@@ -158,7 +158,7 @@ def test_suppressed_explicit_false_is_evented(tmp_path, project) -> None:
     out = eng.record("r1", make_result(w, structured_output={
         "approved": True, "issues": [], "tests_meaningful": False,
     }))
-    assert out["outcome"] == "task_completed"  # exemption still suppresses the rejection
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # exemption still suppresses the rejection
     events = _skipped_events(eng)
     assert len(events) == 1
     assert events[0]["kind"] == "verdict_suppressed"
@@ -190,7 +190,7 @@ def test_panel_review_without_a_tests_lens_emits_the_warning(tmp_path, project) 
     w = _lite_to_review(eng)
     panel = {"findings_by_lens": {"find:code": {"findings": []}}, "verdicts": []}
     out = eng.record("r1", make_result(w, sub_results=panel))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert [e["kind"] for e in _skipped_events(eng)] == ["not_judged"]
 
 

@@ -152,6 +152,22 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
         config_type, "_run_gate",
         staticmethod(lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")),
     )
+    # #389: PUBLISH is deterministic, so `next` drains it in-process and it would really
+    # shell git/gh. This fixture repo has no remote and no authenticated gh, so give the
+    # adapter the ``command_runner`` seam: real local git reads, stubbed network verbs.
+    def _fake_shell(argv, cwd=None, **_kw):
+        if "rev-list" in argv:
+            # The model stages are SIMULATED here (make_result), so the worktree holds no
+            # real implementation commit; report one so PUBLISH gets past its empty-branch
+            # refusal and the CLI plumbing under test actually runs.
+            return subprocess.CompletedProcess(argv, 0, "1\n", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return subprocess.CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "create"]:
+            return subprocess.CompletedProcess(argv, 0, "https://github.com/o/r/pull/5\n", "")
+        return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60)
+
+    monkeypatch.setattr(config_type, "command_runner", staticmethod(_fake_shell), raising=False)
     # Same reason for the #391 worktree hooks: this fixture is a git repo with an adapter
     # in it, not an installed python project, so REVIEW's fresh reinstall has no
     # pyproject.toml to sync and no interpreter here resolves inside the worktree — intake
@@ -187,9 +203,11 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
         result_file = tmp_path / "result.json"
         result_file.write_text(make_result(wi).model_dump_json())
         recorded.append(run("record", "--result", str(result_file))["stage"])
-    # intake is drained deterministically by `next`, so the supervisor records 5 model stages.
+    # intake and publish are drained deterministically by `next`, so the supervisor records
+    # the 5 model stages between them.
     assert recorded == ["scope", "implement", "test", "deliver", "review"]
 
     status = run("status")
+
     assert status["tasks"]["T1"]["state"] == "completed"
     assert (tasks.parent / "completed.log").read_text().startswith("T1")

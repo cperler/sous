@@ -157,27 +157,51 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "validation_notes (what the tests assert / any gaps)."
         ),
     ),
+    # #389: DELIVER no longer opens the PR — it PUBLISHES THE BRANCH and nothing else.
+    # It keeps its position (before REVIEW) precisely because that is what makes a dead
+    # run's work recoverable: the commits reach the remote as soon as they exist (#385's
+    # near-miss lost ~2,400 uncommitted lines in a worktree). Opening the PR moved to
+    # Stage.PUBLISH, after REVIEW approves. There is deliberately NO pr_url paragraph
+    # here any more: at DELIVER time no PR exists for this task by construction, so the
+    # stale-selector path #378 tripped over is unreachable rather than merely guarded.
     Stage.DELIVER: StageSpec(
         stage=Stage.DELIVER,
         model_role=Role.REVIEW,
         schema_ref="deliver",
         agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
-        timeout_s=600,  # docstrings + open a PR
+        timeout_s=600,  # docstrings + a push
         checkpoint=True,
-        effort=Effort.LOW,  # mechanical prose + `gh pr create` — the cheap stage (#96)
+        effort=Effort.LOW,  # mechanical prose + `git push` — the cheap stage (#96)
         template=(
-            "Add/refresh docstrings for changed source, then open a pull request for "
-            "the task branch. If the task is a GitHub issue (#N), include 'Closes #N' "
-            "in the PR description so the merge closes the issue. If the context above "
-            "already shows a pr_url for this task (a review fix cycle), treat it only "
-            "as a selector: run `gh pr view <url> --json state,headRefName,baseRefName` "
-            "and reuse it only when it is OPEN and its head is the task branch. If it "
-            "is CLOSED/MERGED or names another head, look for another OPEN PR for the "
-            "task branch; otherwise open a replacement against the recorded current "
-            "base. Before opening a replacement, fetch that base and require it to be "
-            "an ancestor of HEAD. If it is not, refuse delivery and explain that the "
-            "branch must sync the base and rerun tests; do not merge/rebase after TEST. "
-            "Never open a duplicate.\n"
+            "Add/refresh docstrings for changed source, commit them, then push the task "
+            "branch to the remote (`git push -u origin <branch>`). Do NOT open a pull "
+            "request: the PR is opened by a later stage, only once review has approved "
+            "the work. Verify the push actually landed — the remote ref for the branch "
+            "must resolve to the same commit as local HEAD — rather than assuming it.\n"
+            "Return: branch, pushed_head_sha (the full 40-character commit sha now on "
+            "the remote)."
+        ),
+    ),
+    # #389: opening the PR, gated on REVIEW approval by its POSITION in the pipeline
+    # rather than by any condition it evaluates. Deterministic on every lane: `gh pr
+    # create` is mechanical git/gh work with no judgment in it, so it is never worth a
+    # model call. checkpoint=False — it makes no commits, which also keeps it out of the
+    # commit-attribution audit's COMMITTING set (checkpoint and not deterministic).
+    Stage.PUBLISH: StageSpec(
+        stage=Stage.PUBLISH,
+        model_role=Role.CHEAP_SHELL,
+        schema_ref="publish",
+        agent_role=None,
+        timeout_s=300,  # a single `gh pr create` against an already-pushed branch
+        checkpoint=False,
+        deterministic=True,
+        template=(
+            "Open a pull request for the task branch, which is already pushed. If the "
+            "task is a GitHub issue (#N), include 'Closes #N' in the PR description so "
+            "the merge closes the issue. Open it against the repository's default branch. "
+            "Look for an existing OPEN pull request for the branch first and reuse it: "
+            "this stage has its own retry budget, so a second attempt after a partial "
+            "failure must never open a duplicate.\n"
             "Return: pr_number, pr_url."
         ),
     ),
@@ -197,16 +221,35 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         # copy/port block, so Bash writes and test artifacts are discarded. Inherited by every
         # finder and verifier sub-call via ``review_panel._sub_item``.
         tool_policy=ToolPolicy(allow_file_writes=False),
+        # #389: REVIEW now judges a DIFF, not a PR — it runs BEFORE the PR is opened, so
+        # there is no pr_url in context to point it at. It reads ``base_sha..HEAD`` on the
+        # task branch, in the disposable copy of the live worktree that
+        # ``adapters/execution/review_isolation.py`` already hands it; ``base_sha`` is
+        # folded into context by INTAKE (the same range the TEST stage diffs), so the
+        # reviewer sees exactly this task's commits.
+        #   Gained: the reviewer judges the work BEFORE it is published, so a PR only ever
+        #     describes approved work and a rejection re-pushes a branch instead of
+        #     churning an open PR through three rounds of rejected commits.
+        #   Lost: the PR web view — file-tree navigation, and PR CI status, since checks
+        #     only run once a PR exists. Accepted: CI's content is already covered
+        #     upstream — TEST ran the project's declared suite over this very branch, and
+        #     ``SelfHostConfig.review_findings`` runs ruff/mypy over the task worktree at
+        #     REVIEW and returns a BLOCKING finding on red. Both run before the verdict,
+        #     which PR CI would not.
         template=(
-            "Review the PR (see pr_url in the context above) against the task goal and "
-            "code quality. Assess the goal criterion-by-criterion and check for "
+            "Review the change on the task branch against the task goal and "
+            "code quality. The change is the commit range `base_sha..HEAD` (see base_sha "
+            "in the context above) in the checkout you are running in; read it with "
+            "`git diff <base_sha>..HEAD` and `git log <base_sha>..HEAD`. No pull request "
+            "is open yet — one is opened only if you approve, so judge the diff itself. "
+            "Assess the goal criterion-by-criterion and check for "
             "regressions; approve only if it achieves the goal without regressions. "
             "INDEPENDENTLY verify the change's tests: read them and judge whether they "
             "meaningfully exercise this change (would they fail if it regressed, or are "
             "they vacuous/tautological/always-green?) — report tests_meaningful (bool); "
             "you are a different agent from the one that wrote them, which is the point. "
             "Separately, record any NON-BLOCKING findings (nits, edge cases, polish, "
-            "follow-on ideas) that must not hold up this PR, and CLASSIFY each with a "
+            "follow-on ideas) that must not hold up this change, and CLASSIFY each with a "
             "`disposition` against the filing bar — would a maintainer put this on the "
             "backlog if they'd noticed it independently, without staring at this exact "
             "diff? `file` only if it clears that bar: out-of-scope (different subsystem / "
@@ -227,7 +270,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "note, so nothing is silently dropped without ballooning the backlog. Do NOT "
             "restate one idea as both a non_blocking finding and the `improvement` below "
             "— pick one.\n"
-            "Finally — the self-improvement loop — step back from THIS PR and propose: "
+            "Finally — the self-improvement loop — step back from THIS CHANGE and propose: "
             "(a) improvement — the single highest-value forward-looking enhancement this "
             "task suggests for the PROJECT/roadmap. Emit one ONLY if a maintainer would "
             "independently prioritize it (a concrete trigger / demonstrated need); do NOT "
@@ -506,8 +549,8 @@ def _unenforced_tool_posture_directive(policy: ToolPolicy) -> str:
 _STACKED_DIFF_SCOPE = (
     "\n\n## Stacked branch: review only THIS task's own commits\n"
     "This task's worktree was composed at intake on batch dependencies whose own PRs have "
-    "not merged yet (composed_deps above: {deps}). Their commits ride along in this branch "
-    "and in this PR, so diffing against the trunk — `gh pr diff <n>` included — shows their "
+    "not merged yet (composed_deps above: {deps}). Their commits ride along in this branch, "
+    "so diffing against the trunk shows their "
     "changes mixed in with this task's.\n"
     "{scope}"
     "Judge this task's own commits ONLY: do not reject this task for a change its dependency "
@@ -691,8 +734,8 @@ def render_prompt(
 
     - REVIEW + stacked branch (#310): when the task was composed on unmerged batch
       dependencies (``composed_deps`` non-empty), names them and scopes the review to
-      ``base_sha..HEAD`` — this task's own commits — because the PR's trunk-relative diff
-      carries the dependencies' commits too.
+      ``base_sha..HEAD`` — this task's own commits — because the branch's trunk-relative
+      diff carries the dependencies' commits too.
 
     - REVIEW + frontend change (#62): appends the design-review lens when folded context
       signals a frontend file was changed.
@@ -744,7 +787,7 @@ def render_prompt(
     if stage is Stage.REVIEW:
         instruction += _TESTS_MEANINGFUL_DIRECTIVE
         # #310: a task stacked on unmerged batch dependencies (#216) is told which commits
-        # are its own, so the reviewer doesn't judge the PR's trunk-relative diff — which
+        # are its own, so the reviewer doesn't judge the branch's trunk-relative diff — which
         # carries the dependencies' commits too — as if it were this task's change. Empty
         # for an unstacked task, so its prompt is byte-identical to the pre-#310 one.
         instruction += _stacked_diff_directive(context)

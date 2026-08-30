@@ -102,7 +102,7 @@ def test_status_never_flags_terminal_or_held_tasks(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
-    for _ in range(6):  # run the whole pipeline green
+    for _ in range(7):  # run the whole pipeline green
         w = eng.next_work("r1", "t1")
         if w is None:
             break

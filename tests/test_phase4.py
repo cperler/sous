@@ -138,8 +138,9 @@ def test_headless_run_target_completes_in_process(tmp_path) -> None:
     assert status["tasks"]["t1"]["state"] == "completed"
     audit = status["lane_audit"]
     assert audit["clean"] is True
-    # intake runs on the deterministic ENGINE lane; the five model stages are headless:claude.
-    assert audit["by_lane"] == {"engine:none": 1, "headless:claude": 5}
+    # intake and publish run on the deterministic ENGINE lane (#389); the five model
+    # stages are headless:claude.
+    assert audit["by_lane"] == {"engine:none": 2, "headless:claude": 5}
     assert "headless:claude" in audit["sanctioned_lanes"]
 
 

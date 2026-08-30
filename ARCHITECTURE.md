@@ -144,18 +144,47 @@ written.
 
 ## The pipeline
 
-The standing six-stage pipeline, collapsed from the reference system's ~12–15:
+The standing seven-stage pipeline, collapsed from the reference system's ~12–15:
 
 ```
-  intake ──▶ scope ──▶ implement ──▶ test ──▶ deliver ──▶ review
-  (worktree,  (plan,    (edit +      (run     (push +     (approve /
-   baseline)   feasible?) commit)     suite)   open PR)    reject → fix cycle)
+  intake ──▶ scope ──▶ implement ──▶ test ──▶ deliver ──▶ review ──▶ publish
+  (worktree,  (plan,    (edit +      (run     (push the   (approve /  (open the
+   baseline)   feasible?) commit)     suite)   branch)     reject →     PR)
+                                                           fix cycle)
 ```
 
-`simplify` is an additional stage-vocabulary member, not a seventh step in the standing
+**Delivery is split from publication (#389).** DELIVER pushes the branch at its old
+position; PUBLISH opens the pull request, and it runs AFTER REVIEW. The two halves used to
+be one stage, which meant a PR was opened against trunk before anything had judged the work
+and a rejected task pushed onto that open PR on every fix cycle (`batch-380-381`'s #381 sat
+on an open PR through three rounds of rejected work). Splitting them keeps both properties
+that mattered:
+
+- *Durability.* The push stays where it was, so a run that dies mid-review has already put
+  its work on the remote — the #385 class does not get worse. DELIVER's gate
+  (`state_machine.branch_not_pushed`) requires a branch plus a verified 40-hex
+  `pushed_head_sha`, so "I pushed" is checked, not asserted.
+- *A PR always describes judged work.* Nothing is published until REVIEW approves, so the
+  stale-`pr_url` reuse of #378 is unreachable BY CONSTRUCTION rather than by a state check:
+  during the fix cycles there is no recorded PR url to go stale.
+
+The approval gate is PUBLISH's POSITION in the pipeline, not a condition it evaluates —
+which is why a `quality_tier: none` child, whose pipeline has no REVIEW at all, simply
+reaches PUBLISH straight after DELIVER.
+
+**What REVIEW reads.** Running before the PR exists, REVIEW judges the commit range
+`base_sha..HEAD` on the task branch (`base_sha` is folded at INTAKE — the same range TEST
+diffs), inside the disposable copy of the live worktree `review_isolation.py` already hands
+it. What it loses is the PR web view and PR CI status, since checks only run once a PR
+exists. That is accepted because CI's content is already covered EARLIER: TEST ran the
+project's declared suite over this branch, and `SelfHostConfig.review_findings` runs
+ruff/mypy over the task worktree at REVIEW and returns a BLOCKING finding on red — both
+before the verdict, which PR CI would not be.
+
+`simplify` is an additional stage-vocabulary member, not a step in the standing
 FULL preset. SCOPE may opt a decomposed child with `quality_tier: full` into
-`intake → implement → simplify → test → deliver → review`; `light` omits simplify and
-`none` omits both simplify and review. The pass has its own WorkItem, checkpoint, agent,
+`intake → implement → simplify → test → deliver → review → publish`; `light` omits simplify
+and `none` omits both simplify and review. The pass has its own WorkItem, checkpoint, agent,
 timeout, and ledger row, so its cost and failures are visible without restoring the old
 opaque quality loop.
 
@@ -168,7 +197,11 @@ opaque quality loop.
   REUSED worktree inherited from a previous, dead run (#385 — report-only: never reset,
   never adopted), and captures the test baseline; `deterministic_test.py` runs the suite and
   classifies failures; `deterministic_deliver.py`
-  pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
+  pushes the branch and verifies the push landed; `deterministic_publish.py` opens the PR
+  (never a duplicate — PUBLISH has its own retry budget, so a retry after a partial failure
+  must find and reuse the PR the first attempt created). PUBLISH is deterministic on EVERY
+  lane, not opt-in per lane like TEST/DELIVER: `gh pr create` carries no judgment worth a
+  model call. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
 - **Dispatch/record contract.** `Engine.next_work()` emits an immutable `WorkItem` whose
   `content_hash` (over stage+prompt+schema+model+lane+attempt) is its idempotency key; the
@@ -182,7 +215,7 @@ opaque quality loop.
 - **Context plane.** Stages hand data forward through an engine-owned whitelist, not free
   text: `CONTEXT_KEYS` in `state_machine.py` names exactly which structured keys each stage
   folds into `task.context` (e.g. intake → `branch`/`worktree`/`baseline_failures`/
-  `inherited_changes`, deliver → `pr_url`). The fold is bounded (per-value caps + a 16 KB
+  `inherited_changes`, deliver → `pushed_head_sha`, publish → `pr_url`). The fold is bounded (per-value caps + a 16 KB
   whole-context ceiling evicted heaviest-key-first) and deterministic, so replay reproduces
   it. `DETERMINISTIC_ONLY_KEYS`
   (`change_class`) fold only from the ENGINE lane — a model can't claim "docs-only" to relax

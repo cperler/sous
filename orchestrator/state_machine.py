@@ -193,8 +193,12 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),
     Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),
-    Stage.DELIVER: ("pr_number", "pr_url"),
+    # #389: DELIVER pushes the branch; PUBLISH (after REVIEW) opens the PR. The pr_*
+    # pair therefore enters the context plane at PUBLISH, which is also why no earlier
+    # stage can see a stale pr_url — there is none to see.
+    Stage.DELIVER: ("pushed_head_sha",),
     Stage.REVIEW: ("issues",),
+    Stage.PUBLISH: ("pr_number", "pr_url"),
 }
 
 # Engine-INJECTED context keys (#72): folded into task.context by the engine directly
@@ -388,7 +392,7 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     # than crash record(). Before #172 the garbage landed silently and made the stored doc
     # unloadable on its next read; dropping the bad value is strictly safer. #201: record
     # each drop so the engine can emit a warning-grade event (drop is no longer invisible).
-    if result.stage is Stage.DELIVER:
+    if result.stage is Stage.PUBLISH:
         for field in ("pr_number", "pr_url"):
             if field in out:
                 try:
@@ -431,7 +435,10 @@ _PR_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)/?$")
 
 
 def pr_not_opened(structured_output: dict | None) -> str | None:
-    """Veto reason when a SUCCESS DELIVER did not actually open a PR — else ``None`` (#351).
+    """Veto reason when a SUCCESS PUBLISH did not actually open a PR — else ``None`` (#351).
+
+    Gates PUBLISH since #389 split the PR-open off DELIVER; the check itself is unchanged,
+    it just moved with the work it describes.
 
     ``pr_url`` is free text, so before this check a *compare* link
     (``…/pull/new/task/259``) and a prose sentence beginning ``"blocked: GitHub API
@@ -451,18 +458,54 @@ def pr_not_opened(structured_output: dict | None) -> str | None:
     detail = f"pr_number={number!r} pr_url={_bound_dropped_value(url)}"
     if not isinstance(number, int) or isinstance(number, bool) or number <= 0:
         return (
-            "deliver gate: no pull request was opened — a delivered stage must report a "
-            f"positive pr_number ({detail}). The branch may already be pushed; open the PR "
-            "for it (or re-run once the GitHub API is reachable) rather than reporting a "
-            "compare link or an error message as the PR."
+            "publish gate: no pull request was opened — a published stage must report a "
+            f"positive pr_number ({detail}). The branch is already pushed by DELIVER; open "
+            "the PR for it (or re-run once the GitHub API is reachable) rather than "
+            "reporting a compare link or an error message as the PR."
         )
     if not isinstance(url, str) or (m := _PR_URL_RE.match(url.strip())) is None:
         return (
-            "deliver gate: pr_url is not a pull-request URL — it must end in /pull/<number>, "
+            "publish gate: pr_url is not a pull-request URL — it must end in /pull/<number>, "
             f"not a compare link or a message ({detail})."
         )
     if int(m.group(1)) != number:
-        return f"deliver gate: pr_url and pr_number disagree ({detail})."
+        return f"publish gate: pr_url and pr_number disagree ({detail})."
+    return None
+
+
+_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+
+
+def branch_not_pushed(structured_output: dict | None) -> str | None:
+    """Veto reason when a SUCCESS DELIVER did not actually push the branch — else ``None``.
+
+    #389's twin of :func:`pr_not_opened`, and it exists for the same reason. Once DELIVER
+    stops opening a PR, the PR is no longer the thing that proves DELIVER did its job, so
+    without this the stage could report SUCCESS having pushed nothing and the run would
+    reach PUBLISH with an unpublished branch — the failure #351 caught on the PR side,
+    arriving through the door the split opened.
+
+    Real evidence is a non-empty ``branch`` plus a full 40-hex ``pushed_head_sha``: an
+    abbreviated sha, a ref name, or a prose apology are all rejected, because each is
+    something a stage reports when it did NOT verify the remote. Pure: the engine call
+    site turns the reason into the veto and the event.
+    """
+    out = structured_output or {}
+    branch = out.get("branch")
+    sha = out.get("pushed_head_sha")
+    detail = f"branch={_bound_dropped_value(branch)} pushed_head_sha={_bound_dropped_value(sha)}"
+    if not isinstance(branch, str) or not branch.strip():
+        return (
+            "deliver gate: no branch was pushed — a delivered stage must report the "
+            f"branch it pushed ({detail})."
+        )
+    if not isinstance(sha, str) or _SHA_RE.match(sha.strip().lower()) is None:
+        return (
+            "deliver gate: pushed_head_sha is not a full commit sha — a delivered stage "
+            "must push the branch and report the 40-character sha the remote now resolves "
+            f"to ({detail}). Push the branch (or re-run once the remote is reachable) "
+            "rather than reporting an abbreviated sha, a ref name, or an error message."
+        )
     return None
 
 

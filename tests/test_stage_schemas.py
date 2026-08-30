@@ -43,11 +43,25 @@ def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
     assert "retrospective ({title, detail, target?}" in prompt
 
 
-def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> None:
+def test_deliver_prompt_has_no_pr_url_to_go_stale() -> None:
+    """#389: the #378 stale-``pr_url`` path is closed by CONSTRUCTION, not by a check.
+
+    DELIVER used to be told to revalidate a recorded pr_url before reusing it, because a
+    fix cycle could re-deliver onto a PR that had since been merged. DELIVER now only
+    pushes, and no PR exists for the task until PUBLISH runs after REVIEW — so there is no
+    recorded url for the stage to mistake for live evidence, and the paragraph that tried
+    to spot a stale one is gone rather than reworded."""
     prompt = STAGE_SPECS[Stage.DELIVER].template
-    assert "gh pr view <url> --json state,headRefName,baseRefName" in prompt
-    assert "reuse it only when it is OPEN and its head is the task branch" in prompt
-    assert "do not merge/rebase after TEST" in prompt
+    assert "pr_url" not in prompt and "gh pr view" not in prompt
+    assert "Do NOT open a pull request" in prompt
+    assert "pushed_head_sha" in prompt
+
+
+def test_publish_prompt_refuses_to_open_a_duplicate_pr() -> None:
+    """The duplicate guard survives the split: PUBLISH has its own retry budget."""
+    prompt = STAGE_SPECS[Stage.PUBLISH].template
+    assert "existing OPEN pull request" in prompt
+    assert "never open a duplicate" in prompt
 
 
 def test_local_override_wins(tmp_path) -> None:

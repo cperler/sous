@@ -90,6 +90,12 @@ class Stage(StrEnum):
     TEST = "test"
     DELIVER = "deliver"
     REVIEW = "review"
+    # #389: the PR-opening half of what DELIVER used to do, split off and placed AFTER
+    # REVIEW. DELIVER still pushes the branch at its old position (so a dead run never
+    # loses work on the remote), but the PR is only opened once REVIEW has approved —
+    # so a PR always describes judged work and a fix cycle re-pushes instead of churning
+    # an open PR. The gate is the stage's POSITION in the pipeline, not a condition.
+    PUBLISH = "publish"
 
 
 # Canonical display order for stage records. SIMPLIFY is opt-in through a decomposed
@@ -103,6 +109,7 @@ STAGE_ORDER: tuple[Stage, ...] = (
     Stage.TEST,
     Stage.DELIVER,
     Stage.REVIEW,
+    Stage.PUBLISH,
 )
 
 
@@ -337,9 +344,23 @@ LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
         Stage.TEST,
         Stage.DELIVER,
         Stage.REVIEW,
+        Stage.PUBLISH,
     ),
-    ExecutionLane.LITE: (Stage.INTAKE, Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER, Stage.REVIEW),
-    ExecutionLane.MICRO: (Stage.INTAKE, Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW),
+    ExecutionLane.LITE: (
+        Stage.INTAKE,
+        Stage.IMPLEMENT,
+        Stage.TEST,
+        Stage.DELIVER,
+        Stage.REVIEW,
+        Stage.PUBLISH,
+    ),
+    ExecutionLane.MICRO: (
+        Stage.INTAKE,
+        Stage.IMPLEMENT,
+        Stage.DELIVER,
+        Stage.REVIEW,
+        Stage.PUBLISH,
+    ),
 }
 
 # Stages a preset runs on the $0 deterministic ENGINE lane BY DEFAULT (#68, promoting #33's
@@ -351,6 +372,8 @@ LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
 # meaningfulness, so that veto still lives on a model. Resolved at add_task; an explicit
 # --deterministic-stages (or a cost-routing decision) overrides it. Intersected with the
 # stage set that actually runs, so MICRO (no TEST stage) gets DELIVER only.
+# PUBLISH is absent here ON PURPOSE: it is deterministic on EVERY lane (its StageSpec sets
+# deterministic=True), so it never needs to be opted in per-lane the way TEST/DELIVER do.
 _DETERMINISTIC_BY_DEFAULT: frozenset[Stage] = frozenset({Stage.TEST, Stage.DELIVER})
 LANE_DETERMINISTIC_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
     lane: (

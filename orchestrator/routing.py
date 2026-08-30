@@ -60,8 +60,9 @@ def engine_lane_required(stage: Stage, lane: LanePolicy) -> str | None:
     per-task choice about where the cheap mechanical stages should run), the caller has no
     option to decline it, because the model lane physically cannot do the work.
 
-    The one case today is DELIVER on codex. DELIVER pushes the task branch and then opens the
-    PR, and codex's sandbox breaks the push: ``git-credential-osxkeychain`` cannot reach the
+    The two cases today are DELIVER and PUBLISH on codex — since #389 split them, DELIVER
+    pushes the task branch and PUBLISH opens the PR, and codex's sandbox breaks BOTH halves
+    for the same reason. The push: ``git-credential-osxkeychain`` cannot reach the
     keychain from inside it, so git falls through to a credential path that raises a **GUI
     passkey dialog**. Confirmed by a ``git push --dry-run`` inside a real ``codex exec``
     sandbox — it succeeded only because a human was at the machine to click the prompt. A
@@ -73,9 +74,11 @@ def engine_lane_required(stage: Stage, lane: LanePolicy) -> str | None:
     what let the handshake get far enough to prompt at all. The credential path itself is
     interactive, and overriding ``credential.helper`` does not suppress ``osxkeychain``.
 
-    So DELIVER goes to the ENGINE lane, where ``DeterministicDeliverRunner`` pushes and opens
-    the PR from the engine's own process — outside any sandbox, where the keychain answers
-    without a dialog — at \\$0 and with no model call. That is the same argument the
+    ``gh`` needs the same credentials to create the PR, so PUBLISH is vetoed alongside it.
+
+    So both go to the ENGINE lane, where ``DeterministicDeliverRunner`` pushes and
+    ``DeterministicPublishRunner`` opens the PR from the engine's own process — outside any
+    sandbox, where the keychain answers without a dialog — at \\$0 and with no model call. That is the same argument the
     mechanical stages already make generally: don't ask a model to run ``gh pr
     create``. The cost is the model DELIVER's docstring-refresh pass, which the deterministic
     runner documents itself as not doing.
@@ -83,7 +86,7 @@ def engine_lane_required(stage: Stage, lane: LanePolicy) -> str | None:
     NOT expressed as a router provider swap (codex DELIVER -> claude DELIVER): that would keep
     a model on a mechanical stage, bill it, and quietly make an "all-codex" run not all-codex.
     """
-    if stage is Stage.DELIVER and lane.provider is Provider.CODEX:
+    if stage in (Stage.DELIVER, Stage.PUBLISH) and lane.provider is Provider.CODEX:
         return "codex_sandbox_cannot_push"
     return None
 

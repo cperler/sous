@@ -81,6 +81,8 @@ def test_stage_spec_effort_defaults() -> None:
         Stage.TEST: Effort.MEDIUM,
         Stage.DELIVER: Effort.LOW,
         Stage.REVIEW: Effort.MEDIUM,
+        # #389: deterministic like INTAKE — the ENGINE lane has no model to throttle.
+        Stage.PUBLISH: None,
     }
     assert {s: spec.effort for s, spec in STAGE_SPECS.items()} == expect
 

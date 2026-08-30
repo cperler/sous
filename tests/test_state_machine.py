@@ -34,4 +34,4 @@ def test_pr_not_opened_accepts_only_a_coherent_real_pr(output, expect_veto) -> N
     reason = pr_not_opened(output)
     assert (reason is not None) is expect_veto, (output, reason)
     if expect_veto:
-        assert reason and reason.startswith("deliver gate:")
+        assert reason and reason.startswith("publish gate:")

@@ -32,6 +32,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from adapters.execution.deterministic_deliver import DeterministicDeliverRunner
+from adapters.execution.deterministic_publish import DeterministicPublishRunner
 from adapters.execution.deterministic_setup import DeterministicSetupRunner
 from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.runners import build_registry
@@ -118,20 +119,40 @@ class E2EProject:
 
 
 class GhStub:
-    """Injectable subprocess runner for the DELIVER executor: runs REAL git for the
-    read-only local queries (rev-parse / rev-list, so commit counting is genuine) but
-    stubs the network verbs — ``git push`` succeeds without a remote, ``gh pr create``
-    returns a synthetic PR url (recorded), ``gh pr list`` reports no existing PR."""
+    """Injectable subprocess runner for the DELIVER/PUBLISH executors: runs REAL git for the
+    read-only local queries (rev-parse / rev-list, so commit counting is genuine) but stubs
+    the network verbs.
+
+    It MODELS a remote rather than merely letting the network verbs succeed: ``git push``
+    records the worktree's current HEAD as the remote ref and ``git ls-remote`` answers from
+    that record, so #389's push-landed verification is exercised for real — a test whose
+    push silently did nothing would fail here instead of passing on a stub's shrug.
+    ``gh pr create`` returns a synthetic PR url (recorded) and ``gh pr list`` reports no
+    existing PR."""
 
     def __init__(self) -> None:
         self.prs: list[tuple[str | None, str]] = []
+        self.pushes: list[tuple[str | None, str]] = []  # (cwd, branch)
         self._n = 1000
+        self._remote: dict[str, str] = {}  # branch -> sha
 
     def __call__(self, argv, cwd=None, **_kw):
-        if argv and argv[0] == "git" and "push" not in argv:
-            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60)
+        if "ls-remote" in argv:
+            # Strip the refs/heads/ PREFIX — never rsplit on "/", which would turn the
+            # ordinary slashed branch name task/t1 into t1.
+            ref = argv[-1].removeprefix("refs/heads/")
+            sha = self._remote.get(ref, "")
+            return subprocess.CompletedProcess(argv, 0, f"{sha}\trefs/heads/{ref}\n" if sha else "", "")
         if "push" in argv:
+            branch = argv[-1]
+            head = subprocess.run(
+                ["git", "rev-parse", "HEAD"], cwd=cwd, capture_output=True, text=True, timeout=60
+            )
+            self._remote[branch] = (head.stdout or "").strip()
+            self.pushes.append((cwd, branch))
             return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv and argv[0] == "git":
+            return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, timeout=60)
         if argv[:3] == ["gh", "pr", "list"]:
             return subprocess.CompletedProcess(argv, 0, "", "")
         if argv[:3] == ["gh", "pr", "create"]:
@@ -173,7 +194,9 @@ class ScriptedLane:
         if w.stage is Stage.TEST:
             return DeterministicTestRunner(self.project).dispatch(w)  # REAL subprocess test run
         if w.stage is Stage.DELIVER:
-            return DeterministicDeliverRunner(self.project, runner=self.gh).dispatch(w)  # REAL git + stubbed gh
+            return DeterministicDeliverRunner(self.project, runner=self.gh).dispatch(w)  # REAL git + stubbed remote
+        if w.stage is Stage.PUBLISH:
+            return DeterministicPublishRunner(self.project, runner=self.gh).dispatch(w)  # #389
         # --- scripted model stages (real-effect) ---------------------------------
         key = (w.task_id, w.stage)
         if self.rate_limit_once.get(key, 0) > 0:
@@ -272,7 +295,7 @@ def test_a_three_task_dag_completes_in_dependency_order(tmp_path, monkeypatch) -
     # real worktrees were created on disk by the real intake executor.
     assert all((repo / ".worktrees" / t).is_dir() for t in ("t1", "t2", "t3"))
     # ledger rows are present and coherent: 3 tasks x 6 stages, lane audit clean.
-    assert status["lane_audit"]["total_calls"] == 18
+    assert status["lane_audit"]["total_calls"] == 21  # 3 tasks x 7 stages (#389 added PUBLISH)
     assert status["lane_audit"]["clean"] is True
     assert len(_events(eng, "r1", "task_completed")) == 3
     fin = _events(eng, "r1", "run_finalized")

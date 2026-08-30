@@ -28,8 +28,8 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
 
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     types = [e["type"] for e in events]
-    assert types.count("stage_dispatched") == 6
-    assert types.count("stage_recorded") == 6
+    assert types.count("stage_dispatched") == 7  # #389 added PUBLISH behind REVIEW
+    assert types.count("stage_recorded") == 7
     assert "task_completed" in types
     # run_finalized is immediately followed by its alerting `notification` row (#55).
     # Anchored on the finalize index rather than the tail: every finalized run now also
@@ -43,7 +43,7 @@ def test_events_jsonl_timeline(tmp_path, project) -> None:
     assert types.index("stage_dispatched") < types.index("stage_recorded")
 
 
-def test_malformed_pr_number_now_fails_the_deliver_stage(tmp_path, project) -> None:
+def test_malformed_pr_number_now_fails_the_publish_stage(tmp_path, project) -> None:
     """#351 supersedes #201's warning for this case: a DELIVER that cannot name a real PR
     is vetoed to a FAILURE, which is strictly louder than a warning event on a green stage.
 
@@ -54,7 +54,7 @@ def test_malformed_pr_number_now_fails_the_deliver_stage(tmp_path, project) -> N
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     while (w := eng.next_work("r1", "t1")) is not None:
-        if w.stage is Stage.DELIVER:
+        if w.stage is Stage.PUBLISH:
             eng.record("r1", make_result(
                 w,
                 structured_output={"pr_number": "", "pr_url": "https://example.test/pr/9"},
@@ -63,9 +63,9 @@ def test_malformed_pr_number_now_fails_the_deliver_stage(tmp_path, project) -> N
         eng.record("r1", make_result(w))
 
     task = eng.store.load_task("r1", "t1")
-    assert task.stages[Stage.DELIVER].status is StageStatus.FAILED
+    assert task.stages[Stage.PUBLISH].status is StageStatus.FAILED
     assert "no pull request was opened" in (task.last_error or "")
-    assert task.pr_url is None, "a vetoed deliver must not fold its outputs"
+    assert task.pr_url is None, "a vetoed publish must not fold its outputs"
 
     events = [json.loads(line) for line in (tmp_path / "events.jsonl").read_text().splitlines()]
     assert not [e for e in events if e["type"] == "task_completed"]
@@ -179,9 +179,12 @@ def test_per_stage_log_tree(tmp_path, project) -> None:
         "04-test.json",
         "05-deliver.json",
         "06-review.json",
+        "07-publish.json",  # #389: the PR is opened after review
     ]
     # each captures the durable StageResult payload (structured_output + lane + cost)
     deliver = json.loads((stage_dir / "05-deliver.json").read_text())
-    assert deliver["structured_output"]["pr_url"].endswith("/1234")
+    assert deliver["structured_output"]["pushed_head_sha"]
     assert deliver["lane_used"]["execution_mode"] == "interactive"
     assert deliver["status"] == "success" and "cost_usd" in deliver
+    publish = json.loads((stage_dir / "07-publish.json").read_text())
+    assert publish["structured_output"]["pr_url"].endswith("/1234")

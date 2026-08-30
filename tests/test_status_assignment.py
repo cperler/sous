@@ -69,7 +69,7 @@ def test_invalid_effort_string_raises_at_assignment() -> None:
     assert task.effort_pin is None
 
 
-def test_deliver_fold_skips_malformed_pr_values_instead_of_crashing() -> None:
+def test_publish_fold_skips_malformed_pr_values_instead_of_crashing() -> None:
     """The _absorb_outputs pr_* fold stays TOLERANT under the convention: a malformed
     model-produced value (pr_number="") is dropped at the write instead of raising out
     of record() — and instead of landing silently and corrupting the stored doc, which
@@ -79,13 +79,13 @@ def test_deliver_fold_skips_malformed_pr_values_instead_of_crashing() -> None:
 
     task = _task()
     _absorb_outputs(task, make_result_stub(
-        Stage.DELIVER, {"pr_number": "", "pr_url": "https://example.test/pr/7"},
+        Stage.PUBLISH, {"pr_number": "", "pr_url": "https://example.test/pr/7"},
     ))
     assert task.pr_number is None  # malformed value skipped, not stored, no raise
     assert task.pr_url == "https://example.test/pr/7"  # the valid sibling still folds
 
 
-def test_deliver_fold_returns_drop_notice_for_malformed_pr_value() -> None:
+def test_publish_fold_returns_drop_notice_for_malformed_pr_value() -> None:
     """#201: dropping a malformed pr_* value is no longer SILENT — _absorb_outputs
     returns a bounded drop notice (field + offending value + reason) per drop so the
     engine can emit a warning-grade audit event. The valid sibling still folds and
@@ -95,7 +95,7 @@ def test_deliver_fold_returns_drop_notice_for_malformed_pr_value() -> None:
 
     task = _task()
     notices = _absorb_outputs(task, make_result_stub(
-        Stage.DELIVER, {"pr_number": "", "pr_url": "https://example.test/pr/7"},
+        Stage.PUBLISH, {"pr_number": "", "pr_url": "https://example.test/pr/7"},
     ))
     assert task.pr_number is None  # dropped value stays unset
     assert task.pr_url == "https://example.test/pr/7"  # valid sibling still folds
@@ -107,15 +107,15 @@ def test_deliver_fold_returns_drop_notice_for_malformed_pr_value() -> None:
     assert set(notice) == {"field", "value", "reason"}
 
 
-def test_deliver_fold_returns_no_notice_when_all_pr_values_valid() -> None:
-    """#201: a clean DELIVER fold drops nothing, so the notice list is empty (the engine
+def test_publish_fold_returns_no_notice_when_all_pr_values_valid() -> None:
+    """#201: a clean PUBLISH fold drops nothing, so the notice list is empty (the engine
     emits no pr_field_dropped event)."""
     from orchestrator.state_machine import _absorb_outputs
     from tests.test_context_plane import make_result_stub
 
     task = _task()
     notices = _absorb_outputs(task, make_result_stub(
-        Stage.DELIVER, {"pr_number": 42, "pr_url": "https://example.test/pr/42"},
+        Stage.PUBLISH, {"pr_number": 42, "pr_url": "https://example.test/pr/42"},
     ))
     assert notices.pr_fields == []
     assert task.pr_number == 42

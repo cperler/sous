@@ -47,8 +47,8 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     status = _run(capsys, *base, "status")
     assert status["tasks"]["#42"]["state"] == "completed"
     assert status["lane_audit"]["clean"] is True
-    assert status["lane_audit"]["total_calls"] == 6
-    assert status["cost"]["total_invocations"] == 6
+    assert status["lane_audit"]["total_calls"] == 7  # #389 added the deterministic PUBLISH
+    assert status["cost"]["total_invocations"] == 7
     # #169: the cost block carries the per-effort + ENGINE-lane rollups. The deterministic
     # intake stage ran on the ENGINE lane, so its $0 invocation is attributed there.
     assert "by_effort_spend" in status["cost"]
@@ -56,7 +56,9 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     assert status["cost"]["engine_lane"]["cost_usd"] == 0.0
 
     report = _run(capsys, *base, "cost-report")
-    assert set(report["by_stage"]) == {"intake", "scope", "implement", "test", "deliver", "review"}
+    assert set(report["by_stage"]) == {
+        "intake", "scope", "implement", "test", "deliver", "review", "publish",
+    }
     assert "net_win_usd" in report["session_reuse"]
     assert (tmp_path / "cost-report.md").exists()  # written at run finalize
 

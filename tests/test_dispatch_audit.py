@@ -21,6 +21,7 @@ from orchestrator import status_store as status_store_mod
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import ExecutionLane, Provider, ResultStatus, Stage
+from orchestrator.stages import STAGE_SPECS
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
@@ -112,13 +113,20 @@ def test_continuity_rate_is_derivable_from_events_alone(tmp_path, project) -> No
     dispatched = [e for e in raw if e["type"] == "stage_dispatched"]
     resumed = [e for e in dispatched if e["session_ref"]]
     assert len(dispatched) > 2
-    # the first dispatch is necessarily cold; every later one chains the minted ref
-    assert len(resumed) == len(dispatched) - 1
+    # A provider session only rides a stage dispatched to a PROVIDER lane. A deterministic
+    # ENGINE-lane stage — INTAKE, and PUBLISH since #389 — has no provider process to
+    # resume, so its dispatch is honestly session-less rather than falsely chained, and it
+    # is the whole population of "fresh" here: intake's own result mints the ref before the
+    # first model stage, so every provider dispatch in this run is warm.
+    deterministic = [e for e in dispatched if STAGE_SPECS[Stage(e["stage"])].deterministic]
+    provider_dispatches = [e for e in dispatched if e not in deterministic]
+    assert len(resumed) == len(provider_dispatches)
+    assert all(e["session_ref"] is None for e in deterministic)
     assert all("session_ref" in e for e in dispatched)  # no key-absent holes to guess at
 
     audit = eng.events_audit("r1")["continuity"]
     assert audit["known"] == len(dispatched) and audit["unknown"] == 0
-    assert audit["resumed"] == len(resumed) and audit["fresh"] == 1
+    assert audit["resumed"] == len(resumed) and audit["fresh"] == len(deterministic)
     assert audit["rate"] == len(resumed) / len(dispatched)
 
 

@@ -12,12 +12,14 @@ are scripts, not model calls. This runner serves the whole
     Ports ``run_setup_stage`` from the reference bash system.
   - TEST    → ``deterministic_test.DeterministicTestRunner`` (#33): run the project's test
     commands, classify failures, split inherited baseline red from caused (``test``).
-  - DELIVER → ``deterministic_deliver.DeterministicDeliverRunner`` (#33): push the branch
-    and open/reuse a PR (``deliver``).
+  - DELIVER → ``deterministic_deliver.DeterministicDeliverRunner`` (#33): push the task
+    branch to the remote and verify the push landed (``deliver``).
+  - PUBLISH → ``deterministic_publish.DeterministicPublishRunner`` (#389): open the pull
+    request for the already-pushed branch, after REVIEW has approved it (``publish``).
 
 The registry keys one runner per cell, so this class is the single ENGINE-lane entry and
-delegates TEST/DELIVER to their focused modules (the engine still never imports any of
-them — they are execution-adapter concerns).
+delegates TEST/DELIVER/PUBLISH to their focused modules (the engine still never imports
+any of them — they are execution-adapter concerns).
 
 For INTAKE a project may override the git logic with a ``setup_task(task_id) -> dict``
 method (the intake structured_output) — duck-typed, so tests supply a no-git fake and
@@ -175,6 +177,14 @@ class DeterministicSetupRunner:
             )
         ]
 
+    def _command_runner(self) -> Callable[..., subprocess.CompletedProcess] | None:
+        """The project's optional ``command_runner`` (a ``subprocess.run``-shaped callable).
+
+        None when the project declares none, which is what the deterministic runners treat
+        as "use subprocess.run" — so an adapter that does not care is unaffected."""
+        runner = getattr(self._project, "command_runner", None)
+        return runner if callable(runner) else None
+
     def dispatch(self, work: WorkItem) -> StageResult:
         # The ENGINE cell serves every deterministic stage; delegate the non-intake ones to
         # their focused runners (#33). Local imports keep the adapter modules decoupled and
@@ -183,10 +193,22 @@ class DeterministicSetupRunner:
             from .deterministic_test import DeterministicTestRunner
 
             return DeterministicTestRunner(self._project).dispatch(work)
+        # The git/gh stages take the project's ``command_runner`` when it declares one —
+        # the same override seam ``setup_task`` gives INTAKE, one level down. A project
+        # whose worktrees are synthetic (or that wants its shell calls audited/sandboxed)
+        # supplies it; everyone else gets None and the runners default to subprocess.run.
         if work.stage is Stage.DELIVER:
             from .deterministic_deliver import DeterministicDeliverRunner
 
-            return DeterministicDeliverRunner(self._project).dispatch(work)
+            return DeterministicDeliverRunner(
+                self._project, runner=self._command_runner()
+            ).dispatch(work)
+        if work.stage is Stage.PUBLISH:
+            from .deterministic_publish import DeterministicPublishRunner
+
+            return DeterministicPublishRunner(
+                self._project, runner=self._command_runner()
+            ).dispatch(work)
         # #5: allocate this task's per-task port block AT INTAKE (where the worktree is
         # created), so every later stage's dev/test server binds a slice unique to the task.
         # Best-effort and opt-in: a project without port needs (no port_env/needs_ports)

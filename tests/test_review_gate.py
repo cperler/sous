@@ -15,7 +15,7 @@ from orchestrator.errors import ContractError
 from orchestrator.render import format_review_issue
 from orchestrator.schemas.enums import ResultStatus, Stage, StageStatus, TaskState
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import finish_after_review, make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -81,7 +81,7 @@ def test_fix_cycle_then_approval_completes(tmp_path, project) -> None:
     w2 = eng.next_work("r1", "t1")
     assert w2.stage is Stage.REVIEW
     out = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
 
 
@@ -93,7 +93,10 @@ FIXUP = {
 
 
 def _drive_fixup_tail(eng: Engine):
-    """Drive the re-opened IMPLEMENT→TEST→DELIVER tail and return its REVIEW."""
+    """Drive the re-opened IMPLEMENT→TEST→DELIVER tail and return its REVIEW.
+
+    PUBLISH sits behind that REVIEW since #389; callers that need the task to COMPLETE
+    drive it with ``finish_after_review``."""
     stages = []
     for _ in range(3):
         work = eng.next_work("r1", "t1")
@@ -139,7 +142,7 @@ def test_approved_fixup_reimplements_redelivers_and_records_application(tmp_path
     out = eng.record(
         "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
     )
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     task = eng.store.load_task("r1", "t1")
     assert task.review_fixups[0].applied is True
     events = eng.store.read_events("r1")
@@ -191,7 +194,7 @@ def test_rejected_review_holds_fixup_when_combined_cycle_cannot_redeliver(
     assert task.review_cycles == 1
     assert task.review_fixups == []
     held = next(e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_held")
-    assert "no IMPLEMENT→DELIVER→REVIEW tail" in held["reason"]
+    assert "no IMPLEMENT→DELIVER→REVIEW→PUBLISH tail" in held["reason"]
 
     eng.record("r1", make_result(eng.next_work("r1", "t1")))
     final_review = eng.next_work("r1", "t1")
@@ -199,7 +202,7 @@ def test_rejected_review_holds_fixup_when_combined_cycle_cannot_redeliver(
     out = eng.record(
         "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
     )
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert "applied in place, not filed" not in project.task_source.notes[0]["body"]
 
 
@@ -224,10 +227,10 @@ def test_repeated_fixup_parks_instead_of_looping(tmp_path, project) -> None:
 @pytest.mark.parametrize(
     ("pipeline", "reason"),
     [
-        ([Stage.INTAKE, Stage.REVIEW], "no IMPLEMENT→DELIVER→REVIEW tail"),
+        ([Stage.INTAKE, Stage.REVIEW], "no IMPLEMENT→DELIVER→REVIEW→PUBLISH tail"),
         (
-            [Stage.REVIEW, Stage.IMPLEMENT, Stage.DELIVER],
-            "does not order IMPLEMENT→DELIVER→REVIEW",
+            [Stage.REVIEW, Stage.IMPLEMENT, Stage.DELIVER, Stage.PUBLISH],
+            "does not order IMPLEMENT→DELIVER→REVIEW→PUBLISH",
         ),
     ],
 )
@@ -291,7 +294,7 @@ def test_suggestion_only_rejection_auto_approves(tmp_path, project) -> None:
             {"severity": "suggestion", "description": "docstring nit"},
         ],
     }))
-    assert out["outcome"] == "task_completed"  # severity gate: suggestions never block
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # severity gate: suggestions never block
     events = eng.store.read_events("r1")
     verdicts = [e for e in events if e["type"] == "review_verdict"]
     assert verdicts and verdicts[-1]["kind"] == "auto_approved"
@@ -316,7 +319,7 @@ def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, pro
         eng.record("r1", make_result(eng.next_work("r1", "t1")))
     w2 = eng.next_work("r1", "t1")
     out2 = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
-    assert out2["outcome"] == "task_completed"
+    assert finish_after_review(eng, out2)["outcome"] == "task_completed"
 
 
 def test_deterministic_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
@@ -332,7 +335,7 @@ def test_deterministic_test_stage_exempts_vacuous_tests_rejection(tmp_path, proj
     out = eng.record("r1", make_result(w, structured_output={
         "approved": True, "issues": [], "tests_meaningful": False,
     }))
-    assert out["outcome"] == "task_completed"  # deterministic TEST → no model test surface
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # deterministic TEST → no model test surface
 
 
 def test_micro_no_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
@@ -351,7 +354,7 @@ def test_micro_no_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) 
     out = eng.record("r1", make_result(w, structured_output={
         "approved": True, "issues": [], "tests_meaningful": False,
     }))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
 
 
 def _advance_to_review_with_test(eng, *, test_output, test_mode=None, test_provider=None,
@@ -386,7 +389,7 @@ def test_docs_only_tag_exempts_vacuous_tests_rejection(tmp_path, project) -> Non
     out = eng.record("r1", make_result(w, structured_output={
         "approved": True, "issues": [], "tests_meaningful": False,
     }))
-    assert out["outcome"] == "task_completed"  # docs-only exempts the missing-tests rejection
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # docs-only exempts the missing-tests rejection
     assert eng.store.load_task("r1", "t1").context["change_class"] == "docs-only"
 
 
@@ -466,7 +469,7 @@ def test_converged_re_review_auto_approves(tmp_path, project) -> None:
         "issues": [{"severity": "important", "file": "a.py",
                     "description": "naming  could be tighter"}],
     }))
-    assert out["outcome"] == "task_completed"  # converged, not parked
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # converged, not parked
     events = [e for e in eng.store.read_events("r1") if e["type"] == "review_verdict"]
     assert events[-1]["kind"] == "converged_auto_approved"
 
@@ -516,7 +519,7 @@ def test_missing_approved_field_fails_open(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"issues": []}))
-    assert out["outcome"] == "task_completed"  # fail-open: only explicit false triggers
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # fail-open: only explicit false triggers
 
 
 def test_rejection_event_is_audited(tmp_path, project) -> None:
@@ -607,7 +610,7 @@ def test_finding_fixup_reimplements_and_reports_application_from_evidence(
         final, structured_output={"approved": True, "issues": []}
     ))
 
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert eng.store.load_task("r1", "t1").review_fixups[0].applied is True
     applied = [e for e in eng.store.read_events("r1") if e["type"] == "review_fixup_applied"]
     assert len(applied) == 1 and applied[0]["source"] == "finding"
@@ -630,10 +633,12 @@ def test_finding_fixup_note_reports_application_not_the_ask(tmp_path, project) -
     eng.record("r1", make_result(_advance_to_review(eng), structured_output={
         "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
     }))
-    eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output={
-        "approved": True, "issues": [],
-        "non_blocking": [{**FINDING_FIXUP, "disposition": "drop"}],
-    }))
+    finish_after_review(eng, eng.record("r1", make_result(
+        _drive_fixup_tail(eng), structured_output={
+            "approved": True, "issues": [],
+            "non_blocking": [{**FINDING_FIXUP, "disposition": "drop"}],
+        },
+    )))
 
     note = project.task_source.notes[0]["body"]
     assert f"{FINDING_FIXUP['title']} — applied in place, not filed" in note
@@ -663,7 +668,7 @@ def test_two_finding_fixups_share_one_cycle(tmp_path, project) -> None:
     out = eng.record("r1", make_result(
         _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
     ))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert all(f.applied for f in eng.store.load_task("r1", "t1").review_fixups)
 
 
@@ -681,9 +686,9 @@ def test_improvement_and_finding_fixups_share_one_cycle(tmp_path, project) -> No
     assert task.review_cycles == 1
     assert [f.source for f in task.review_fixups] == ["improvement", "finding"]
 
-    eng.record("r1", make_result(
+    finish_after_review(eng, eng.record("r1", make_result(
         _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
-    ))
+    )))
     note = project.task_source.notes[0]["body"]
     # the improvement is reported in its own section, the finding in the findings section
     assert f"Improvement fixup:** {FIXUP['title']}" in note
@@ -701,7 +706,7 @@ def test_unschedulable_finding_fixup_completes_instead_of_parking(tmp_path, proj
         "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
     }))
 
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     task = eng.store.load_task("r1", "t1")
     assert task.state is TaskState.COMPLETED
     assert task.last_error is None  # a completed task carries no error
@@ -726,7 +731,7 @@ def test_held_finding_fixup_is_not_swept_applied_by_its_own_review(tmp_path, pro
 
     out = eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output=output))
 
-    assert out["outcome"] == "task_completed"  # degrades, does not park
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # degrades, does not park
     task = eng.store.load_task("r1", "t1")
     assert task.state is TaskState.COMPLETED
     assert len(task.review_fixups) == 1
@@ -770,7 +775,7 @@ def test_fix_now_finding_is_noted_but_never_claimed_fixed(tmp_path, project) -> 
         "non_blocking": [{**FINDING_FIXUP, "disposition": "fix_now"}],
     }))
 
-    assert out["outcome"] == "task_completed"  # no cycle: fix_now does not act
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # no cycle: fix_now does not act
     assert eng.store.load_task("r1", "t1").review_fixups == []
     note = project.task_source.notes[0]["body"]
     assert f"{FINDING_FIXUP['title']} — noted for in-place handling, not applied" in note

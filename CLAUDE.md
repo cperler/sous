@@ -106,7 +106,10 @@ tracker or fix-forward.
   emits warning-grade `commit_attribution_trailer_found` per offending commit plus a
   `commit_attribution_scanned` receipt (clean and never-looked must not read alike).
   Report-only — it NEVER amends, because DELIVER pushes before its checkpoint lands and an
-  engine-side amend would rewrite already-remote history. Work on `main`. Remote:
+  engine-side amend would rewrite already-remote history. #389's DELIVER/PUBLISH split does
+  not change that reasoning: the PR now waits for REVIEW, but the PUSH did not move, so by
+  the time the audit runs the commits are already on the remote. (PUBLISH itself is outside
+  the audit entirely — it is deterministic and makes no commits.) Work on `main`. Remote:
   `github.com/cperler/sous` (private; push `main` after committing).
 - **Run logs are retained until the human deletes them.** Post-run cleanup removes the
   worktree, the task branch, and checkpoint tags — but NEVER the run's log dir under

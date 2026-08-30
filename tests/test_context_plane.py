@@ -243,18 +243,19 @@ def test_context_ceiling_evicts_largest_stage_not_reverse_order() -> None:
     assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # test fold alone fits
     # deliver adds a TINY contribution (~65 bytes) that tips the whole context over the
     # ceiling. Size-aware eviction must shed the fat test.failures, not the small deliver
-    # keys. The pre-fix reverse-pipeline order evicted DELIVER first (it precedes TEST in
-    # reversed(STAGE_ORDER)), starving the near-ceiling test.failures — the bug this guards.
+    # keys. The pre-fix reverse-pipeline order evicted the PR-bearing stage first (it
+    # precedes TEST in reversed(STAGE_ORDER)), starving the near-ceiling test.failures —
+    # the bug this guards.
     _absorb_outputs(
         task,
         make_result_stub(
-            Stage.DELIVER,
+            Stage.PUBLISH,
             {"pr_number": 1234, "pr_url": "https://github.com/o/r/pull/1234"},
         ),
     )
     assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
     assert "failures" not in task.context  # the FAT contribution is evicted first
-    assert task.context["pr_number"] == 1234  # the small deliver keys SURVIVE
+    assert task.context["pr_number"] == 1234  # the small publish keys SURVIVE
     assert task.context["pr_url"].endswith("/1234")
 
 
@@ -412,13 +413,28 @@ def test_workitem_cwd_is_the_folded_worktree(tmp_path, project) -> None:
     assert scope.cwd == "/wt/42"  # every later stage runs in the worktree
 
 
-def test_review_prompt_contains_pr_url(tmp_path, project) -> None:
-    # review Phase B acceptance check: review's prompt is given task.pr_url
+def test_review_prompt_points_at_the_diff_range_not_a_pr(tmp_path, project) -> None:
+    """#389: REVIEW runs BEFORE the PR is opened, so it is aimed at a commit range.
+
+    The acceptance criterion the split has to keep: the reviewer can still see exactly
+    this task's change. It gets that from ``base_sha`` (folded at INTAKE, the same range
+    TEST diffs) rather than from a pr_url — and no pr_url can be in its context, because
+    at REVIEW time no PR exists for this task at all."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
     prompt = _prompt_at(eng, Stage.REVIEW)
-    assert "/1234" in prompt  # deliver's pr_url, folded into context
+    assert "base_sha" in prompt  # the range the reviewer reads
+    assert "pr_url" not in prompt and "/1234" not in prompt  # nothing to go stale
+
+
+def test_publish_prompt_follows_an_approved_review(tmp_path, project) -> None:
+    """#389: PUBLISH is the stage that has a PR to talk about, and it comes last."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    prompt = _prompt_at(eng, Stage.PUBLISH)
+    assert "PUBLISH" in prompt and "pull request" in prompt
 
 
 def test_prompt_orders_stable_parts_before_per_task_context(tmp_path, project) -> None:

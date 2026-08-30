@@ -95,9 +95,9 @@ def test_clean_resume_after_kill_no_double_execution(tmp_path) -> None:
 
     assert status["run_state"] == "completed"
     assert all(status["tasks"][t]["state"] == "completed" for t in ("A", "B", "C"))
-    # Exactly one ledger row per stage execution (3 tasks x 6 stages) — no stage
+    # Exactly one ledger row per stage execution (3 tasks x 7 stages) — no stage
     # was re-run after resume.
-    assert status["lane_audit"]["total_calls"] == 18
+    assert status["lane_audit"]["total_calls"] == 21
     assert status["lane_audit"]["clean"] is True
     # #175: after the resume the dispatch/record timeline still balances with zero orphaned
     # leases — every stage_dispatched is closed by a stage_recorded or (had the kill caught a

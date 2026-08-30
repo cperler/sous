@@ -9,7 +9,7 @@ from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage
 from orchestrator.status_store import StatusStore
-from tests.conftest import FakeProject, make_result
+from tests.conftest import FakeProject, finish_after_review, make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -68,7 +68,7 @@ def test_advisory_finding_becomes_tracked_followup(tmp_path) -> None:
     eng = _engine(tmp_path, project)
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"  # advisory never blocks
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # advisory never blocks
     filed = project.task_source.followups
     assert any("API contract" in f["title"] for f in filed)  # filed at finalize
     review = eng.store.load_task("r1", "t1").stages[Stage.REVIEW].output
@@ -80,7 +80,7 @@ def test_raising_hook_never_breaks_record(tmp_path) -> None:
     eng = _engine(tmp_path, project)
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"  # best-effort: review proceeds
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"  # best-effort: review proceeds
     events = [e for e in eng.store.read_events("r1") if e["type"] == "policy_findings_failed"]
     assert events and "exploded" in events[0]["error"]
 
@@ -89,4 +89,4 @@ def test_no_hook_and_empty_findings_are_untouched(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)  # plain FakeProject: no review_findings hook
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={"approved": True, "issues": []}))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"

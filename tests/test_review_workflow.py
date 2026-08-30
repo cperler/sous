@@ -27,7 +27,7 @@ from orchestrator.review_workflow import (
 )
 from orchestrator.schemas.enums import Stage, TaskState
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import finish_after_review, make_result
 
 # --------------------------------------------------------------------------- helpers
 
@@ -433,7 +433,9 @@ def test_synthesized_approval_records_identically_and_completes(tmp_path, projec
     out_b = eng_b.record(
         "r1", make_result(_advance_to_review(eng_b), structured_output=_equivalent(folded))
     )
-    assert out_a["outcome"] == out_b["outcome"] == "task_completed"
+    final_a = finish_after_review(eng_a, out_a)
+    final_b = finish_after_review(eng_b, out_b)
+    assert final_a["outcome"] == final_b["outcome"] == "task_completed"
     assert eng_a.store.load_task("r1", "t1").state is TaskState.COMPLETED
     # Engine-authored refuted and advisory entries still reach evidence-out after filing
     # became opt-in because the fold explicitly stamps both as `file`.
@@ -520,7 +522,7 @@ def test_convergence_auto_approval_fires_on_synthesized_fingerprints(tmp_path, p
 
     # The fix didn't fully land, but the panel found nothing NEW: a subset re-review.
     out2 = eng.record("r1", make_result(_fix_cycle_back_to_review(eng), sub_results=panel))
-    assert out2["outcome"] == "task_completed"
+    assert finish_after_review(eng, out2)["outcome"] == "task_completed"
     verdicts = [e for e in eng.store.read_events("r1") if e["type"] == "review_verdict"]
     assert verdicts[-1]["kind"] == "converged_auto_approved"
 
@@ -895,7 +897,7 @@ def test_a_non_list_notices_field_does_not_crash_record(tmp_path, project) -> No
     eng.add_task("r1", "t1")
     panel = _panel_with_notices({"find:code": {"findings": []}}, None, 7)
     out = eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
-    assert out["outcome"] == "task_completed"
+    assert finish_after_review(eng, out)["outcome"] == "task_completed"
     assert _panel_notices(eng) == []
 
 

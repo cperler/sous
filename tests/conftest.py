@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 from datetime import UTC, datetime
 
 import pytest
@@ -124,6 +125,11 @@ class FakeTaskSource:
         return ref
 
 
+# A synthetic 40-hex sha for the fake remote (#389: DELIVER reports the head it pushed).
+FAKE_HEAD_SHA = "0123456789abcdef0123456789abcdef01234567"
+_CompletedProcess = subprocess.CompletedProcess
+
+
 class FakeProject:
     name = "fake"
 
@@ -131,6 +137,7 @@ class FakeProject:
         self._classifier = FakeClassifier()
         self._task_source = FakeTaskSource()
         self._engine_task_source = FakeTaskSource()
+        self.commands: list[tuple[list[str], str | None]] = []
 
     def install_cmd(self):
         return ["echo", "install"]
@@ -171,6 +178,30 @@ class FakeProject:
         # create real worktrees. Returns the intake contract with a synthetic worktree.
         safe = task_id.lstrip("#")
         return {"branch": f"task/{safe}", "worktree": f"/wt/{safe}", "baseline_captured": True}
+
+    def command_runner(self, argv, cwd=None, **_kw):
+        """No-git/no-gh fake for the deterministic DELIVER/PUBLISH runners (#389).
+
+        The worktree ``setup_task`` hands out is synthetic, so a real ``git`` would fail in
+        it. Model just enough for the two runners to succeed: a branch, a commit count, a
+        HEAD sha that the remote reports back after a push, no pre-existing PR, and a
+        synthetic PR url from ``gh pr create``."""
+        self.commands.append((list(argv), cwd))
+        if argv[:2] == ["git", "rev-parse"] and "--abbrev-ref" in argv:
+            return _CompletedProcess(argv, 0, "task/42\n", "")
+        if argv[:2] == ["git", "rev-parse"]:
+            return _CompletedProcess(argv, 0, FAKE_HEAD_SHA + "\n", "")
+        if "rev-list" in argv:
+            return _CompletedProcess(argv, 0, "2\n", "")
+        if "ls-remote" in argv:
+            # The push is modeled as already-landed, so DELIVER's verification passes
+            # without the fake having to carry mutable remote state.
+            return _CompletedProcess(argv, 0, f"{FAKE_HEAD_SHA}\trefs/heads/task/42\n", "")
+        if argv[:3] == ["gh", "pr", "list"]:
+            return _CompletedProcess(argv, 0, "[]", "")
+        if argv[:3] == ["gh", "pr", "create"]:
+            return _CompletedProcess(argv, 0, "https://github.com/x/y/pull/1234\n", "")
+        return _CompletedProcess(argv, 0, "", "")
 
 
 @pytest.fixture
@@ -240,6 +271,23 @@ def make_result(
     )
 
 
+def finish_after_review(eng, review_out: dict, *, run: str = "r1", task: str = "t1") -> dict:
+    """The task's outcome once the PUBLISH stage behind REVIEW has run (#389).
+
+    Before #389 an approving REVIEW was the pipeline's last stage, so its own ``record()``
+    returned ``task_completed``. The PR is now opened AFTER approval, so REVIEW returns
+    ``stage_completed`` and PUBLISH carries the completion. A review that did not merely
+    complete its stage — a rejection, a park, a held fixup — has no PUBLISH behind it and
+    is returned unchanged, so a test asserting on the review gate itself reads the same
+    either way.
+    """
+    if review_out.get("outcome") != "stage_completed":
+        return review_out
+    work = eng.next_work(run, task)
+    assert work is not None and work.stage is Stage.PUBLISH, work
+    return eng.record(run, make_result(work))
+
+
 def _default_output(stage: Stage) -> dict:
     return {
         Stage.INTAKE: {"branch": "issue-42", "worktree": "/wt/42", "baseline_captured": True},
@@ -248,6 +296,8 @@ def _default_output(stage: Stage) -> dict:
         Stage.SIMPLIFY: {"files_changed": [], "summary": "already simple", "committed": False},
         Stage.TEST: {"passed": True, "failures": [], "tests_meaningful": True,
                      "validation_notes": "asserts the changed behavior"},
-        Stage.DELIVER: {"pr_number": 1234, "pr_url": "https://github.com/x/y/pull/1234"},
+        # #389: DELIVER pushes the branch; PUBLISH (after REVIEW) opens the PR.
+        Stage.DELIVER: {"branch": "issue-42", "pushed_head_sha": "a" * 40},
         Stage.REVIEW: {"approved": True, "issues": []},
+        Stage.PUBLISH: {"pr_number": 1234, "pr_url": "https://github.com/x/y/pull/1234"},
     }[stage]

@@ -289,8 +289,10 @@ def proposal_body(proposal: dict, *, prior_ref: str | None = None) -> str:
         "`orchestrator/schemas/stages/`; personas in `.claude/agents/`; skills in "
         "`.claude/skills/*/SKILL.md`; scaffold assets in `templates/project-default/`.",
         "",
-        "This task is human-gated before delivery; applying the proposal still requires "
-        "explicit approval and merge.",
+        "This task is human-gated before delivery: the engine parks it before the DELIVER "
+        "stage, which is the push — so nothing reaches the remote, and no pull request is "
+        "opened, until a human releases it. Applying the proposal still requires explicit "
+        "approval and merge.",
     ])
     return "\n".join(lines)
 

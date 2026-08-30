@@ -56,11 +56,12 @@ def test_every_call_is_cost_attributed_clean(tmp_path, project) -> None:
 
     assert all(o["lane_attributed"] for o in outcomes)  # each record saw the intended lane
     audit = eng.lane_audit("r1")
-    assert audit["total_calls"] == 6  # one ledger row per stage — no bypass
+    assert audit["total_calls"] == 7  # one ledger row per stage — no bypass
     assert audit["clean"] is True
     assert audit["unattributed"] == 0 and audit["off_lane"] == 0
-    # intake is the deterministic ENGINE lane; the five model stages are interactive:claude.
-    assert audit["by_lane"] == {"engine:none": 1, "interactive:claude": 5}
+    # intake and publish are the deterministic ENGINE lanes; the five model stages are
+    # interactive:claude.
+    assert audit["by_lane"] == {"engine:none": 2, "interactive:claude": 5}
 
 
 def test_events_audit_balances_a_clean_run(tmp_path, project) -> None:
@@ -73,7 +74,7 @@ def test_events_audit_balances_a_clean_run(tmp_path, project) -> None:
     audit = eng.status("r1")["events_audit"]
     assert audit["clean"] is True
     assert audit["orphans"] == []
-    assert audit["dispatched"] == audit["recorded"] == 6  # one close per dispatch
+    assert audit["dispatched"] == audit["recorded"] == 7  # one close per dispatch
     assert audit["superseded"] == 0 and audit["abandoned"] == 0
     assert audit["outstanding"] == 0  # a completed run holds no live lease
 

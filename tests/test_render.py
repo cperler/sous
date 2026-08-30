@@ -317,9 +317,12 @@ def test_engine_writes_markdown_artifacts(tmp_path, project) -> None:
     assert md_files == [
         "01-intake.md", "02-scope.md", "03-implement.md",
         "04-test.md", "05-deliver.md", "06-review.md",
+        # #389: the PR is opened after review, so PUBLISH is the pipeline's last stage.
+        "07-publish.md",
         # #357: the completion note is persisted alongside the per-stage prose, so the
-        # findings it carries survive a failed publish.
+        # findings it carries survive a failed delivery of the note itself.
         "completion-note.md",
     ]
     # the per-stage md carries the embedded structured substance
-    assert "pr_url" in (stage_dir / "05-deliver.md").read_text()
+    assert "pushed_head_sha" in (stage_dir / "05-deliver.md").read_text()
+    assert "pr_url" in (stage_dir / "07-publish.md").read_text()

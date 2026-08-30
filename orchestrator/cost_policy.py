@@ -89,6 +89,8 @@ _LANE_RANK: tuple[ExecutionLane, ...] = (
 
 # Stages that are $0 on the deterministic ENGINE lane (#33) — preferred as deterministic
 # whenever routing downgrades a task to conserve budget.
+# PUBLISH is not listed: its StageSpec is deterministic=True unconditionally, so it is
+# already on the $0 ENGINE lane and there is nothing for cost pressure to route (#389).
 _CHEAP_DETERMINISTIC: tuple[Stage, ...] = (Stage.TEST, Stage.DELIVER)
 
 

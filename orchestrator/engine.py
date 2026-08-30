@@ -150,6 +150,7 @@ from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
     apply_result,
     begin_stage,
+    branch_not_pushed,
     is_done,
     next_stage,
     no_model_test_surface,
@@ -183,6 +184,11 @@ def _elapsed_s(started_at: str | None) -> float | None:
         return None
 
 
+# #389: every tier ends in PUBLISH, after DELIVER has already pushed the branch. Note
+# tier NONE has no REVIEW to gate on — PUBLISH simply follows DELIVER there. That is not
+# a special case being smuggled in: the approval gate is PUBLISH's POSITION in the
+# pipeline, not a condition it evaluates, so a pipeline with no REVIEW has nothing to
+# wait for and publishes immediately, exactly as it did when DELIVER opened the PR.
 _CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
     QualityTier.FULL: (
         Stage.INTAKE,
@@ -191,6 +197,7 @@ _CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
         Stage.TEST,
         Stage.DELIVER,
         Stage.REVIEW,
+        Stage.PUBLISH,
     ),
     QualityTier.LIGHT: (
         Stage.INTAKE,
@@ -198,12 +205,14 @@ _CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
         Stage.TEST,
         Stage.DELIVER,
         Stage.REVIEW,
+        Stage.PUBLISH,
     ),
     QualityTier.NONE: (
         Stage.INTAKE,
         Stage.IMPLEMENT,
         Stage.TEST,
         Stage.DELIVER,
+        Stage.PUBLISH,
     ),
 }
 _IMPLEMENT_TIMEOUTS: dict[ImplementationBudget, int] = {
@@ -729,6 +738,12 @@ class Engine:
         if hold_before is None and any(
             str(label).strip().casefold() == "meta-authoring" for label in spec.labels
         ):
+            # Still DELIVER after #389's DELIVER/PUBLISH split, and deliberately so: DELIVER
+            # is now the PUSH, so parking here parks the task before ANYTHING reaches the
+            # remote at all — strictly more conservative than the old behaviour, which
+            # parked before a PR opened but after nothing had been pushed. Moving the hold
+            # to PUBLISH would let a meta-authoring change land on the remote unreviewed by
+            # a human, which is the exact thing the label exists to prevent.
             hold_before = Stage.DELIVER
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
@@ -1652,7 +1667,7 @@ class Engine:
             checkpoint_tag=checkpoint_tag,
             reset_to=reset_to,
             salvage_anchor=salvage_anchor,
-            # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
+            # Deterministic ENGINE-lane runners (intake/test/deliver/publish) read task context
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
             context=(
@@ -3367,8 +3382,13 @@ class Engine:
             except DecompositionError as exc:
                 return f"scope decomposition gate: {exc}"
             return None
-        if result.stage is Stage.DELIVER:
+        if result.stage is Stage.PUBLISH:
             return pr_not_opened(result.structured_output)
+        if result.stage is Stage.DELIVER:
+            # #389: DELIVER no longer opens the PR, so the PR can no longer stand as proof
+            # it ran — the branch reaching the remote is what DELIVER now owes, and this
+            # gate is what makes that claim checkable.
+            return branch_not_pushed(result.structured_output)
         if result.stage is not Stage.TEST:
             return None
         out = result.structured_output or {}
@@ -3723,19 +3743,31 @@ class Engine:
 
     @staticmethod
     def _review_fixup_tail_ineligibility(task: Task) -> str | None:
-        """Return a hold reason unless a fixup can be reimplemented and re-delivered.
+        """Return a hold reason unless a fixup can be reimplemented, re-pushed, re-reviewed
+        and published.
 
         A fixup becomes durable application evidence only after the pipeline can run
-        IMPLEMENT, DELIVER, and REVIEW in that order.  Both standalone and combined
+        IMPLEMENT, DELIVER, REVIEW and PUBLISH in that order.  Both standalone and combined
         rejection/fixup paths use this result so bespoke pipelines surface an audit hold
         instead of later claiming an un-delivered change was applied.
+
+        #389 added PUBLISH to the required tail. Without it a fixup cycle could re-push the
+        fix and re-review it while the PR — opened before the cycle in the old ordering —
+        still described the pre-fixup work. Under the new ordering PUBLISH runs after the
+        re-review, so the PR that eventually opens describes the fixed, approved change.
         """
-        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW)
+        required_tail = (Stage.IMPLEMENT, Stage.DELIVER, Stage.REVIEW, Stage.PUBLISH)
         if not all(stage in task.pipeline for stage in required_tail):
-            return "task pipeline has no IMPLEMENT→DELIVER→REVIEW tail for an in-place fixup"
+            return (
+                "task pipeline has no IMPLEMENT→DELIVER→REVIEW→PUBLISH tail "
+                "for an in-place fixup"
+            )
         positions = tuple(task.pipeline.index(stage) for stage in required_tail)
         if positions != tuple(sorted(positions)):
-            return "task pipeline does not order IMPLEMENT→DELIVER→REVIEW for a fixup"
+            return (
+                "task pipeline does not order IMPLEMENT→DELIVER→REVIEW→PUBLISH "
+                "for a fixup"
+            )
         return None
 
     @staticmethod
@@ -5989,6 +6021,7 @@ class Engine:
         latest: dict[str, dict] = {}
         latest_delivery: dict[str, dict] = {}
         completed_with_pr: dict[str, str] = {}
+        completed_without_pr: dict[str, str] = {}
         persist_failed_by_task: dict[str, int] = {}
         for ev in events:
             kind = ev.get("type")
@@ -6002,8 +6035,19 @@ class Engine:
                 "completion_pr_validation_skipped",
             ):
                 latest_delivery[task_id] = ev
-            elif kind == "task_completed" and ev.get("pr_url"):
-                completed_with_pr[task_id] = str(ev["pr_url"])
+            elif kind == "task_completed":
+                if ev.get("pr_url"):
+                    completed_with_pr[task_id] = str(ev["pr_url"])
+                elif ev.get("publishes"):
+                    # #389/#378: the audit gap that let a task escape scrutiny entirely.
+                    # ``completed_with_pr`` only ever examined tasks that HAD a url, so a
+                    # task that ran PUBLISH and completed with NO url at all was invisible —
+                    # the loudest possible delivery failure read as clean. A pre-#389 event
+                    # carries no ``publishes`` key and is skipped, so old runs re-audit
+                    # exactly as they did rather than turning retroactively red.
+                    completed_without_pr[task_id] = (
+                        "completed task ran PUBLISH but recorded no pr_url"
+                    )
             elif kind == "completion_note_persist_failed":
                 persist_failed_by_task[task_id] = persist_failed_by_task.get(task_id, 0) + 1
         notes_by_task: dict[str, dict] = {
@@ -6019,6 +6063,21 @@ class Engine:
             if ev.get("type") == "completion_note_failed"
         }
         delivery_invalid_by_task: dict[str, int] = {}
+        for task_id, error in sorted(completed_without_pr.items()):
+            delivery_invalid_by_task[task_id] = 1
+            note = notes_by_task.get(task_id)
+            detail: dict[str, object] = {
+                "pr_url": None, "state": None, "head_ref": None, "head_sha": None,
+                "expected_head_ref": None, "expected_head_sha": None,
+            }
+            if note is None:
+                notes_by_task[task_id] = {
+                    "task_id": task_id, "error": error, "note_file": None,
+                    "unfiled": [], "delivery": detail,
+                }
+            else:
+                note["error"] = f"{note['error']}; {error}" if note["error"] else error
+                note["delivery"] = detail
         for task_id, pr_url in completed_with_pr.items():
             evidence = latest_delivery.get(task_id)
             if evidence is None:
@@ -6486,6 +6545,12 @@ class Engine:
             run_id,
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
+             # #389: does this task's pipeline OWE a pull request at all? Stamped here so
+             # ``completion_notes_audit`` can tell "completed without a PR because it never
+             # had a PUBLISH stage" (a branchless/non-code task — fine) from "completed
+             # without a PR despite running PUBLISH" (a delivery that silently produced
+             # nothing) using the events alone, with no second source of truth.
+             "publishes": Stage.PUBLISH in task.pipeline,
              "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
              "review_fixups_applied": sum(fixup.applied for fixup in task.review_fixups)},
         )
@@ -6521,6 +6586,11 @@ class Engine:
         delivered checkpoint; a stale merged URL cannot prove later fix commits shipped.
         Failures never undo the already-durable task transition, but they make the
         completion audit non-clean instead of letting ``undelivered: 0`` lie.
+
+        #389 narrowed what MERGED can mean here. The PR is now opened by PUBLISH, the last
+        stage, so a just-completed task's PR is OPEN by construction — MERGED is tolerated
+        only for the human who merged it in the window between PUBLISH and completion, not
+        (as before) for a PR that had been open and merged during the review cycles.
         """
         if not task.pr_url:
             return
