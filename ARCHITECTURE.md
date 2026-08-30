@@ -334,14 +334,14 @@ never satisfy.
 - **Cross-run learnings KB.** `orchestrator/learnings_kb.py` persists a shared
   `<runs-root>/learnings-kb.jsonl` across runs: terminal tasks harvest their learnings
   (classified, fingerprint-deduped), and each new task's FIRST stage recalls relevant prior
-  entries into the `prior_learnings` context key — read-only advisory text, folded once per
-  task, rendered (hedged) into every stage prompt. `orchestrator kb show|add` is the manual
-  surface. Two filters keep the recall pool honest (#384): a provider
-  capacity/rate-limit notice is not a learning — it is an infra event already durable in
-  `events.jsonl`/`stage-costs.jsonl`, so `is_capacity_notice` drops it at harvest AND at
-  recall (the KB is append-only, so pre-filter rows can only be neutralised at read time),
-  and the drop is evented as `learnings_harvested.skipped_capacity` rather than being
-  silent; and an entry is tagged with only the changed files its own text NAMES
+  entries into the `prior_learnings` context key — read-only advisory text, folded once
+  per task, rendered (hedged) into every stage prompt. The manual surface is `orchestrator
+  kb show|add|prune|backfill-outcomes`. Two filters keep the recall pool honest (#384): a
+  provider capacity/rate-limit notice is not a learning — it is an infra event already
+  durable in `events.jsonl`/`stage-costs.jsonl`, so `is_capacity_notice` drops it at
+  harvest AND at recall (the KB is append-only, so pre-filter rows can only be neutralised
+  at read time), and the drop is evented as `learnings_harvested.skipped_capacity` rather
+  than being silent; and an entry is tagged with only the changed files its own text NAMES
   (`mentioned_files`), never the task's whole `files_changed` list, because file overlap
   strictly dominates `_score` and an inherited path list let a contentless failure outrank
   every real lesson in that package. A third signal DEMOTES rather than filters (#393):
@@ -353,7 +353,23 @@ never satisfy.
   hazard in a file. That is a fact about the finding rather than the TTL/recency guess #384
   declined to make, and it needs no update path on the append-only log; an entry missing the
   stamp (every row predating #393) counts as unresolved, so no legacy row is silently
-  demoted. A distilled retrospective pattern with no sample error is likewise not
+  demoted. That last property is why the manual surface grew a maintenance half (#480): the
+  stamp only reaches rows written after it merged, so the accumulated legacy population —
+  the very rows #384 complained about — kept recalling at full weight and nothing demoted
+  them. Both maintenance commands respect the append-only log by APPENDING an amendment
+  record (`{kind: "amendment", amends: <entry id>, retired?, task_outcome?, reason?}`) that
+  `read_entries` folds onto its target at read time; deleting or rewriting a row would
+  destroy the evidence that it ever recalled into a run, and the global text-fingerprint
+  dedupe makes a corrected re-append silently impossible anyway. `kb prune` retires rows
+  from recall by deterministic selectors (id/kind/run/`--before`/`--resolved`/`--unstamped`,
+  ANDed; an empty selector set selects NOTHING, never the whole KB) and they remain visible
+  to `kb show --include-retired` for audit — and to the dedupe seed, so the next harvest of
+  the same text cannot resurrect a pruned lesson. `kb backfill-outcomes` recovers the
+  missing stamp for a legacy row from the run log's task doc
+  (`<runs-root>/<run>/status-<run>-<task>.json`); a pruned run dir, an unreadable doc, or a
+  non-terminal state leaves the row unstamped and REPORTED rather than guessed, holding
+  #393's rule that unknown never reads as resolved. Both preview by default and write only
+  under `--apply`. A distilled retrospective pattern with no sample error is likewise not
   persisted. REVIEW process retrospectives use a detector-only `process` kind:
   they never enter task prompts. `orchestrator/meta_authoring.py` groups those observations
   by their optional stage-template/agent/skill/schema/kit target and, after the same target

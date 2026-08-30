@@ -19,6 +19,14 @@ Entry shape::
      target ({kind, ref}|null), task_outcome (terminal TaskState value; absent when
      unknown — see ``resolved_defect``)}
 
+Because the log is append-only, the manual maintenance surface (``orchestrator kb prune`` /
+``kb backfill-outcomes``, #480) never rewrites a row — it APPENDS an amendment naming one::
+
+    {id, ts, kind: "amendment", amends (target entry id), retired?, task_outcome?, reason?}
+
+``read_entries`` folds those onto their targets at read time, so a retired row leaves recall
+while both the original line and the decision that demoted it stay in the file for audit.
+
 Pure functions over the file (the engine wires the path in), so they are trivially
 testable and never depend on the engine's working directory.
 """
@@ -32,7 +40,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
-from .schemas.enums import FailureKind, Stage, TaskState
+from .schemas.enums import TERMINAL_TASK_STATES, FailureKind, Stage, TaskState
 
 # One entry's ``text`` ceiling. The DEFAULT mirrors the context-plane per-item bound so a
 # KB hit folded into a prompt is already the right size.
@@ -66,6 +74,12 @@ _MIN_BOUNDARY_FRACTION = 0.6
 
 VALID_KINDS = frozenset({"failure", "review", "infra", "salvage", "manual", "process"})
 
+# #480: a maintenance record, NOT a lesson kind — deliberately outside ``VALID_KINDS`` so
+# ``append_learnings`` can never mint one and recall can never surface one as advice. An
+# amendment carries no ``text``, so a reader predating this change drops it on the existing
+# text-required filter rather than folding a contentless row into a prompt.
+AMENDMENT_KIND = "amendment"
+
 VALID_PROCESS_TARGET_KINDS = frozenset(
     {"stage-template", "agent", "skill", "stage-schema", "kit"}
 )
@@ -73,6 +87,7 @@ VALID_PROCESS_TARGET_KINDS = frozenset(
 _STAGE_VALUES = frozenset(s.value for s in Stage)
 _FAILURE_KIND_VALUES = frozenset(k.value for k in FailureKind)
 _TASK_STATE_VALUES = frozenset(s.value for s in TaskState)
+_TERMINAL_STATE_VALUES = frozenset(s.value for s in TERMINAL_TASK_STATES)
 
 # Cheap English/boilerplate stopwords dropped from title-token matching so overlap is
 # driven by the substantive terms (module names, feature nouns), not glue words.
@@ -346,9 +361,12 @@ def _task_files(task: object) -> list[str]:
 # --- read / append ------------------------------------------------------------------
 
 
-def read_entries(path: str | Path) -> list[dict]:
-    """Read every KB entry in file order. Tolerant: a corrupt/blank line is skipped (the
-    KB is an audit-grade append log — one bad line must never sink recall/harvest)."""
+def read_records(path: str | Path) -> list[dict]:
+    """Every JSON object in the file, in file order — lessons AND amendments (#480).
+
+    Tolerant: a corrupt/blank line is skipped (the KB is an audit-grade append log — one bad
+    line must never sink recall/harvest). This is the RAW view; ``read_entries`` is the
+    folded lesson view almost every caller wants."""
     path = Path(path)
     if not path.exists():
         return []
@@ -357,12 +375,64 @@ def read_entries(path: str | Path) -> list[dict]:
         if not line.strip():
             continue
         try:
-            entry = json.loads(line)
+            record = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if isinstance(entry, dict) and entry.get("text"):
-            out.append(entry)
+        if isinstance(record, dict):
+            out.append(record)
     return out
+
+
+def _is_amendment(record: dict) -> bool:
+    """True for an amendment record (#480). Keyed on the kind AND a usable ``amends`` ref,
+    so a malformed row is ignored rather than silently amending nothing."""
+    return record.get("kind") == AMENDMENT_KIND and bool(str(record.get("amends") or "").strip())
+
+
+def _apply_amendments(records: list[dict]) -> list[dict]:
+    """Fold amendment records onto the lesson rows they name — pure, deterministic (#480).
+
+    Two passes rather than one, so an amendment is applied regardless of where it sits
+    relative to its target: pass one collects the lessons (a row with ``text`` that is not
+    itself an amendment), pass two applies each amendment in FILE ORDER, so a later
+    amendment overrides an earlier one for the same field. An amendment naming an unknown
+    id is a no-op — it stays in the raw log as the record of a decision, but invents no
+    lesson.
+
+    Entries are copied, never mutated in place, and an unamended lesson comes back
+    byte-identical to what was written."""
+    entries = [dict(r) for r in records if not _is_amendment(r) and r.get("text")]
+    by_id = {str(e.get("id")): e for e in entries if e.get("id")}
+    for record in records:
+        if not _is_amendment(record):
+            continue
+        target = by_id.get(str(record.get("amends")).strip())
+        if target is None:
+            continue
+        if record.get("retired"):
+            target["retired"] = True
+            reason = str(record.get("reason") or "").strip()
+            if reason:
+                target["retired_reason"] = reason
+        outcome = record.get("task_outcome")
+        if isinstance(outcome, str) and outcome in _TASK_STATE_VALUES:
+            target["task_outcome"] = outcome
+    return entries
+
+
+def read_entries(path: str | Path, *, include_retired: bool = False) -> list[dict]:
+    """Read every KB LESSON in file order, with amendments folded in (#480).
+
+    Retired rows are excluded by default: recall, the meta-authoring detector, and
+    ``kb show`` all want the live pool. Pass ``include_retired=True`` for the audit view
+    (``kb show --include-retired``) and for dedupe seeding, where a retired row must still
+    suppress a re-append — see ``append_learnings``.
+
+    Tolerant of a corrupt/blank line, as an audit-grade append log must be."""
+    entries = _apply_amendments(read_records(path))
+    if include_retired:
+        return entries
+    return [e for e in entries if not e.get("retired")]
 
 
 def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = True) -> list[dict]:
@@ -400,7 +470,12 @@ def append_learnings(path: str | Path, entries: list[dict], *, dedupe: bool = Tr
             return (fp, entry.get("run_id"), kind or None, ref or None)
         return (fp,)
 
-    seen = {dedupe_key(e) for e in read_entries(path)} if dedupe else set()
+    # include_retired: a RETIRED row must still suppress a re-append (#480). Retiring is a
+    # human judgement that a lesson is stale; letting the next harvest of the same text
+    # resurrect it would make the prune undo itself on the very next run.
+    seen = (
+        {dedupe_key(e) for e in read_entries(path, include_retired=True)} if dedupe else set()
+    )
     written: list[dict] = []
     lines: list[str] = []
     for raw in entries:
@@ -530,6 +605,155 @@ def harvest_process_retrospective(
     )
 
 
+# --- manual maintenance: prune + outcome backfill (#480) -----------------------------
+#
+# The KB is an append-only, audit-grade log, so "prune" cannot mean "rewrite the file".
+# Deleting a row would destroy the evidence that the row ever recalled into a run — which is
+# exactly what a later audit of a bad decision needs — and would leave no trace of WHO
+# decided it was stale or why. So a prune APPENDS: a retirement amendment naming the entry's
+# id, folded at read time by ``_apply_amendments``. The original line and the decision to
+# demote it both survive.
+#
+# An in-place rewrite was not merely undesirable, it was unavailable: ``append_learnings``
+# dedupes on a global normalized-text fingerprint, so re-appending a corrected copy of a row
+# is silently suppressed. Amending by reference is the only shape that works with the log's
+# existing invariants.
+#
+# The backfill exists because #393's ``task_outcome`` stamp only reaches rows written after
+# it merged. Every older row lacks the stamp and therefore reads (correctly, per
+# ``resolved_defect``'s narrowing) as still-live — so the resolved-finding demotion reached
+# none of the accumulated data. The outcome is recoverable after the fact: the task doc in
+# the run log records the terminal state the harvest would have stamped.
+
+
+def append_amendments(path: str | Path, amendments: list[dict]) -> list[dict]:
+    """Append maintenance amendments to the KB, returning the records actually written.
+
+    Each input supplies ``amends`` (the target entry id, required) plus any of
+    ``retired`` (bool), ``task_outcome`` (a ``TaskState`` value), and ``reason``. An
+    amendment carrying no actual change, or no target, is skipped rather than written — an
+    audit log should not accumulate rows that assert nothing.
+
+    Unlike ``append_learnings`` there is no dedupe: re-retiring an already-retired row is
+    idempotent in effect, and the second record is itself evidence (a human looked again).
+    """
+    path = Path(path)
+    written: list[dict] = []
+    lines: list[str] = []
+    for raw in amendments:
+        target = str(raw.get("amends") or "").strip()
+        if not target:
+            continue
+        retired = bool(raw.get("retired"))
+        outcome = raw.get("task_outcome")
+        outcome = str(outcome) if outcome is not None else None
+        if outcome is not None and outcome not in _TASK_STATE_VALUES:
+            outcome = None  # never stamp a state the schema does not know
+        if not retired and outcome is None:
+            continue  # asserts nothing
+        record: dict = {
+            "id": raw.get("id") or _new_id(),
+            "ts": raw.get("ts") or _now(),
+            "kind": AMENDMENT_KIND,
+            "amends": target,
+        }
+        if retired:
+            record["retired"] = True
+        if outcome is not None:
+            record["task_outcome"] = outcome
+        reason = str(raw.get("reason") or "").strip()
+        if reason:
+            record["reason"] = bound_text(reason)
+        lines.append(json.dumps(record, separators=(",", ":"), ensure_ascii=False))
+        written.append(record)
+    if lines:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+    return written
+
+
+def select_entries(
+    entries: list[dict],
+    *,
+    ids: list[str] | None = None,
+    kinds: list[str] | None = None,
+    run_id: str | None = None,
+    before: str | None = None,
+    resolved: bool = False,
+    unstamped: bool = False,
+) -> list[dict]:
+    """The entries a prune would retire, by deterministic selectors. Pure and total.
+
+    Selectors AND together (``--kind review --before 2026-07-01`` is 'review rows older
+    than July'). An EMPTY selector set selects NOTHING, not everything: the destructive
+    reading of a bare ``kb prune`` must never be 'retire the whole KB'.
+
+    ``before`` compares against the entry's ISO-8601 ``ts`` lexicographically, which is a
+    correct chronological compare for that format and lets a bare date (``2026-07-01``) work
+    as a prefix bound. ``resolved`` selects the #393 resolved-defect rows; ``unstamped``
+    selects ``review`` rows carrying no ``task_outcome`` at all — the legacy population the
+    backfill could not resolve.
+    """
+    if not any([ids, kinds, run_id, before, resolved, unstamped]):
+        return []
+    id_set = {str(i) for i in (ids or [])}
+    kind_set = {str(k) for k in (kinds or [])}
+    out: list[dict] = []
+    for entry in entries:
+        if id_set and str(entry.get("id") or "") not in id_set:
+            continue
+        if kind_set and str(entry.get("kind") or "") not in kind_set:
+            continue
+        if run_id and str(entry.get("run_id") or "") != run_id:
+            continue
+        if before and not str(entry.get("ts") or "") < before:
+            continue
+        if resolved and not resolved_defect(entry):
+            continue
+        if unstamped and (entry.get("kind") != "review" or entry.get("task_outcome")):
+            continue
+        out.append(entry)
+    return out
+
+
+def outcome_from_run_logs(runs_root: str | Path, entry: dict) -> str | None:
+    """The terminal ``task_outcome`` for one legacy entry, recovered from the run log (#480).
+
+    Reads the task doc the entry's ``run_id``/``task_id`` name
+    (``<runs-root>/<run>/status-<run>-<task>.json``, falling back to the flat
+    ``<runs-root>/status-<run>-<task>.json`` layout) and returns its state.
+
+    Returns None — leaving the row unstamped, which ``resolved_defect`` reads as still-live —
+    for every uncertain case: an entry with no run/task ids, a run dir the human has since
+    pruned, an unreadable or unparseable doc, and a state that is not a KNOWN TERMINAL one.
+    That last narrowing matters: a doc left mid-flight at ``running`` says nothing about
+    whether the finding was fixed, and #393's rule is that unknown must never read as
+    resolved.
+    """
+    run_id = str(entry.get("run_id") or "").strip()
+    task_id = str(entry.get("task_id") or "").strip()
+    if not run_id or not task_id:
+        return None
+    # These ids reach the filesystem, so refuse any that could climb out of the runs root.
+    if any(bad in part for part in (run_id, task_id) for bad in ("/", "\\", "..")):
+        return None
+    root = Path(runs_root)
+    name = f"status-{run_id}-{task_id}.json"
+    for candidate in (root / run_id / name, root / name):
+        try:
+            doc = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(doc, dict):
+            continue
+        state = doc.get("state")
+        if isinstance(state, str) and state in _TERMINAL_STATE_VALUES:
+            return state
+        return None  # found the doc; it simply is not terminal
+    return None
+
+
 # --- deterministic recall -----------------------------------------------------------
 
 
@@ -585,6 +809,10 @@ def relevant_learnings(path: str | Path, query: dict, *, limit: int = 5) -> list
     harvested (#384) — the filter is applied at READ time too because the KB is
     append-only, so rows written before the harvest filter existed would otherwise keep
     winning slots forever.
+
+    A RETIRED row (#480) never reaches the scoring at all: ``read_entries`` drops it, which
+    is the whole point of the manual prune — an entry a human judged stale should stop
+    competing for slots, while staying in the file for audit.
 
     A RESOLVED review finding (#393, ``resolved_defect``) is DEMOTED rather than excluded,
     unlike those two. A capacity notice and a process observation teach a product task

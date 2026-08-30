@@ -665,3 +665,204 @@ def test_resolution_bit_does_not_weaken_the_no_signal_floor(tmp_path) -> None:
     assert kb.relevant_learnings(path, {"title_tokens": ["something", "else"]}) == []
     for entry in kb.read_entries(path):
         assert len(kb._score(entry, {"title_tokens": ["nope"]})) == 4
+
+
+# --- #480: append-only prune (amendments) + task_outcome backfill ---------------------
+
+
+def _one(path, text="review nit about src/pkg/cli.py", **kw) -> dict:
+    """Append one lesson (files auto-derived from its own text) and hand back the row."""
+    files = kw.pop("files", kb.mentioned_files(text, ["src/pkg/auth.py", "src/pkg/a.py"]))
+    entry = {"kind": "review", "text": text, "files": files, **kw}
+    return kb.append_learnings(path, [entry])[0]
+
+
+def test_amendment_fold_retires_stamps_and_last_write_wins(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    entry = _one(path)
+    kb.append_amendments(path, [
+        {"amends": entry["id"], "task_outcome": "failed"},
+        {"amends": entry["id"], "task_outcome": "completed"},  # later record wins
+        {"amends": entry["id"], "retired": True, "reason": "describes code that is gone"},
+    ])
+
+    assert kb.read_entries(path) == []  # retired rows leave the live pool
+    folded = kb.read_entries(path, include_retired=True)
+    assert len(folded) == 1
+    assert folded[0]["task_outcome"] == "completed"
+    assert folded[0]["retired"] is True
+    assert folded[0]["retired_reason"] == "describes code that is gone"
+    # the ORIGINAL line survives untouched — the fold never rewrites the log
+    raw = kb.read_records(path)
+    assert len(raw) == 4 and raw[0] == entry
+    assert [r["kind"] for r in raw[1:]] == ["amendment"] * 3
+
+
+def test_amendments_are_never_lessons(tmp_path) -> None:
+    """An amendment must not surface as advice, and one naming an unknown id invents
+    nothing — it stays in the raw log as the record of a decision."""
+    path = tmp_path / "kb.jsonl"
+    _one(path, text="watch the auth cache in src/pkg/auth.py")
+    kb.append_amendments(path, [{"amends": "lk-doesnotexist", "retired": True}])
+
+    assert len(kb.read_entries(path, include_retired=True)) == 1
+    assert len(kb.read_records(path)) == 2
+    texts = kb.relevant_learnings(
+        path, {"files": ["src/pkg/auth.py"], "stage": None, "failure_kind": None,
+               "title_tokens": []},
+    )
+    assert texts == ["watch the auth cache in src/pkg/auth.py"]
+
+
+def test_retired_row_leaves_recall(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    stale = _one(path, text="stale finding in src/pkg/auth.py")
+    live = _one(path, text="live hazard in src/pkg/auth.py")
+    query = {"files": ["src/pkg/auth.py"], "stage": None, "failure_kind": None,
+             "title_tokens": []}
+    assert set(kb.relevant_learnings(path, query)) == {stale["text"], live["text"]}
+
+    kb.append_amendments(path, [{"amends": stale["id"], "retired": True}])
+    assert kb.relevant_learnings(path, query) == [live["text"]]
+
+
+def test_retired_row_still_suppresses_a_reappend(tmp_path) -> None:
+    """Retiring is a judgement that a lesson is stale; the next harvest of the same text
+    must not resurrect it, or the prune would undo itself on the following run."""
+    path = tmp_path / "kb.jsonl"
+    entry = _one(path, text="the same lesson, learned again")
+    kb.append_amendments(path, [{"amends": entry["id"], "retired": True}])
+
+    assert kb.append_learnings(path, [{"kind": "review", "text": "the same lesson, learned again"}]) == []
+    assert kb.read_entries(path) == []
+
+
+def test_append_amendments_skips_records_that_assert_nothing(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    entry = _one(path)
+    written = kb.append_amendments(path, [
+        {"retired": True},                                     # no target
+        {"amends": entry["id"]},                               # no change
+        {"amends": entry["id"], "task_outcome": "not_a_state"},  # unknown state
+    ])
+    assert written == []
+    assert len(kb.read_records(path)) == 1
+
+
+def test_select_entries_ands_selectors_and_never_selects_everything(tmp_path) -> None:
+    path = tmp_path / "kb.jsonl"
+    old = _one(path, text="old review of src/a.py", run_id="r1", ts="2026-06-01T00:00:00+00:00")
+    new = _one(path, text="new review of src/b.py", run_id="r2", ts="2026-08-01T00:00:00+00:00")
+    fail = kb.append_learnings(path, [{
+        "kind": "failure", "text": "flaky harness", "run_id": "r1",
+        "ts": "2026-06-02T00:00:00+00:00",
+    }])[0]
+    entries = kb.read_entries(path)
+
+    # a bare prune must select NOTHING, not the whole KB
+    assert kb.select_entries(entries) == []
+    assert [e["id"] for e in kb.select_entries(entries, before="2026-07-01")] == [old["id"], fail["id"]]
+    # selectors AND together
+    assert [e["id"] for e in kb.select_entries(entries, before="2026-07-01", kinds=["review"])] == [old["id"]]
+    assert [e["id"] for e in kb.select_entries(entries, run_id="r2")] == [new["id"]]
+    assert [e["id"] for e in kb.select_entries(entries, ids=[fail["id"]])] == [fail["id"]]
+    # every row here is an unstamped review or a non-review; none is resolved
+    assert [e["id"] for e in kb.select_entries(entries, unstamped=True)] == [old["id"], new["id"]]
+    assert kb.select_entries(entries, resolved=True) == []
+
+    kb.append_amendments(path, [{"amends": new["id"], "task_outcome": "completed"}])
+    stamped = kb.read_entries(path)
+    assert [e["id"] for e in kb.select_entries(stamped, resolved=True)] == [new["id"]]
+    assert [e["id"] for e in kb.select_entries(stamped, unstamped=True)] == [old["id"]]
+
+
+def _task_doc(root, run_id, task_id, state, *, flat=False) -> None:
+    import json as _json
+
+    d = root if flat else root / run_id
+    d.mkdir(parents=True, exist_ok=True)
+    (d / f"status-{run_id}-{task_id}.json").write_text(
+        _json.dumps({"run_id": run_id, "task_id": task_id, "state": state}), encoding="utf-8"
+    )
+
+
+def test_outcome_from_run_logs_resolves_only_terminal_states(tmp_path) -> None:
+    root = tmp_path / "runs"
+    _task_doc(root, "r1", "#12", "completed")
+    _task_doc(root, "r2", "#13", "running")        # mid-flight says nothing about a fix
+    _task_doc(root, "r3", "#14", "flat", flat=True)  # placeholder, overwritten below
+    _task_doc(root, "r3", "#14", "failed", flat=True)
+
+    assert kb.outcome_from_run_logs(root, {"run_id": "r1", "task_id": "#12"}) == "completed"
+    assert kb.outcome_from_run_logs(root, {"run_id": "r2", "task_id": "#13"}) is None
+    # the flat (non-nested) store layout is the fallback
+    assert kb.outcome_from_run_logs(root, {"run_id": "r3", "task_id": "#14"}) == "failed"
+    # unknown must never read as resolved: no ids, a pruned run dir, unparseable JSON
+    assert kb.outcome_from_run_logs(root, {"run_id": None, "task_id": None}) is None
+    assert kb.outcome_from_run_logs(root, {"run_id": "gone", "task_id": "#1"}) is None
+    (root / "r1" / "status-r1-#99.json").write_text("{not json", encoding="utf-8")
+    assert kb.outcome_from_run_logs(root, {"run_id": "r1", "task_id": "#99"}) is None
+    # an id that could climb out of the runs root is refused rather than followed
+    assert kb.outcome_from_run_logs(root, {"run_id": "../etc", "task_id": "#1"}) is None
+
+
+def test_cli_kb_prune_previews_then_retires(tmp_path, capsys) -> None:
+    import json
+
+    root = str(tmp_path)
+    path = tmp_path / "learnings-kb.jsonl"
+    stale = _one(path, text="stale finding in src/pkg/auth.py", run_id="r1")
+    _one(path, text="live hazard in src/pkg/auth.py", run_id="r2")
+
+    # dry run reports the selection and writes nothing
+    assert cli_main(["--root", root, "kb", "prune", "--run", "r1"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True and out["selected"] == 1 and out["retired"] == 0
+    assert out["entries"][0]["id"] == stale["id"]
+    assert len(kb.read_records(path)) == 2
+
+    assert cli_main(["--root", root, "kb", "prune", "--run", "r1", "--apply",
+                     "--reason", "code is gone"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is False and out["retired"] == 1
+
+    assert kb.relevant_learnings(
+        path, {"files": ["src/pkg/auth.py"], "stage": None, "failure_kind": None,
+               "title_tokens": []},
+    ) == ["live hazard in src/pkg/auth.py"]
+
+    assert cli_main(["--root", root, "kb", "show"]) == 0
+    assert json.loads(capsys.readouterr().out)["count"] == 1
+    assert cli_main(["--root", root, "kb", "show", "--include-retired"]) == 0
+    shown = json.loads(capsys.readouterr().out)
+    assert shown["count"] == 2
+    retired = [e for e in shown["entries"] if e.get("retired")]
+    assert len(retired) == 1 and retired[0]["retired_reason"] == "code is gone"
+
+
+def test_cli_kb_backfill_outcomes_stamps_from_run_logs(tmp_path, capsys) -> None:
+    import json
+
+    root = str(tmp_path)
+    path = tmp_path / "learnings-kb.jsonl"
+    resolvable = _one(path, text="a finding in src/pkg/a.py", run_id="r1", task_id="#12")
+    orphan = _one(path, text="a finding from a pruned run", run_id="gone", task_id="#99")
+    _task_doc(tmp_path, "r1", "#12", "completed")
+
+    assert cli_main(["--root", root, "kb", "backfill-outcomes"]) == 0
+    out = json.loads(capsys.readouterr().out)
+    assert out["dry_run"] is True and out["candidates"] == 2
+    assert out["resolved"] == 1 and out["unresolved"] == 1 and out["stamped"] == 0
+    assert out["outcomes"] == [{"id": resolvable["id"], "task_outcome": "completed"}]
+    assert out["unresolved_entries"][0]["id"] == orphan["id"]
+    assert len(kb.read_records(path)) == 2  # preview wrote nothing
+
+    assert cli_main(["--root", root, "kb", "backfill-outcomes", "--apply"]) == 0
+    assert json.loads(capsys.readouterr().out)["stamped"] == 1
+
+    entries = {e["id"]: e for e in kb.read_entries(path)}
+    assert entries[resolvable["id"]]["task_outcome"] == "completed"
+    assert kb.resolved_defect(entries[resolvable["id"]]) is True
+    # the unresolvable row stays unstamped, so it keeps reading as still-live
+    assert "task_outcome" not in entries[orphan["id"]]
+    assert kb.resolved_defect(entries[orphan["id"]]) is False
