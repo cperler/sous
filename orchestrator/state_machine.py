@@ -418,8 +418,13 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     # exception into record()) and every rejected path comes back as a notice.
     file_claims: list[dict[str, object]] = []
     if result.stage is Stage.SCOPE and "files" in out:
-        claims, file_claims = normalize_claims(out["files"])
-        task.scope_files = list(claims)
+        declaration = normalize_claims(out["files"])
+        file_claims = declaration.notices
+        task.scope_files = list(declaration.claims)
+        # #426: only the non-default (append) paths are persisted, so an absent entry —
+        # including every task doc written before #426 — reads as ``rewrite`` and gates
+        # exactly as it did before.
+        task.scope_file_modes = dict(declaration.modes)
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,

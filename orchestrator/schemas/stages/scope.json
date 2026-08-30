@@ -14,8 +14,21 @@
     },
     "files": {
       "type": "array",
-      "items": {"type": "string"},
-      "description": "repo-relative paths this task expects to MODIFY (not merely read); the engine serializes tasks whose declared files collide (#377). Optional: a task that declares nothing neither defers nor blocks."
+      "items": {
+        "anyOf": [
+          {"type": "string"},
+          {
+            "type": "object",
+            "required": ["path"],
+            "properties": {
+              "path": {"type": "string"},
+              "mode": {"type": "string", "enum": ["append", "rewrite"], "default": "rewrite"}
+            },
+            "additionalProperties": false
+          }
+        ]
+      },
+      "description": "repo-relative paths this task expects to MODIFY (not merely read); the engine serializes tasks whose declared files collide (#377). Optional: a task that declares nothing neither defers nor blocks. An entry may be a bare path string (equivalent to mode 'rewrite') or an object declaring the edit KIND (#426): mode 'append' means the edit ONLY adds a self-contained block (a new test case, a new doc section) and touches no existing line, shared constant or signature in that file, so two append-declaring tasks are not serialized against each other. Default to 'rewrite' when unsure."
     },
     "subtasks": {
       "type": "array",
