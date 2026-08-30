@@ -95,6 +95,12 @@ class TaskSource(Protocol):
     #   file_followup_keyed(title, body, labels=None, *, idempotency_key) -> str | None
     #       optional create-or-look-up variant for crash-safe external side effects. Kept
     #       distinct so adding keyed recovery does not break existing duck-typed adapters.
+    #   issue_url(task_id) -> str | None
+    #       Web address of the task's source issue (#409), for the human-gate alert to link
+    #       to. Called from inside an alerting path, so it must be OFFLINE and fast —
+    #       derive it from the id (GitHubIssuesSource builds it from its repo slug), never
+    #       fetch it. Return None when the task has no web address; the alert simply omits
+    #       the link. Same duck-typed best-effort contract as the hooks above.
     #   comment_on_ref(ref, body) -> None
     #       APPEND to an already-filed issue identified by the ref ``file_followup``
     #       returned (#406). Distinct from ``publish_note``, which is keyed to a TASK id:
@@ -140,6 +146,14 @@ class TaskSource(Protocol):
     #         stages ([{stage, status, attempt, model, error}] for every stage that RAN),
     #         cost ({usd, invocations, unmetered_calls} — the unmetered count travels WITH
     #         the figure per #319, so a sink never renders a confident $0 for unknown usage).
+    #       ``task_blocked`` carries the same enrichment block PLUS what a human needs to
+    #       release the park without opening a terminal (#409): ``stage`` (where it
+    #       stopped), ``hold_before`` (the checkpoint stage, when the park is a hold),
+    #       ``gate`` (the gate identity) and ``reason``, ``issue_url`` (from the optional
+    #       source hook above, may be None), and ``actions`` — a list of
+    #       ``{label, command}`` giving the exact approve / reject / abandon CLI lines. It
+    #       fires ONCE per park episode (deduped on the task doc, cleared by ``approve``),
+    #       so a re-invoked driver re-reading a parked run does not re-alert.
     #       ``task_completed`` also carries ``note_md`` (the render_completion_note markdown
     #       already published to the PR, bounded — reused rather than re-authored, since the
     #       engine never calls a model), plus followups_filed/improvement_ref.

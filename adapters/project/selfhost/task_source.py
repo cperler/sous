@@ -91,6 +91,18 @@ class LocalFileTaskSource:
         with open(log, "a", encoding="utf-8") as fh:
             fh.write(f"{task_id}\t{pr_url or ''}\n")
 
+    def issue_url(self, task_id: str) -> str | None:
+        """Link a human-gate alert can point at (#409) — the offline mirror of the GitHub
+        source's ``issue_url``. A local task has no web address of its own, so this returns
+        whatever the task file recorded under ``url``/``issue_url`` and None otherwise
+        (which thins the alert by one line and breaks nothing)."""
+        data = self._load() if self.tasks_path.exists() else {}
+        entry = data.get(task_id)
+        if not isinstance(entry, dict):
+            return None
+        url = entry.get("issue_url") or entry.get("url")
+        return str(url) if url else None
+
     def describe_issue(self, ref: str) -> dict:
         """Look up a task's state + PR for the conformance gate (#18 bullet 2) — the offline
         mirror of the GitHub source's ``describe_issue``. A task is ``closed`` once it has a

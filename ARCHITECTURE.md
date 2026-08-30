@@ -508,6 +508,21 @@ cross-run `learnings-kb.jsonl` share one parent:
   configured, kind-filterable, and always short-timeout — the engine's `notify_failed` guard
   covers a raising sink, but only a timeout covers one that HANGS. Wired into the selfhost
   adapter; before this it had no `notify` at all, so every dogfood batch was silent.
+- **The human-gate alert** (#409): a park is the one transition that stops the run until a
+  person acts, so `task_blocked` is built by one shared `Engine._blocked_notification` and
+  carries the facts block PLUS what it takes to act — `stage`/`hold_before`/`gate`/`reason`,
+  an `issue_url` from the optional `issue_url(task_id)` source hook, and `actions`: the exact
+  `approve` / `reject` / `abandon` CLI lines, rendered by the pure `alerting.release_commands`
+  off the run's own store root so they paste and run. The email sink leads a park mail with
+  ACTION NEEDED and prints that block above the cost/stage detail. All three park paths route
+  through it — the `next_work` `hold_before` checkpoint, `record`'s autonomous park
+  (scope-infeasible, review-rejected-held, review-fixup-held) and `_hold_decomposition`,
+  which until #409 parked an umbrella with no alert at all. It fires ONCE per park episode:
+  the dedupe key `<stage>:<gate>` is persisted on the task doc (`notified_blocks`) and tested
+  inside the store mutation, because engine memory does not survive the CLI rebuild a resumed
+  driver performs — and it is cleared by `approve`, so a later re-park at the same stage
+  alerts again. A run reaching PAUSED, or a driver exiting `blocked_on_orphaned_dispatches`,
+  already share the transport as `run_paused` / `run_blocked`.
 - **Retrospective** (`orchestrator/retrospective.py`): on a failed run, folds
   `events.jsonl` + per-stage logs into per-task failure trails, the cascade map, and recurring
   error patterns (same structured signature the breaker uses).

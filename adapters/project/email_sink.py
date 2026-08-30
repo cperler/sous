@@ -41,6 +41,14 @@ On kinds: the default is to mail EVERYTHING. The human-gate kinds (``task_blocke
 ``run_paused``, ``run_blocked``) are arguably more urgent than completion — they stall the
 batch until someone acts — so opting them out is a deliberate choice, not the default. Set
 the allowlist to narrow it (e.g. ``task_completed,task_failed``).
+
+#409 asked whether a run reaching PAUSED or exiting ``blocked_on_orphaned_dispatches``
+should share this transport: they already do, as ``run_paused`` and ``run_blocked``, so
+that class of "a human must act" event needed no new kind — only ``task_blocked`` gained
+the ACTION-NEEDED subject and the ``actions`` block, because it is the one whose release
+is a single specific command against a specific task. The park alert also closes its own
+thread: releasing a task produces the ordinary ``task_completed`` / ``task_failed`` /
+``run_finalized`` mail for whatever it goes on to do.
 """
 
 from __future__ import annotations
@@ -50,6 +58,8 @@ import smtplib
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from email.message import EmailMessage
+
+from orchestrator.alerting import NOTIFY_TASK_BLOCKED as _KIND_TASK_BLOCKED
 
 # Envelope/format constants.
 _DEFAULT_TIMEOUT_S = 10.0
@@ -174,14 +184,34 @@ def _stage_lines(stages: object) -> list[str]:
     return lines
 
 
+def _action_lines(actions: object) -> list[str]:
+    """The release commands on a human-gate alert (#409): one labelled block per
+    disposition, rendered so the command can be copied straight out of the mail."""
+    if not isinstance(actions, list):
+        return []
+    lines = []
+    for item in actions:
+        if not isinstance(item, dict) or not item.get("command"):
+            continue
+        if label := item.get("label"):
+            lines.append(f"  {label}")
+        lines.append(f"    {item['command']}")
+    return lines
+
+
 def render_subject(kind: str, payload: Mapping[str, object]) -> str:
     """Subject line: the verdict, the task, and the PR number when there is one — so the
-    inbox list alone answers "what happened to which task"."""
+    inbox list alone answers "what happened to which task".
+
+    A human-gate park is the one kind the inbox must not merely record: the run is stalled
+    until someone acts, so its subject leads with ACTION NEEDED (#409) — the difference
+    between a digest line and a request."""
     task_id = payload.get("task_id")
     bits = [str(task_id)] if task_id else [str(payload.get("run_id") or "")]
     if title := payload.get("title"):
         bits.append(str(title))
-    subject = f"[orchestrator] {kind} — {' — '.join(b for b in bits if b)}"
+    prefix = "[orchestrator] ACTION NEEDED" if kind == _KIND_TASK_BLOCKED else "[orchestrator]"
+    subject = f"{prefix} {kind} — {' — '.join(b for b in bits if b)}"
     if (pr := payload.get("pr_number")) is not None:
         subject += f" (PR #{pr})"
     return subject.replace("\n", " ").replace("\r", " ")[:200]
@@ -201,8 +231,13 @@ def render_body(kind: str, payload: Mapping[str, object]) -> str:
         ("Task", payload.get("task_id")),
         ("Title", payload.get("title")),
         ("Issue", payload.get("issue_number")),
+        # Distinct from "Issue" above: a park payload carries BOTH the number and the
+        # link, and two lines labelled the same are unreadable without already knowing.
+        ("Issue link", payload.get("issue_url")),
         ("State", payload.get("task_state") or payload.get("state")),
         ("Stage", payload.get("stage")),
+        ("Held before", payload.get("hold_before")),
+        ("Gate", payload.get("gate")),
         ("Reason", payload.get("reason")),
         ("PR", payload.get("pr_url")),
         ("Review approved", payload.get("review_approved")),
@@ -211,6 +246,11 @@ def render_body(kind: str, payload: Mapping[str, object]) -> str:
         ("Improvement", payload.get("improvement_ref")),
     ]
     lines += [f"{label}: {value}" for label, value in facts if value is not None]
+
+    # The human-gate block (#409) goes ABOVE the cost/stage detail: the recipient of a
+    # park alert needs the command first, and everything below it is context.
+    if action_lines := _action_lines(payload.get("actions")):
+        lines += ["", "ACTION NEEDED — this run is parked until you release it:", *action_lines]
 
     if cost := _money(payload.get("cost")):
         lines.append(f"Cost: {cost}")
