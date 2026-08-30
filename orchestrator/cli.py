@@ -297,8 +297,10 @@ def main(argv: list[str] | None = None) -> int:
       ``$ORCHESTRATOR_DASHBOARD_ROOTS``) and several project adapters: each row's adapter is
       resolved from the ``project_ref`` on its own run doc, so ``--project`` is only the
       fallback for run docs written before that field existed. Both modes cover the same roots.
-    * **Cross-run learnings KB** (``kb show``/``kb add``) — reads/appends
-      ``<runs-root>/learnings-kb.jsonl``.
+    * **Cross-run learnings KB** (``kb show|add|prune|backfill-outcomes``) — reads/appends
+      ``<runs-root>/learnings-kb.jsonl``.  The log is append-only, so ``prune`` and
+      ``backfill-outcomes`` append amendment records (retire / stamp ``task_outcome``)
+      rather than rewriting rows; both preview by default and write only under ``--apply``.
     """
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root",
@@ -738,17 +740,47 @@ def main(argv: list[str] | None = None) -> int:
                          "adds roots too, so the everyday command can be a bare `dashboard`")
 
     kb = sub.add_parser("kb", help="cross-run learnings KB (#72): show relevant prior "
-                                   "learnings, or teach the system a lesson (--root = runs/)")
+                                   "learnings, teach the system a lesson, or maintain the "
+                                   "recall pool (--root = runs/)")
     kbsub = kb.add_subparsers(dest="kb_cmd", required=True)
     kbs = kbsub.add_parser("show", help="print KB entries, most-relevant-first when --query given")
     kbs.add_argument("--query", help="space-separated tokens to score entries against")
     kbs.add_argument("--limit", type=int, default=20, help="max entries to show")
+    kbs.add_argument("--include-retired", action="store_true",
+                     help="also show rows retired by `kb prune` (the audit view; they are "
+                          "excluded from recall and from the default listing)")
     kba = kbsub.add_parser("add", help="append a manual learning (the human teaching the system)")
     kba.add_argument("text", help="the lesson text (bounded to ~500 chars)")
     kba.add_argument("--kind", default="manual",
                      help="failure|review|infra|salvage|manual (default manual)")
     kba.add_argument("--stage", help="optional stage this lesson is about")
     kba.add_argument("--files", help="optional comma-separated files this lesson touches")
+    kbp = kbsub.add_parser("prune", help="retire stale entries from RECALL (#480). The KB is "
+                                         "append-only, so this appends a retirement "
+                                         "amendment; nothing is deleted or rewritten")
+    kbp.add_argument("--id", action="append", dest="ids", default=[],
+                     help="retire this entry id (repeatable)")
+    kbp.add_argument("--kind", action="append", dest="kinds", default=[],
+                     help="retire entries of this kind (repeatable)")
+    kbp.add_argument("--run", dest="kb_run", default=None,
+                     help="retire entries harvested from this run id")
+    kbp.add_argument("--before", default=None,
+                     help="retire entries older than this ISO timestamp/date (e.g. 2026-07-01)")
+    kbp.add_argument("--resolved", action="store_true",
+                     help="retire review findings whose task later COMPLETED (#393)")
+    kbp.add_argument("--unstamped", action="store_true",
+                     help="retire review findings carrying no task_outcome at all — the "
+                          "legacy rows `kb backfill-outcomes` could not resolve")
+    kbp.add_argument("--reason", default=None, help="why these rows are stale (kept on the record)")
+    kbp.add_argument("--apply", action="store_true",
+                     help="actually append the retirements (default is a dry-run preview)")
+    kbb = kbsub.add_parser("backfill-outcomes",
+                           help="stamp task_outcome onto pre-#393 entries by reading each "
+                                "one's task doc from the run logs under --root")
+    kbb.add_argument("--limit", type=int, default=0,
+                     help="max entries to report individually (0 = all); counts are always full")
+    kbb.add_argument("--apply", action="store_true",
+                     help="actually append the stamps (default is a dry-run preview)")
 
     args = p.parse_args(argv)
 
@@ -770,12 +802,25 @@ def main(argv: list[str] | None = None) -> int:
         # same as dashboard); the KB lives at <runs-root>/learnings-kb.jsonl unless a project
         # override / env var relocates it. --project is optional (only for that override).
         from .learnings_kb import (
+            append_amendments,
             append_learnings,
+            outcome_from_run_logs,
             read_entries,
             relevant_learnings,
             resolve_kb_path,
+            select_entries,
             tokenize,
         )
+
+        def _excerpt(entry: dict) -> dict:
+            """One entry, small enough to scan a preview by eye but identifiable."""
+            text = str(entry.get("text") or "")
+            return {
+                "id": entry.get("id"), "ts": entry.get("ts"), "kind": entry.get("kind"),
+                "run_id": entry.get("run_id"), "task_id": entry.get("task_id"),
+                "task_outcome": entry.get("task_outcome"),
+                "text": text if len(text) <= 160 else text[:157] + "...",
+            }
 
         if not args.root:
             p.error("--root is required for kb (the runs-root, e.g. runs/)")
@@ -790,6 +835,48 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, "path": str(path), "added": len(written),
                    "entry": written[0] if written else None})
             return 0
+        if args.kb_cmd == "prune":
+            # Append-only: a prune retires rows from RECALL by appending an amendment, so
+            # the original line and the decision to demote it both survive for audit.
+            stale_rows = select_entries(
+                read_entries(path), ids=args.ids, kinds=args.kinds, run_id=args.kb_run,
+                before=args.before, resolved=args.resolved, unstamped=args.unstamped,
+            )
+            retirements = append_amendments(
+                path,
+                [{"amends": e.get("id"), "retired": True, "reason": args.reason}
+                 for e in stale_rows],
+            ) if (args.apply and stale_rows) else []
+            _emit({"ok": True, "path": str(path), "dry_run": not args.apply,
+                   "selected": len(stale_rows), "retired": len(retirements),
+                   "reason": args.reason,
+                   "entries": [_excerpt(e) for e in stale_rows]})
+            return 0
+        if args.kb_cmd == "backfill-outcomes":
+            # #393 stamps task_outcome at harvest, so every older row lacks it and recalls as
+            # still-live. The outcome is still recoverable: the run log's task doc records the
+            # terminal state the harvest would have stamped. Unresolvable rows are REPORTED,
+            # never guessed — an unstamped row keeps reading as unresolved.
+            runs_root = Path(args.root)
+            candidates = [e for e in read_entries(path) if not e.get("task_outcome")]
+            stamps, unresolved = [], []
+            for entry in candidates:
+                outcome = outcome_from_run_logs(runs_root, entry)
+                if outcome:
+                    stamps.append({"amends": entry.get("id"), "task_outcome": outcome,
+                                   "reason": "backfilled from run logs (#480)"})
+                else:
+                    unresolved.append(entry)
+            stamped = append_amendments(path, stamps) if args.apply else []
+            shown = args.limit if args.limit and args.limit > 0 else None
+            _emit({"ok": True, "path": str(path), "runs_root": str(runs_root),
+                   "dry_run": not args.apply, "candidates": len(candidates),
+                   "resolved": len(stamps), "unresolved": len(unresolved),
+                   "stamped": len(stamped),
+                   "outcomes": [{"id": a["amends"], "task_outcome": a["task_outcome"]}
+                                for a in stamps[:shown]],
+                   "unresolved_entries": [_excerpt(e) for e in unresolved[:shown]]})
+            return 0
         # show
         if args.query:
             tokens = tokenize(args.query)
@@ -800,7 +887,9 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"path": str(path), "query": args.query, "count": len(texts),
                    "learnings": texts})
         else:
-            entries = read_entries(path)[-args.limit:]
+            entries = read_entries(
+                path, include_retired=args.include_retired
+            )[-args.limit:]
             _emit({"path": str(path), "count": len(entries), "entries": entries})
         return 0
 
