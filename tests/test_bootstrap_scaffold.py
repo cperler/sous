@@ -391,12 +391,17 @@ def test_python_scaffold_declares_worktree_origin_defenses(tmp_path) -> None:
     # this profile would never invoke.
     assert [(name, kind) for name, _, kind in probes] == [
         ("uv run python interpreter", "launcher"),
-        ("svc module", "source"),  # the detected package
+        # #502: the source half resolves through the declared TEST COMMAND, because a bare
+        # `python -c` import reports the local copy whatever the runner would import.
+        ("svc module (test-runner import)", "runner-source"),
     ]
-    # The probe argv must run through the runner THIS profile declares.
-    assert all(argv[:4] == ["uv", "run", "python", "-c"] for _, argv, _ in probes)
+    # The interpreter probe runs through the runner THIS profile declares...
+    assert probes[0][1][:4] == ["uv", "run", "python", "-c"]
     assert probes[0][1][4] == "import sys; print(sys.executable)"
-    assert "import svc as _m" in probes[1][1][4]
+    # ...and the source probe through the unit-test command THIS profile declares.
+    assert probes[1][1][:2] == ["sh", "-c"]
+    assert "uv run python -m pytest -q" in probes[1][1][2]
+    assert "import svc as _probed_module" in probes[1][1][2]
     assert not any(".venv/bin" in arg for _, argv, _ in probes for arg in argv)
 
 
@@ -425,12 +430,19 @@ def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path)
     interpreter = worktree / ".venv" / "bin" / "python"
 
     class _Probed:
-        """The generated probes with `uv run python` swapped for this worktree's own venv."""
+        """The generated probes with `uv run python` swapped for this worktree's own venv.
+
+        Only the `<runner> python -c` probes are rewritten (and exercised) here; the
+        runner-routed source probe (#502) shells the project's whole test command, which this
+        pip-less venv cannot run — it has its own real-environment coverage in
+        `tests/test_worktree_origin.py`.
+        """
 
         def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
             return [
                 (name, [str(interpreter), *argv[3:]], kind)
                 for name, argv, kind in cfg.worktree_origin_probes()
+                if kind != "runner-source"
             ]
 
     # Nothing installed yet: a launcher that does not exist cannot be pointing at another
@@ -450,6 +462,22 @@ def test_generated_probes_are_accepted_and_catch_a_foreign_interpreter(tmp_path)
     # The same launcher, honestly built in this worktree, verifies.
     (worktree / ".venv" / "bin" / "pytest").write_text(f"#!{interpreter}\n")
     assert verify_worktree_origin(_Probed(), worktree).trusted
+
+
+def test_module_probe_falls_back_when_no_python_test_runner_is_declared(tmp_path) -> None:
+    """A hand-added `source_modules` on a non-pytest stack keeps the WEAKER probe (#502).
+
+    The runner-routed probe hands a throwaway pytest module to the declared test command, so
+    a project whose unit tests are `go test` would fail every probe on a healthy worktree.
+    That is worse than the weaker check it replaced, so the fallback stays."""
+    prof = profile_from_languages("svc", ["go"], MANIFEST)
+    prof.worktree = {"python": ["uv", "run", "python"], "source_modules": ["svc"]}
+    scaffold_adapter("svc", tmp_path / "adapters", profile=prof)
+    cfg = _import_adapter(tmp_path / "adapters", "svc").get_config()
+
+    (name, argv, kind), = cfg.worktree_origin_probes()
+    assert (name, kind) == ("svc module", "source")
+    assert argv[:4] == ["uv", "run", "python", "-c"]
 
 
 def test_module_form_derives_an_interpreter_probe_and_bare_scripts_still_derive_launchers() -> None:

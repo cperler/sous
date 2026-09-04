@@ -9,9 +9,22 @@ runner or source tree.  Projects may therefore declare two small, duck-typed hoo
 
 ``worktree_origin_probes() -> list[tuple[str, list[str], str]]``
     Named commands whose final non-empty stdout line is an absolute path used by the
-    toolchain.  The third value is ``"launcher"`` for an in-worktree executable whose final
-    symlink may target a shared interpreter, or ``"source"`` for imported code whose real
-    path must live below the worktree.  Legacy two-value probes are treated as ``"source"``.
+    toolchain.  The third value is one of:
+
+    ``"launcher"``
+        An in-worktree executable whose final symlink may target a shared interpreter.
+    ``"runner-source"``
+        Imported code resolved THROUGH the project's test runner, whose fully resolved path
+        must live below the worktree.  This is the strong form: it is evidence about the
+        import the tests themselves perform.
+    ``"source"``
+        The same containment rule, but resolved by any means the adapter chose.  Weaker
+        evidence, and it is weaker in a specific, observed way (#502): a bare
+        ``python -c "import pkg; print(pkg.__file__)"`` puts the workspace's own cwd first on
+        ``sys.path``, so it reports the local copy even when the runner imports a sibling
+        worktree's install.  Prefer ``adapters.project.origin_probes.runner_source_probe``.
+
+    Legacy two-value probes are treated as ``"source"``.
 
 Omitting the probe hook is an explicit, warning-grade skip rather than a guessed pass.
 Declaring a probe makes it fail closed: an unrunnable probe or an outside path means no test
@@ -27,6 +40,13 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 _PROBE_TIMEOUT_S = 60
+
+# Accepted probe kinds. ``runner-source`` (#502) has the SAME containment rule as ``source``
+# and is checked identically — it is a distinct kind so a notice records which flavour of
+# evidence was available, and so an adapter can say "this path is what the test runner
+# imported" rather than leaving the reader to infer it from the argv.
+_PROBE_KINDS = ("launcher", "runner-source", "source")
+_KIND_LIST = "/".join(_PROBE_KINDS)
 
 
 @dataclass(frozen=True)
@@ -116,9 +136,11 @@ def verify_worktree_origin(project: object, worktree: Path) -> OriginVerificatio
         ):
             notices.append(_error_notice(root, str(name), "probe name/argv is invalid"))
             continue
-        if not isinstance(kind, str) or kind not in {"launcher", "source"}:
+        if not isinstance(kind, str) or kind not in _PROBE_KINDS:
             notices.append(
-                _error_notice(root, name, f"probe kind must be launcher or source, got {kind!r}")
+                _error_notice(
+                    root, name, f"probe kind must be one of {_KIND_LIST}, got {kind!r}"
+                )
             )
             continue
         try:
@@ -126,23 +148,26 @@ def verify_worktree_origin(project: object, worktree: Path) -> OriginVerificatio
                 command, cwd=root, capture_output=True, text=True, timeout=_PROBE_TIMEOUT_S
             )
         except (OSError, subprocess.SubprocessError) as exc:
-            notices.append(_error_notice(root, name, f"{type(exc).__name__}: {exc}"))
+            notices.append(_error_notice(root, name, f"{type(exc).__name__}: {exc}", kind))
             continue
         lines = [line.strip() for line in proc.stdout.splitlines() if line.strip()]
         if proc.returncode != 0 or not lines:
             detail = (proc.stderr or proc.stdout).strip()[-300:]
             reason = f"rc={proc.returncode}" + (f": {detail}" if detail else "")
-            notices.append(_error_notice(root, name, reason))
+            notices.append(_error_notice(root, name, reason, kind))
             continue
         reported = Path(lines[-1])
         if not reported.is_absolute():
-            notices.append(_error_notice(root, name, f"probe returned non-absolute path: {reported}"))
+            notices.append(
+                _error_notice(root, name, f"probe returned non-absolute path: {reported}", kind)
+            )
             continue
         normalized = Path(os.path.abspath(reported))
         # Only a launcher's FINAL component may point to a shared interpreter. Its parent is
         # still resolved so a copied `.venv` symlink cannot smuggle a sibling launcher under
-        # an in-worktree lexical spelling. Imported source is dereferenced completely: an
-        # intermediate package symlink executes its real sibling target, not its local alias.
+        # an in-worktree lexical spelling. Imported source — `source` and `runner-source`
+        # alike — is dereferenced completely: an intermediate package symlink executes its
+        # real sibling target, not its local alias.
         resolved = (
             normalized.parent.resolve() / normalized.name
             if kind == "launcher"
@@ -185,11 +210,22 @@ def _skip_notice(root: Path, reason: str) -> dict[str, object]:
     }
 
 
-def _error_notice(root: Path, probe: str, reason: str) -> dict[str, object]:
-    return {
+def _error_notice(
+    root: Path, probe: str, reason: str, kind: str | None = None
+) -> dict[str, object]:
+    """A probe that could not establish origin at all.
+
+    ``kind`` is carried when it is known (#502), so a reader can tell a failed
+    ``runner-source`` probe — the strong evidence going missing — from a malformed
+    declaration that never named a kind.
+    """
+    notice: dict[str, object] = {
         "notice": "worktree_origin_probe_failed",
         "probe": probe,
         "expected_worktree": str(root),
         "reason": reason,
         "detail": f"{probe} could not establish toolchain origin: {reason}",
     }
+    if kind is not None:
+        notice["probe_kind"] = kind
+    return notice

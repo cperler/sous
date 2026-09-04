@@ -44,5 +44,10 @@ Notes:
   `worktree_origin_probes()` for the test runner and imported project source.
   Each named probe is `(name, argv, kind)`, prints its absolute path as its final stdout line,
   and uses `kind="launcher"` only when the final executable symlink may target a shared
-  interpreter; imported modules use `kind="source"` so their real path must remain inside the
-  worktree. If probes are omitted, verification is explicitly recorded as skipped.
+  interpreter; imported modules use `kind="runner-source"` (or the weaker `"source"`) so their
+  real path must remain inside the worktree. Route a module probe through the project's own
+  test command — `adapters.project.origin_probes.runner_source_probe` does this, and it is what
+  a pytest profile generates. A bare `python -c "import pkg; print(pkg.__file__)"` proves
+  nothing about what the tests import (#502): it puts the workspace's cwd first on `sys.path`,
+  so it reports the local source even when the runner imports another worktree's install.
+  If probes are omitted, verification is explicitly recorded as skipped.
