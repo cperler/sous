@@ -109,7 +109,14 @@ written.
   it declares neither, the skip is now stated to the reviewer in-band (#390) alongside a standing
   posture that a revert/mutation check the reviewer runs itself CORROBORATES the TEST stage's
   reported result rather than adjudicating it — an unattributable sandbox result is inconclusive,
-  not a `tests_meaningful: false`.
+  not a `tests_meaningful: false`. #411 made that in-band block an ORDERING rather than a
+  caveat: the runner probe runs FIRST, before any command whose result the review relies on,
+  because twenty-odd further retrospectives showed a check framed as a fallback gets skipped
+  on a run where nothing looks anomalous. The reviewer reports the outcome as `workspace_origin`
+  (confirmed/mismatched/not_checked), and anything short of confirmed — an omission included —
+  emits a warning-grade `review_workspace_origin_unconfirmed`. Report-only, like the #261
+  test-validation notice: a review that grounded nothing must not read the same as one
+  that did.
 - **Permission gate: a lane decision, not a constant** (#304, superseding #272's "the flag
   stays"). `--dangerously-skip-permissions` used to be appended to *every* headless dispatch
   from `transport.py`. It is now derived: `CapabilityDescriptor.permission_posture` declares a

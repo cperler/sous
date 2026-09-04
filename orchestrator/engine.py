@@ -1990,6 +1990,43 @@ class Engine:
             for name in ("fresh_install_paths", "worktree_origin_probes")
         )
 
+    def _unconfirmed_workspace_origin(
+        self, task: Task, result: StageResult
+    ) -> dict[str, object] | None:
+        """Did this REVIEW confirm that its workspace's runner imports its OWN source (#411)?
+
+        Returns a notice dict when the answer is "no" or "nobody looked", else None. The
+        event is emitted by the caller in ``_stage_events``, per the project's "the fold
+        returns what it dropped, the engine emits" convention.
+
+        Scoped to exactly the dispatches that were ASKED: a model-lane REVIEW whose prompt
+        carried ``_WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE`` because the adapter declares
+        neither #391 hook. Re-derived here from the same predicate the dispatch used rather
+        than persisted, so the two cannot fall out of step. A project WITH the hooks proves
+        origin structurally and is never asked, so it never reports and never events.
+
+        Report-only, and deliberately so: #390 showed that prose alone does not hold (the
+        directive was in the prompt for twenty-odd retrospectives that went on to trust a
+        sibling worktree's test run), but a reviewer who ran no dynamic check at all can
+        still review a diff correctly. Making the omission LOUD is the fix; making it
+        blocking would reject honest reviews.
+        """
+        if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+            return None
+        if Stage.REVIEW in task.deterministic_stages:
+            return None  # no model read the prompt, so nothing was asked of it
+        if self._project_declares_worktree_origin():
+            return None
+        reported = (result.structured_output or {}).get("workspace_origin")
+        if reported == "confirmed":
+            return None
+        if reported == "mismatched":
+            return {"kind": "mismatched", "reported": "mismatched"}
+        return {
+            "kind": "not_checked",
+            "reported": reported if isinstance(reported, str) else None,
+        }
+
     def _permission_posture(
         self, lane: LanePolicy, tool_policy: ToolPolicy | None
     ) -> PermissionPosture:
@@ -2539,6 +2576,7 @@ class Engine:
         scope_blocked_reason: str | None = None
         review_verdict: dict | None = None
         test_validation: dict[str, object] | None = None
+        workspace_origin: dict[str, object] | None = None
         review_fixup_actions: list[dict[str, object]] = []
         fixups_applied: list[ReviewFixup] = []
         cooldown_until: str | None = None
@@ -2555,6 +2593,7 @@ class Engine:
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
             nonlocal test_validation, review_fixup_actions, fixups_applied
+            nonlocal workspace_origin
             nonlocal cooldown_until, cooldown_wait_source, cooldown_budget_charged
             nonlocal provider_reset_at, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
@@ -2721,6 +2760,9 @@ class Engine:
                     # per the "pure fold returns what it dropped" convention. Observability
                     # only — it never gates completion (fail-OPEN stays fail-OPEN).
                     test_validation = unjudged_tests_notice(t, effective)
+                    # #411: and did the reviewer confirm the workspace it ran those
+                    # commands in was its own? Same observability-only posture.
+                    workspace_origin = self._unconfirmed_workspace_origin(t, effective)
                     if scope_blocked_reason is not None:
                         t.state = TaskState.BLOCKED_ON_HUMAN
                         outcome = "scope_not_feasible_held"
@@ -2940,6 +2982,16 @@ class Engine:
                     {"ts": _now(), "type": "test_validation_skipped", "level": "warning",
                      "run_id": run_id, "task_id": result.task_id,
                      "stage": result.stage.value, **test_validation}
+                )
+            # #411: the reviewer ran its checks in a workspace nothing could prove was its
+            # own, and did not come back with a confirmation. Warning-grade and report-only
+            # — "unconfirmed" and "confirmed" must not read alike in events.jsonl, which is
+            # the whole reason the #390 prompt-only fix did not hold.
+            if workspace_origin is not None:
+                events.append(
+                    {"ts": _now(), "type": "review_workspace_origin_unconfirmed",
+                     "level": "warning", "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value, **workspace_origin}
                 )
             # Execution adapters return warnings; the engine owns durable event I/O.  A
             # toolchain-origin mismatch is status-affecting in the runner AND observable

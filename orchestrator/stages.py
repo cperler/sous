@@ -333,6 +333,27 @@ _DOCS_ONLY_DIRECTIVE = (
 )
 
 
+# #390/#411: the ONE recipe for proving that the code this workspace's tests import is this
+# workspace's own. Hoisted to its own constant because three prompts state it (the mutation-
+# check posture, the unverified-workspace directive, and — through the first — the panel's
+# `find:tests` lens); #411's evidence run is the reason it must be stated once rather than
+# re-derived per site, since each restatement drifted a little further from the invocation
+# that actually proves the point.
+#
+# The recipe is the #502 one: go through the TEST RUNNER. A bare `python -c` cannot prove it
+# and repeatedly gave reviewers a false confirmation — ff-batch-20260903-2004 #227 followed
+# the old wording exactly, got the right answer from `python -c`, and then ran every mutation
+# check against a sibling worktree's source anyway.
+_RUNNER_ORIGIN_CHECK = (
+    "resolve an exercised module's `__file__` FROM INSIDE THE TEST RUNNER — a collected test "
+    "that prints it, run by the project's own test command — and confirm that path lies under "
+    "this workspace. A bare `python -c \"import pkg; print(pkg.__file__)\"` is NOT that check "
+    "and can agree with this workspace while the runner does not: `python -c` puts your cwd "
+    "first on `sys.path`, so it reports the local copy while the runner (different rootdir, "
+    "different install) imports another worktree's."
+)
+
+
 # #390: the trust posture for a revert/mutation check the REVIEWER runs itself. Six
 # retrospectives across four runs report one failure mode: a review workspace whose
 # environment was provisioned by COPY resolves the package to a SIBLING worktree's absolute
@@ -351,13 +372,8 @@ _MUTATION_CHECK_TRUST = (
     "reported result; it does not replace it. TEST ran in the one worktree whose install is "
     "guaranteed to match its source, while a review workspace can resolve the package to a "
     "SIBLING worktree, which fabricates a survived mutation and a spurious failure alike. "
-    "So before concluding anything from such a check, resolve the exercised module's "
-    "`__file__` FROM INSIDE THE TEST RUNNER — a collected test that prints it, run by the "
-    "project's own test command — and confirm it lives under this workspace. A bare "
-    "`python -c \"import pkg; print(pkg.__file__)\"` does NOT establish this: it puts your cwd "
-    "first on `sys.path`, so it reports the local copy while the runner (different rootdir, "
-    "different install) imports another worktree's. If you cannot confirm it that way, or "
-    "identical invocations disagree, the check is "
+    "So before concluding anything from such a check, " + _RUNNER_ORIGIN_CHECK + " If you "
+    "cannot confirm it that way, or identical invocations disagree, the check is "
     "INCONCLUSIVE: say so, fall back to reading the tests, and do not answer "
     "`tests_meaningful: false` or raise a blocking issue on its strength alone."
 )
@@ -395,19 +411,38 @@ _TESTS_MEANINGFUL_DIRECTIVE = (
 # who is about to run commands in the unverified workspace. Conditional, so a verified
 # review's prompt stays byte-identical (the #302 ``tool_posture_unenforced`` precedent), and
 # it only ADDS caution, so a wrong flag cannot buy a thinner review.
+#
+# #411 rewrote it from a CAVEAT into an ORDERING. The #390 wording put the origin check in a
+# trailing conditional clause ("where you cannot ground it that way…"), and 20+ retrospectives
+# across ten runs show what a reactive framing buys: reviewers ran it only once a result
+# already looked wrong. ff-batch-20260903-1724 #232 is the clean statement of it — the probe
+# caught a sibling-worktree mismatch, but only because that reviewer happened to run it, and
+# its own lesson was that a check framed as a fallback "is easy to skip on a run where nothing
+# seems anomalous". So the check now leads, with an explicit "before any command you rely on",
+# and the two remedies live runs actually proved (module invocation past the console-script
+# shim, ff-v1-b32 #258 / ff-v1-b21 #100; corroborating in the tree the runner really reads
+# when it is clean and at the same commit, ff-batch-20260903-2004 #249) replace the single
+# "prefer reading the diff" exit. The reported `workspace_origin` is the structural half: a
+# skipped check becomes a warning-grade event instead of an invisible omission, because #390
+# proved that prose alone does not hold.
 _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE = (
     "\n\n## This workspace's toolchain origin was NOT verified\n"
     "This project declares no worktree-origin hooks, so nothing has proven that the test "
     "runner and the imported source in this workspace come from THIS checkout rather than "
-    "another worktree's copied environment. Treat any command you run here as corroborating "
-    "evidence rather than proof: ground it by resolving an exercised module's `__file__` "
-    "THROUGH THE TEST RUNNER itself — a collected test that prints it, run by the project's "
-    "own test command — and confirming that path lies under this workspace. A bare "
-    "`python -c \"import pkg; print(pkg.__file__)\"` is NOT that check and can agree with this "
-    "workspace while the runner does not: `python -c` puts your cwd first on `sys.path`, so "
-    "it reports the local source even when the runner imports another worktree's install. "
-    "Where you cannot ground it that way, prefer reading the diff and the tests over a "
-    "sandbox result you cannot attribute."
+    "another worktree's copied environment.\n"
+    "**Do this FIRST, before any test, lint, or mutation command whose result you will rely "
+    "on — not after one looks suspicious:** " + _RUNNER_ORIGIN_CHECK + "\n"
+    "If the runner reports a path OUTSIDE this workspace, every command result here is about "
+    "somebody else's code, and the mismatch is structural rather than a fluke of this task. "
+    "Two remedies have worked: invoke the runner as a MODULE through the interpreter "
+    "(`python -m <runner>`) instead of its console-script shim, whose baked shebang is "
+    "usually what points at the other worktree; or, when the tree the runner actually reads "
+    "is clean and at the identical commit — check that, do not assume it — re-run the check "
+    "there and say that is what you did. Where you can do neither, prefer reading the diff "
+    "and the tests over a sandbox result you cannot attribute.\n"
+    "Report the outcome as `workspace_origin`: `confirmed` (the runner resolved into this "
+    "workspace), `mismatched` (it resolved elsewhere), or `not_checked`. An omission is "
+    "recorded as not checked and evented — it does not read as confirmed."
 )
 
 

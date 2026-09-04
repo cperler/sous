@@ -208,7 +208,7 @@ def test_review_prompt_scopes_the_omission_carve_out_to_an_absent_test_surface()
     assert "## Reporting tests_meaningful" in prompt
     # #390 replaced the one-direction mutation sentence this used to assert; its own
     # regression coverage lives in tests/test_review_worktree_trust.py.
-    assert "resolve the exercised module's `__file__`" in prompt
+    assert "resolve an exercised module's `__file__`" in prompt
     assert "JUDGE `tests_meaningful` whenever this change has tests you can read" in prompt
     assert "OMIT the field ONLY when there is genuinely NO test surface" in prompt
     assert "not judged" in prompt and "NOT a pass" in prompt

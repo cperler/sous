@@ -10,6 +10,11 @@
       "type": ["boolean", "null"],
       "description": "independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false rejects the review even when approved — the reviewer is a different agent from the one that wrote the tests, which is the point. Answer it whenever there are tests to read; omit it (or answer null) ONLY when the change has genuinely no test surface. An absent/null answer fails OPEN but is recorded as 'not judged' — never as a pass — and is evented (test_validation_skipped) when the TEST stage did not judge it either (#261)"
     },
+    "workspace_origin": {
+      "type": "string",
+      "enum": ["confirmed", "mismatched", "not_checked"],
+      "description": "#411: where the TEST RUNNER in this review workspace resolved the code it imported. Asked for only when the workspace's toolchain origin could not be verified structurally (the project declares no #391 origin hooks) — a review workspace provisioned by copy can import a SIBLING worktree's source, which fabricates a survived mutation and a spurious failure alike. `confirmed`: a collected test printed an exercised module's `__file__` and it lies under this workspace. `mismatched`: it resolved outside this workspace, so command results here are about another checkout's code. `not_checked`: the check was not run. An absent value is recorded as `not_checked` and evented (review_workspace_origin_unconfirmed) — never as `confirmed`. Report-only: it does not gate approval, because a reviewer who ran nothing dynamic can still review a diff correctly"
+    },
     "issues": {
       "type": "array",
       "items": {
