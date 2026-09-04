@@ -229,9 +229,17 @@ class ProjectConfig(Protocol):
     #   worktree_origin_probes() -> list[tuple[str, list[str], str]]
     #       Named argv commands whose final non-empty stdout line is an absolute runner or
     #       source path. The kind is "launcher" (the final symlink may target a shared
-    #       interpreter) or "source" (the fully resolved path must remain in the worktree).
-    #       Legacy two-value declarations default conservatively to "source". The execution
-    #       adapter verifies every path before accepting baseline, TEST, or REVIEW results.
+    #       interpreter), "runner-source" (imported code resolved THROUGH the project's test
+    #       runner) or "source" (the same containment rule, resolved by any other means).
+    #       Both source kinds require the fully resolved path to remain in the worktree.
+    #       PREFER "runner-source" (#502): a bare `python -c "import pkg; print(pkg.__file__)"`
+    #       puts the workspace's own cwd first on `sys.path`, so it reports the local source
+    #       even when the test runner imports another worktree's install — a probe that
+    #       passes while the tests that follow it read somebody else's code.
+    #       `adapters.project.origin_probes.runner_source_probe` builds the strong form from
+    #       the project's own `test_unit_cmd`. Legacy two-value declarations default
+    #       conservatively to "source". The execution adapter verifies every path before
+    #       accepting baseline, TEST, or REVIEW results.
     #       Omission emits an explicit warning-grade skipped-verification notice.
     #       ``orchestrator-scaffold`` generates BOTH for a python profile from profile.toml's
     #       ``[worktree]`` table (#391), so a scaffolded project inherits the defense rather

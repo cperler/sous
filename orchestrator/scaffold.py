@@ -159,6 +159,18 @@ _IN_TREE_VENV_RUNNERS: set[tuple[str, ...]] = {("uv", "run")}
 _PROBED_COMMAND_KEYS = ("test_unit", "typecheck")
 
 
+def _is_python_test_runner(test_argv: list[str]) -> bool:
+    """Can a python probe test be handed to this project's unit-test command? (#502)
+
+    The runner-routed source probe writes a throwaway pytest module and passes it to the
+    declared test command, so it needs a command that collects such a file. A profile whose
+    unit tests are `go test` or `pnpm test` — reachable by hand-adding `source_modules` —
+    falls back to the weaker environment probe instead of being handed a command that would
+    fail on every healthy worktree.
+    """
+    return "pytest" in test_argv
+
+
 def _python_runner(commands: dict[str, list[str]]) -> tuple[list[str], list[str]] | None:
     """The (prefix, python-invocation) pair this profile's python commands run through."""
     for key in (*_PROBED_COMMAND_KEYS, "lint", "install"):
@@ -631,7 +643,13 @@ _WORKTREE_HELPERS = """
 # (a stray VIRTUAL_ENV, a redirected project environment) — hence the interpreter probe.
 # Each probe prints the path a launcher, interpreter, or import really resolves to; the
 # execution adapter refuses any path that lands outside the worktree under test.
+#
+# The SOURCE probe runs through the project's own test command (#502). A bare
+# `python -c "import pkg; print(pkg.__file__)"` cannot prove what the tests import: it puts
+# the workspace's cwd first on `sys.path`, so it reports the local copy even when the runner
+# imports another worktree's install.
 _PROBE_PY = {runner_argv}
+_TEST_ARGV = {test_argv}
 
 
 def _launcher_probe(relative: str) -> tuple[str, list[str], str]:
@@ -649,8 +667,26 @@ def _launcher_probe(relative: str) -> tuple[str, list[str], str]:
     return (f"{{relative}} shebang interpreter", [*_PROBE_PY, "-c", code], "launcher")
 
 
+def _runner_module_probe(module: str) -> tuple[str, list[str], str]:
+    \"\"\"Resolve an imported project module THROUGH the command that runs the tests (#502).
+
+    This is the probe worth having: the path it reports is the one a later test result can
+    actually be attributed to, so a failing probe means the tests themselves cannot import
+    from outside this worktree. If this project's test command needs different flags for a
+    single-file run (a coverage threshold, say), tune `test_unit` in profile.toml.
+    \"\"\"
+    from adapters.project.origin_probes import PROBE_FILE, runner_source_probe
+
+    return runner_source_probe(module, [*_TEST_ARGV, PROBE_FILE])
+
+
 def _module_probe(module: str) -> tuple[str, list[str], str]:
-    \"\"\"Resolve an imported project module to the file it was actually loaded from.\"\"\"
+    \"\"\"Resolve an imported project module in the runner's ENVIRONMENT, not its process.
+
+    The weaker fallback, used when no python test runner is declared to route the import
+    through. It proves the environment resolves the module inside this worktree; it does not
+    prove the test process does (see `_runner_module_probe`).
+    \"\"\"
     code = f"import {{module}} as _m; print(_m.__file__)"
     return (f"{{module}} module", [*_PROBE_PY, "-c", code], "source")
 
@@ -687,6 +723,7 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
     fresh, launchers = wt.get("fresh_install_paths", []), wt.get("launcher_probes", [])
     modules, runner = wt.get("source_modules", []), wt.get("python", [])
     interpreter = wt.get("interpreter_probe", [])
+    test_argv = profile.commands.get("test_unit") or []
     probed = launchers or interpreter or modules
     if not (fresh or (probed and runner)):
         return "", ""
@@ -707,7 +744,8 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
     if interpreter:
         sources.append(f"[_interpreter_probe({_argv_literal(interpreter)})]")
     if modules:
-        sources.append(f"[_module_probe(m) for m in {_argv_literal(modules)}]")
+        probe = "_runner_module_probe" if _is_python_test_runner(test_argv) else "_module_probe"
+        sources.append(f"[{probe}(m) for m in {_argv_literal(modules)}]")
     body = "\n            + ".join(sources)
     methods += f"""
     def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
@@ -717,7 +755,9 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
         )
 """
     helpers = _WORKTREE_HELPERS.format(
-        runner=" ".join(runner[:-1]) or "python", runner_argv=_argv_literal(runner)
+        runner=" ".join(runner[:-1]) or "python",
+        runner_argv=_argv_literal(runner),
+        test_argv=_argv_literal(test_argv),
     )
     return helpers, methods
 

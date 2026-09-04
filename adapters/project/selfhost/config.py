@@ -17,6 +17,7 @@ import sys
 
 from adapters.project.email_sink import email_sink_from_env
 from adapters.project.github_issues import GitHubIssuesSource
+from adapters.project.origin_probes import PROBE_FILE, runner_source_probe
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
@@ -63,7 +64,15 @@ class SelfHostConfig:
         return [".venv"]
 
     def worktree_origin_probes(self) -> list[tuple[str, list[str], str]]:
-        """Resolve both the pytest launcher and this package through the worktree venv."""
+        """Resolve both the pytest launcher and this package as the SUITE resolves them.
+
+        The source half runs through ``test_unit_cmd`` itself (#502). It used to be a
+        ``uv run python -c "import orchestrator.engine; print(...)"`` — an invocation that
+        cannot prove what the tests import, because ``python -c`` puts the workspace's own
+        cwd first on ``sys.path`` and so reports the local copy no matter where the
+        environment's install points. Building the probe FROM ``test_unit_cmd`` also keeps
+        the two from drifting apart when this project changes how it runs its tests.
+        """
         return [
             (
                 "pytest shebang interpreter",
@@ -75,14 +84,7 @@ class SelfHostConfig:
                 ],
                 "launcher",
             ),
-            (
-                "orchestrator module",
-                [
-                    "uv", "run", "python", "-c",
-                    "import orchestrator.engine as module; print(module.__file__)",
-                ],
-                "source",
-            ),
+            runner_source_probe("orchestrator.engine", self.test_unit_cmd([PROBE_FILE])),
         ]
 
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]:

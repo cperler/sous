@@ -352,9 +352,12 @@ _MUTATION_CHECK_TRUST = (
     "guaranteed to match its source, while a review workspace can resolve the package to a "
     "SIBLING worktree, which fabricates a survived mutation and a spurious failure alike. "
     "So before concluding anything from such a check, resolve the exercised module's "
-    "`__file__` inside the test process and confirm it lives under this workspace — probe it "
-    "the way the suite actually runs, since a different rootdir can resolve a different "
-    "install. If you cannot confirm that, or identical invocations disagree, the check is "
+    "`__file__` FROM INSIDE THE TEST RUNNER — a collected test that prints it, run by the "
+    "project's own test command — and confirm it lives under this workspace. A bare "
+    "`python -c \"import pkg; print(pkg.__file__)\"` does NOT establish this: it puts your cwd "
+    "first on `sys.path`, so it reports the local copy while the runner (different rootdir, "
+    "different install) imports another worktree's. If you cannot confirm it that way, or "
+    "identical invocations disagree, the check is "
     "INCONCLUSIVE: say so, fall back to reading the tests, and do not answer "
     "`tests_meaningful: false` or raise a blocking issue on its strength alone."
 )
@@ -398,8 +401,13 @@ _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE = (
     "runner and the imported source in this workspace come from THIS checkout rather than "
     "another worktree's copied environment. Treat any command you run here as corroborating "
     "evidence rather than proof: ground it by resolving an exercised module's `__file__` "
-    "under this workspace first, and where you cannot, prefer reading the diff and the tests "
-    "over a sandbox result you cannot attribute."
+    "THROUGH THE TEST RUNNER itself — a collected test that prints it, run by the project's "
+    "own test command — and confirming that path lies under this workspace. A bare "
+    "`python -c \"import pkg; print(pkg.__file__)\"` is NOT that check and can agree with this "
+    "workspace while the runner does not: `python -c` puts your cwd first on `sys.path`, so "
+    "it reports the local source even when the runner imports another worktree's install. "
+    "Where you cannot ground it that way, prefer reading the diff and the tests over a "
+    "sandbox result you cannot attribute."
 )
 
 

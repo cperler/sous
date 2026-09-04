@@ -38,7 +38,8 @@ def test_selfhost_satisfies_protocol() -> None:
     assert cfg.fresh_install_paths() == [".venv"]
     assert [(name, kind) for name, _, kind in cfg.worktree_origin_probes()] == [
         ("pytest shebang interpreter", "launcher"),
-        ("orchestrator module", "source"),
+        # #502: routed through `test_unit_cmd`, not a same-environment `python -c`.
+        ("orchestrator.engine module (test-runner import)", "runner-source"),
     ]
     assert cfg.test_e2e_cmd() == ["true"]  # this repo has no E2E layer
     assert cfg.typecheck_cmd() == ["uv", "run", "ruff", "check", "."]

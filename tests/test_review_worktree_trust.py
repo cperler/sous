@@ -70,6 +70,16 @@ def test_origin_probe_must_match_how_the_suite_runs() -> None:
     assert "rootdir" in _MUTATION_CHECK_TRUST
 
 
+def test_grounding_must_go_through_the_test_runner_not_python_c() -> None:
+    """#502: `python -c` puts cwd first on `sys.path`, so it agrees with the workspace even
+    when the runner imports a sibling worktree. Both places that ask the reviewer to ground a
+    result must name the runner, or the reviewer can "confirm" it with the check that lies."""
+    for directive in (_MUTATION_CHECK_TRUST, _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE):
+        assert "TEST RUNNER" in directive.upper()
+        assert "python -c" in directive
+        assert "sys.path" in directive
+
+
 def test_panel_tests_finder_shares_the_same_constant() -> None:
     """A finder runs its revert check in its own disposable copy, so it faces the identical
     aliasing. One constant, so the two wordings cannot drift apart."""

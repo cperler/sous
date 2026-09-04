@@ -6,11 +6,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.review_isolation import ReviewIsolation
 from adapters.execution.runners import build_registry
 from adapters.execution.transport import RawResult
 from adapters.execution.worktree_origin import verify_worktree_origin
+from adapters.project.origin_probes import PROBE_FILE, runner_source_probe
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.routing import Router
@@ -257,3 +260,122 @@ def test_disposable_review_does_not_copy_venv_and_installs_fresh(tmp_path) -> No
     assert raw.execution_notices == ()
     assert seen and not seen[0].exists()
     assert (live / ".venv" / "origin").read_text().strip() == "/some/sibling/worktree"
+
+
+# --- #502: the source probe must go through the TEST RUNNER, not `python -c` --------------
+
+def _svc_worktree(tmp_path: Path) -> tuple[Path, Path]:
+    """A worktree holding its own `svc` package, plus an outside copy on PYTHONPATH.
+
+    This is the live shape from family-finance `ff-batch-20260903-1724`: a workspace whose
+    own source sits right there, while the environment the runner imports through resolves
+    the same package somewhere else entirely.
+    """
+    worktree = tmp_path / "wt"
+    (worktree / "svc").mkdir(parents=True)
+    (worktree / "svc" / "__init__.py").write_text("HERE = 'worktree'\n")
+    (worktree / "tests").mkdir()
+    outside = tmp_path / "installed"
+    (outside / "svc").mkdir(parents=True)
+    (outside / "svc" / "__init__.py").write_text("HERE = 'sibling'\n")
+    return worktree, outside
+
+
+def _pytest_script() -> list[str]:
+    """The BARE console script, which (unlike `python -m pytest`) leaves cwd off sys.path.
+
+    That is the family-finance shape: `uv run pytest`, whose import resolution is decided by
+    the environment rather than by where the command happened to be launched from.
+    """
+    script = Path(sys.executable).with_name("pytest")
+    if not script.exists():  # pragma: no cover - the dev/CI env always installs pytest
+        pytest.skip("no pytest console script next to this interpreter")
+    return [str(script)]
+
+
+def _probed(probe: tuple[str, list[str], str]):
+    return type("P", (), {"worktree_origin_probes": lambda self: [probe]})()
+
+
+def test_python_c_probe_passes_where_the_runner_imports_another_worktree(tmp_path, monkeypatch) -> None:
+    """The false green #502 is about, reproduced against real interpreters.
+
+    `python -c` puts the workspace's own cwd first on `sys.path`, so it reports the local
+    copy — and says nothing about the import the tests will perform.
+    """
+    worktree, outside = _svc_worktree(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(outside))
+
+    legacy = ("svc module", [sys.executable, "-c", "import svc as m; print(m.__file__)"], "source")
+    assert verify_worktree_origin(_probed(legacy), worktree).trusted is True
+
+    runner = runner_source_probe("svc", [*_pytest_script(), "-q", PROBE_FILE])
+    verdict = verify_worktree_origin(_probed(runner), worktree)
+
+    assert verdict.trusted is False
+    (notice,) = verdict.notices
+    assert notice["notice"] == "worktree_origin_mismatch"
+    assert notice["probe_kind"] == "runner-source"
+    assert notice["resolved_path"] == str(outside / "svc" / "__init__.py")
+
+
+def test_runner_probe_trusts_a_workspace_the_runner_really_imports(tmp_path, monkeypatch) -> None:
+    """The other direction: an honest environment must not be failed closed."""
+    worktree, _ = _svc_worktree(tmp_path)
+    monkeypatch.setenv("PYTHONPATH", str(worktree))  # the install points at THIS worktree
+
+    probe = runner_source_probe("svc", [*_pytest_script(), "-q", PROBE_FILE])
+    assert verify_worktree_origin(_probed(probe), worktree).trusted is True
+    # The throwaway probe test and its output file are removed, whatever the verdict, and
+    # no bytecode cache is left behind: a REVIEW workspace must not go dirty for a probe.
+    assert sorted(p.name for p in (worktree / "tests").iterdir()) == []
+
+
+def test_runner_probe_fails_closed_when_the_suite_cannot_run(tmp_path) -> None:
+    """No result is not a pass: a runner that cannot start leaves origin unestablished."""
+    worktree, _ = _svc_worktree(tmp_path)
+
+    probe = runner_source_probe("svc", [*_pytest_script(), "--not-a-flag", PROBE_FILE])
+    verdict = verify_worktree_origin(_probed(probe), worktree)
+
+    assert verdict.trusted is False
+    (notice,) = verdict.notices
+    assert notice["notice"] == "worktree_origin_probe_failed"
+    assert notice["probe_kind"] == "runner-source"
+
+
+def test_runner_source_kind_is_resolved_like_source_not_like_launcher(tmp_path) -> None:
+    """`runner-source` is a LABEL on the strong evidence, not a weaker containment rule."""
+    worktree = tmp_path / "review"
+    sibling = tmp_path / "sibling" / "pkg"
+    sibling.mkdir(parents=True)
+    (sibling / "module.py").write_text("")
+    alias = worktree / "pkg"
+    alias.parent.mkdir(parents=True)
+    alias.symlink_to(sibling)
+
+    probe = ("svc module", [sys.executable, "-c", f"print({str(alias / 'module.py')!r})"], "runner-source")
+    verdict = verify_worktree_origin(_probed(probe), worktree)
+
+    assert verdict.trusted is False
+    assert verdict.notices[0]["probe_kind"] == "runner-source"
+    assert verdict.notices[0]["resolved_path"] == str(sibling / "module.py")
+
+
+def test_unknown_probe_kind_is_still_refused(tmp_path) -> None:
+    probe = ("svc module", [sys.executable, "-c", "print('/tmp')"], "runner")
+    verdict = verify_worktree_origin(_probed(probe), tmp_path)
+
+    assert verdict.trusted is False
+    assert verdict.notices[0]["notice"] == "worktree_origin_probe_failed"
+    assert "runner-source" in str(verdict.notices[0]["reason"])
+
+
+def test_probe_test_is_written_where_the_project_tests_live() -> None:
+    """Placement is load-bearing: pytest prepends a collected file's OWN directory to
+    `sys.path`, so a probe dropped at the repo root would re-create the cwd-first lie."""
+    _, argv, kind = runner_source_probe("svc", ["pytest", PROBE_FILE])
+
+    assert (argv[0], kind) == ("sh", "runner-source")
+    assert 'for candidate in tests test; do' in argv[2]
+    assert PROBE_FILE not in argv[2]  # substituted for the real, per-run file

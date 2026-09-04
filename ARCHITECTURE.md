@@ -102,7 +102,10 @@ written.
   outside this in-process runner boundary and retains #302's explicit unenforced posture.
   Isolation alone does not prove the workspace's toolchain is its OWN: a copied venv or a stale
   editable-install path can execute a sibling worktree's package, which is why a project
-  declaring the #381/#391 hooks gets its declared artifacts rebuilt and probed fail-closed. When
+  declaring the #381/#391 hooks gets its declared artifacts rebuilt and probed fail-closed. The
+  source probe runs THROUGH the project's test command (#502, `kind="runner-source"`), because a
+  bare `python -c` import puts the workspace's cwd first on `sys.path` and so passes while the
+  runner imports a sibling worktree — the false green observed live. When
   it declares neither, the skip is now stated to the reviewer in-band (#390) alongside a standing
   posture that a revert/mutation check the reviewer runs itself CORROBORATES the TEST stage's
   reported result rather than adjudicating it — an unattributable sandbox result is inconclusive,
