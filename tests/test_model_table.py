@@ -60,13 +60,13 @@ def test_claude_roles_map_to_four_distinct_models() -> None:
 
 
 def test_stage_specs_assign_the_claude_tiers() -> None:
-    """The stage -> role assignment, resolved through the table: scope/implement decide the
-    outcome (frontier), review judges it independently (deep_reason), deliver is prose and
+    """The stage -> role assignment, resolved through the table: scope/implement and review are
+    all deep_reason (fable stays a per-task pin), deliver is prose and
     mechanics (review tier), and simplify/test are cheap_shell."""
     t = DEFAULT_MODEL_TABLE
     expected = {
-        Stage.SCOPE: Role.FRONTIER,
-        Stage.IMPLEMENT: Role.FRONTIER,
+        Stage.SCOPE: Role.DEEP_REASON,
+        Stage.IMPLEMENT: Role.DEEP_REASON,
         Stage.REVIEW: Role.DEEP_REASON,
         Stage.DELIVER: Role.REVIEW,
         Stage.SIMPLIFY: Role.CHEAP_SHELL,
@@ -74,8 +74,8 @@ def test_stage_specs_assign_the_claude_tiers() -> None:
     }
     for stage, role in expected.items():
         assert STAGE_SPECS[stage].model_role == role, stage
-    assert t.model_for_role(STAGE_SPECS[Stage.SCOPE].model_role) == "claude-fable-5-1"
-    assert t.model_for_role(STAGE_SPECS[Stage.IMPLEMENT].model_role) == "claude-fable-5-1"
+    assert t.model_for_role(STAGE_SPECS[Stage.SCOPE].model_role) == "claude-opus-5-5"
+    assert t.model_for_role(STAGE_SPECS[Stage.IMPLEMENT].model_role) == "claude-opus-5-5"
     assert t.model_for_role(STAGE_SPECS[Stage.REVIEW].model_role) == "claude-opus-5-5"
     assert t.model_for_role(STAGE_SPECS[Stage.DELIVER].model_role) == "claude-sonnet-5-5"
     assert t.model_for_role(STAGE_SPECS[Stage.SIMPLIFY].model_role) == "claude-haiku-4-5"

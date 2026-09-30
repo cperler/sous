@@ -69,7 +69,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.SCOPE: StageSpec(
         stage=Stage.SCOPE,
-        model_role=Role.FRONTIER,
+        model_role=Role.DEEP_REASON,
         schema_ref="scope",
         agent_role="scope",
         timeout_s=600,  # deep reasoning, no file edits
@@ -110,7 +110,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.IMPLEMENT: StageSpec(
         stage=Stage.IMPLEMENT,
-        model_role=Role.FRONTIER,
+        model_role=Role.DEEP_REASON,
         schema_ref="implement",
         agent_role="implement",
         timeout_s=1800,  # the heavy stage: multi-file edits + commits

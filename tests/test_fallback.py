@@ -26,16 +26,16 @@ from tests.conftest import make_result
 
 
 def _scope_chain() -> list[str]:
-    """SCOPE's claude dispatch chain: role default (fable), then each step down to the floor."""
+    """SCOPE's claude dispatch chain: role default (opus), then each step down to the floor."""
     chain = [DEFAULT_MODEL_TABLE.model_for_role(STAGE_SPECS[Stage.SCOPE].model_role)]
     while (nxt := DEFAULT_MODEL_TABLE.fallback_after(chain[-1])) is not None:
         chain.append(nxt)
     return chain
 
 
-# scope starts on fable; a rate limit / capacity downgrade steps to the next tier (opus),
-# and a second step reaches sonnet, then the haiku floor.
-SCOPE_DEFAULT, SCOPE_STEP1, SCOPE_STEP2, SCOPE_FLOOR = _scope_chain()
+# scope starts on opus; a rate limit / capacity downgrade steps to the next tier (sonnet),
+# and a second step reaches the haiku floor.
+SCOPE_DEFAULT, SCOPE_STEP1, SCOPE_FLOOR = _scope_chain()
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -127,13 +127,13 @@ def test_capacity_downgrade_when_opted_in_drops_effort_first(tmp_path, project) 
 
 def test_capacity_downgrade_model_only_when_effort_at_floor(tmp_path, project) -> None:
     """The MODEL downgrades only when the effort lever is unavailable: a task pinned to
-    the low-effort floor drops one model step (fable -> opus) exactly as pre-#96, with the model event."""
+    the low-effort floor drops one model step (opus -> sonnet) exactly as pre-#96, with the model event."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", route_by_capacity=True)
     eng.add_task("r1", "t1", effort="low")  # effort pinned at the floor
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)
-    assert w.stage is Stage.SCOPE and w.model == SCOPE_STEP1  # fable -> opus, one step
+    assert w.stage is Stage.SCOPE and w.model == SCOPE_STEP1  # opus -> sonnet, one step
     assert w.effort == "low"  # the pin held
     ev = _downgrade_events(eng)
     assert len(ev) == 1
@@ -288,8 +288,8 @@ def test_capacity_downgrade_at_floor_is_noop(tmp_path, project) -> None:
     eng.add_task("r1", "t1", effort="low")  # effort lever floored -> the model lever fires
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)
-    assert w.model == SCOPE_FLOOR  # a 9-step drop from fable floors at haiku
-    assert len(_downgrade_events(eng)) == 1  # fable -> haiku, one event
+    assert w.model == SCOPE_FLOOR  # a 9-step drop from opus floors at haiku
+    assert len(_downgrade_events(eng)) == 1  # opus -> haiku, one event
     assert _effort_events(eng) == []
 
 
@@ -304,7 +304,7 @@ def test_rate_limit_requeues_on_cheaper_model(tmp_path, project) -> None:
     assert out["task_state"] == "retrying"
     assert out["next_stage"] == "scope"  # same stage re-queued
     task = eng.store.load_task("r1", "t1")
-    assert task.pending_fallback_model == SCOPE_STEP1  # fable -> opus
+    assert task.pending_fallback_model == SCOPE_STEP1  # opus -> sonnet
     assert task.learnings == []  # transient: no learning burned
     assert task.error_signatures == []  # breaker untouched
     # re-dispatch uses the cheaper model at the SAME attempt
@@ -341,7 +341,7 @@ def test_rate_limit_with_no_wait_budget_is_hard_failure(tmp_path, project) -> No
 
 def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
-    w = _advance_to(eng, Stage.SCOPE)  # fable
+    w = _advance_to(eng, Stage.SCOPE)  # opus
     eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     w2 = eng.next_work("r1", "t1")  # opus
     assert w2.model == SCOPE_STEP1
@@ -352,13 +352,13 @@ def test_rate_limit_steps_down_then_succeeds(tmp_path, project) -> None:
 def test_rate_limit_at_floor_becomes_failure(tmp_path, project) -> None:
     """Rate-limited on the cheapest model with NO cooldown budget -> normal failure.
     intake is deterministic (no model), so reach the floor by degrading a model stage
-    down the chain fable -> opus -> sonnet -> haiku. (With budget, the floor now cooldowns —
+    down the chain opus -> sonnet -> haiku. (With budget, the floor now cooldowns —
     see test_capacity_wiring.py.)"""
     eng = _engine(tmp_path, project, max_attempts=3, breaker_threshold=9,
                   max_rate_limit_waits=0)
-    w = _advance_to(eng, Stage.SCOPE)  # first model stage, on fable
+    w = _advance_to(eng, Stage.SCOPE)  # first model stage, on opus
     assert w.model == SCOPE_DEFAULT
-    for expected in (SCOPE_STEP1, SCOPE_STEP2, SCOPE_FLOOR):
+    for expected in (SCOPE_STEP1, SCOPE_FLOOR):
         eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
         w = eng.next_work("r1", "t1")
         assert w.model == expected
