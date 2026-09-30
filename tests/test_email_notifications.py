@@ -262,6 +262,36 @@ def test_failed_describe_pr_thins_the_mail_and_is_evented(tmp_path) -> None:
     assert [e["part"] for e in degraded] == ["pr"]
 
 
+def test_rejected_pr_carries_its_delivery_verdict_to_both_mails(tmp_path) -> None:
+    """A PR the #378 check rejects (here: CLOSED) is still described for the mail, but the
+    verdict rides along so neither the task mail nor the run digest says "merge it"."""
+    project, calls = _recording_project()
+    project.task_source.pr_info["state"] = "CLOSED"
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _drive(eng)
+
+    pr = next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)["pr"]
+    assert pr["state"] == "CLOSED"
+    assert "CLOSED" in pr["delivery_problem"]
+    entry = next(p for k, p in calls if k == "run_finalized")["tasks"][0]
+    assert (entry["pr_state"], entry["delivery_verified"]) == ("CLOSED", False)
+
+
+def test_validated_pr_has_no_delivery_problem(tmp_path) -> None:
+    project, calls = _recording_project()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _drive(eng)
+
+    assert next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)["pr"][
+        "delivery_problem"] is None
+    entry = next(p for k, p in calls if k == "run_finalized")["tasks"][0]
+    assert (entry["pr_state"], entry["delivery_verified"]) == ("OPEN", True)
+
+
 def test_failure_and_park_paths_never_read_the_pr(tmp_path) -> None:
     """The failure/park alerts stay offline (#409): the facts builder never calls the
     tracker itself, only the completion path hands it a PR it already read."""
@@ -458,6 +488,43 @@ def test_mail_without_the_note_renders_review_stages_and_cost_itself() -> None:
     assert "implement  completed  claude-opus" in body  # the stage table
     assert "Total: $1.2345 over 7 model call(s)" in body
     assert "- rename y: https://github.com/x/y/issues/9" in body
+
+
+@pytest.mark.parametrize("pr_extra", [
+    {"state": "CLOSED"},
+    {"state": "OPEN", "delivery_problem": "PR head x does not match task/524"},
+    {"state": "MERGED", "delivery_problem": "PR head SHA a does not match delivered b"},
+])
+def test_completed_mail_never_says_merge_for_a_rejected_pr(pr_extra) -> None:
+    """The #378 check judged the PR invalid: the reader must be told to look, not merge
+    (and a merged-but-mismatched PR is not "nothing to do" either)."""
+    payload = _completed_payload()
+    payload["pr"] = {**payload["pr"], **pr_extra}
+    body = render_body(NOTIFY_TASK_COMPLETED, payload)
+    first = body.splitlines()[0]
+    assert first.startswith("Next: do not merge yet.")
+    assert "delivery could not be verified" in first
+    assert "review and merge" not in body and "already merged" not in body
+    if problem := pr_extra.get("delivery_problem"):
+        assert f"Delivery problem: {problem}" in body
+
+
+def test_run_digest_counts_only_verified_unmerged_prs_as_ready() -> None:
+    def task(tid: str, **extra) -> dict:
+        return {"task_id": tid, "state": "completed",
+                "pr_url": f"https://github.com/x/y/pull/{tid}", **extra}
+
+    body = render_body("run_finalized", {"run_id": "r1", "state": "completed", "tasks": [
+        task("1", pr_state="OPEN", delivery_verified=True),
+        task("2", pr_state="MERGED", delivery_verified=True),
+        task("3", pr_state="CLOSED", delivery_verified=False),
+        task("4"),  # an older payload with no verdict still counts as ready
+        {"task_id": "5", "state": "failed", "pr_url": None},
+    ]})
+    assert "Next: review and merge the 2 PR(s) below." in body
+    assert "Check first: 1 PR(s) failed the delivery check" in body
+    assert "2 completed (PR merged)" in body
+    assert "3 completed (PR delivery unverified)" in body
 
 
 def test_park_mail_leads_with_the_release_commands() -> None:

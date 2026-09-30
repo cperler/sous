@@ -171,9 +171,12 @@ class TaskSource(Protocol):
     #       offline and never read the PR. ``describe_pr`` may therefore return those summary
     #       keys alongside its delivery evidence (GitHubIssuesSource does, from the same
     #       ``gh pr view`` call); a source that omits them just yields a thinner mail.
+    #       The engine stamps ``pr.delivery_problem`` (None when the PR validated) so a
+    #       sink never tells the reader to merge a PR #378 rejected (closed, wrong head).
     #       ``run_finalized`` carries a per-task ``tasks`` roster ({task_id, state, title,
-    #       pr_url, issue_number, issue_url, cost}) plus ``counts`` (tasks per state and
-    #       total), ``duration_s`` and the run's ``cost``, so a batch digest is renderable.
+    #       pr_url, issue_number, issue_url, cost}, plus ``pr_state``/``delivery_verified``
+    #       when the task has a #378 receipt) plus ``counts`` (tasks per state and total),
+    #       ``duration_s`` and the run's ``cost``, so a batch digest is renderable.
     #       The derived blocks are best-effort: a payload missing ``stages``/``cost``/
     #       ``review``/``pr``/the issue excerpt is evented (``notification_facts_degraded``,
     #       with the ``part``) rather than silently thinned, so a sink should treat every

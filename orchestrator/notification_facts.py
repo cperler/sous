@@ -198,6 +198,10 @@ def pr_facts(info: dict) -> dict:
         "review_decision": info.get("review_decision"),
         "checks": info.get("checks"),
         "merged_at": info.get("merged_at"),
+        # Stamped by the engine's #378 check, not the source: why this PR does not prove
+        # delivery (None when it validated or was never checked).
+        "delivery_problem": _clip(str(info["delivery_problem"]), 300)
+        if info.get("delivery_problem") else None,
     }
 
 

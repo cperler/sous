@@ -372,7 +372,18 @@ def _next_blocks(kind: str, p: Mapping[str, object]) -> list[Block | None]:
     if kind == _KIND_TASK_COMPLETED:
         if not url:
             return [_para("Next: nothing to merge; this task opened no PR.")]
-        if str(pr.get("state") or "").upper() == "MERGED":
+        state = str(pr.get("state") or "").upper()
+        problem = pr.get("delivery_problem")
+        if problem or state not in ("", "OPEN", "MERGED"):
+            # The engine's delivery check rejected this PR (closed, or its head is not what
+            # the run delivered): merging it is exactly the wrong move.
+            shown = state.lower() if state else "in an unknown state"
+            return [
+                _para(f"Next: do not merge yet. The PR is {shown} and delivery could not "
+                      "be verified; check the run trail first: ", Link(url)),
+                _field("Delivery problem", problem),
+            ]
+        if state == "MERGED":
             return [_para("Next: nothing; the PR is already merged: ", Link(url))]
         if pr.get("checks") == "failure":
             return [_para("Next: CI is failing on the PR. Check it, then merge: ", Link(url))]
@@ -592,19 +603,41 @@ def _gate_line(gate: object) -> Para | None:
     return _para(text + (f", filed {filed}" if filed else ""))
 
 
+def _roster_pr_status(t: Mapping[str, object]) -> str | None:
+    """A digest entry's PR, for the "what to merge" count: ``unverified`` when the engine's
+    delivery check rejected it, ``merged`` when it already landed, ``ready`` otherwise;
+    None for a task that is not completed or opened no PR. A roster without the check's
+    verdict (an older payload) counts as ready, as it always did."""
+    if t.get("state") != "completed" or not _url(t.get("pr_url")):
+        return None
+    if t.get("delivery_verified") is False:
+        return "unverified"
+    if str(t.get("pr_state") or "").upper() == "MERGED":
+        return "merged"
+    return "ready"
+
+
 def _run_sections(p: Mapping[str, object]) -> list[Section | None]:
     """run_finalized: the batch digest — headline numbers, then one entry per task."""
     roster = [t for t in _list(p.get("tasks")) if isinstance(t, dict)]
-    ready = [t for t in roster if t.get("state") == "completed" and _url(t.get("pr_url"))]
+    statuses = [_roster_pr_status(t) for t in roster]
+    ready = statuses.count("ready")
+    unverified = statuses.count("unverified")
     head: list[Block | None] = [
         _field("Duration", _duration(p.get("duration_s")) if "duration_s" in p else None),
         _field("Cost", _money(p.get("cost"))),
         _gate_line(p.get("integration_gate")),
-        _para(f"Next: review and merge the {len(ready)} PR(s) below.") if ready else None,
+        _para(f"Next: review and merge the {ready} PR(s) below.") if ready else None,
+        _para(f"Check first: {unverified} PR(s) failed the delivery check; do not merge "
+              "them before reading the run trail.") if unverified else None,
     ]
     entries: list[tuple[Inline, ...]] = []
-    for t in roster:
+    for t, status in zip(roster, statuses, strict=True):
         line: list[Inline] = [f"{t.get('task_id')} {t.get('state')}"]
+        if status == "unverified":
+            line.append(" (PR delivery unverified)")
+        elif status == "merged":
+            line.append(" (PR merged)")
         if title := t.get("title"):
             line.append(f" — {title}")
         if cost := _money_cell(t.get("cost")):

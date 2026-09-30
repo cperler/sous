@@ -423,6 +423,14 @@ _PLAN_UNRUN_STATUSES = frozenset({
 # prior park would treat a settled park→resume pair as an interrupted episode.
 _SUPERVISOR_LIFECYCLE_EVENTS = frozenset({"supervisor_parked", "supervisor_resumed"})
 
+# The #378 completion-PR evidence receipts; the latest one per task is its delivery verdict.
+_PR_EVIDENCE_EVENTS = frozenset({
+    "completion_pr_validated",
+    "completion_pr_invalid",
+    "completion_pr_unverified",
+    "completion_pr_validation_skipped",
+})
+
 # Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
 # rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
 # is too noisy to act on, so the band falls back to the flat downgrade_threshold (today's
@@ -6674,12 +6682,7 @@ class Engine:
             task_id = str(ev.get("task_id") or "unknown")
             if kind in ("completion_note_failed", "completion_note_published"):
                 latest[task_id] = ev
-            elif kind in (
-                "completion_pr_validated",
-                "completion_pr_invalid",
-                "completion_pr_unverified",
-                "completion_pr_validation_skipped",
-            ):
+            elif kind in _PR_EVIDENCE_EVENTS:
                 latest_delivery[task_id] = ev
             elif kind == "task_completed" and ev.get("pr_url"):
                 completed_with_pr[task_id] = str(ev["pr_url"])
@@ -7242,7 +7245,9 @@ class Engine:
 
         Returns the described PR (None when there is no PR, no hook, or the read failed) so
         the completion alert reuses this one read for its PR summary (#524) instead of
-        calling the tracker a second time.
+        calling the tracker a second time. The return carries ``delivery_problem`` — the
+        joined invalidity reasons, or None when the PR validated — so the alert never says
+        "merge" for a PR this check rejected.
 
         OPEN is valid only for the task branch (and, when a DELIVER checkpoint exists, its
         exact head). MERGED is valid only when GitHub's preserved PR head SHA equals the
@@ -7306,7 +7311,11 @@ class Engine:
         if reasons:
             payload.update({"level": "warning", "error": "; ".join(reasons)})
         self.store.append_event(run_id, payload)
-        return info if isinstance(info, dict) else None
+        if not isinstance(info, dict):
+            return None
+        # The alert must not tell the reader to merge a PR this check just judged invalid
+        # (closed, head mismatch): the verdict travels with the described PR.
+        return {**info, "delivery_problem": "; ".join(reasons) or None}
 
     def _followup_cap(self, run_id: str, task: Task) -> int:
         """How many issues THIS task may file from one evidence-out pass (#191/#196).
@@ -8792,7 +8801,9 @@ class Engine:
     def _finalize_roster(self, run: Run) -> list[dict]:
         """Per-task roster for the ``run_finalized`` alert (#359): ``{task_id, state, title,
         pr_url, issue_number, issue_url, cost}`` per task, in run order (the last three
-        added by #524 so the digest links each task's issue and shows what it cost).
+        added by #524 so the digest links each task's issue and shows what it cost). A task
+        with a #378 PR-evidence receipt also carries ``pr_state`` and ``delivery_verified``,
+        so the digest counts only verified, unmerged PRs as ready to merge.
 
         ``TaskRef`` carries only the state cache, so the PR url and title come from the task
         DOCS — N reads, taken once at the single finalize transition (the same path already
@@ -8803,6 +8814,13 @@ class Engine:
         rows: list[dict] = []
         with contextlib.suppress(Exception):
             rows = self.run_rows(run.run_id)
+        # The latest #378 PR-evidence receipt per task, so the digest can tell a PR that is
+        # ready to merge from one already merged or one whose delivery failed validation.
+        evidence: dict[str, dict] = {}
+        with contextlib.suppress(Exception):
+            for ev in self.store.read_events(run.run_id):
+                if ev.get("type") in _PR_EVIDENCE_EVENTS:
+                    evidence[str(ev.get("task_id"))] = ev
         for ref in run.task_refs:
             entry: dict = {"task_id": ref.task_id, "state": ref.state.value,
                            "title": None, "pr_url": None, "issue_number": None,
@@ -8814,6 +8832,9 @@ class Engine:
                 entry["issue_number"] = task.issue_number
             with contextlib.suppress(Exception):
                 entry["cost"] = cost_rollup([r for r in rows if r.get("task_id") == ref.task_id])
+            if receipt := evidence.get(ref.task_id):
+                entry["pr_state"] = receipt.get("state")
+                entry["delivery_verified"] = receipt.get("type") == "completion_pr_validated"
             roster.append(entry)
         return roster
 
