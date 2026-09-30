@@ -42,6 +42,10 @@ On kinds: the default is to mail EVERYTHING. The human-gate kinds (``task_blocke
 batch until someone acts — so opting them out is a deliberate choice, not the default. Set
 the allowlist to narrow it (e.g. ``task_completed,task_failed``).
 
+For a large batch, a digest that keeps the one end-of-run summary and every alert that needs
+action, but drops the per-task completion mails, is the allowlist without ``task_completed``:
+``run_finalized,task_failed,task_blocked,run_blocked,run_paused,task_stale``.
+
 What a mail says (#524). Each fact appears once, decision first:
 
 * The SUBJECT carries the outcome, the task id, its title and the PR number
