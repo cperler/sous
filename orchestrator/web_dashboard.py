@@ -150,9 +150,7 @@ def _task_detail(run_root: Path, task: str) -> dict:
     files = []
     for p in sorted(d.iterdir(), key=lambda p: p.name):
         # Only serve known stage-file names that are regular files; check symlink safety.
-        if not _STAGE_FILE_RE.fullmatch(p.name) or not p.is_file():
-            continue
-        if p.resolve().parent != d:  # Symlink leading outside is refused.
+        if not _STAGE_FILE_RE.fullmatch(p.name) or not p.is_file() or p.resolve().parent != d:
             continue
         files.append({"name": p.name, "size": p.stat().st_size})
     return {"files": files, "review": _review_findings(d)}
