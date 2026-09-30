@@ -10,9 +10,9 @@ each run lives in its own ``runs/<run_id>/`` StatusStore root (``status-<run_id>
 ``events.jsonl`` + ``stage-costs.jsonl`` + ``stages/``), and ``Engine.status`` already
 computes per-task state / staleness / in-flight activity + the cost + budget blocks. This
 module discovers the run dirs, folds each run's ``status()`` into a compact row, lifts the
-"needs a human" items (blocked-on-human, supervisor-parked, paused, stale,
+"needs a human" items (blocked-on-human, supervisor-parked, paused, failed task, stale,
 budget-exhausted, unreadable, adapter-unresolved) into a top ATTENTION band — each carrying
-the commands that resolve it — and renders it. Each row also carries the per-task, driver,
+the commands that resolve it — and renders it (the console layout is ``dashboard_render``). Each row also carries the per-task, driver,
 cost-breakdown and recent-event detail both the console and the web view read (#525).
 
 The engine is never touched for model work: the dashboard only *reads*. The ``Engine`` used
@@ -49,7 +49,6 @@ from .driver_log import (
     STATE_WAITING_CAPACITY,
     STATE_WAITING_COOLDOWN,
 )
-from .render import aggregate_cost_cell
 from .runs_layout import iter_run_dirs
 from .schemas.enums import TERMINAL_RUN_STATES, TERMINAL_TASK_STATES
 from .stream_probe import find_current_stream
@@ -85,12 +84,14 @@ _ATTENTION_RANK = {
     "blocked_on_human": 0,
     "parked": 1,
     "paused": 2,
-    "budget_exhausted": 3,
-    "unreadable": 4,
+    # #525: a task that failed outright waits on a human to look, re-file or retry it.
+    "failed": 3,
+    "budget_exhausted": 4,
+    "unreadable": 5,
     # #386: a run whose project adapter will not load is as unreadable as a corrupt doc —
     # the board can name it but can say nothing about its state.
-    "adapter_unresolved": 5,
-    "stale": 6,
+    "adapter_unresolved": 6,
+    "stale": 7,
 }
 
 
@@ -368,14 +369,21 @@ UNREADABLE_STATE = "<unreadable>"
 ADAPTER_UNRESOLVED_STATE = "<adapter-unresolved>"
 
 
+def _first_line(text: str | None) -> str | None:
+    """The first line of ``text``, capped at ``_ERROR_MESSAGE_CAP`` so it fits a board line;
+    None for empty text."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return None
+    line = stripped.splitlines()[0]
+    return line[: _ERROR_MESSAGE_CAP - 1] + "…" if len(line) > _ERROR_MESSAGE_CAP else line
+
+
 def _error_info(exc: BaseException) -> dict:
     """The type and message of the exception that degraded a row (#498). Before this the
     catch discarded it, so a transient failure on a healthy run was undiagnosable after the
     fact. Only the first line of the message is kept, capped, so it fits a board line."""
-    message = str(exc).strip().splitlines()[0] if str(exc).strip() else ""
-    if len(message) > _ERROR_MESSAGE_CAP:
-        message = message[: _ERROR_MESSAGE_CAP - 1] + "…"
-    return {"type": type(exc).__name__, "message": message}
+    return {"type": type(exc).__name__, "message": _first_line(str(exc)) or ""}
 
 
 def _error_text(error: dict | None) -> str | None:
@@ -669,6 +677,9 @@ def _stage_progress(task: Task, stage_costs: dict, *, now_epoch: float) -> list[
                 "calls": calls,
                 "unmetered_calls": unmetered,
                 "duration_s": duration,
+                # What a failed stage reported, first line only (#525) — the cause the
+                # "needs you" band prints for a failed task.
+                "error": _first_line(rec.error),
             }
         )
     return out
@@ -1024,6 +1035,29 @@ def _run_row(
         stall_after_s=stall_after_s,
         now_epoch=now_epoch,
     )
+    # A task that FAILED needs a human to look at it (#525): nothing else re-dispatches it.
+    # Named by the stage that failed and what that stage reported; the one command offered
+    # is the status read that shows the rest, since the fix is a judgement, not a verb.
+    for task in task_details:
+        if task["state"] != "failed":
+            continue
+        failed = next((s for s in reversed(task["stages"]) if s["status"] == "failed"), None)
+        flags.append(f"failed:{task['task_id']}")
+        attention_items.append(
+            {
+                "kind": "failed",
+                "run_id": loc.run_id,
+                "task_id": task["task_id"],
+                "stage": failed["stage"] if failed else task["current_stage"],
+                "reason": (failed or {}).get("error") or "the stage reported no error text",
+                "commands": [
+                    {
+                        "label": "status — see which stage failed and why",
+                        "command": f"{_cli_base(root, loc.run_id)} status",
+                    }
+                ],
+            }
+        )
 
     return {
         **base,
@@ -1061,22 +1095,12 @@ def _run_row(
 #
 # Snapshot layout (#525 design pass). Both views read this one structure, ordered by the
 # questions an operator asks: does anything need me / what is running now / how far along
-# / what has it cost / what happened. Mocks, then the fields each element reads.
+# / what has it cost / what happened. Layouts, then the fields each element reads.
 #
-# Console, compact (narrow terminal):
-#   NEEDS YOU (2)
-#     ! batch-7  #512 blocked at REVIEW: needs an API that does not exist
-#         approve: orchestrator --root … --run batch-7 approve --task '#512' --by "$USER"
-#     ! batch-6  paused: 3 consecutive failures      unpause: orchestrator … unpause
-#   RUNNING  sous: batch-7  driver alive, running stages     3/5  ≥$4.10 (1 unmetered)
-#     #514 Fix the flaky gate   IMPLEMENT 12m  opus  stream active (8s)
-#     #515 Add the CSV export   waiting on #514
-#   RECENT   14:02 #514: started IMPLEMENT on opus · 13:58 #512: blocked at REVIEW …
-#
-# Console, wide: the same bands, plus per task the stage strip and per-stage cost —
-#     #514 Fix the flaky gate  PR —  intake ✓ scope ✓ implement ▶ test · review · deliver
-#                              $0.00 · $0.40 · $1.90 (running 12m) · — · — · —
-#   and a COST band per run: by stage, by task, tokens in/out, unmetered counts.
+# Console: rendered by ``dashboard_render`` in that question order, COMPACT below 100
+#   columns (one line per run, running tasks only, per-run cost only) and WIDE otherwise
+#   (every task's stage strip, cost per task and stage). Both layouts are pinned as golden
+#   text in tests/test_dashboard_render.py, which is the place to read them.
 #
 # Web: header (projects, usage, board spend) → attention cards with copy-able commands →
 #   one card per run (driver line, progress, cost) with a collapsible task table (stage
@@ -1090,7 +1114,7 @@ def _run_row(
 #                             current_stage, stage_age_s, model, activity.{state,
 #                             seconds_since_event, line}, depends_on, waiting_on}
 #   stage strip               runs[].tasks[].stages[].{stage, status, attempt, cost_usd,
-#                             metered, unmetered_calls, duration_s}
+#                             metered, unmetered_calls, duration_s, error}
 #   cost band                 runs[].cost_breakdown.{cost_usd, calls, unmetered_calls,
 #                             input_tokens, output_tokens, by_task{}, by_stage{}}
 #   timeline                  runs[].recent_events[].{ts, task_id, level, sentence}
@@ -1300,21 +1324,6 @@ def _project_groups(rows: list[dict]) -> list[dict]:
 # --- rendering --------------------------------------------------------------------------
 
 
-def _state_icon(state: str) -> str:
-    return {
-        "running": "*",
-        "paused": "!",
-        "parked": "!",
-        "completed": "+",
-        "completed_with_rejections": "~",
-        "superseded": "=",  # #257: retired by a human, not run to a conclusion
-        "failed": "x",
-        "pending": "-",
-        UNREADABLE_STATE: "?",
-        ADAPTER_UNRESOLVED_STATE: "?",
-    }.get(state, "-")
-
-
 def _progress_str(progress: dict) -> str:
     total = progress.get("total", 0)
     # "done" = every terminal, non-pending-on-a-human outcome: shipped, deliberately
@@ -1328,155 +1337,16 @@ def _progress_str(progress: dict) -> str:
     return f"{done}/{total}"
 
 
-def _fmt_age(secs: float | None) -> str:
-    if secs is None:
-        return "?"
-    if secs < 90:
-        return f"{int(secs)}s"
-    if secs < 5400:
-        return f"{int(secs // 60)}m"
-    return f"{int(secs // 3600)}h"
+def render_dashboard(snapshot: dict, *, width: int | None = None) -> str:
+    """Render a snapshot as the plain-text console board (#525): needs you → running now →
+    progress → cost → recent. ``width`` is the terminal's column count: below
+    ``dashboard_render.WIDE_MIN_COLUMNS`` the board is COMPACT (one line per run, running
+    tasks only, no per-stage cost table); at or above it, or when None, it is the fuller
+    wide board. The rendering lives in ``dashboard_render`` (imported here lazily, since it
+    reads this module's state markers) — this name is the stable entry point."""
+    from .dashboard_render import render_board
 
-
-def _render_attention_item(item: dict) -> str:
-    kind = item["kind"]
-    run = item["run_id"]
-    if kind == "blocked_on_human":
-        return f"  ! [{run}] {item['task_id']} BLOCKED_ON_HUMAN — {item.get('reason')}"
-    if kind == "paused":
-        return f"  ! [{run}] PAUSED — {item.get('reason')}"
-    if kind == "parked":
-        command = item.get("resume_command") or "start a fresh interactive supervisor"
-        reason = item.get("reason") or "supervisor context exhausted"
-        return f"  ! [{run}] PARKED — needs a fresh supervisor ({reason}); resume: {command}"
-    if kind == "budget_exhausted":
-        frac = item.get("fraction")
-        pct = f"{frac * 100:.0f}%" if isinstance(frac, (int, float)) else "?"
-        return f"  ! [{run}] BUDGET EXHAUSTED — metered spend at {pct} of budget"
-    if kind == "stale":
-        secs = item.get("seconds_since_update")
-        ago = _fmt_age(secs) if isinstance(secs, (int, float)) else "?"
-        return f"  ! [{run}] {item.get('task_id')} STALE — no update for {ago} (stage {item.get('stage')})"
-    if kind == "unreadable":
-        # #498: name the cause. "Inspect by hand" alone sent the operator to status docs
-        # that were usually fine; the caught exception is what says what actually failed.
-        cause = _error_text(item.get("error")) or item.get("reason")
-        return f"  ! [{run}] UNREADABLE status — {cause or f'inspect runs/{run}/ by hand'}"
-    if kind == "adapter_unresolved":
-        return f"  ! [{run}] PROJECT ADAPTER UNRESOLVED — {item.get('reason')}"
-    return f"  ! [{run}] {kind}"  # pragma: no cover - defensive
-
-
-def _degraded_marker(row: dict) -> str:
-    """The state cell of a degraded row (#498): what went wrong, not a blanket
-    "unreadable" — an adapter that will not resolve says so, and a status read that raised
-    names its exception."""
-    if row.get("state") == ADAPTER_UNRESOLVED_STATE:
-        return "<adapter unresolved>"
-    cause = _error_text(row.get("error"))
-    return f"<unreadable status: {cause}>" if cause else "<unreadable status>"
-
-
-def render_dashboard(snapshot: dict) -> str:
-    """Render a snapshot to a compact, plain-text board: a global header, a top "needs you"
-    band (empty → an all-quiet line), then one line per run with indented in-flight lines."""
-    header = snapshot["header"]
-    attention = snapshot["attention"]
-    runs = snapshot["runs"]
-    lines: list[str] = []
-
-    # --- header ---
-    counts = header["counts"]
-    if header["all_quiet"]:
-        done = (
-            counts.get("completed", 0)
-            + counts.get("completed_with_rejections", 0)
-            + counts.get("superseded", 0)  # #257
-        )
-        lines.append(f"ALL QUIET — {header['running']} running, {done} done")
-    else:
-        lines.append(f"ATTENTION — {header['attention_count']} item(s) need you")
-
-    usage = header.get("usage")
-    if usage and usage.get("five_hour_pct") is not None:
-        # #386: the probe reads the ACCOUNT's window, and the board now spans projects that
-        # share it. Say "account" so the number is not misread as this root's own capacity.
-        lines.append(
-            f"usage (account): 5h {usage['five_hour_pct']:.0f}% / 7d "
-            f"{usage.get('seven_day_pct') or 0:.0f}%"
-        )
-    else:
-        lines.append("usage (account): unavailable")
-
-    state_bits = " ".join(f"{s}={n}" for s, n in sorted(counts.items()))
-    # #331: unmetered calls sum into total_spend_usd at $0, so an unqualified figure would
-    # understate the board's real spend while looking exact. Same honesty rule as
-    # cost-summary.md, in one header-width phrase.
-    unmetered = header.get("unmetered_calls") or 0
-    invocations = header.get("total_invocations") or 0
-    if unmetered and invocations and unmetered >= invocations:
-        spend_str = f"n/a — all {unmetered} call(s) unmetered"
-    elif unmetered:
-        spend_str = (
-            f"≥${header['total_spend_usd']:.4f} "
-            f"({unmetered} unmetered call(s) of unknown cost excluded)"
-        )
-    else:
-        spend_str = f"${header['total_spend_usd']:.4f}"
-    lines.append(f"spend: {spend_str} across {header['shown']} run(s)  |  {state_bits}")
-    # The board is the one place two pricing regimes get added together. Say it in the
-    # header rather than letting a ~20x-overstated legacy run inflate a total silently.
-    legacy_runs = header.get("legacy_accounting_runs") or 0
-    if legacy_runs:
-        lines.append(
-            f"  ⚠️ {legacy_runs} run(s) priced under the pre-#350 regime "
-            f"({header.get('legacy_accounting_rows') or 0} row(s)) — overstated ~20x, "
-            f"not comparable with the rest; the total above is inflated by them"
-        )
-
-    # --- attention band ---
-    if attention:
-        lines.append("")
-        lines.append("── needs you ──")
-        lines.extend(_render_attention_item(it) for it in attention)
-
-    # --- runs ---
-    lines.append("")
-    lines.append("── runs ──")
-    if not runs:
-        lines.append("  (no runs found)")
-    # #386: the project column is what disambiguates a board holding several projects'
-    # runs. Sized to the widest label present so a single-project board stays narrow.
-    proj_w = min(max((len(str(r.get("project") or "?")) for r in runs), default=1), 18)
-    for row in runs:
-        icon = _state_icon(row["state"])
-        project = str(row.get("project") or "?")[:proj_w]
-        if row.get("degraded") or row.get("unreadable"):
-            flags = f"  [{', '.join(row['flags'])}]" if row["flags"] else ""
-            lines.append(
-                f"  {icon} {row['run_id']:<24} {project:<{proj_w}} {_degraded_marker(row)}"
-                f"{flags}"
-            )
-            continue
-        # #331: `≥$X` / `n/a (unmetered)` rather than a bare figure when this run's spend is
-        # partly or wholly unknown; `$?` stays the marker for "no cost data at all".
-        cost = row.get("cost_usd")
-        cost_str = (
-            aggregate_cost_cell(
-                cost, row.get("unmetered_calls") or 0, row.get("total_invocations") or 0
-            )
-            if isinstance(cost, (int, float))
-            else "$?"
-        )
-        flags = f"  [{', '.join(row['flags'])}]" if row["flags"] else ""
-        age = _fmt_age(row.get("last_event_age_s"))
-        lines.append(
-            f"  {icon} {row['run_id']:<24} {project:<{proj_w}} {row['state']:<26} "
-            f"{_progress_str(row['progress']):>7}  {cost_str:>10}{flags}  (last {age} ago)"
-        )
-        for inf in row["inflight"]:
-            lines.append(f"      {inf['task_id']} · {inf['line']}")
-    return "\n".join(lines)
+    return render_board(snapshot, width=width)
 
 
 # --- watch loop -------------------------------------------------------------------------
@@ -1490,6 +1360,7 @@ def render_watch(
     clear: Callable[[], None] | None = None,
     interval: float = 30,
     max_iters: int | None = None,
+    width: int | Callable[[], int | None] | None = None,
     **snapshot_kwargs: Unpack[DashboardSnapshotKwargs],
 ) -> None:
     """Clear-screen + reprint the board every ``interval`` seconds until interrupted.
@@ -1497,14 +1368,18 @@ def render_watch(
     Mirrors the ``watch``/``tail --follow`` injected-sleeper pattern so it is drivable without
     real sleeping: ``sleeper`` is ``time.sleep`` in production and a stub in tests, and a
     ``KeyboardInterrupt`` from anywhere (Ctrl-C, or a test sleeper that raises to stop) ends the
-    loop cleanly. ``max_iters`` bounds it for tests; ``clear`` defaults to an ANSI clear."""
+    loop cleanly. ``max_iters`` bounds it for tests; ``clear`` defaults to an ANSI clear.
+
+    ``width`` picks compact or wide exactly as in :func:`render_dashboard`. It may also be a
+    callable, re-read before every repaint, so resizing the terminal mid-watch switches mode."""
     if clear is None:
         clear = lambda: emit("\x1b[2J\x1b[H")  # noqa: E731 - tiny ANSI clear
     iters = 0
     try:
         while max_iters is None or iters < max_iters:
             clear()
-            emit(render_dashboard(dashboard_snapshot(root, **snapshot_kwargs)))
+            cols = width() if callable(width) else width
+            emit(render_dashboard(dashboard_snapshot(root, **snapshot_kwargs), width=cols))
             iters += 1
             if max_iters is not None and iters >= max_iters:
                 break

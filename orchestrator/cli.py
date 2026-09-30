@@ -379,6 +379,8 @@ def main(argv: list[str] | None = None) -> int:
       ``$ORCHESTRATOR_DASHBOARD_ROOTS``) and several project adapters: each row's adapter is
       resolved from the ``project_ref`` on its own run doc, so ``--project`` is only the
       fallback for run docs written before that field existed. Both modes cover the same roots.
+      The console board picks its compact or wide layout from the terminal width (#525);
+      ``--compact`` / ``--wide`` force one.
     * **Cross-run learnings KB** (``kb show|add|prune|backfill-outcomes``) — reads/appends
       ``<runs-root>/learnings-kb.jsonl``.  The log is append-only, so ``prune`` and
       ``backfill-outcomes`` append amendment records (retire / stamp ``task_outcome``)
@@ -819,6 +821,14 @@ def main(argv: list[str] | None = None) -> int:
     db_mode.add_argument("--watch", action="store_true", help="clear-screen + reprint on a loop")
     db_mode.add_argument("--serve", action="store_true",
                          help="serve a read-only web dashboard (polls for run updates) instead of printing")
+    # #525: the console board has a compact layout (one line per run, running tasks only)
+    # and a wide one (every task's stage strip, per-stage cost), picked from the terminal
+    # width. These force one or the other.
+    db_width = db.add_mutually_exclusive_group()
+    db_width.add_argument("--wide", action="store_true",
+                          help="force the wide board (per-task stage strips and cost)")
+    db_width.add_argument("--compact", action="store_true",
+                          help="force the compact board (one line per run, running tasks only)")
     db.add_argument("--port", type=int, default=8787, help="--serve bind port")
     db.add_argument("--host", default="127.0.0.1", help="--serve bind host (default localhost only)")
     db.add_argument("--interval", type=int, default=30, help="--watch refresh interval seconds")
@@ -1136,6 +1146,16 @@ def main(argv: list[str] | None = None) -> int:
                 on_ready=lambda url: print(f"orchestrator dashboard serving at {url} (Ctrl-C to stop)"),
             )
             return 0
+        import shutil
+
+        from .dashboard_render import console_width
+
+        def width() -> int:
+            # Re-read per repaint under --watch, so a resized terminal switches layout.
+            return console_width(
+                shutil.get_terminal_size().columns, wide=args.wide, compact=args.compact
+            )
+
         if args.watch:
             import contextlib
             import time
@@ -1143,9 +1163,9 @@ def main(argv: list[str] | None = None) -> int:
             # Ctrl-C ends the loop cleanly (render_watch also swallows KeyboardInterrupt).
             with contextlib.suppress(KeyboardInterrupt):
                 render_watch(roots, emit=print, sleeper=time.sleep,
-                             interval=args.interval, **snap_kw)
+                             interval=args.interval, width=width, **snap_kw)
             return 0
-        print(render_dashboard(dashboard_snapshot(roots, **snap_kw)))
+        print(render_dashboard(dashboard_snapshot(roots, **snap_kw), width=width()))
         return 0
 
     if args.cmd == "panel-report":

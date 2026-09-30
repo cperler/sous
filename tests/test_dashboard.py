@@ -170,8 +170,9 @@ def test_supervisor_park_is_distinct_attention_not_stale(tmp_path) -> None:
     assert [item["kind"] for item in snap["attention"]] == ["parked"]
     assert not [item for item in snap["attention"] if item["kind"] == "stale"]
     out = render_dashboard(snap)
-    assert "PARKED — needs a fresh supervisor" in out
-    assert "fresh-session /orchestrate-task-interactive" in out
+    assert "! r1  PARKED — needs a fresh supervisor" in out
+    # The resume command is printed on its own line under the item, whole.
+    assert "\n        fresh-session /orchestrate-task-interactive r1 t1\n" in out
 
 
 def test_blocked_on_human_surfaced_in_attention(tmp_path) -> None:
@@ -189,6 +190,9 @@ def test_blocked_on_human_surfaced_in_attention(tmp_path) -> None:
     assert len(blocked) == 1
     assert blocked[0]["task_id"] == "t1"
     assert blocked[0]["reason"] == "needs an API that does not exist"
+    out = render_dashboard(snap)
+    assert "! r1 t1  BLOCKED at SCOPE, needs your decision — needs an API that does not exist" in out
+    assert "waiting on your decision" in out  # the task's progress line
 
 
 def test_stale_task_flagged(tmp_path) -> None:
@@ -247,7 +251,12 @@ def test_completed_with_rejections_state(tmp_path) -> None:
     assert row["state"] == "completed_with_rejections"
     assert row["terminal"] is True
     out = render_dashboard(snap)
-    assert "completed_with_rejections" in out
+    # #525: a short label, not the raw state code.
+    assert "1 run: 1 done with rejections" in out
+    progress = out.split("── progress ──")[1].split("── cost ──")[0]
+    assert "done with rejections · 1/1 done" in progress
+    assert "t1  closed" in progress
+    assert "completed_with_rejections" not in progress
 
 
 # --- attention band + header ----------------------------------------------------------
@@ -300,6 +309,13 @@ def test_attention_band_orders_blocked_and_paused_above_stale(tmp_path) -> None:
     out = render_dashboard(snap)
     assert "── needs you ──" in out
     assert out.splitlines()[0].startswith("ATTENTION")
+    # The board's sections, in the order an operator asks the questions.
+    headings = [ln for ln in out.splitlines() if ln.startswith("── ")]
+    assert headings == [
+        "── needs you ──", "── running now ──", "── progress ──", "── cost ──", "── recent ──",
+    ]
+    band = out.split("── needs you ──")[1].split("── running now ──")[0]
+    assert band.index("BLOCKED") < band.index("PAUSED") < band.index("STALE")
 
 
 # --- corrupt / partial status ---------------------------------------------------------
@@ -318,6 +334,7 @@ def test_corrupt_run_doc_is_unreadable_row_not_crash(tmp_path) -> None:
     assert row["attention"] is True
     out = render_dashboard(snap)  # must not raise
     assert "<unreadable status>" in out
+    assert "UNREADABLE status — no status-*.json in the run dir parses" in out
 
 
 def test_partial_task_doc_becomes_unreadable_row(tmp_path) -> None:
