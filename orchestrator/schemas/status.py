@@ -197,6 +197,10 @@ class Task(_StatusModel):
     spec_source_updated_at: str | None = None
     spec_fingerprint: str | None = None
     spec_refreshed_at: str | None = None
+    # The source's labels at capture (#524), snapshotted with title/body so a notification
+    # can show them without a tracker call from inside an alerting path. Additive field:
+    # pre-#524 task docs load with [] (no labels known), so no SCHEMA_VERSION bump.
+    labels: list[str] = Field(default_factory=list)
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
     # SCOPE-authored child controls (#60). ``agent_role`` is resolved through the project
     # roster at dispatch time; quality/budget remain durable provenance rather than being

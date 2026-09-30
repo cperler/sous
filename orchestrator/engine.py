@@ -104,6 +104,15 @@ from .model_table import (
     provider_for_model,
     resolve_model_alias,
 )
+from .notification_facts import (
+    cost_rollup,
+    issue_facts,
+    pr_facts,
+    review_facts,
+    run_counts,
+    run_duration_s,
+    stage_facts,
+)
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -414,6 +423,14 @@ _PLAN_UNRUN_STATUSES = frozenset({
 # from this set, so the two types must be listed together: a park that only looked for a
 # prior park would treat a settled park→resume pair as an interrupted episode.
 _SUPERVISOR_LIFECYCLE_EVENTS = frozenset({"supervisor_parked", "supervisor_resumed"})
+
+# The #378 completion-PR evidence receipts; the latest one per task is its delivery verdict.
+_PR_EVIDENCE_EVENTS = frozenset({
+    "completion_pr_validated",
+    "completion_pr_invalid",
+    "completion_pr_unverified",
+    "completion_pr_validation_skipped",
+})
 
 # Minimum ledger rows a (stage, effort) group needs before its empirical retry/failure
 # rate is trusted to move the adaptive downgrade band (#155). Below this, the observation
@@ -939,6 +956,7 @@ class Engine:
                 state=TaskState.PENDING,
                 title=spec.title,
                 body=spec.body,
+                labels=[str(label) for label in (getattr(spec, "labels", None) or [])],
                 # #271: stamp the snapshot's provenance WITH the snapshot — when it was
                 # captured, what the source called its own last-modified time, and the
                 # content fingerprint a later staleness check compares against. Written
@@ -4889,14 +4907,11 @@ class Engine:
         total like any other, so the count of unmetered calls travels WITH the figure —
         without it an alert would render a confident ``$0.0000`` for a task whose usage was
         never recoverable, which reads as "free" when the truth is "unknown"."""
-        rows = [r for r in self.run_rows(run_id) if r.get("task_id") == task_id]
-        return {
-            "usd": round(sum(r.get("cost_usd") or 0.0 for r in rows), 6),
-            "invocations": len(rows),
-            "unmetered_calls": sum(1 for r in rows if r.get("metered") is False),
-        }
+        return cost_rollup([r for r in self.run_rows(run_id) if r.get("task_id") == task_id])
 
-    def _notification_facts(self, run_id: str, task: Task) -> dict:
+    def _notification_facts(
+        self, run_id: str, task: Task, *, pr_info: dict | None = None
+    ) -> dict:
         """The shared, deterministic enrichment every per-task notification carries (#359):
         enough for a sink to render an ACTIONABLE alert — what landed, where the PR is, what
         it cost, and where the full trail lives — without the recipient re-opening `status`.
@@ -4910,11 +4925,23 @@ class Engine:
         escape. The flat fields are plain attribute reads that cannot raise; the two derived
         blocks (stage roll-up, ledger scan — the latter does file I/O) are wrapped
         individually so one failing still yields the other, and a degraded payload is EVENTED
-        rather than silently thinned (the "never silent" convention)."""
+        rather than silently thinned (the "never silent" convention).
+
+        #524 widened it so the mail says what the task was and what changed without a
+        click: the issue link, labels and a bounded excerpt of the ask (from the task doc's
+        snapshot, not a tracker call), the review outcome, per-stage model/tokens/cost, and —
+        when the caller already read the PR — a bounded PR summary. ``pr_info`` is passed in
+        rather than fetched here ON PURPOSE: only the completion path reads the PR (it
+        already does, for #378's delivery evidence), and the failure/park paths must stay
+        offline (#409), so this function never shells out to a tracker itself. The pure
+        builders live in ``notification_facts``."""
         facts: dict = {
             "task_id": task.task_id,
             "title": task.title or None,
             "issue_number": task.issue_number,
+            # Offline link via the optional source hook (#409); None thins the alert.
+            "issue_url": self._issue_url(task.task_id),
+            "labels": list(task.labels),
             "pr_url": task.pr_url,
             "pr_number": task.pr_number,
             "task_state": task.state.value,
@@ -4926,25 +4953,31 @@ class Engine:
             "run_dir": str(self.store.root),
         }
         try:
-            facts["stages"] = [
-                {
-                    "stage": stage.value,
-                    "status": rec.status.value,
-                    "attempt": rec.attempt,
-                    "model": rec.model,
-                    "error": rec.error,
-                }
-                for stage, rec in task.stages.items()
-                if rec.status is not StageStatus.PENDING
-            ]
-            review = task.stages.get(Stage.REVIEW)
-            facts["review_approved"] = (review.output or {}).get("approved") if review else None
+            issue = issue_facts(task.body)
+            facts["issue_excerpt"] = issue["excerpt"]
+            facts["issue_acceptance"] = issue["acceptance"]
+        except Exception as exc:  # noqa: BLE001 - enrichment must never break the transition
+            self._event_facts_degraded(run_id, task, "issue", exc)
+        try:
+            facts["stages"] = stage_facts(task)
         except Exception as exc:  # noqa: BLE001 - enrichment must never break the transition
             self._event_facts_degraded(run_id, task, "stages", exc)
+        try:
+            review = task.stages.get(Stage.REVIEW)
+            output = (review.output or {}) if review else {}
+            facts["review_approved"] = output.get("approved")
+            facts["review"] = review_facts(task, output)
+        except Exception as exc:  # noqa: BLE001 - enrichment must never break the transition
+            self._event_facts_degraded(run_id, task, "review", exc)
         try:
             facts["cost"] = self._task_cost_facts(run_id, task.task_id)
         except Exception as exc:  # noqa: BLE001 - a ledger read must never break the transition
             self._event_facts_degraded(run_id, task, "cost", exc)
+        if pr_info:
+            try:
+                facts["pr"] = pr_facts(pr_info)
+            except Exception as exc:  # noqa: BLE001 - enrichment must never break the transition
+                self._event_facts_degraded(run_id, task, "pr", exc)
         return facts
 
     def _event_facts_degraded(self, run_id: str, task: Task, part: str, exc: Exception) -> None:
@@ -5009,7 +5042,6 @@ class Engine:
             "hold_before": held_before,
             "gate": gate,
             "reason": reason,
-            "issue_url": self._issue_url(task.task_id),
             "actions": release_commands(
                 root=str(self.store.root), run_id=run_id, task_id=task.task_id, gate=gate
             ),
@@ -6135,6 +6167,7 @@ class Engine:
             applied_diff = spec_diff_summary(t.title, t.body, new_title, new_body)
             t.title = new_title
             t.body = new_body
+            t.labels = [str(label) for label in (getattr(spec, "labels", None) or [])]
             t.spec_fingerprint = new_fingerprint
             t.spec_source_updated_at = source_updated_at
             # ``spec_captured_at`` moves too: it dates the copy the prompts render from,
@@ -6659,12 +6692,7 @@ class Engine:
             task_id = str(ev.get("task_id") or "unknown")
             if kind in ("completion_note_failed", "completion_note_published"):
                 latest[task_id] = ev
-            elif kind in (
-                "completion_pr_validated",
-                "completion_pr_invalid",
-                "completion_pr_unverified",
-                "completion_pr_validation_skipped",
-            ):
+            elif kind in _PR_EVIDENCE_EVENTS:
                 latest_delivery[task_id] = ev
             elif kind == "task_completed" and ev.get("pr_url"):
                 completed_with_pr[task_id] = str(ev["pr_url"])
@@ -7114,7 +7142,7 @@ class Engine:
         optimize_refs: list[dict] = []
         note_md: str | None = None
         ts = self.project.task_source
-        self._record_completion_pr_evidence(run_id, task, ts)
+        pr_info = self._record_completion_pr_evidence(run_id, task, ts)
         try:
             if task.pr_url or task.decomposition_children:
                 ts.mark_complete(task.task_id, task.pr_url)
@@ -7159,7 +7187,14 @@ class Engine:
             # marking complete / filing follow-ups must not also cost us the note. Both
             # inputs default to empty/None, so a block-1 failure still yields a valid — if
             # thinner — note rather than none at all.
-            note_md = render_completion_note(task, followups, improvement_ref, optimize_refs)
+            # The ledger roll-up for the note's Total line is the same figure the alert's
+            # ``cost`` block carries (#524), so the note and the mail quote one number.
+            cost_total: dict | None = None
+            with contextlib.suppress(Exception):
+                cost_total = self._task_cost_facts(run_id, task.task_id)
+            note_md = render_completion_note(
+                task, followups, improvement_ref, optimize_refs, cost_total
+            )
             self._publish_completion_note(run_id, task, ts, note_md, followups)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
@@ -7189,11 +7224,24 @@ class Engine:
             summary += f" — {task.title}"
         if task.pr_url:
             summary += f" ({task.pr_url})"
+        if task.pr_url and pr_info is None:
+            # The PR exists but could not be described (no hook, or the read failed and was
+            # evented as completion_pr_*): the mail goes out without its PR summary, and the
+            # trail says why it is thinner than it could be.
+            self._event_facts_degraded(
+                run_id, task, "pr",
+                RuntimeError("PR could not be described; see the completion_pr_* event"),
+            )
         self.emit_notification(
             run_id, NOTIFY_TASK_COMPLETED,
-            {**self._notification_facts(run_id, task),
+            {**self._notification_facts(run_id, task, pr_info=pr_info),
              "run_id": run_id, "task_id": task.task_id, "kind": NOTIFY_TASK_COMPLETED,
              "summary": summary,
+             # #524: WHAT was filed, not only how many — a mail that says "3 follow-ups"
+             # still sends the reader to the tracker to find them.
+             "followups": [
+                 {"title": f.get("title"), "ref": f.get("ref")} for f in followups
+             ],
              "followups_filed": len(followups),
              "improvement_ref": improvement_ref,
              "optimize_suggestion_refs": [r["ref"] for r in optimize_refs if r.get("ref")],
@@ -7202,8 +7250,14 @@ class Engine:
 
     def _record_completion_pr_evidence(
         self, run_id: str, task: Task, task_source: object
-    ) -> None:
+    ) -> dict | None:
         """Best-effort live proof that ``task.pr_url`` actually delivered this head (#378).
+
+        Returns the described PR (None when there is no PR, no hook, or the read failed) so
+        the completion alert reuses this one read for its PR summary (#524) instead of
+        calling the tracker a second time. The return carries ``delivery_problem`` — the
+        joined invalidity reasons, or None when the PR validated — so the alert never says
+        "merge" for a PR this check rejected.
 
         OPEN is valid only for the task branch (and, when a DELIVER checkpoint exists, its
         exact head). MERGED is valid only when GitHub's preserved PR head SHA equals the
@@ -7212,7 +7266,7 @@ class Engine:
         completion audit non-clean instead of letting ``undelivered: 0`` lie.
         """
         if not task.pr_url:
-            return
+            return None
         describe_pr = getattr(task_source, "describe_pr", None)
         if not callable(describe_pr):
             error = "task source has no PR lifecycle hook"
@@ -7223,7 +7277,7 @@ class Engine:
                  "task_id": task.task_id, "pr_url": task.pr_url,
                  "reason": error, "error": error},
             )
-            return
+            return None
         expected_ref = str((task.context or {}).get("branch") or "")
         checkpoint = task.last_checkpoint if isinstance(task.last_checkpoint, dict) else {}
         expected_sha = str(checkpoint.get("sha") or "")
@@ -7237,7 +7291,7 @@ class Engine:
                  "expected_head_ref": expected_ref or None,
                  "expected_head_sha": expected_sha or None, "error": str(exc)},
             )
-            return
+            return None
         state = str(info.get("state") or "").upper()
         head_ref = str(info.get("head_ref") or "")
         head_sha = str(info.get("head_sha") or "")
@@ -7267,6 +7321,11 @@ class Engine:
         if reasons:
             payload.update({"level": "warning", "error": "; ".join(reasons)})
         self.store.append_event(run_id, payload)
+        if not isinstance(info, dict):
+            return None
+        # The alert must not tell the reader to merge a PR this check just judged invalid
+        # (closed, head mismatch): the verdict travels with the described PR.
+        return {**info, "delivery_problem": "; ".join(reasons) or None}
 
     def _followup_cap(self, run_id: str, task: Task) -> int:
         """How many issues THIS task may file from one evidence-out pass (#191/#196).
@@ -8753,7 +8812,10 @@ class Engine:
 
     def _finalize_roster(self, run: Run) -> list[dict]:
         """Per-task roster for the ``run_finalized`` alert (#359): ``{task_id, state, title,
-        pr_url}`` per task, in run order.
+        pr_url, issue_number, issue_url, cost}`` per task, in run order (the last three
+        added by #524 so the digest links each task's issue and shows what it cost). A task
+        with a #378 PR-evidence receipt also carries ``pr_state`` and ``delivery_verified``,
+        so the digest counts only verified, unmerged PRs as ready to merge.
 
         ``TaskRef`` carries only the state cache, so the PR url and title come from the task
         DOCS — N reads, taken once at the single finalize transition (the same path already
@@ -8761,15 +8823,55 @@ class Engine:
         finalize must never be broken by an unreadable task doc, so an unloadable task
         degrades to its ref-level facts rather than losing the whole roster."""
         roster: list[dict] = []
+        rows: list[dict] = []
+        with contextlib.suppress(Exception):
+            rows = self.run_rows(run.run_id)
+        # The latest #378 PR-evidence receipt per task, so the digest can tell a PR that is
+        # ready to merge from one already merged or one whose delivery failed validation.
+        evidence: dict[str, dict] = {}
+        with contextlib.suppress(Exception):
+            for ev in self.store.read_events(run.run_id):
+                if ev.get("type") in _PR_EVIDENCE_EVENTS:
+                    evidence[str(ev.get("task_id"))] = ev
         for ref in run.task_refs:
-            entry = {"task_id": ref.task_id, "state": ref.state.value,
-                     "title": None, "pr_url": None}
+            entry: dict = {"task_id": ref.task_id, "state": ref.state.value,
+                           "title": None, "pr_url": None, "issue_number": None,
+                           "issue_url": self._issue_url(ref.task_id), "cost": None}
             with contextlib.suppress(Exception):
                 task = self.store.load_task(run.run_id, ref.task_id)
                 entry["title"] = task.title or None
                 entry["pr_url"] = task.pr_url
+                entry["issue_number"] = task.issue_number
+            with contextlib.suppress(Exception):
+                entry["cost"] = cost_rollup([r for r in rows if r.get("task_id") == ref.task_id])
+            if receipt := evidence.get(ref.task_id):
+                entry["pr_state"] = receipt.get("state")
+                entry["delivery_verified"] = receipt.get("type") == "completion_pr_validated"
             roster.append(entry)
         return roster
+
+    def _finalize_run_facts(self, run: Run) -> dict:
+        """The ``run_finalized`` headline block (#524): ``counts`` (tasks per state plus
+        total), ``duration_s`` (run creation to now) and ``cost`` (the whole run's ledger
+        roll-up, unmetered count alongside per #319). Each part is guarded on its own and a
+        failed one is evented, because this runs inside the finalize transition."""
+        facts: dict = {}
+        for part, build in (
+            ("counts", lambda: run_counts(run)),
+            ("duration_s", lambda: run_duration_s(run.created_at, _now())),
+            ("cost", lambda: cost_rollup(self.run_rows(run.run_id))),
+        ):
+            try:
+                facts[part] = build()
+            except Exception as exc:  # noqa: BLE001 - finalize must never break on enrichment
+                with contextlib.suppress(Exception):
+                    self.store.append_event(
+                        run.run_id,
+                        {"ts": _now(), "type": "notification_facts_degraded",
+                         "run_id": run.run_id, "task_id": None, "part": part,
+                         "error": str(exc)},
+                    )
+        return facts
 
     def _maybe_finalize_run(self, run_id: str) -> None:
         """Finalize the run once every task is terminal (multi-task aware)."""
@@ -8845,6 +8947,8 @@ class Engine:
                  # nothing about which of N tasks shipped.
                  "run_dir": str(self.store.root),
                  "tasks": self._finalize_roster(run),
+                 # #524: the run-level headline — states, wall time, and total spend.
+                 **self._finalize_run_facts(run),
                  "integration_gate": {
                      "green": integration_gate.get("green"),
                      "failing": integration_gate.get("failing", []),

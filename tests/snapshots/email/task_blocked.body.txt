@@ -1,0 +1,30 @@
+Held before: deliver
+Gate: before:deliver
+Reason: meta-authoring task held before DELIVER for a human read
+ACTION NEEDED — this run is parked until you release it:
+  approve — release the gate and continue
+    orchestrator approve batch-7 '#524' --by <you>
+  reject — close the task as infeasible
+    orchestrator reject batch-7 '#524' --reason '<why>'
+
+ISSUE
+Link: https://github.com/acme/widgets/issues/524
+Labels: enhancement, ux
+The completion emails are useful, but the body repeats itself and says less than it could.
+Acceptance:
+- A sample email shows the issue summary and PR diffstat.
+- Snapshot tests for each kind.
+
+REVIEW
+Verdict: approved
+
+STAGES AND COST
+Stage   Status     Model             Effort     In   Out         Cost    Time
+------  ---------  ----------------  ------  -----  ----  -----------  ------
+intake  completed  —                 —           —     —  $0 (engine)      1s
+scope   completed  claude-fable-5-1  high    88.0k  3.1k      $0.4200  1m 35s
+Total: $0.4200 over 1 model call(s)
+
+TRAIL
+Run batch-7, 1 review cycle(s).
+Full trail: /Users/me/Development/runs/widgets/2026-09-30/batch-7

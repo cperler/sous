@@ -57,6 +57,11 @@ class FakeTaskSource:
         self.pr_info: dict = {
             "state": "OPEN", "head_ref": "issue-42", "head_sha": None,
             "base_ref": "main",
+            # The #524 alert summary a real source returns from the same read.
+            "number": 1234, "title": "Fake PR", "additions": 12, "deletions": 3,
+            "changed_files": 1, "files": [{"path": "a.py", "additions": 12, "deletions": 3}],
+            "commits": [{"sha": "abc123def456", "title": "Do it"}],
+            "review_decision": None, "checks": "success", "merged_at": None, "draft": False,
         }
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:

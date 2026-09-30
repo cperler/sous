@@ -1,0 +1,1 @@
+[orchestrator] COMPLETED #524 — Rework completion emails (PR #530)

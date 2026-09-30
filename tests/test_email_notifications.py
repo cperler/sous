@@ -24,6 +24,7 @@ from adapters.project.email_sink import (
     config_from_env,
     email_sink_from_env,
     render_body,
+    render_html,
     render_subject,
 )
 from adapters.project.selfhost.config import SelfHostConfig
@@ -176,6 +177,137 @@ def test_run_finalized_carries_per_task_roster(tmp_path) -> None:
     roster = {t["task_id"]: t for t in final["tasks"]}
     assert roster["t1"]["state"] == TaskState.COMPLETED.value
     assert roster["t1"]["pr_url"] == "https://github.com/x/y/pull/1234"
+    # #524: the digest headline — per-state counts, wall time, whole-run spend — and a
+    # per-task issue number and cost, so one mail answers "what did this batch do".
+    assert roster["t1"]["issue_number"] == 42
+    assert roster["t1"]["cost"]["invocations"] > 0
+    assert final["counts"] == {"completed": 1, "total": 1}
+    assert final["duration_s"] >= 0
+    assert final["cost"]["usd"] == roster["t1"]["cost"]["usd"]
+    assert "unmetered_calls" in final["cost"]
+
+
+def test_completed_payload_carries_issue_pr_review_and_stage_detail(tmp_path) -> None:
+    """#524: enough to judge the task without opening the tracker — the ask, what changed
+    on the PR, the review outcome, and per-stage model/tokens/cost."""
+    project, calls = _recording_project()
+    project.task_source.issue_url = lambda tid: f"https://example.test/issues/{tid}"
+    project.task_source.spec_overrides["t1"] = {
+        "labels": ["enhancement", "ux"],
+        "body": "## Problem\nThe mails repeat themselves.\n\n## Acceptance\n- no repeats",
+    }
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _drive(eng)
+
+    payload = next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)
+    assert payload["issue_url"] == "https://example.test/issues/t1"
+    assert payload["labels"] == ["enhancement", "ux"]
+    assert payload["issue_excerpt"] == "The mails repeat themselves."
+    assert payload["issue_acceptance"] == "- no repeats"
+
+    # The PR summary comes from the SAME describe_pr read as #378's delivery evidence.
+    pr = payload["pr"]
+    assert pr["title"] == "Fake PR" and pr["checks"] == "success"
+    assert (pr["additions"], pr["deletions"], pr["changed_files"]) == (12, 3, 1)
+    assert pr["files"] == [{"path": "a.py", "additions": 12, "deletions": 3}]
+    assert pr["commits"] == [{"sha": "abc123def456", "title": "Do it"}]
+
+    assert payload["review"]["approved"] is True
+    assert payload["review"]["cycles"] == 0
+    implement = next(s for s in payload["stages"] if s["stage"] == Stage.IMPLEMENT.value)
+    assert {"model", "effort", "lane", "input_tokens", "output_tokens", "cost_usd",
+            "metered", "duration_s"} <= set(implement)
+    assert payload["followups"] == []
+
+    # The note mailed is the note published, and it now carries the ledger total — the
+    # same figure as the payload's cost block, so the two cannot disagree.
+    assert f"${payload['cost']['usd']:.4f}" in payload["note_md"]
+    assert "**Total:**" in payload["note_md"]
+
+
+def test_labels_are_snapshotted_and_refreshed_with_the_spec(tmp_path) -> None:
+    project, _calls = _recording_project()
+    project.task_source.spec_overrides["t1"] = {"labels": ["bug"]}
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    assert eng.store.load_task("r1", "t1").labels == ["bug"]
+
+    project.task_source.spec_overrides["t1"] = {"labels": ["bug", "ux"], "body": "edited"}
+    eng.refresh_spec("r1", "t1")
+    assert eng.store.load_task("r1", "t1").labels == ["bug", "ux"]
+
+
+def test_failed_describe_pr_thins_the_mail_and_is_evented(tmp_path) -> None:
+    """Enrichment stays total: an unreadable PR drops the PR block, never the completion,
+    and the trail says why the mail is thinner."""
+    project, calls = _recording_project()
+
+    def _boom(url: str) -> dict:
+        raise RuntimeError("gh unreachable")
+
+    project.task_source.describe_pr = _boom
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    outcomes = _drive(eng)
+
+    assert outcomes[-1]["outcome"] == "task_completed"
+    payload = next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)
+    assert "pr" not in payload
+    assert payload["pr_url"] == "https://github.com/x/y/pull/1234"  # the link survives
+    degraded = [e for e in _events(tmp_path) if e["type"] == "notification_facts_degraded"]
+    assert [e["part"] for e in degraded] == ["pr"]
+
+
+def test_rejected_pr_carries_its_delivery_verdict_to_both_mails(tmp_path) -> None:
+    """A PR the #378 check rejects (here: CLOSED) is still described for the mail, but the
+    verdict rides along so neither the task mail nor the run digest says "merge it"."""
+    project, calls = _recording_project()
+    project.task_source.pr_info["state"] = "CLOSED"
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _drive(eng)
+
+    pr = next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)["pr"]
+    assert pr["state"] == "CLOSED"
+    assert "CLOSED" in pr["delivery_problem"]
+    entry = next(p for k, p in calls if k == "run_finalized")["tasks"][0]
+    assert (entry["pr_state"], entry["delivery_verified"]) == ("CLOSED", False)
+
+
+def test_validated_pr_has_no_delivery_problem(tmp_path) -> None:
+    project, calls = _recording_project()
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _drive(eng)
+
+    assert next(p for k, p in calls if k == NOTIFY_TASK_COMPLETED)["pr"][
+        "delivery_problem"] is None
+    entry = next(p for k, p in calls if k == "run_finalized")["tasks"][0]
+    assert (entry["pr_state"], entry["delivery_verified"]) == ("OPEN", True)
+
+
+def test_failure_and_park_paths_never_read_the_pr(tmp_path) -> None:
+    """The failure/park alerts stay offline (#409): the facts builder never calls the
+    tracker itself, only the completion path hands it a PR it already read."""
+    project, calls = _recording_project()
+    reads: list[str] = []
+    project.task_source.describe_pr = lambda url: reads.append(url) or {}
+    eng = _engine(tmp_path, project, max_attempts=1)
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1")))
+    eng.record("r1", make_result(eng.next_work("r1", "t1"), status=ResultStatus.FAILURE,
+                                 error="boom", structured_output={}))
+
+    failed = next(p for k, p in calls if k == "task_failed")
+    assert reads == [] and "pr" not in failed
+    assert "labels" in failed and "issue_url" in failed and "review" in failed
 
 
 def test_notify_hook_failure_never_breaks_the_completion(tmp_path) -> None:
@@ -265,33 +397,134 @@ def test_kind_allowlist_filters() -> None:
     assert [m["X-Orchestrator-Kind"] for m in sent] == ["task_completed"]
 
 
-def test_message_carries_the_actionable_facts() -> None:
-    cfg = config_from_env(_ENV)
-    assert cfg is not None
-    payload = {
-        "run_id": "r1", "task_id": "t1", "kind": NOTIFY_TASK_COMPLETED,
-        "summary": "task t1 COMPLETED", "title": "Add an email sink",
+_NOTE = """## Orchestration run complete — #524
+
+- **Task:** Add an email sink
+- **PR:** https://github.com/x/y/pull/1234
+- **Review:** ✅ approved
+
+| # | Stage | Status | Model | Effort | In | Out | Cost |
+|---:|---|---|---|---|---:|---:|---:|
+| 01 | implement | completed | `claude-opus` | high | 1.2k | 300 | $1.2345 |
+
+**Total:** $1.2345 over 7 model call(s)
+"""
+
+
+def _completed_payload(**extra) -> dict:
+    return {
+        "run_id": "r1", "task_id": "#524", "kind": NOTIFY_TASK_COMPLETED,
+        "summary": "task #524 COMPLETED — Add an email sink (https://github.com/x/y/pull/1234)",
+        "title": "Add an email sink", "issue_number": 524,
+        "issue_url": "https://github.com/x/y/issues/524",
         "pr_url": "https://github.com/x/y/pull/1234", "pr_number": 1234,
         "cost": {"usd": 1.2345, "invocations": 7, "unmetered_calls": 0},
         "stages": [{"stage": "implement", "status": "completed", "attempt": 1,
-                    "model": "claude-opus", "error": None}],
+                    "model": "claude-opus", "lane": "headless", "cost_usd": 1.2345,
+                    "metered": True, "error": None}],
+        "pr": {"url": "https://github.com/x/y/pull/1234", "number": 1234,
+               "title": "Add an email sink", "state": "OPEN", "checks": "success",
+               "additions": 10, "deletions": 2, "changed_files": 1,
+               "files": [{"path": "sink.py", "additions": 10, "deletions": 2}],
+               "commits": [{"sha": "abc123", "title": "Add the sink"}]},
         "run_dir": "/runs/r1",
-        "note_md": "## what changed\n- added the sink",
+        "note_md": _NOTE,
+        **extra,
     }
-    msg = build_message(cfg, NOTIFY_TASK_COMPLETED, payload)
+
+
+def test_message_carries_the_actionable_facts() -> None:
+    cfg = config_from_env(_ENV)
+    assert cfg is not None
+    msg = build_message(cfg, NOTIFY_TASK_COMPLETED, _completed_payload())
 
     assert msg["To"] == "craig@example.test, ops@example.test"
     assert msg["From"] == "bot@example.test"
     assert msg["X-Orchestrator-Run"] == "r1"
+    assert msg["X-Orchestrator-Kind"] == NOTIFY_TASK_COMPLETED
     subject = msg["Subject"]
-    assert "task_completed" in subject and "t1" in subject and "PR #1234" in subject
+    assert subject == "[orchestrator] COMPLETED #524 — Add an email sink (PR #1234)"
 
-    body = msg.get_content()
-    assert "https://github.com/x/y/pull/1234" in body  # the link asked for
-    assert "$1.2345" in body and "7 model call(s)" in body
-    assert "implement: completed" in body
-    assert "/runs/r1" in body  # pointer to the full trail
-    assert "added the sink" in body  # the "what was done" prose
+    text = msg.get_body(preferencelist=("plain",)).get_content()
+    assert text.startswith("Next: review and merge https://github.com/x/y/pull/1234")
+    assert "+10 −2 across 1 file(s), 1 commit(s)" in text  # the diffstat
+    assert "$1.2345 over 7 model call(s)" in text  # from the embedded note
+    assert "/runs/r1" in text  # pointer to the full trail
+
+    # #524: an HTML alternative with the same content, alongside the complete text part.
+    assert msg.is_multipart()
+    rich = msg.get_body(preferencelist=("html",)).get_content()
+    assert '<a href="https://github.com/x/y/pull/1234">' in rich
+    assert "<table" in rich and "sink.py" in rich
+
+
+def test_completed_mail_shows_each_fact_once() -> None:
+    """#524's core complaint: the subject, first line, note header and stage list said the
+    same things. Each fact now appears exactly once across subject and body."""
+    payload = _completed_payload()
+    whole = render_subject(NOTIFY_TASK_COMPLETED, payload) + "\n" + render_body(
+        NOTIFY_TASK_COMPLETED, payload
+    )
+    assert whole.count("https://github.com/x/y/pull/1234") == 1
+    assert whole.count("Add an email sink") == 1  # PR title == task title is not repeated
+    assert whole.count("#524") == 1
+    assert whole.count("PR #1234") == 1
+    assert whole.count("over 7 model call(s)") == 1  # the note's total; no second one
+    assert whole.count("| Stage |") == 1  # the note's stage table; no second one
+    assert "COMPLETED" not in render_body(NOTIFY_TASK_COMPLETED, payload)  # summary dropped
+
+
+def test_mail_without_the_note_renders_review_stages_and_cost_itself() -> None:
+    """A failure, a park, or a degraded completion has no note: the sink renders the same
+    facts from the payload's structured blocks instead."""
+    payload = _completed_payload(note_md=None, review={
+        "approved": False, "cycles": 2, "blocking": ["high — a.py:3 — breaks X"],
+        "non_blocking": [{"title": "rename y", "disposition": "file"}],
+    }, followups=[{"title": "rename y", "ref": "https://github.com/x/y/issues/9"}])
+    body = render_body(NOTIFY_TASK_COMPLETED, payload)
+    assert "Verdict: changes requested" in body
+    assert "- high — a.py:3 — breaks X" in body
+    assert "- rename y (file)" in body
+    assert "implement  completed  claude-opus" in body  # the stage table
+    assert "Total: $1.2345 over 7 model call(s)" in body
+    assert "- rename y: https://github.com/x/y/issues/9" in body
+
+
+@pytest.mark.parametrize("pr_extra", [
+    {"state": "CLOSED"},
+    {"state": "OPEN", "delivery_problem": "PR head x does not match task/524"},
+    {"state": "MERGED", "delivery_problem": "PR head SHA a does not match delivered b"},
+])
+def test_completed_mail_never_says_merge_for_a_rejected_pr(pr_extra) -> None:
+    """The #378 check judged the PR invalid: the reader must be told to look, not merge
+    (and a merged-but-mismatched PR is not "nothing to do" either)."""
+    payload = _completed_payload()
+    payload["pr"] = {**payload["pr"], **pr_extra}
+    body = render_body(NOTIFY_TASK_COMPLETED, payload)
+    first = body.splitlines()[0]
+    assert first.startswith("Next: do not merge yet.")
+    assert "delivery could not be verified" in first
+    assert "review and merge" not in body and "already merged" not in body
+    if problem := pr_extra.get("delivery_problem"):
+        assert f"Delivery problem: {problem}" in body
+
+
+def test_run_digest_counts_only_verified_unmerged_prs_as_ready() -> None:
+    def task(tid: str, **extra) -> dict:
+        return {"task_id": tid, "state": "completed",
+                "pr_url": f"https://github.com/x/y/pull/{tid}", **extra}
+
+    body = render_body("run_finalized", {"run_id": "r1", "state": "completed", "tasks": [
+        task("1", pr_state="OPEN", delivery_verified=True),
+        task("2", pr_state="MERGED", delivery_verified=True),
+        task("3", pr_state="CLOSED", delivery_verified=False),
+        task("4"),  # an older payload with no verdict still counts as ready
+        {"task_id": "5", "state": "failed", "pr_url": None},
+    ]})
+    assert "Next: review and merge the 2 PR(s) below." in body
+    assert "Check first: 1 PR(s) failed the delivery check" in body
+    assert "2 completed (PR merged)" in body
+    assert "3 completed (PR delivery unverified)" in body
 
 
 def test_park_mail_leads_with_the_release_commands() -> None:
@@ -310,7 +543,9 @@ def test_park_mail_leads_with_the_release_commands() -> None:
         ],
     }
     subject = render_subject(NOTIFY_TASK_BLOCKED, payload)
-    assert subject.startswith("[orchestrator] ACTION NEEDED task_blocked")
+    assert subject == (
+        "[orchestrator] ACTION NEEDED: #390 parked before deliver — Meta-authoring change"
+    )
 
     body = render_body(NOTIFY_TASK_BLOCKED, payload)
     assert "Gate: before:deliver" in body
@@ -319,27 +554,51 @@ def test_park_mail_leads_with_the_release_commands() -> None:
     assert "orchestrator approve --task #390" in body
     assert "orchestrator reject --task #390" in body
     # The command block comes BEFORE the context a recipient reads only if they care.
-    assert body.index("orchestrator approve") < body.index("Cost:")
+    assert body.index("orchestrator approve") < body.index("Total:")
 
 
-def test_issue_number_and_issue_link_are_labelled_distinctly() -> None:
+def test_issue_number_and_issue_link_are_shown_once() -> None:
     """A real park payload carries BOTH issue_number (from the shared facts merge) and
-    issue_url, so the two lines must not both read `Issue:` — that is unreadable."""
+    issue_url. The link already names the issue, so the number is not a second line."""
     body = render_body(NOTIFY_TASK_BLOCKED, {
-        "summary": "s", "issue_number": 390,
+        "task_id": "#390", "issue_number": 390,
         "issue_url": "https://github.com/cperler/sous/issues/390"})
     labels = [line.split(":", 1)[0] for line in body.splitlines() if ":" in line]
     assert len(labels) == len(set(labels)), f"duplicate fact labels in body:\n{body}"
-    assert "Issue: 390" in body
-    assert "Issue link: https://github.com/cperler/sous/issues/390" in body
+    assert "Link: https://github.com/cperler/sous/issues/390" in body
+    assert "390" not in body.replace("https://github.com/cperler/sous/issues/390", "")
+    # The HTML part keeps the number as the anchor text of that one link.
+    assert ">#390</a>" in render_html(NOTIFY_TASK_BLOCKED, {
+        "issue_number": 390, "issue_url": "https://github.com/cperler/sous/issues/390"})
 
 
 def test_other_kinds_keep_their_plain_subject_and_no_action_block() -> None:
-    """The new fields are additive: a kind without them renders exactly as before."""
-    subject = render_subject("task_completed", {"task_id": "t1"})
-    assert subject.startswith("[orchestrator] task_completed")
+    """Kinds outside the per-task/run layouts keep the plain ``kind — id`` subject, and a
+    malformed ``actions`` value never produces an action block."""
+    assert render_subject("task_stale", {"task_id": "t1"}).startswith(
+        "[orchestrator] task_stale — t1"
+    )
+    assert render_subject("task_completed", {"task_id": "t1"}) == "[orchestrator] COMPLETED t1"
     body = render_body("task_completed", {"summary": "task t1 COMPLETED", "actions": "oops"})
     assert "ACTION NEEDED" not in body
+    body = render_body("task_blocked", {"task_id": "t1", "actions": "oops"})
+    assert "ACTION NEEDED" not in body
+
+
+def test_html_escapes_payload_text() -> None:
+    """Payload text is model- and tracker-authored: it must never inject markup."""
+    rich = render_html(NOTIFY_TASK_COMPLETED, _completed_payload(
+        issue_excerpt="<script>alert(1)</script>",
+        note_md="- **Review:** <b>x</b> & `<i>`",
+    ))
+    assert "<script>" not in rich and "&lt;script&gt;" in rich
+    assert "<b>x</b>" not in rich and "<code>&lt;i&gt;</code>" in rich
+
+
+def test_html_part_is_bounded_without_cutting_a_tag() -> None:
+    rich = render_html("task_completed", {"note_md": "- x\n" * 100_000})
+    assert rich.startswith("<html>") and rich.rstrip().endswith("</html>")
+    assert "<pre>" in rich and "… [truncated]" in rich
 
 
 def test_unmetered_cost_is_labelled_a_floor() -> None:

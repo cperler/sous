@@ -601,6 +601,20 @@ deletes or overwrites) and leaves the legacy KB in place with a note about its n
   configured, kind-filterable, and always short-timeout — the engine's `notify_failed` guard
   covers a raising sink, but only a timeout covers one that HANGS. Wired into the selfhost
   adapter; before this it had no `notify` at all, so every dogfood batch was silent.
+- **What the mail says** (#524): the facts block also carries the issue link, labels and a
+  bounded excerpt of the ask (from the task doc's snapshot, including a `labels` field
+  stamped at `add_task`), the review outcome, and per-stage model/effort/tokens/cost/time;
+  the pure builders live in `orchestrator/notification_facts.py`. `task_completed` adds a
+  bounded PR summary (diffstat, files, commits, CI state) from the SAME `describe_pr` read
+  #378's delivery check makes, so completion reads the PR once and the failure/park paths
+  never read it. `run_finalized` adds per-state counts, duration and run cost. The sink
+  builds each mail once as a list of sections and renders it to a complete plain-text part
+  and an HTML alternative. Each fact shows once, decision first: the subject carries outcome,
+  task, title and PR number; the body opens with the next action (merge link, retry
+  guidance, or release commands), then issue, PR, review/stages/cost, and trail. For a
+  completion the review/stage/cost section IS the embedded completion note (which now has
+  token columns and a ledger-backed Total line), so the PR comment and the mail cannot
+  drift. `tests/test_email_snapshots.py` pins each kind's rendered subject and bodies.
 - **The human-gate alert** (#409): a park is the one transition that stops the run until a
   person acts, so `task_blocked` is built by one shared `Engine._blocked_notification` and
   carries the facts block PLUS what it takes to act — `stage`/`hold_before`/`gate`/`reason`,
