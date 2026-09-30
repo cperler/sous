@@ -127,7 +127,13 @@ def _review_findings(d: Path) -> dict | None:
         payload = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return {"file": latest.name, "error": f"{type(exc).__name__}: {exc}"}
-    out = payload.get("structured_output") or {}
+    # Valid JSON need not be an object (a list, string or number parses too), and neither
+    # need ``structured_output`` — treat either as empty rather than 500 the whole panel.
+    if not isinstance(payload, dict):
+        payload = {}
+    out = payload.get("structured_output")
+    if not isinstance(out, dict):
+        out = {}
     return {
         "file": latest.name,
         "attempt": payload.get("attempt"),

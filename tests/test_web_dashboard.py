@@ -288,6 +288,25 @@ def test_task_detail_lists_files_and_review_findings(tmp_path) -> None:
     assert review["non_blocking"][0]["title"] == "rename x"
 
 
+def test_task_detail_survives_a_non_object_review_record(tmp_path) -> None:
+    # Valid JSON that is not an object (or a non-object structured_output) must not 500 the
+    # panel: the file links still list, and the review reads as empty rather than crashing.
+    d = _stage_files(tmp_path)
+    (d / "05-review.json").write_text("[]")
+    status, _, body = _route("/api/task-detail", {"run": ["r1"], "task": ["t1"]}, root=tmp_path)
+    assert status == 200
+    payload = json.loads(body)
+    assert "scope-attempt0.prompt.txt" in [f["name"] for f in payload["files"]]
+    assert payload["review"]["file"] == "05-review.json"
+    assert payload["review"]["issues"] == [] and payload["review"]["approved"] is None
+    (d / "06-review.json").write_text(json.dumps({"attempt": 2, "structured_output": "oops"}))
+    status, _, body = _route("/api/task-detail", {"run": ["r1"], "task": ["t1"]}, root=tmp_path)
+    assert status == 200
+    review = json.loads(body)["review"]
+    assert review["file"] == "06-review.json" and review["attempt"] == 2
+    assert review["non_blocking"] == []
+
+
 def test_task_detail_without_review_or_files(tmp_path) -> None:
     _drive_intake(_engine(tmp_path / "r1"), "r1")
     status, _, body = _route("/api/task-detail", {"run": ["r1"], "task": ["t1"]}, root=tmp_path)
