@@ -32,9 +32,14 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      files/modules touched, feature layering, and explicit "after #N"/"depends on #N"/"blocked
      by #N" prose. Do **not** invent ordering edges for things that merely *could* run in
      sequence — an unnecessary edge serializes work that could parallelize.
-   - **Lane fit** (`pipeline`): docs-only / pure-config → `micro` (and put `test`,`deliver` in
-     `deterministic_stages` — a docs change needs no model test/PR-writing); small mechanical /
-     localized → `lite`; risky, cross-cutting, or ambiguous → `full`.
+   - **Lane fit** (`pipeline`): start from the cheapest lane (`micro` < `lite` < `full`) and
+     move up only when the body gives a reason. Docs-only, pure-config, or a single new
+     file with no logic (e.g. an agent prompt) → `micro` (put `test`,`deliver` in
+     `deterministic_stages` — no model test/PR-writing needed); small, mechanical, or
+     localized code change → `lite`; `full` only for risky, cross-cutting, or ambiguous work
+     (touches shared engine/adapter logic, needs design, or the body is unclear). When you
+     pick `full`, the `rationale` must say which of those applies. Read-only analysis that
+     produces a write-up is `lite`, not `full`.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`
