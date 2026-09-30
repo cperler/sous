@@ -116,6 +116,7 @@ from .render import (
     render_retrospective,
     render_stage,
     render_task_index,
+    suggestion_title,
     unfiled_findings,
 )
 from .retrospective import build_retrospective
@@ -144,6 +145,7 @@ from .schemas.enums import (
     TaskState,
     effort_below,
     resolve_effort,
+    with_optimize,
 )
 from .schemas.status import ReviewFixup, Run, RunDriver, Task, TaskRef
 from .schemas.work import (
@@ -722,6 +724,12 @@ class Engine:
         default to a pre-DELIVER hold. Validation (non-empty, duplicate-free)
         is the Task model's.
 
+        OPTIMIZE (#519) joins the resolved pipeline — preset, cost-routed, or pinned — when
+        the project's roster declares an ``optimize`` agent, which is the whole opt-in; a
+        ``none`` quality tier declines it like any other quality pass. The decision is baked
+        into the persisted ``Task.pipeline`` here, so no later subcommand has to re-derive it
+        from an Engine rebuilt from constructor defaults.
+
         Cost-aware lane routing (#34): when the run enables ``route_by_cost`` AND no
         ``pipeline`` is explicitly pinned, the deterministic ``cost_router`` picks the
         lane preset from the run's remaining budget fraction (refined by ``estimate`` /
@@ -811,6 +819,17 @@ class Engine:
         # stages, so the preset default does not reach it.
         if deterministic_stages is None and not pipeline_pinned:
             deterministic_stages = LANE_DETERMINISTIC_STAGES.get(effective_lane, ())
+        # #519: the optional OPTIMIZE pass, for a project where speed is part of the product.
+        # Applied to whatever pipeline is about to be PERSISTED — lane preset, cost-routed
+        # preset, or a decomposition child's quality-tier pipeline — so every path picks the
+        # stage up from one call site instead of three that can drift. A `none` quality tier
+        # is the one exception: that tier means "run no quality pass", and OPTIMIZE is one.
+        resolved_pipeline = tuple(pipeline) if pipeline else LANE_STAGES[effective_lane]
+        optimize_agent: str | None = None
+        if resolved_quality is not QualityTier.NONE:
+            optimize_agent = self._optimize_agent()
+            if optimize_agent is not None:
+                resolved_pipeline = with_optimize(resolved_pipeline)
         # Register the task ref + dependency edge as a locked read-modify-write so a
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
         # Done BEFORE writing the task doc so a duplicate never clobbers an existing
@@ -895,7 +914,7 @@ class Engine:
                 issue_number=spec.issue_number,
                 depends_on=deps,
                 execution_lane=effective_lane,
-                pipeline=tuple(pipeline) if pipeline else LANE_STAGES[effective_lane],
+                pipeline=resolved_pipeline,
                 deterministic_stages=tuple(deterministic_stages or ()),
                 hold_before=hold_before,
                 max_attempts=self.max_attempts,
@@ -919,7 +938,38 @@ class Engine:
                 {"ts": _now(), "type": "lane_routed", "run_id": run_id,
                  "task_id": task_id, **route_reason},
             )
+        if optimize_agent is not None and Stage.OPTIMIZE in resolved_pipeline:
+            # #519: a stage the project's roster added to a pipeline the caller did not ask
+            # for is a routing decision, so it is evented like one — naming the agent that
+            # supplied the opt-in, because "why is this task running an extra paid stage?"
+            # is answered by the roster entry and nothing else in the run log names it.
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "pipeline_stage_inserted", "run_id": run_id,
+                 "task_id": task_id, "stage": Stage.OPTIMIZE.value, "agent": optimize_agent,
+                 "reason": "project roster declares an 'optimize' agent",
+                 "pipeline": [stage.value for stage in resolved_pipeline]},
+            )
         return task
+
+    def _optimize_agent(self) -> str | None:
+        """The project's OPTIMIZE agent, or ``None`` when the project has not opted in (#519).
+
+        The roster entry IS the opt-in: a project where speed is part of the product names an
+        ``optimize`` agent, and every other project's pipelines are byte-identical to what
+        they were before the stage existed. Read through ``getattr`` and fully guarded,
+        because "this adapter has no opinion about optimizing" must resolve to not-opted-in
+        rather than break task registration — the same tolerance ``_project_commands`` gives
+        an adapter that omits an optional command.
+        """
+        agent_for = getattr(self.project, "agent_for", None)
+        if not callable(agent_for):
+            return None
+        try:
+            agent = agent_for(Stage.OPTIMIZE, "optimize")
+        except Exception:  # noqa: BLE001 - an adapter roster must never block registration
+            return None
+        return str(agent) if agent else None
 
     def _partial_registration_reason(self, run_id: str, task_id: str) -> str | None:
         """``None`` when ``task_id``'s status document exists AND agrees with the ref's
@@ -6652,6 +6702,7 @@ class Engine:
         # marking complete / filing follow-ups must not also cost us the note.
         followups: list[dict] = []
         improvement_ref: str | None = None
+        optimize_refs: list[dict] = []
         note_md: str | None = None
         ts = self.project.task_source
         self._record_completion_pr_evidence(run_id, task, ts)
@@ -6671,6 +6722,17 @@ class Engine:
                 self._issue_fingerprint(f["title"]) for f in followups if f.get("ref") is not None
             }
             improvement_ref = self._file_review_improvement(run_id, task, ts, skip_fingerprints=filed_fps)
+            # #519: the OPTIMIZE pass's un-applied architectural suggestions, deduped against
+            # everything this same finalize actually filed — the improvement included, since
+            # the reviewer and the optimizer read the same diff and can land on the same idea.
+            if improvement_ref is not None:
+                review = task.stages.get(Stage.REVIEW)
+                improvement = (review.output or {}).get("improvement") if review else None
+                if isinstance(improvement, dict):
+                    filed_fps.add(self._issue_fingerprint(str(improvement.get("title") or "")))
+            optimize_refs = self._file_optimize_suggestions(
+                run_id, task, ts, skip_fingerprints=filed_fps
+            )
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
                 run_id,
@@ -6688,7 +6750,7 @@ class Engine:
             # marking complete / filing follow-ups must not also cost us the note. Both
             # inputs default to empty/None, so a block-1 failure still yields a valid — if
             # thinner — note rather than none at all.
-            note_md = render_completion_note(task, followups, improvement_ref)
+            note_md = render_completion_note(task, followups, improvement_ref, optimize_refs)
             self._publish_completion_note(run_id, task, ts, note_md, followups)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
             self.store.append_event(
@@ -6701,6 +6763,9 @@ class Engine:
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
              "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
+             "optimize_suggestions_filed": sum(
+                 1 for r in optimize_refs if not r.get("deduped")
+             ),
              "review_fixups_applied": sum(fixup.applied for fixup in task.review_fixups)},
         )
         # Alerting (#359): the success half of the per-task pair, symmetric with the
@@ -6722,6 +6787,7 @@ class Engine:
              "summary": summary,
              "followups_filed": len(followups),
              "improvement_ref": improvement_ref,
+             "optimize_suggestion_refs": [r["ref"] for r in optimize_refs if r.get("ref")],
              "note_md": _bounded(note_md, NOTIFY_NOTE_MAX_CHARS)},
         )
 
@@ -6793,6 +6859,28 @@ class Engine:
             payload.update({"level": "warning", "error": "; ".join(reasons)})
         self.store.append_event(run_id, payload)
 
+    def _followup_cap(self, run_id: str, task: Task) -> int:
+        """How many issues THIS task may file from one evidence-out pass (#191/#196).
+
+        Cap precedence: per-task override > run-wide default (set at create_run) > engine
+        constructor default. A cheap single run read at filing time (mirrors the
+        route_by_capacity pattern) so a run-wide baseline survives the per-command CLI
+        process boundary that rebuilds the engine.
+
+        Shared by the review follow-ups and the OPTIMIZE suggestions (#519) so the two filing
+        paths cannot drift onto different caps. Each path counts its OWN filings against it:
+        the cap bounds one kind of evidence turning into a hydra, and a task that both
+        reviewed and optimized has genuinely two kinds to report.
+        """
+        if task.max_filed_followups is not None:
+            return task.max_filed_followups
+        run = self.store.load_run(run_id)
+        return (
+            run.max_filed_followups
+            if run.max_filed_followups is not None
+            else self.max_filed_followups
+        )
+
     def _file_review_followups(self, run_id: str, task: Task, task_source: object) -> list[dict]:
         """File non-blocking review findings as UNLABELED follow-up issues — but only
         the ones that clear the #188 filing threshold, so task completion doesn't become a
@@ -6812,19 +6900,7 @@ class Engine:
         findings = (review.output or {}).get("non_blocking") if review else None
         if not findings:
             return []
-        # Cap precedence (#191/#196): per-task override > run-wide default (set at
-        # create_run) > engine constructor default. A cheap single run read at filing time
-        # (mirrors the route_by_capacity pattern) so a run-wide baseline survives the
-        # per-command CLI process boundary that rebuilds the engine.
-        if task.max_filed_followups is not None:
-            cap = task.max_filed_followups
-        else:
-            run = self.store.load_run(run_id)
-            cap = (
-                run.max_filed_followups
-                if run.max_filed_followups is not None
-                else self.max_filed_followups
-            )
+        cap = self._followup_cap(run_id, task)
         filed: list[dict] = []
         for finding in findings:
             if not isinstance(finding, dict):
@@ -6936,6 +7012,100 @@ class Engine:
              "task_id": task.task_id, "title": title, "ref": ref},
         )
         return ref
+
+    def _file_optimize_suggestions(
+        self, run_id: str, task: Task, task_source: object,
+        skip_fingerprints: set[str] | None = None,
+    ) -> list[dict]:
+        """File the OPTIMIZE pass's architectural suggestions as ``enhancement`` issues (#519).
+
+        The stage deliberately does NOT apply these — a process-pool restructure or a
+        different lock strategy is a redesign, and a task that starts doing one has stopped
+        being the task. Filing them is what keeps "don't do it here" from meaning "lose the
+        idea", so this is the same shape as the review's ``improvement``: filing is opt-in on
+        an explicit ``file`` disposition, bounded by the per-task cap (``_followup_cap``), and
+        deduped by title against what this same finalize already filed (``skip_fingerprints``
+        — the follow-ups and the improvement), so one observation is never two issues.
+
+        Returns ``[{"title", "ref"}]`` for the FILED suggestions, ``ref`` None when the filing
+        call itself raised (the #190 rule: a failed filing must not look like a suppression),
+        plus a ``{"title", "deduped": True}`` entry per suppressed duplicate — the completion
+        note needs those to say "already filed above" instead of mislabeling a suppressed
+        duplicate as cap overflow, which would invite a human to file it a second time.
+        A no-op when the adapter has no ``file_followup`` or the stage ran/returned nothing —
+        a project that never opts into OPTIMIZE never reaches the loop at all.
+
+        The suggestion schema has no title field (its shape is ``{description, rationale,
+        disposition}``), so the issue title is the description's leading line, bounded — which
+        also makes the dedupe fingerprint stable for the same suggestion restated at length.
+        """
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return []
+        record = task.stages.get(Stage.OPTIMIZE)
+        suggestions = (record.output or {}).get("suggestions") if record else None
+        if not suggestions or not isinstance(suggestions, list):
+            return []
+        cap = self._followup_cap(run_id, task)
+        filed: list[dict] = []  # real filings only — what the cap counts
+        deduped: list[dict] = []
+        for suggestion in suggestions:
+            if not isinstance(suggestion, dict):
+                continue
+            # coerce: a model may emit non-strings, and the interactive lane validates nothing
+            description = str(suggestion.get("description") or "").strip()
+            if not description:
+                continue
+            title = suggestion_title(description)
+            disposition = str(suggestion.get("disposition") or "").strip().casefold()
+            if disposition != "file" or len(filed) >= cap:
+                # Both cases are surfaced in the completion note (``unfiled_suggestions``),
+                # so the event is the audit trail rather than the only channel.
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "optimize_suggestion_not_filed", "run_id": run_id,
+                     "task_id": task.task_id, "title": title,
+                     "disposition": disposition or None,
+                     "reason": (
+                         "over per-task cap" if disposition == "file"
+                         else "disposition is not 'file'"
+                     )},
+                )
+                continue
+            if skip_fingerprints and self._issue_fingerprint(title) in skip_fingerprints:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "optimize_suggestion_deduped", "run_id": run_id,
+                     "task_id": task.task_id, "title": title},
+                )
+                # Deliberately NOT counted against the cap: a duplicate already has an issue,
+                # so suppressing it must not also cost a later suggestion its budget.
+                deduped.append({"title": title, "deduped": True})
+                continue
+            body = (
+                f"{description}\n\n"
+                f"{str(suggestion.get('rationale') or '').strip()}\n\n"
+                f"_Filed automatically from the {task.task_id} OPTIMIZE pass "
+                f"({task.pr_url or 'PR'}) — an architectural change that pass deliberately "
+                "did not apply._"
+            )
+            try:
+                ref = file_followup(title=title, body=body, labels=["enhancement"])
+            except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "optimize_suggestion_failed", "run_id": run_id,
+                     "task_id": task.task_id, "title": title, "error": str(exc)},
+                )
+                filed.append({"title": title, "ref": None})
+                continue
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "optimize_suggestion_filed", "run_id": run_id,
+                 "task_id": task.task_id, "title": title, "ref": ref},
+            )
+            filed.append({"title": title, "ref": ref})
+        return [*filed, *deduped]
 
     def _run_verification_commands(
         self, cwd: str | Path, *, timeout_s: int

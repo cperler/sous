@@ -102,8 +102,15 @@ def test_task_initializes_every_stage_with_started_at() -> None:
 
 
 def test_lane_stage_sets() -> None:
+    # Both opt-in vocabulary members are absent from every preset: SIMPLIFY comes from a
+    # decomposed child's full quality tier, OPTIMIZE from the project's agent roster (#519).
     assert Stage.SIMPLIFY not in LANE_STAGES[ExecutionLane.FULL]
-    assert set(LANE_STAGES[ExecutionLane.FULL]) == set(STAGE_ORDER) - {Stage.SIMPLIFY}
+    assert Stage.OPTIMIZE not in LANE_STAGES[ExecutionLane.FULL]
+    assert set(LANE_STAGES[ExecutionLane.FULL]) == set(STAGE_ORDER) - {
+        Stage.SIMPLIFY, Stage.OPTIMIZE
+    }
+    for lane in ExecutionLane:
+        assert Stage.OPTIMIZE not in LANE_STAGES[lane]
     assert Stage.SCOPE not in LANE_STAGES[ExecutionLane.LITE]
     assert Stage.TEST not in LANE_STAGES[ExecutionLane.MICRO]
     # intake/implement/deliver/review always run

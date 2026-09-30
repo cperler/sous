@@ -375,8 +375,10 @@ class Task(_StatusModel):
         if isinstance(data, dict) and not data.get("pipeline"):
             lane = data.get("execution_lane") or ExecutionLane.FULL
             data["pipeline"] = LANE_STAGES[ExecutionLane(lane)]
-        # v3 status docs predate SIMPLIFY. Their persisted stage map is otherwise complete,
-        # so a normal field default cannot supply the new vocabulary member.
+        # v3 status docs predate SIMPLIFY and v4 docs predate OPTIMIZE (#519). Their persisted
+        # stage maps are otherwise complete, so a normal field default cannot supply the new
+        # vocabulary member — and the pipeline above is left exactly as stored, so an old run
+        # never acquires a stage it did not plan.
         if isinstance(data, dict) and isinstance(data.get("stages"), dict):
             stages = dict(data["stages"])
             for stage in Stage:

@@ -56,8 +56,11 @@ observability. A batch of tasks runs over a DAG with transitive cascade-blocking
 clean resume-after-kill.
 
 The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test` → `deliver`
-→ `review`, collapsed from the reference system's ~12–15. `simplify` is an additional
-stage-vocabulary member SCOPE can opt a decomposed child into, not a seventh standing step.
+→ `review`, collapsed from the reference system's ~12–15. Two more are additional
+stage-vocabulary members rather than standing steps: `simplify`, which SCOPE can opt a
+decomposed child into, and `optimize`, a measured speed pass a PROJECT opts into with one
+agent-roster entry (it files the architectural changes it declines to make as enhancement
+issues).
 
 ## The load-bearing idea: engine / adapter split
 

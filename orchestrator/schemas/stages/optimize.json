@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "optimize",
+  "description": "Stage output contract: one bounded, measured speed pass, plus the architectural changes it deliberately did NOT make.",
+  "type": "object",
+  "required": ["files_changed", "summary", "committed", "measurements"],
+  "properties": {
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "summary": {"type": "string"},
+    "committed": {"type": "boolean"},
+    "measurements": {
+      "type": "array",
+      "description": "what was actually timed, before and after. Required (an empty array is the honest answer for a no-op pass) because an unmeasured speed claim is not a speed claim. MODEL-REPORTED today: the engine does not yet verify these numbers, so a reader must treat them as the stage's own account. #520 replaces them with before/after numbers the engine runs itself from an adapter-declared benchmark command, and keeps the stage's commit only on a measured win.",
+      "items": {
+        "type": "object",
+        "required": ["name", "before", "after"],
+        "properties": {
+          "name": {"type": "string", "description": "what was measured (the benchmark/operation), not the optimization"},
+          "before": {"type": "number"},
+          "after": {"type": "number"},
+          "unit": {"type": "string", "description": "e.g. ms, s, ops/s, MB — state it, or before/after are unreadable"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "suggestions": {
+      "type": "array",
+      "description": "architectural changes this stage judged out of its own scope and did NOT apply (a process-pool restructure, a shared-memory layout, a different lock strategy) — so a task never turns into a redesign and the idea is not lost. Optional; omit or return an empty array when there are none. The engine files one as an enhancement issue at finalize only when it carries an explicit `file` disposition, subject to the same per-task cap and title dedupe as a review finding.",
+      "items": {
+        "type": "object",
+        "required": ["description"],
+        "properties": {
+          "description": {"type": "string", "description": "the change itself, one sentence first — its leading line becomes the enhancement issue title"},
+          "rationale": {"type": "string", "description": "why it would pay off, and what this pass measured that points at it — the issue body"},
+          "disposition": {
+            "type": "string",
+            "enum": ["file", "drop"],
+            "description": "same filing threshold as a review finding's. Choose `file` deliberately, with justification, to open an enhancement issue; `drop` for something a maintainer would not independently prioritize. An absent or unrecognized disposition is surfaced in the completion note, never filed — filing requires explicit `file`."
+          }
+        },
+        "additionalProperties": true
+      }
+    }
+  },
+  "additionalProperties": true
+}
