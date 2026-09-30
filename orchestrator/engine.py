@@ -7025,7 +7025,9 @@ class Engine:
         idea", so this is the same shape as the review's ``improvement``: filing is opt-in on
         an explicit ``file`` disposition, bounded by the per-task cap (``_followup_cap``), and
         deduped by title against what this same finalize already filed (``skip_fingerprints``
-        — the follow-ups and the improvement), so one observation is never two issues.
+        — the follow-ups and the improvement), so one observation is never two issues. The
+        dedupe is checked BEFORE the cap so that what a suppressed duplicate is CALLED does
+        not depend on how much budget earlier suggestions consumed.
 
         Returns ``[{"title", "ref"}]`` for the FILED suggestions, ``ref`` None when the filing
         call itself raised (the #190 rule: a failed filing must not look like a suppression),
@@ -7058,20 +7060,22 @@ class Engine:
                 continue
             title = suggestion_title(description)
             disposition = str(suggestion.get("disposition") or "").strip().casefold()
-            if disposition != "file" or len(filed) >= cap:
-                # Both cases are surfaced in the completion note (``unfiled_suggestions``),
-                # so the event is the audit trail rather than the only channel.
+            if disposition != "file":
+                # Surfaced in the completion note (``unfiled_suggestions``) too, so the
+                # event is the audit trail rather than the only channel.
                 self.store.append_event(
                     run_id,
                     {"ts": _now(), "type": "optimize_suggestion_not_filed", "run_id": run_id,
                      "task_id": task.task_id, "title": title,
                      "disposition": disposition or None,
-                     "reason": (
-                         "over per-task cap" if disposition == "file"
-                         else "disposition is not 'file'"
-                     )},
+                     "reason": "disposition is not 'file'"},
                 )
                 continue
+            # Dedupe BEFORE the cap, and independent of it: a duplicate is never filed
+            # either way, but the ORDER decides what the note and the event call it. With
+            # the cap checked first, an earlier suggestion that exhausts the budget makes a
+            # later duplicate read as "over per-task cap" — which invites a human to raise
+            # the cap and file a second copy of an issue that already exists.
             if skip_fingerprints and self._issue_fingerprint(title) in skip_fingerprints:
                 self.store.append_event(
                     run_id,
@@ -7081,6 +7085,14 @@ class Engine:
                 # Deliberately NOT counted against the cap: a duplicate already has an issue,
                 # so suppressing it must not also cost a later suggestion its budget.
                 deduped.append({"title": title, "deduped": True})
+                continue
+            if len(filed) >= cap:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "optimize_suggestion_not_filed", "run_id": run_id,
+                     "task_id": task.task_id, "title": title,
+                     "disposition": disposition, "reason": "over per-task cap"},
+                )
                 continue
             body = (
                 f"{description}\n\n"

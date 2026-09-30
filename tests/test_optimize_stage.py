@@ -377,6 +377,50 @@ def test_a_deduped_suggestion_is_not_reported_as_cap_overflow(tmp_path, optimizi
     assert completed["optimize_suggestions_filed"] == 1  # the dedupe is not a filing
 
 
+def test_a_duplicate_is_deduped_even_when_an_earlier_suggestion_filled_the_cap(
+    tmp_path, optimizing
+) -> None:
+    """Order must not decide what a suppressed duplicate is CALLED.
+
+    The sibling test above files the duplicate first, so the cap is still open when it is
+    reached. Here the novel suggestion goes first and exhausts a cap of 1, so a cap-first
+    check would report the duplicate as "over per-task cap" — telling a human to raise the
+    cap and file a second copy of an issue the review already filed.
+    """
+    eng = _engine(tmp_path, optimizing)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", max_filed_followups=1)
+    _drive(eng, outputs={
+        Stage.REVIEW: {
+            "approved": True, "issues": [],
+            "non_blocking": [{"title": "Move scoring to a process pool",
+                              "detail": "the GIL bounds it", "disposition": "file"}],
+        },
+        # novel first (consumes the whole cap), duplicate second
+        Stage.OPTIMIZE: _optimize_output([_SUGGESTIONS[1], _SUGGESTIONS[0]]),
+    })
+
+    events = _events(tmp_path)
+    assert any(
+        e["type"] == "optimize_suggestion_deduped"
+        and e["title"] == "Move scoring to a process pool"
+        for e in events
+    )
+    assert not any(
+        e["type"] == "optimize_suggestion_not_filed"
+        and e["title"] == "Move scoring to a process pool"
+        for e in events
+    )
+    note = optimizing.task_source.notes[0]["body"]
+    assert "Move scoring to a process pool — already filed above" in note
+    assert "Move scoring to a process pool — over per-task cap" not in note
+    # The cap still bounds real filings: the review's one, plus the one novel suggestion.
+    assert [f["title"] for f in optimizing.task_source.followups] == [
+        "Move scoring to a process pool",
+        "Share the model weights through shared memory",
+    ]
+
+
 def test_the_completion_note_carries_measurements_and_both_suggestion_halves(
     tmp_path, optimizing
 ) -> None:
