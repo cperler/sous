@@ -190,11 +190,19 @@ so its cost and failures are visible without restoring the old opaque quality lo
   hard-resets the worktree to the anchor and drops the stage's `checkpoint`, so
   `task.last_checkpoint` keeps naming the last VERIFIED commit and a later retry resets to it.
   The stage still records SUCCESS (reverting a pass that did not pay off is an outcome of the
-  pass, not a failure to retry), and every path emits exactly one event
+  pass, not a failure to retry) — with one exception: dropping the checkpoint does not by
+  itself take a commit off HEAD, and nothing between OPTIMIZE and DELIVER re-reads the tree,
+  so the revert is CONFIRMED against HEAD rather than assumed from the reset's exit code. A
+  real worktree whose HEAD is still not the anchor (no anchor to reset to, an unreadable HEAD,
+  a reset git refused) downgrades the result to FAILURE, which both reports honestly and puts
+  the stage on the retry path whose dispatch resets the worktree. With no worktree at all
+  there is nothing to clean and nothing a reset would fix, so that one stays a warning.
+  Every path emits exactly one event
   (`optimize_benchmark_verified` / `_no_win` / `_failed` / `_unavailable` / `_skipped`) plus a
   verdict block on the stage output, because a gate that could not run must never read like
-  one that passed. The model's own `measurements` stay in the output as profiling detail and
-  decide nothing.
+  one that passed — and the completion note's heading comes off that block's real `reverted`
+  flag, so it cannot print "REVERTED" over a commit still on the branch. The model's own
+  `measurements` stay in the output as profiling detail and decide nothing.
 
 - **Per-task pipeline (schema v2–v5).** `STAGE_ORDER` is the display order; the state
   machine (`orchestrator/state_machine.py`) walks each task's own

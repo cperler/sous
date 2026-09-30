@@ -713,6 +713,13 @@ _BENCHMARK_HEADINGS = {
     "skipped": "### Speed pass committed nothing",
 }
 
+# A not-kept verdict whose revert the engine could NOT confirm. The headings above all claim a
+# revert, so reading one off ``status`` alone would print "REVERTED" over a commit still
+# sitting on the branch — a false statement in the artifact a human merges from.
+_BENCHMARK_UNREVERTED_HEADING = (
+    "### Speed pass NOT VERIFIED and NOT REVERTED — its commit is still on the branch"
+)
+
 
 def _benchmark_lines(benchmark: object) -> list[str]:
     """The engine-measured before/after block for the completion note (#520).
@@ -721,11 +728,18 @@ def _benchmark_lines(benchmark: object) -> list[str]:
     the shared ``benchmark_gate.format_metric_rows`` (so the note and ``events.jsonl`` cannot
     disagree), the tolerance the verdict required, and whether the stage's commit survived.
     An OPTIMIZE output with no verdict block at all (a run recorded before #520) renders
-    nothing rather than implying a check that never ran."""
+    nothing rather than implying a check that never ran.
+
+    The heading comes from the verdict's ACTUAL ``reverted`` flag, not from its status: a
+    not-kept pass whose revert the engine could not confirm says so, because "REVERTED" over a
+    commit that is still on the branch is the one sentence a human must not be told."""
     if not isinstance(benchmark, dict) or not benchmark.get("status"):
         return []
     status = str(benchmark.get("status"))
-    lines = ["", _BENCHMARK_HEADINGS.get(status, f"### Speed pass ({status})")]
+    heading = _BENCHMARK_HEADINGS.get(status, f"### Speed pass ({status})")
+    if status not in ("verified", "skipped") and not benchmark.get("reverted"):
+        heading = _BENCHMARK_UNREVERTED_HEADING
+    lines = ["", heading]
     rows = [r for r in (benchmark.get("metrics") or []) if isinstance(r, dict)]
     lines += [f"- {line}" for line in format_metric_rows(rows)]
     tolerance = benchmark.get("tolerance")
@@ -738,6 +752,12 @@ def _benchmark_lines(benchmark: object) -> list[str]:
     if benchmark.get("revert_error"):
         # A revert the engine could not perform must not read as one it did.
         lines.append(f"- WARNING: the revert itself failed: {benchmark['revert_error']}")
+    if benchmark.get("revert_unconfirmed"):
+        lines.append(
+            "- WARNING: the engine could not confirm the commit was removed "
+            f"({benchmark['revert_unconfirmed']}); treat this change as unverified and "
+            "not intended to ship"
+        )
     for notice in benchmark.get("notices") or []:
         if isinstance(notice, dict) and notice.get("detail"):
             lines.append(f"- note: {notice['detail']}")

@@ -32,7 +32,8 @@
           "enum": ["verified", "no_win", "failed", "unavailable", "skipped"]
         },
         "reason": {"type": "string"},
-        "reverted": {"type": "boolean", "description": "was the stage's commit dropped"},
+        "reverted": {"type": "boolean", "description": "whether the engine CONFIRMED the stage's commit is off the worktree HEAD — not merely that a reset was attempted. False on a not-kept verdict means the commit may still be on the branch, `revert_unconfirmed` names why, and the stage is failed rather than reported green."},
+        "revert_unconfirmed": {"type": "string", "description": "why the engine could not confirm the commit was removed; present only on a not-kept verdict whose revert it could not verify"},
         "tolerance": {"type": "number", "description": "the minimum relative improvement this verdict required"},
         "metrics": {
           "type": "array",

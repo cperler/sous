@@ -532,3 +532,127 @@ def test_the_completion_note_reports_the_verdict_not_the_claim(tmp_path, worktre
     assert "REVERTED — no measured win" in note
     assert "hot: 100.0 -> 98.0" in note
     assert "required improvement: more than 5.0%" in note
+
+
+# --- a revert the gate could not perform (#520 review) -------------------------------------
+#
+# Every not-kept path above ends in a git reset. When the git plumbing itself breaks first,
+# the gate used to drop the checkpoint and report SUCCESS with the unverified commit STILL on
+# HEAD — and nothing between here and DELIVER re-reads the tree, so it shipped as if measured.
+# The revert is now confirmed against HEAD, and an unconfirmed one fails the stage.
+
+
+def _optimize_stage(eng: Engine):
+    return eng.store.load_task("r1", "t1").stages[Stage.OPTIMIZE]
+
+
+def test_a_missing_anchor_cannot_revert_so_the_stage_fails(tmp_path, worktree) -> None:
+    """The reviewer's reproduction: no base_sha and no prior checkpoint means no commit to
+    reset to, so the unverified commit stays on HEAD — which must not read as a green pass."""
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha="")
+
+    sha, outcome = _record_optimize(eng, work, wt, after={"hot": 10.0})
+
+    assert _head(wt) == sha  # the commit really is still there — the gate says so, not guesses
+    (event,) = _gate_events(eng)
+    assert event["type"] == "optimize_benchmark_unavailable" and event["reason"] == "no_anchor"
+    assert event["reverted"] is False and "no anchor commit" in event["revert_unconfirmed"]
+    stage = _optimize_stage(eng)
+    assert stage.status.value == "failed"  # not a SUCCESS carrying an unverified commit
+    assert "could not be removed from the worktree" in (stage.error or "")
+    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+    assert outcome["outcome"] != "stage_completed"
+
+
+def test_an_unresolvable_anchor_fails_the_stage_rather_than_claiming_a_revert(
+    tmp_path, worktree
+) -> None:
+    """A checkpoint sha that no longer resolves (a pruned tag, a recreated worktree) makes
+    both the range read and the reset fail; the commit survives, so the stage must not."""
+    wt, _ = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha="a" * 40)
+
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 10.0})
+
+    assert _head(wt) == sha
+    (event,) = _gate_events(eng)
+    assert event["reason"] == "range_unreadable" and event["reverted"] is False
+    assert event["revert_error"]  # the reset was attempted and git refused the anchor
+    assert "rev-parse aaaa" in event["revert_unconfirmed"]
+    assert _optimize_stage(eng).status.value == "failed"
+
+
+def test_an_unreadable_head_fails_the_stage(tmp_path) -> None:
+    """A worktree directory that is not a git repo: HEAD is unresolvable, so the gate cannot
+    know what it would be reverting and cannot confirm it did."""
+    wt = tmp_path / "not-a-repo"
+    wt.mkdir()
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha="b" * 40)
+
+    eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                 checkpoint={"tag": "task/r1/t1/optimize/0", "sha": ""}))
+
+    (event,) = _gate_events(eng)
+    assert event["reason"] == "head_unresolved" and event["reverted"] is False
+    assert "rev-parse HEAD failed" in event["revert_unconfirmed"]
+    assert _optimize_stage(eng).status.value == "failed"
+
+
+def test_no_worktree_to_inspect_is_reported_but_does_not_fail_the_stage(tmp_path) -> None:
+    """The third state: with no worktree there is nothing the engine could have cleaned and
+    nothing a retry's reset would fix, so the warning plus the dropped checkpoint is the whole
+    remedy — a veto would only turn an already-broken setup into a retry loop."""
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(tmp_path / "gone"), base_sha="a" * 40)
+
+    eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                 checkpoint={"tag": "task/r1/t1/optimize/0", "sha": "b" * 40}))
+
+    (event,) = _gate_events(eng)
+    assert event["reason"] == "worktree_missing" and event["reverted"] is False
+    assert "not a directory to inspect" in event["revert_unconfirmed"]
+    assert _optimize_stage(eng).status.value == "completed"
+    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+
+
+def test_the_completion_note_never_claims_a_revert_that_did_not_happen(
+    tmp_path, worktree
+) -> None:
+    """The PR-facing half of the same bug: the heading came off the verdict's status, so an
+    unreverted pass printed "REVERTED" over a commit still sitting on the branch — a false
+    statement in the artifact a human merges from."""
+    wt, _ = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha="")
+    _record_optimize(eng, work, wt, after={"hot": 10.0})
+
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+
+    assert "NOT VERIFIED and NOT REVERTED" in note
+    assert "REVERTED — nothing to verify it with" not in note
+    assert "could not confirm the commit was removed" in note
+
+
+def test_a_reset_git_refuses_fails_the_stage_instead_of_reporting_a_revert(
+    tmp_path, worktree
+) -> None:
+    """The anchor and HEAD both resolve, so the gate knows exactly which commit is still on
+    the branch after git declined to move the tree (here: a held index lock)."""
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 1.0}))
+    (wt / ".git" / "index.lock").write_text("")  # another git process holds the index
+
+    eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                 checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
+
+    assert _head(wt) == sha
+    (event,) = _gate_events(eng)
+    assert event["reason"] == "anchor_checkout_failed" and event["reverted"] is False
+    assert f"HEAD is still {sha[:12]}" in event["revert_unconfirmed"]
+    assert _optimize_stage(eng).status.value == "failed"

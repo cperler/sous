@@ -316,6 +316,18 @@ _ATTRIBUTION_SCAN_COMMIT_CAP = 50
 # rather than wedging record().
 _BENCHMARK_TIMEOUT_S = 1800
 
+# The veto an OPTIMIZE result gets when the gate decided NOT to keep its commit but could not
+# confirm the commit is off the worktree's HEAD (#520 review). Dropping the checkpoint alone
+# does not undo a commit: nothing between here and DELIVER re-checks HEAD against
+# ``last_checkpoint``, so an unreverted commit would ride into the PR as verified work. A
+# FAILURE is the honest report — it also puts the stage on the retry path, whose dispatch
+# resets the worktree to the last-good checkpoint before re-running it. Stable (it feeds
+# ``error_signature`` and the breaker's identical-failure streak): enrich the detail, not this.
+_OPTIMIZE_UNREVERTED_VETO = (
+    "optimize benchmark gate: the pass was not verified and its commit could not be removed "
+    "from the worktree, so the unverified change must not ride forward"
+)
+
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
     """The last ``n_lines`` of ``text`` plus whether anything was dropped, so a
@@ -2614,7 +2626,9 @@ class Engine:
         # #520: the OPTIMIZE stage's speed claim, checked by the harness instead of trusted.
         # The engine runs the project adapter's declared benchmark before and after the
         # stage's commit and strips the checkpoint (plus hard-resets the worktree) unless the
-        # numbers show a win — so "it got faster" is a measurement, not prose. Placed here,
+        # numbers show a win — so "it got faster" is a measurement, not prose. A revert it
+        # cannot CONFIRM fails the stage, because a stripped checkpoint alone still leaves the
+        # unverified commit on HEAD for TEST/DELIVER to ship. Placed here,
         # BEFORE the locked transition absorbs ``effective.checkpoint`` into
         # ``task.last_checkpoint``, which is the whole mechanism for not keeping the commit.
         if effective.stage is Stage.OPTIMIZE and effective.status is ResultStatus.SUCCESS:
@@ -3699,9 +3713,15 @@ class Engine:
         Not a win (or not measurable) means the commit is NOT kept: the worktree is
         hard-reset to the anchor and the returned result carries no ``checkpoint``, so
         ``task.last_checkpoint`` keeps naming the last VERIFIED commit and a later retry
-        resets to it. The stage stays SUCCESS either way — reverting a speed pass that did
-        not pay off is a valid outcome of the pass, not a failure to retry, and the stage
+        resets to it. The stage stays SUCCESS through a revert — reverting a speed pass that
+        did not pay off is a valid outcome of the pass, not a failure to retry, and the stage
         prompt already says so.
+
+        The ONE case that does fail the stage is a revert the gate cannot confirm: the git
+        plumbing itself broke (no anchor, an unreadable HEAD, a reset that failed), so the
+        unverified commit may still be on HEAD. Dropping the checkpoint does not undo a
+        commit and nothing downstream re-reads the tree, so reporting SUCCESS there would
+        ship the unverified change as if it had been measured. See ``_optimize_gate_result``.
 
         Every path writes a verdict block into ``structured_output['benchmark']`` and emits
         exactly one event, because "verified green" and "never measured" must not read alike:
@@ -3724,8 +3744,9 @@ class Engine:
         if not anchor:
             return self._optimize_gate_unavailable(
                 run_id, task, result, reason="no_anchor",
-                detail="no prior checkpoint or base_sha to measure against",
-                worktree=None, anchor="",
+                detail="no prior checkpoint or base_sha to measure against, so the pass "
+                       "can be neither verified nor undone",
+                worktree=worktree, anchor="",
             )
 
         head = str((result.checkpoint or {}).get("sha") or "").strip()
@@ -3736,7 +3757,7 @@ class Engine:
             return self._optimize_gate_unavailable(
                 run_id, task, result, reason="head_unresolved",
                 detail="could not resolve the stage's HEAD commit",
-                worktree=None, anchor=anchor,
+                worktree=worktree, anchor=anchor,
             )
 
         counted = run_git(worktree, "rev-list", "--count", f"{anchor}..{head}")
@@ -3745,7 +3766,7 @@ class Engine:
                 run_id, task, result, reason="range_unreadable",
                 detail=f"git rev-list {anchor}..{head} failed: "
                        f"{(counted.stderr or '').strip()[:200]}",
-                worktree=None, anchor=anchor,
+                worktree=worktree, anchor=anchor,
             )
         if counted.stdout.strip() in ("", "0"):
             # A clean no-op pass. Nothing to keep, nothing to revert, nothing to measure —
@@ -3801,7 +3822,10 @@ class Engine:
                 run_id, task, result, reason="anchor_checkout_failed",
                 detail=f"git reset --hard {anchor} failed: "
                        f"{(reset.stderr or '').strip()[:200]}",
-                worktree=None, anchor=anchor, notices=notices,
+                # The reset just failed; re-running it would only fail again. The
+                # post-condition check below is what decides whether the commit is really
+                # still there (a reset can fail with the tree already at the anchor).
+                worktree=worktree, anchor=anchor, revert=False, notices=notices,
             )
         before_leg = self._run_benchmark(worktree, argv, timeout_s=_BENCHMARK_TIMEOUT_S)
         before_metrics, before_error = parse_benchmark_output(before_leg["stdout"])
@@ -3818,7 +3842,7 @@ class Engine:
                        "detail": f"git reset --hard {head} failed: "
                                  f"{(restore.stderr or '').strip()[:200]}",
                        "legs": [_benchmark_leg_summary("before", before_leg)]},
-                strip_checkpoint=True,
+                strip_checkpoint=True, worktree=worktree, anchor=anchor, revert=False,
             )
         after_leg = self._run_benchmark(worktree, argv, timeout_s=_BENCHMARK_TIMEOUT_S)
         after_metrics, after_error = parse_benchmark_output(after_leg["stdout"])
@@ -3845,7 +3869,7 @@ class Engine:
                        "reverted": False, "anchor": anchor, "head": head, "argv": argv,
                        "tolerance": tolerance, "notices": notices, "detail": detail,
                        "legs": legs},
-                strip_checkpoint=True, revert=(worktree, anchor),
+                strip_checkpoint=True, worktree=worktree, anchor=anchor, revert=True,
             )
 
         verdict = compare_benchmarks(before_metrics, after_metrics, tolerance=tolerance)
@@ -3865,46 +3889,103 @@ class Engine:
             )
         return self._optimize_gate_result(
             run_id, task, result, event="optimize_benchmark_no_win", level="warning",
-            block=block, strip_checkpoint=True, revert=(worktree, anchor),
+            block=block, strip_checkpoint=True,
+            worktree=worktree, anchor=anchor, revert=True,
         )
 
     def _optimize_gate_unavailable(
         self, run_id: str, task: Task, result: StageResult, *,
         reason: str, detail: str, worktree: str | None, anchor: str,
-        notices: list[dict[str, str]] | None = None,
+        revert: bool = True, notices: list[dict[str, str]] | None = None,
     ) -> StageResult:
         """The advisory path: nothing runnable to measure with, so nothing is kept.
 
-        ``worktree=None`` means there is no revert to attempt (no tree, no anchor, or the
-        tree is already sitting at the anchor) — the checkpoint is still dropped, because an
-        unverified commit must never become the anchor a later stage trusts."""
+        ``worktree``/``anchor`` are what the revert and the post-condition check in
+        ``_optimize_gate_result`` need — pass them on EVERY outcome, including the ones that
+        bailed out before running anything, because dropping the checkpoint does not by
+        itself take the stage's commit off the branch. ``revert=False`` suppresses only the
+        reset attempt (the caller already tried it and it failed); the check still runs."""
         return self._optimize_gate_result(
             run_id, task, result, event="optimize_benchmark_unavailable", level="warning",
             block={"status": "unavailable", "reason": reason, "detail": detail,
                    "reverted": False, "anchor": anchor, "notices": notices or []},
-            strip_checkpoint=True,
-            revert=(worktree, anchor) if worktree and anchor else None,
+            strip_checkpoint=True, worktree=worktree, anchor=anchor,
+            revert=revert and bool(worktree and anchor),
         )
+
+    @staticmethod
+    def _optimize_revert_confirmed(
+        worktree: str | None, anchor: str
+    ) -> tuple[bool | None, str]:
+        """Is the unverified OPTIMIZE commit CONFIRMED off the worktree's HEAD? (#520 review.)
+
+        Returns ``(confirmed, detail)`` with three states, because "it is gone", "it may
+        still be there" and "there is no tree to look in" are three different facts:
+
+        * ``True``  — HEAD resolves to the same commit as ``anchor``: the reset really happened.
+        * ``False`` — a real worktree whose HEAD is NOT the anchor, or whose anchor/HEAD could
+          not be resolved at all. Fails toward "still there" on purpose: a commit that MIGHT
+          be on the branch has to be treated as though it is, because the stages after this
+          one read the worktree, not this verdict.
+        * ``None``  — no worktree directory to inspect, so the gate has no subject and nothing
+          it could have cleaned. Reported, never vetoed (the same posture
+          ``_audit_commit_attribution`` takes on a missing worktree).
+
+        Pure detection — no events, no mutation. The caller decides what each state costs."""
+        if not worktree or not Path(worktree).is_dir():
+            return None, f"worktree {worktree or '(unset)'} is not a directory to inspect"
+        if not anchor:
+            return False, "there is no anchor commit to reset the worktree to"
+        head = run_git(worktree, "rev-parse", "HEAD^{commit}")
+        if head.returncode != 0:
+            return False, f"git rev-parse HEAD failed: {(head.stderr or '').strip()[:200]}"
+        target = run_git(worktree, "rev-parse", f"{anchor}^{{commit}}")
+        if target.returncode != 0:
+            return False, (f"git rev-parse {anchor} failed: "
+                           f"{(target.stderr or '').strip()[:200]}")
+        if head.stdout.strip() != target.stdout.strip():
+            return False, (f"HEAD is still {head.stdout.strip()[:12]}, not the anchor "
+                           f"{target.stdout.strip()[:12]}")
+        return True, ""
 
     def _optimize_gate_result(
         self, run_id: str, task: Task, result: StageResult, *,
         event: str, level: str, block: dict, strip_checkpoint: bool,
-        revert: tuple[str, str] | None = None,
+        worktree: str | None = None, anchor: str = "", revert: bool = False,
     ) -> StageResult:
-        """Apply one gate outcome: revert if asked, emit its single event, and fold the
-        verdict block into the stage output.
+        """Apply one gate outcome: revert if asked, CONFIRM the revert, emit its single event,
+        and fold the verdict block into the stage output.
+
+        On every not-kept outcome (``strip_checkpoint``) the revert is verified rather than
+        assumed, and ``block['reverted']`` is that verification — not merely the reset
+        command's exit code. An unconfirmed revert additionally DOWNGRADES the result to a
+        FAILURE (``_OPTIMIZE_UNREVERTED_VETO``): stripping the checkpoint keeps the unverified
+        commit from becoming the anchor, but it does not take the commit off HEAD, and nothing
+        between here and DELIVER re-reads the tree — so without the veto an unmeasurable pass
+        whose revert failed would ship as if it had been verified.
 
         The event is appended directly rather than collected into ``record``'s atomic batch
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
         the record of a reverted worktree until the locked commit would leave a window where
         the tree and the log disagree. No leg carries raw stdout into the block, so the event
         is the block verbatim rather than a thinned copy of it."""
-        if revert is not None:
-            worktree, anchor = revert
+        if revert and worktree and anchor:
             reset = run_git(worktree, "reset", "--hard", anchor)
-            block["reverted"] = reset.returncode == 0
             if reset.returncode != 0:
                 block["revert_error"] = (reset.stderr or "").strip()[:200]
+        veto: str | None = None
+        if strip_checkpoint:
+            confirmed, why = self._optimize_revert_confirmed(worktree, anchor)
+            block["reverted"] = confirmed is True
+            if confirmed is not True:
+                block["revert_unconfirmed"] = why
+                # Only a REAL worktree earns the veto: with no tree to inspect there is
+                # nothing the engine could have cleaned and nothing a retry's reset would
+                # fix, so the warning event and the dropped checkpoint are the whole
+                # remedy available. ``confirmed is False`` means the tree is there and the
+                # commit may still be on it — that one must not report SUCCESS.
+                if confirmed is False:
+                    veto = f"{_OPTIMIZE_UNREVERTED_VETO} ({why})"
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": event, "level": level, "run_id": run_id,
@@ -3913,9 +3994,11 @@ class Engine:
         )
         out = dict(result.structured_output or {})
         out["benchmark"] = block
-        return result.model_copy(
-            update={"structured_output": out, **({"checkpoint": None} if strip_checkpoint else {})}
-        )
+        return result.model_copy(update={
+            "structured_output": out,
+            **({"checkpoint": None} if strip_checkpoint else {}),
+            **({"status": ResultStatus.FAILURE, "error": veto} if veto else {}),
+        })
 
     @staticmethod
     def _issue_fingerprint(issue: object) -> str:
