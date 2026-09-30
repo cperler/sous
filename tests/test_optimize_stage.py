@@ -187,7 +187,11 @@ def test_the_stage_dispatches_with_its_spec_and_checkpoints(tmp_path, optimizing
                                  checkpoint=CHECKPOINT))
     task = eng.store.load_task("r1", "t1")
     assert task.stages[Stage.OPTIMIZE].status is StageStatus.COMPLETED
-    assert task.last_checkpoint == CHECKPOINT
+    # #520: absorbing the checkpoint is now CONDITIONAL on the engine's own benchmark. This
+    # project declares no benchmark_cmd, so the commit is unverified and therefore not kept —
+    # tests/test_optimize_benchmark_gate.py owns the verified path.
+    assert task.last_checkpoint is None
+    assert task.stages[Stage.OPTIMIZE].output["benchmark"]["status"] == "unavailable"
 
 
 def test_the_resolved_pipeline_survives_a_rebuilt_engine(tmp_path, optimizing) -> None:

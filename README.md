@@ -60,7 +60,8 @@ The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test
 stage-vocabulary members rather than standing steps: `simplify`, which SCOPE can opt a
 decomposed child into, and `optimize`, a measured speed pass a PROJECT opts into with one
 agent-roster entry (it files the architectural changes it declines to make as enhancement
-issues).
+issues). The engine verifies `optimize` rather than trusting it: it runs the project's own
+declared benchmark before and after the stage and reverts the commit without a measured win.
 
 ## The load-bearing idea: engine / adapter split
 
