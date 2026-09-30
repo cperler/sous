@@ -532,6 +532,15 @@ class Run(_StatusModel):
     # instead of rendering every run through whichever ``--project`` was passed. Additive
     # field: pre-#386 run docs load with the default, no SCHEMA_VERSION bump.
     project_ref: str | None = None
+    # Where this run's store/log dir is on disk (#523), stamped by the engine at creation
+    # from the store it was built with — NOT a create_run parameter and NOT recomputed from
+    # engine defaults. The default runs location is outside the project
+    # (``<runs root>/<project>/<YYYY-MM-DD>/<run>/``) and the date level is fixed at
+    # creation, so a later process must be able to read where the run landed rather than
+    # re-derive it against a different default root or a different day. Alert mails and
+    # release commands print this path. Additive field: pre-#523 run docs load with the
+    # default, no SCHEMA_VERSION bump.
+    run_dir: str | None = None
     # Interactive supervisor context park (#259). These fields make the current park
     # self-describing from the run doc without replaying events.jsonl. They are cleared
     # when a fresh supervisor resumes; archived events retain the full history. Additive
