@@ -705,7 +705,7 @@ def _task_details(
             and current_rec["status"] == "running"
             and state not in _TERMINAL_TASK
         )
-        deps = list(graph.get(tid) or (task.depends_on if task else []) or [])
+        deps = list(graph.get(tid) or (task.depends_on if task else []))
         waiting_on = (
             [d for d in deps if (tasks.get(d) or {}).get("state") != "completed"]
             if state not in _TERMINAL_TASK
