@@ -690,7 +690,8 @@ def test_github_source_describe_pr_returns_live_delivery_evidence() -> None:
 
     assert calls == [[
         "gh", "pr", "view", "https://github.com/o/r/pull/23", "--json",
-        "number,url,state,headRefName,headRefOid,baseRefName",
+        "number,url,state,headRefName,headRefOid,baseRefName,title,additions,deletions,"
+        "changedFiles,files,commits,reviewDecision,statusCheckRollup,mergedAt,isDraft",
     ]]
     assert info == {
         "number": 23,
@@ -699,7 +700,61 @@ def test_github_source_describe_pr_returns_live_delivery_evidence() -> None:
         "head_ref": "task/10",
         "head_sha": "abc123",
         "base_ref": "main",
+        # #524 summary fields: absent from this minimal response, so empty/None — never
+        # a fabricated "passing" CI state or a zero diffstat.
+        "title": None,
+        "additions": None,
+        "deletions": None,
+        "changed_files": None,
+        "files": [],
+        "commits": [],
+        "review_decision": None,
+        "checks": None,
+        "merged_at": None,
+        "draft": None,
     }
+
+
+def test_github_source_describe_pr_carries_the_alert_summary() -> None:
+    # #524: the same single `gh pr view` call also yields what a completion mail shows.
+    def runner(argv: list[str]) -> str:
+        return json.dumps({
+            "number": 23, "url": "https://github.com/o/r/pull/23", "state": "OPEN",
+            "headRefName": "task/10", "headRefOid": "abc123", "baseRefName": "main",
+            "title": "Rework alerts", "additions": 120, "deletions": 30, "changedFiles": 2,
+            "files": [{"path": "a.py", "additions": 100, "deletions": 20},
+                      {"path": "b.py", "additions": 20, "deletions": 10}],
+            "commits": [{"oid": "0123456789abcdef", "messageHeadline": "Do the thing"}],
+            "reviewDecision": "",
+            "statusCheckRollup": [
+                {"__typename": "CheckRun", "status": "COMPLETED", "conclusion": "SUCCESS"},
+                {"__typename": "StatusContext", "state": "PENDING"},
+            ],
+            "mergedAt": None, "isDraft": False,
+        })
+
+    info = GitHubIssuesSource("o/r", runner=runner).describe_pr(
+        "https://github.com/o/r/pull/23"
+    )
+    assert info["title"] == "Rework alerts"
+    assert (info["additions"], info["deletions"], info["changed_files"]) == (120, 30, 2)
+    assert info["files"][0] == {"path": "a.py", "additions": 100, "deletions": 20}
+    assert info["commits"] == [{"sha": "0123456789ab", "title": "Do the thing"}]
+    assert info["review_decision"] is None  # "" means no decision, not a verdict
+    assert info["checks"] == "pending"
+    assert info["draft"] is False
+
+
+def test_rollup_checks_distinguishes_failure_pending_success_and_none() -> None:
+    from adapters.project.github_issues import rollup_checks
+
+    ok = {"status": "COMPLETED", "conclusion": "SUCCESS"}
+    assert rollup_checks([]) is None  # no checks is not "passing"
+    assert rollup_checks(None) is None
+    assert rollup_checks([ok, {"status": "COMPLETED", "conclusion": "SKIPPED"}]) == "success"
+    assert rollup_checks([ok, {"status": "IN_PROGRESS", "conclusion": ""}]) == "pending"
+    assert rollup_checks([{"status": "IN_PROGRESS"}, {"state": "ERROR"}]) == "failure"
+    assert rollup_checks([ok, {"conclusion": "TIMED_OUT", "status": "COMPLETED"}]) == "failure"
 
 
 def test_github_source_keyed_followup_recovers_existing_issue() -> None:

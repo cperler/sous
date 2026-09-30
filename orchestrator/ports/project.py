@@ -156,11 +156,28 @@ class TaskSource(Protocol):
     #       so a re-invoked driver re-reading a parked run does not re-alert.
     #       ``task_completed`` also carries ``note_md`` (the render_completion_note markdown
     #       already published to the PR, bounded — reused rather than re-authored, since the
-    #       engine never calls a model), plus followups_filed/improvement_ref.
+    #       engine never calls a model), plus followups ([{title, ref}]), followups_filed,
+    #       improvement_ref and optimize_suggestion_refs. The note is the SINGLE source for
+    #       the review verdict, stage table and total: a sink should embed it rather than
+    #       re-render those facts, so the PR comment and the mail cannot drift (#524).
+    #       #524 widened the shared block every per-task kind carries: ``issue_url``,
+    #       ``labels`` and ``issue_excerpt``/``issue_acceptance`` (bounded, from the task
+    #       doc's snapshot — no tracker call), ``review`` ({approved, cycles, blocking,
+    #       non_blocking, *_omitted}), and per-stage effort/lane/tokens/cost_usd/metered/
+    #       duration_s on each ``stages`` entry. ``task_completed`` additionally carries a
+    #       bounded ``pr`` block ({title, state, draft, additions, deletions, changed_files,
+    #       files, commits, review_decision, checks, …}) built from the ``describe_pr`` read
+    #       the completion path already makes for #378; the failure and park paths stay
+    #       offline and never read the PR. ``describe_pr`` may therefore return those summary
+    #       keys alongside its delivery evidence (GitHubIssuesSource does, from the same
+    #       ``gh pr view`` call); a source that omits them just yields a thinner mail.
     #       ``run_finalized`` carries a per-task ``tasks`` roster ({task_id, state, title,
-    #       pr_url}) so a batch digest is renderable. The derived blocks are best-effort: a
-    #       payload missing ``stages``/``cost`` is evented (``notification_facts_degraded``)
-    #       rather than silently thinned, so a sink should treat both as optional.
+    #       pr_url, issue_number, issue_url, cost}) plus ``counts`` (tasks per state and
+    #       total), ``duration_s`` and the run's ``cost``, so a batch digest is renderable.
+    #       The derived blocks are best-effort: a payload missing ``stages``/``cost``/
+    #       ``review``/``pr``/the issue excerpt is evented (``notification_facts_degraded``,
+    #       with the ``part``) rather than silently thinned, so a sink should treat every
+    #       derived key as optional.
 
 
 @runtime_checkable

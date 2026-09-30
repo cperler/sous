@@ -1,0 +1,45 @@
+Next: review and merge https://github.com/acme/widgets/pull/530
+
+ISSUE
+Link: https://github.com/acme/widgets/issues/524
+Labels: enhancement, ux
+The completion emails are useful, but the body repeats itself and says less than it could.
+Acceptance:
+- A sample email shows the issue summary and PR diffstat.
+- Snapshot tests for each kind.
+
+PULL REQUEST
+Title: Rework completion notification emails
+Status: open, CI success, GitHub review approved
+Diff: +412 −96 across 3 file(s), 2 commit(s)
+  +   −  File
+---  --  ------------------------------
+350  80  adapters/project/email_sink.py
+ 50  14  orchestrator/engine.py
+ 12   2  orchestrator/render.py
+Commits:
+- 0f1e2d3c4b5a Rework completion notification emails
+- a1b2c3d4e5f6 Address review: escape note HTML
+
+REVIEW, STAGES AND COST
+- **Review:** ✅ approved
+
+| # | Stage | Status | Model | Effort | In | Out | Cost |
+|---:|---|---|---|---|---:|---:|---:|
+| 01 | intake | completed | — | — | — | — | $0 (engine) |
+| 02 | implement | completed | `claude-opus-5-5` | high | 1.2M | 45.1k | $2.9000 |
+| 03 | review | completed | `claude-fable-5-1` | high | 310.0k | 8.2k | $1.1000 |
+
+**Total:** $4.0000 over 6 model call(s)
+
+### Follow-ups filed (non-blocking findings)
+- Add a digest-only mode → https://github.com/acme/widgets/issues/531
+
+### Noted, not filed
+- Rename `_trim_note` — noted, not tracked
+
+_Produced by the orchestration harness — nothing dropped._
+
+TRAIL
+Run batch-7, 1 review cycle(s).
+Full trail: /Users/me/Development/runs/widgets/2026-09-30/batch-7

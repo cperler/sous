@@ -75,6 +75,41 @@ def _parse_depends_on(body: str) -> list[str]:
     return refs
 
 
+# One ``gh pr view`` call serves both the #378 delivery evidence and the #524 alert summary.
+_PR_VIEW_FIELDS = (
+    "number,url,state,headRefName,headRefOid,baseRefName,title,additions,deletions,"
+    "changedFiles,files,commits,reviewDecision,statusCheckRollup,mergedAt,isDraft"
+)
+# Check conclusions / commit-status states that make the rolled-up CI state "failure".
+_CHECK_FAILED = frozenset(
+    {"FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STARTUP_FAILURE"}
+)
+_CHECK_PENDING = frozenset({"PENDING", "EXPECTED", "QUEUED", "IN_PROGRESS", "WAITING"})
+
+
+def rollup_checks(rollup: object) -> str | None:
+    """Collapse ``statusCheckRollup`` into one CI state for an alert (#524): ``failure`` if
+    any check failed, else ``pending`` if any is unfinished, else ``success``. ``None`` when
+    the PR has no checks at all, which is different from "passing" and must not read so.
+
+    Handles both entry shapes GitHub returns: a CheckRun (``status`` + ``conclusion``) and
+    a legacy commit StatusContext (``state``)."""
+    if not isinstance(rollup, list) or not rollup:
+        return None
+    pending = False
+    for check in rollup:
+        if not isinstance(check, dict):
+            continue
+        conclusion = str(check.get("conclusion") or "").upper()
+        state = str(check.get("state") or "").upper()
+        status = str(check.get("status") or "").upper()
+        if conclusion in _CHECK_FAILED or state in _CHECK_FAILED:
+            return "failure"
+        if state in _CHECK_PENDING or (status and status != "COMPLETED"):
+            pending = True
+    return "pending" if pending else "success"
+
+
 class GitHubIssuesSource:
     """Task source backed by GitHub issues via the ``gh`` CLI."""
 
@@ -186,17 +221,31 @@ class GitHubIssuesSource:
         }
 
     def describe_pr(self, pr_url: str) -> dict:
-        """Return live delivery evidence for completion auditing (#378).
+        """Return live delivery evidence for completion auditing (#378), plus the PR
+        summary a completion alert shows (#524).
 
         ``headRefOid`` survives branch auto-deletion on merged PRs, allowing the engine to
         distinguish "this run's delivered head was merged" from a stale merged URL whose
         PR predates the run's fix commits.
+
+        The summary fields (title, diffstat, per-file +/-, commit headlines, GitHub's review
+        decision, a rolled-up CI state) ride the SAME ``gh pr view`` call, so the engine
+        reads the PR once per completion rather than once for evidence and again for the
+        mail. Unbounded here; the engine caps the lists before they reach a payload.
         """
         raw = self._run(
-            ["gh", "pr", "view", pr_url, "--json",
-             "number,url,state,headRefName,headRefOid,baseRefName"]
+            ["gh", "pr", "view", pr_url, "--json", _PR_VIEW_FIELDS]
         )
         data = json.loads(raw)
+        files = [
+            {"path": f.get("path"), "additions": f.get("additions"),
+             "deletions": f.get("deletions")}
+            for f in data.get("files") or [] if isinstance(f, dict)
+        ]
+        commits = [
+            {"sha": str(c.get("oid") or "")[:12], "title": c.get("messageHeadline")}
+            for c in data.get("commits") or [] if isinstance(c, dict)
+        ]
         return {
             "number": data.get("number"),
             "url": data.get("url") or pr_url,
@@ -204,6 +253,16 @@ class GitHubIssuesSource:
             "head_ref": data.get("headRefName"),
             "head_sha": data.get("headRefOid"),
             "base_ref": data.get("baseRefName"),
+            "title": data.get("title"),
+            "additions": data.get("additions"),
+            "deletions": data.get("deletions"),
+            "changed_files": data.get("changedFiles"),
+            "files": files,
+            "commits": commits,
+            "review_decision": data.get("reviewDecision") or None,
+            "checks": rollup_checks(data.get("statusCheckRollup")),
+            "merged_at": data.get("mergedAt"),
+            "draft": data.get("isDraft"),
         }
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
