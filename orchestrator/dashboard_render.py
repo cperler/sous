@@ -90,6 +90,7 @@ def console_width(columns: int, *, wide: bool = False, compact: bool = False) ->
 
 
 def _fmt_age(secs: float | None) -> str:
+    """Seconds as a short age: ``45s``, ``12m``, ``3h``; ``?`` when unknown."""
     if secs is None:
         return "?"
     if secs < 90:
@@ -100,10 +101,12 @@ def _fmt_age(secs: float | None) -> str:
 
 
 def _clip(text: str, width: int) -> str:
+    """``text`` cut to ``width`` columns with a trailing ellipsis when it overflows."""
     return text if len(text) <= width else text[: max(width - 1, 0)] + "…"
 
 
 def _plural(n: int, word: str) -> str:
+    """``1 run`` / ``2 runs``."""
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
 
 
@@ -115,6 +118,7 @@ def _short_model(model: str | None) -> str | None:
 
 
 def _tokens(n: int) -> str:
+    """A token count, abbreviated in thousands from 1000 up."""
     return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
 
 
@@ -135,6 +139,7 @@ def _wrap_cells(prefix: str, cells: list[str], *, indent: int, width: int) -> li
 
 
 def _section(title: str, body: list[str]) -> list[str]:
+    """A blank line, the ``── title ──`` heading, then ``body``."""
     return ["", f"── {title} ──", *body]
 
 
@@ -153,6 +158,7 @@ def _run_counts(counts: dict[str, int], shown: int) -> str:
 
 
 def _headline(header: dict) -> str:
+    """The board's first line: ALL QUIET or ATTENTION, then the run counts in words."""
     summary = _run_counts(header.get("counts") or {}, header.get("shown") or 0)
     if header.get("all_quiet"):
         return f"ALL QUIET — {summary}"
@@ -195,6 +201,8 @@ def _item_headline(item: dict, task: dict | None) -> str:
 
 
 def _needs_you(snapshot: dict, *, compact: bool) -> list[str]:
+    """The needs-you lines: each attention item, then its commands printed whole (never
+        clipped, so they paste). Compact drops the command labels."""
     runs = snapshot["runs"]
     tasks = {(r["run_id"], t["task_id"]): t for r in runs for t in r.get("tasks") or []}
     roots = {r["run_id"]: r.get("root") for r in runs}
@@ -218,6 +226,8 @@ def _needs_you(snapshot: dict, *, compact: bool) -> list[str]:
 
 
 def _stream_label(activity: dict | None, *, compact: bool) -> str:
+    """Stream state in words: active (with its current tool line when wide), stalled with
+        its age, or no stream."""
     activity = activity or {}
     state = activity.get("state")
     if state == "active":
@@ -229,6 +239,7 @@ def _stream_label(activity: dict | None, *, compact: bool) -> str:
 
 
 def _running_line(task: dict, *, width: int, compact: bool) -> str:
+    """One in-flight task: id, title, stage, time in it, model and stream state."""
     stage = str(task["current_stage"]).upper()
     parts = [f"{stage} for {_fmt_age(task.get('stage_age_s'))}"]
     if model := _short_model(task.get("model")):
@@ -281,6 +292,7 @@ def _degraded_marker(row: dict) -> str:
 
 
 def _run_summary(row: dict) -> str:
+    """A run's one-line state: label, tasks done, attention count, budget, last event age."""
     bits = [
         _RUN_STATE_LABELS.get(row["state"], row["state"]),
         f"{_progress_str(row.get('progress') or {})} done",
@@ -335,6 +347,8 @@ def _waiting(task: dict, row: dict) -> str | None:
 
 
 def _task_lines(task: dict, row: dict, *, width: int, id_w: int) -> tuple[list[str], bool]:
+    """A task's progress line (state, title, what it waits on, PR) plus its stage strip.
+        Returns the lines and whether the strip used the not-started symbol."""
     state = _TASK_STATE_LABELS.get(task["state"], str(task["state"]))
     pr = f"PR {task['pr_url']}" if task.get("pr_url") else None
     tail = "".join(f" — {bit}" for bit in (_waiting(task, row), pr) if bit)
@@ -358,6 +372,8 @@ def _by_project(runs: list[dict]) -> dict[str, list[dict]]:
 
 
 def _progress(runs: list[dict], *, width: int, compact: bool) -> list[str]:
+    """The progress section: runs grouped by project. Compact is one line per run; wide
+        adds every task with its strip, and a legend line when its symbol appears."""
     if not runs:
         return ["  (no runs found)"]
     lines: list[str] = []
@@ -433,6 +449,7 @@ def _stage_cost(stage: dict) -> str | None:
 
 
 def _run_cost_line(row: dict, *, run_w: int, compact: bool) -> str:
+    """One run's cost line; wide adds call counts, unmetered count and token volume."""
     cost = row.get("cost_usd")
     unmetered = row.get("unmetered_calls") or 0
     calls = row.get("total_invocations") or 0
@@ -457,6 +474,7 @@ def _run_cost_line(row: dict, *, run_w: int, compact: bool) -> str:
 
 
 def _task_cost_lines(row: dict, *, width: int) -> list[str]:
+    """Per-task cost with its per-stage cells, each qualified when calls were unmetered."""
     by_task = (row.get("cost_breakdown") or {}).get("by_task") or {}
     stages_of = {t["task_id"]: t.get("stages") or [] for t in row.get("tasks") or []}
     id_w = max((len(t) for t in by_task), default=0)
@@ -476,6 +494,8 @@ def _task_cost_lines(row: dict, *, width: int) -> list[str]:
 
 
 def _cost(header: dict, runs: list[dict], *, width: int, compact: bool) -> list[str]:
+    """The cost section: board spend, account usage headroom, then per-run (wide: per-task
+        and per-stage) figures."""
     lines = [f"  {_spend(header)}", f"  {_usage(header.get('usage'), compact=compact)}"]
     # The board is the one place two pricing regimes get added together. Say it rather
     # than letting a ~20x-overstated legacy run inflate a total silently.
