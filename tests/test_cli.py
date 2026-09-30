@@ -369,3 +369,38 @@ def test_cli_dashboard_watch_alone_still_parses(tmp_path, capsys, monkeypatch) -
     assert rc == 0
     assert captured["root"] == [str(tmp_path)]
     assert captured["interval"] == 1
+
+
+def test_cli_runs_migrate_previews_then_moves_and_leaves_the_kb(tmp_path, capsys) -> None:
+    """#523: `runs-migrate` previews by default, moves whole run dirs under --apply into
+    <runs root>/<project>/<created date>/<run>/, never deletes, and leaves the legacy KB
+    in place with a note about its new home."""
+    legacy = tmp_path / "legacy-runs"
+    base = ["--root", str(legacy), "--shared-root", "--run", "old-run",
+            "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    _run(capsys, *base, "add-task", "--task", "#42")
+    (legacy / "learnings-kb.jsonl").write_text("", encoding="utf-8")
+    capsys.readouterr()
+    created = json.loads((legacy / "old-run" / "status-old-run.json").read_text())["created_at"]
+    dest = tmp_path / "default-runs-root" / "fake" / created[:10] / "old-run"
+
+    preview = _run(capsys, "runs-migrate", "--from", str(legacy))
+    assert preview["dry_run"] is True and preview["moved"] == 0
+    assert preview["plan"][0]["action"] == "move"  # project name from the run doc's ref
+    assert preview["plan"][0]["dst"] == str(dest)
+    assert (legacy / "old-run").is_dir() and not dest.exists()
+
+    applied = _run(capsys, "runs-migrate", "--from", str(legacy), "--apply")
+    assert applied["moved"] == 1
+    assert (dest / "status-old-run.json").exists()
+    assert (dest / "status-old-run-#42.json").exists()
+    assert not (legacy / "old-run").exists()
+    assert (legacy / "learnings-kb.jsonl").exists()
+    assert "NOT moved" in applied["learnings_kb"]
+    # the moved run is now reachable with no --root at all
+    status = _run(capsys, "--run", "old-run", "--project", "tests.fakeproject", "status")
+    assert status["run_id"] == "old-run"
+    # a second apply is a no-op: nothing left to move, nothing overwritten
+    again = _run(capsys, "runs-migrate", "--from", str(legacy), "--apply")
+    assert again["moved"] == 0 and again["plan"] == []

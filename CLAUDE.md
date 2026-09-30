@@ -113,6 +113,14 @@ tracker or fix-forward.
   `runs/<run>/` (status/events.jsonl/stage-costs.jsonl/per-stage `stages/`/cost-summary).
   Those are the durable audit trail (`runs/` is gitignored — local, not committed). Do not
   `rm -rf runs/...` as part of cleanup; leave it for the human to prune explicitly.
+- **Run logs live outside the project, at `~/Development/runs/<project>/<date>/<run>/`**
+  (#523). No `--root` is needed on any command: the store is keyed by the adapter's `name`,
+  the creation date is fixed at `init-run` (and persisted as `Run.run_dir`), and later
+  commands find the run by `--run` alone. `ORCHESTRATOR_RUNS_ROOT` moves the top level;
+  `--root <dir>` is the legacy override (pre-#523 runs, scripts) and `--shared-root` only
+  matters with it. The per-project learnings KB and other cross-run files sit at
+  `~/Development/runs/<project>/`. `runs-migrate --from <project>/runs` moves old dirs in
+  (preview by default, never deletes).
 - **Tasks that declare the same file are serialized, not fanned out** (#377). SCOPE names
   the files a task will modify and `dispatchable` (and `next_work`, so the direct per-task
   CLI path is gated too) holds a task whose declaration collides

@@ -197,6 +197,10 @@ class Task(_StatusModel):
     spec_source_updated_at: str | None = None
     spec_fingerprint: str | None = None
     spec_refreshed_at: str | None = None
+    # The source's labels at capture (#524), snapshotted with title/body so a notification
+    # can show them without a tracker call from inside an alerting path. Additive field:
+    # pre-#524 task docs load with [] (no labels known), so no SCHEMA_VERSION bump.
+    labels: list[str] = Field(default_factory=list)
     provider_tag: str | None = None  # e.g. "codex" (the per-task :codex routing tag)
     # SCOPE-authored child controls (#60). ``agent_role`` is resolved through the project
     # roster at dispatch time; quality/budget remain durable provenance rather than being
@@ -532,6 +536,15 @@ class Run(_StatusModel):
     # instead of rendering every run through whichever ``--project`` was passed. Additive
     # field: pre-#386 run docs load with the default, no SCHEMA_VERSION bump.
     project_ref: str | None = None
+    # Where this run's store/log dir is on disk (#523), stamped by the engine at creation
+    # from the store it was built with — NOT a create_run parameter and NOT recomputed from
+    # engine defaults. The default runs location is outside the project
+    # (``<runs root>/<project>/<YYYY-MM-DD>/<run>/``) and the date level is fixed at
+    # creation, so a later process must be able to read where the run landed rather than
+    # re-derive it against a different default root or a different day. Alert mails and
+    # release commands print this path. Additive field: pre-#523 run docs load with the
+    # default, no SCHEMA_VERSION bump.
+    run_dir: str | None = None
     # Interactive supervisor context park (#259). These fields make the current park
     # self-describing from the run doc without replaying events.jsonl. They are cleared
     # when a fresh supervisor resumes; archived events retain the full history. Additive

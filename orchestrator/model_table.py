@@ -48,8 +48,8 @@ class Role:
 # on a provider price change the same as the claude rows.
 _MODELS: dict[str, ModelInfo] = {
     # claude
-    # Frontier tier — the default for scope/implement (Role.FRONTIER), and still pinnable per
-    # task (#84). Price is the published Anthropic API rate ($10/$50 per Mtok); cache reads
+    # Frontier tier — no stage defaults to it (scope/implement/review run on opus); it is
+    # reserved for thorny tasks via the per-task pin (#84). Price is the published Anthropic API rate ($10/$50 per Mtok); cache reads
     # bill at 0.025x input on 5.1 (not the 0.1x default). Source: platform.claude.com/docs/
     # en/about-claude/pricing, confirmed 2026-09-30.
     "claude-fable-5-1": ModelInfo(
@@ -122,8 +122,8 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 # cross-provider fallthrough (codex -> claude, #7) lives in the engine, not this table: it is
 # a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
-    # fable sits at the HEAD (above opus), and is now the role default for scope/implement
-    # (Role.FRONTIER), so a rate-limited fable degrades to opus naturally
+    # fable sits at the HEAD (above opus), and is a per-task pin only, so a rate-limited
+    # pinned fable degrades to opus naturally
     # (fallback_after('claude-fable-5-1') == 'claude-opus-5-5'). Both the capacity downgrade
     # and the rate-limit fallback only walk DOWN the chain.
     # Superseded tiers (opus-4-8, sonnet-4-6) are deliberately NOT in the chain: they stay

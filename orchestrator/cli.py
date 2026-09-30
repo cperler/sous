@@ -47,6 +47,15 @@ from .ports.project import ADAPTER_CONTRACT_VERSION
 from .project_init import DEFAULT_STACK
 from .project_loader import load_engine_task_source, load_project, validate_config
 from .routing import Router
+from .runs_layout import (
+    RUNS_ROOT_ENV,
+    AmbiguousRunDirError,
+    default_runs_root,
+    find_run_dir,
+    is_dated_project_root,
+    project_runs_root,
+    run_dir_for,
+)
 from .schemas.enums import ExecutionLane, ExecutionMode, Provider, Stage
 from .schemas.work import StageResult, WorkItem
 
@@ -150,14 +159,87 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
     KB, no sibling run stores yet), so the very first run under it would land flat.
     When the caller asserts ``--root`` is the shared runs-root, force the nest even
     with no markers. The established-flat guard still wins so an in-progress flat run
-    stays stable."""
+    stays stable.
+
+    #523 adds the dated layout: an established run is also looked up by id under the
+    date dirs (``<root>/<YYYY-MM-DD>/<run>/``), so ``--root <project runs root> --run X``
+    resolves a run created without ``--root``; and a FRESH run under a root that already
+    holds date dirs nests under today's date rather than landing flat beside them. An id
+    claimed by two dirs is an ``AmbiguousRunDirError`` — never a guess."""
     if not run:
         return root
     if (root / f"status-{run}.json").exists():
         return root  # this run is already established flat here — stay put
     nested = root / run
-    if nested.is_dir() or force_nest or _is_shared_runs_root(root, run):
+    if nested.is_dir():
         return nested
+    found = find_run_dir(root, run)  # <root>/<date>/<run> (#523)
+    if found is not None:
+        return found
+    if is_dated_project_root(root):
+        return run_dir_for(root, run)  # fresh run under a dated project root: today
+    if force_nest or _is_shared_runs_root(root, run):
+        return nested
+    return root
+
+
+#: Commands allowed to CREATE a run's store dir under the default layout (#523). Every
+#: other per-run command must find an existing run: a typo'd id there would otherwise
+#: leave an empty ``<today>/<typo>/`` dir under ``~/Development/runs`` on every miss.
+#: (run-queue's factory creates via ``_default_store_root(..., create=True)`` directly.)
+_RUN_CREATING_COMMANDS = frozenset({"init-run"})
+
+
+def _default_store_root(project_name: str, run: str, *, create: bool = False) -> Path:
+    """The per-run store dir when NO ``--root`` is given (#523):
+    ``<default runs root>/<project name>/<YYYY-MM-DD>/<run>/``. An existing run is found by
+    id across the date dirs (its date was fixed at creation). A miss yields today's dir
+    only when ``create`` is set (a run-creating command); otherwise it exits naming the
+    project root searched, so an unknown id never materializes a directory.
+    Nothing here nests by heuristic and nothing touches ``<cwd>/runs/``."""
+    project_root = project_runs_root(default_runs_root(), project_name)
+    found = find_run_dir(project_root, run)
+    if found is not None:
+        return found
+    if not create:
+        raise SystemExit(
+            f"error: run {run!r} not found under {project_root!s} "
+            "(create it with init-run, or pass --root for a legacy runs dir)"
+        )
+    return run_dir_for(project_root, run)
+
+
+def _store_root_for(args: argparse.Namespace, project_name: str) -> Path:
+    """Resolve the per-run store dir from the parsed args: ``--root`` (legacy/override,
+    through ``_resolve_store_root``) or, absent that, the default external layout keyed
+    by the project adapter's name. States where the store landed on stderr whenever that
+    differs from a literal ``--root`` (never silent). An ambiguous id exits with the
+    offending paths named."""
+    run = getattr(args, "run", None)
+    try:
+        if args.root:
+            root = _resolve_store_root(
+                Path(args.root), run, force_nest=getattr(args, "shared_root", False),
+            )
+            if root != Path(args.root):
+                print(
+                    f"note: --root {args.root!s} is a runs-root; this run's store is at "
+                    f"{root!s}",
+                    file=sys.stderr,
+                )
+            return root
+        if not run:
+            raise SystemExit(f"error: --run is required for {args.cmd} without --root")
+        root = _default_store_root(
+            project_name, run, create=args.cmd in _RUN_CREATING_COMMANDS,
+        )
+    except AmbiguousRunDirError as exc:
+        raise SystemExit(f"error: {exc} (pass --root at the one you mean)") from None
+    print(
+        f"note: no --root given; run store at {root!s} "
+        f"(default runs root: ${RUNS_ROOT_ENV} or ~/Development/runs)",
+        file=sys.stderr,
+    )
     return root
 
 
@@ -187,7 +269,8 @@ def _dashboard_roots(args: argparse.Namespace) -> list[str]:
     """Every runs-root the board should cover, in order, de-duplicated (#386).
 
     Sources, all additive: the global ``--root``, each repeated ``--also-root``, and the
-    ``os.pathsep``-separated ``ORCHESTRATOR_DASHBOARD_ROOTS``. ``--also-root`` rather than a
+    ``os.pathsep``-separated ``ORCHESTRATOR_DASHBOARD_ROOTS``; with none of them, the
+    default runs root (``$ORCHESTRATOR_RUNS_ROOT`` or ``~/Development/runs``, #523). ``--also-root`` rather than a
     repeatable ``--root`` on the subparser is forced by argparse: a subparser copies its own
     namespace over the parent's, so re-declaring ``--root`` there would clobber a global
     ``--root`` given BEFORE the subcommand with the subparser's default.
@@ -202,6 +285,11 @@ def _dashboard_roots(args: argparse.Namespace) -> list[str]:
             continue
         seen.add(item)
         roots.append(item)
+    if not roots:
+        # #523: with nothing named, the board covers EVERY project under the default runs
+        # root — the walker descends <project>/<date>/<run>, so one bare `dashboard` spans
+        # projects without listing their roots.
+        roots.append(str(default_runs_root()))
     return roots
 
 
@@ -218,8 +306,10 @@ def _consumes_shared_root(args: argparse.Namespace) -> bool:
 def _engine(args: argparse.Namespace) -> Engine:
     """Build and return a fully-wired ``Engine`` from the parsed CLI args.
 
-    Resolves the per-run store directory (auto-nesting under a shared runs-root
-    when appropriate), then constructs the ``StatusStore``, ``CostLedger``,
+    Resolves the per-run store directory (``--root`` auto-nesting under a shared
+    runs-root when appropriate, or the default external
+    ``<runs root>/<project>/<date>/<run>/`` layout when no ``--root`` is given, #523),
+    then constructs the ``StatusStore``, ``CostLedger``,
     project adapter, ``Router``, and execution-lane ``Registry`` in one shot.
 
     Execution mode is derived from ``--mode`` but overridden to
@@ -229,21 +319,13 @@ def _engine(args: argparse.Namespace) -> Engine:
     """
     from .status_store import StatusStore
 
-    root = _resolve_store_root(
-        Path(args.root), getattr(args, "run", None),
-        force_nest=getattr(args, "shared_root", False),
-    )
+    project = load_project(args.project)
+    # The project loads FIRST: without --root the store dir is keyed by the adapter's
+    # name (#523), and the resolver states where the store landed (never silent).
+    root = _store_root_for(args, project.name)
     root.mkdir(parents=True, exist_ok=True)
-    if root != Path(args.root):
-        # Never silent: state the nesting so the operator sees where the store landed.
-        print(
-            f"note: --root {args.root!s} is a shared runs-root; nesting this run's "
-            f"store at {root!s} (learnings KB stays at {root.parent!s}/learnings-kb.jsonl)",
-            file=sys.stderr,
-        )
     store = StatusStore(root)
     ledger = CostLedger(root / "stage-costs.jsonl")
-    project = load_project(args.project)
 
     # Config-only execution mode (interactive×claude default; headless = in-process).
     mode = ExecutionMode(getattr(args, "mode", "interactive"))
@@ -304,16 +386,16 @@ def main(argv: list[str] | None = None) -> int:
     """
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root",
-                   help="runs-root or per-run store dir (not needed for validate). Per-run "
+                   help="OVERRIDE the runs location (legacy scripts / pre-#523 runs). Omit it "
+                        "and every run lives at $ORCHESTRATOR_RUNS_ROOT (default "
+                        "~/Development/runs)/<project name>/<YYYY-MM-DD>/<run>/, found by "
+                        "--run alone. When given: a runs-root or per-run store dir; per-run "
                         "commands auto-nest under <root>/<run>/ when <root> is a shared "
-                        "runs-root (holds a learnings-kb.jsonl or other runs' stores), so "
-                        "--root runs is the natural spelling shared with dashboard/kb/tail")
+                        "runs-root, and look the run up under <root>/<date>/<run>/ too")
     p.add_argument("--shared-root", action="store_true",
-                   help="assert --root IS the shared runs-root and force per-run nesting to "
-                        "<root>/<run>/ even with no markers (#91). Closes the day-one gap the "
-                        "auto-detect heuristic misses: a FRESH runs/ dir holds no KB or sibling "
-                        "stores yet, so the first run would otherwise land flat. Pass this when "
-                        "--root is the top-level runs/ dir")
+                   help="with --root: assert it IS the shared runs-root and force per-run "
+                        "nesting to <root>/<run>/ even with no markers (#91). Not needed "
+                        "without --root — the default layout never nests by heuristic")
     p.add_argument("--run", help="run id (not needed for validate)")
     p.add_argument("--project",
                    help="project-config module (e.g. adapters.project.selfhost) or a "
@@ -707,6 +789,17 @@ def main(argv: list[str] | None = None) -> int:
     bsc.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also "
                           "precede 'brainstorm')")
+    mg = sub.add_parser("runs-migrate",
+                        help="move pre-#523 run dirs out of a legacy runs/ root into the dated "
+                             "default layout <runs root>/<project>/<YYYY-MM-DD>/<run>/. "
+                             "Previews by default; --apply moves (never deletes)")
+    mg.add_argument("--from", dest="migrate_from", required=True,
+                    help="the legacy runs-root holding <run>/ dirs (e.g. <project>/runs)")
+    mg.add_argument("--to", default=None,
+                    help="destination runs root (default: $ORCHESTRATOR_RUNS_ROOT or "
+                         "~/Development/runs)")
+    mg.add_argument("--apply", action="store_true",
+                    help="actually move the run dirs (default is a dry-run preview)")
     gc = sub.add_parser("gc", help="list/prune long-lived git checkpoint tags (no run/project needed)")
     gc.add_argument("--repo", default=".", help="git repo/worktree to scan for checkpoint tags")
     gc.add_argument("--keep-latest", type=int, default=0,
@@ -792,7 +885,10 @@ def main(argv: list[str] | None = None) -> int:
     # its position onto a non-engine command would otherwise have it silently dropped;
     # warn instead of erroring so a legitimate global-position pass to an engine command
     # stays valid (#101).
-    if getattr(args, "shared_root", False) and not _consumes_shared_root(args):
+    if getattr(args, "shared_root", False) and not args.root:
+        print("warning: --shared-root has no effect without --root (the default runs "
+              "layout never nests by heuristic)", file=sys.stderr)
+    elif getattr(args, "shared_root", False) and not _consumes_shared_root(args):
         print(
             f"warning: --shared-root is ignored by the '{args.cmd}' command; it only "
             "affects per-run store nesting for engine commands (init-run/add-task/next/"
@@ -825,10 +921,14 @@ def main(argv: list[str] | None = None) -> int:
                 "text": text if len(text) <= 160 else text[:157] + "...",
             }
 
-        if not args.root:
-            p.error("--root is required for kb (the runs-root, e.g. runs/)")
+        if not args.root and not args.project:
+            p.error("kb needs --root (the runs-root) or --project (its runs root under "
+                    f"${RUNS_ROOT_ENV}, #523)")
         project = load_project(args.project) if args.project else None
-        path = resolve_kb_path(Path(args.root), project)
+        kb_root = Path(args.root) if args.root else project_runs_root(
+            default_runs_root(), project.name,  # type: ignore[union-attr]
+        )
+        path = resolve_kb_path(kb_root, project)
         if args.kb_cmd == "add":
             files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
             written = append_learnings(path, [{
@@ -860,7 +960,7 @@ def main(argv: list[str] | None = None) -> int:
             # still-live. The outcome is still recoverable: the run log's task doc records the
             # terminal state the harvest would have stamped. Unresolvable rows are REPORTED,
             # never guessed — an unstamped row keeps reading as unresolved.
-            runs_root = Path(args.root)
+            runs_root = kb_root
             candidates = [e for e in read_entries(path) if not e.get("task_outcome")]
             stamps, unresolved = [], []
             for entry in candidates:
@@ -896,6 +996,53 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"path": str(path), "count": len(entries), "entries": entries})
         return 0
 
+    if args.cmd == "runs-migrate":
+        # Opt-in relocation of a legacy runs/ root into the dated layout (#523). Preview by
+        # default; --apply only MOVES whole run dirs (never deletes, never overwrites), and
+        # the learnings KB stays put with a note about its new expected home — run logs are
+        # the human's to prune, so this tool only ever adds a copy-free rename.
+        import shutil
+
+        from .runs_layout import plan_migration
+
+        dest_root = Path(args.to).expanduser() if args.to else default_runs_root()
+        project_name = load_project(args.project).name if args.project else None
+
+        def _name_for_ref(ref: str) -> str | None:
+            try:
+                return str(load_project(ref).name)
+            except Exception:  # noqa: BLE001 - an unloadable ref is a SKIP, not a crash
+                return None
+
+        migration = plan_migration(
+            args.migrate_from, dest_root, project_name=project_name, name_for_ref=_name_for_ref,
+        )
+        moved: list[dict[str, str | None]] = []
+        if args.apply:
+            for entry in migration:
+                if entry["action"] != "move" or not entry["dst"]:
+                    continue
+                dst = Path(entry["dst"])
+                if dst.exists():  # re-checked at move time: never overwrite
+                    entry["action"], entry["reason"] = "skip", "destination already exists"
+                    continue
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.move(entry["src"] or "", str(dst))
+                moved.append(entry)
+        legacy_kb = Path(args.migrate_from) / "learnings-kb.jsonl"
+        kb_note = None
+        if legacy_kb.exists():
+            homes = sorted({str(Path(e["dst"]).parent.parent / "learnings-kb.jsonl")
+                            for e in migration if e["dst"]})
+            kb_note = (f"{legacy_kb} is NOT moved; the dated layout reads the KB at the project "
+                       f"level ({', '.join(homes) or '<runs root>/<project>/learnings-kb.jsonl'})"
+                       " — move or merge it by hand")
+        _emit({"ok": True, "dry_run": not args.apply, "from": str(args.migrate_from),
+               "to": str(dest_root), "plan": migration, "moved": len(moved),
+               "skipped": sum(1 for e in migration if e["action"] == "skip"),
+               "learnings_kb": kb_note})
+        return 0
+
     if args.cmd == "gc":
         # Checkpoint tags (task/<run>/<task>/<stage>/<attempt>) outlive their run; list
         # them newest-first, hold back --keep-latest N, and delete the rest under --prune.
@@ -922,9 +1069,20 @@ def main(argv: list[str] | None = None) -> int:
         # say so cleanly rather than erroring.
         from .stream_probe import find_current_stream, follow_stream, read_tail
 
-        if not args.root:
-            p.error("--root is required for tail")
-        stream_path = find_current_stream(Path(args.root), args.task, args.stage)
+        # The run's dir comes from --root (a per-run dir, or a runs-root with --run) or,
+        # without --root, from --run + --project through the default layout (#523).
+        if args.root:
+            run_root = (
+                _resolve_store_root(Path(args.root), args.run) if args.run else Path(args.root)
+            )
+        elif args.run and args.project:
+            try:
+                run_root = _default_store_root(load_project(args.project).name, args.run)
+            except AmbiguousRunDirError as exc:
+                p.error(str(exc))
+        else:
+            p.error("tail needs --root (the run's dir) or --run with --project")
+        stream_path = find_current_stream(run_root, args.task, args.stage)
         if stream_path is None:
             print(f"(no live stream for task {args.task} — interactive/ENGINE lane, "
                   "or nothing dispatched yet)")
@@ -957,11 +1115,6 @@ def main(argv: list[str] | None = None) -> int:
         from .usage_probe import read_usage
 
         roots = _dashboard_roots(args)
-        if not roots:
-            p.error(
-                "dashboard needs at least one runs-root: --root, --also-root, or "
-                f"${DASHBOARD_ROOTS_ENV}"
-            )
         factory = default_engine_factory(args.project, mode=args.mode, provider=args.provider)
         snap_kw: DashboardSnapshotKwargs = {
             "stale_after_s": args.stale_after,
@@ -1000,9 +1153,13 @@ def main(argv: list[str] | None = None) -> int:
         # would be actively misleading because the point is to compare many run stores.
         from .panel_report import build_panel_report, render_panel_report
 
-        if not args.root:
-            p.error("--root is required for panel-report (the shared runs-root, e.g. runs/)")
-        print(render_panel_report(build_panel_report(args.root, limit=args.limit)))
+        if args.root:
+            panel_root: Path = Path(args.root)
+        elif args.project:
+            panel_root = project_runs_root(default_runs_root(), load_project(args.project).name)
+        else:
+            panel_root = default_runs_root()  # every project under the default root (#523)
+        print(render_panel_report(build_panel_report(panel_root, limit=args.limit)))
         return 0
 
     if args.cmd == "util":
@@ -1210,8 +1367,8 @@ def main(argv: list[str] | None = None) -> int:
                    "order": batch_topological_order(plan)})
             return 0
         # batch-plan apply — needs the engine (root/run/project).
-        if not args.root or not args.run or not args.project:
-            p.error("--root, --run and --project are required for `batch-plan apply`")
+        if not args.run or not args.project:
+            p.error("--run and --project are required for `batch-plan apply`")
         eng = _engine(args)
         try:
             result = apply_plan(eng, args.run, plan, known_ids=_known_ids(args.project),
@@ -1308,8 +1465,8 @@ def main(argv: list[str] | None = None) -> int:
             _emit({"ok": True, "released": released})
             return 0
 
-        if not args.root or not args.project:
-            p.error("--root and --project are required for run-queue")
+        if not args.project:
+            p.error("--project is required for run-queue")
         from .usage_probe import resolve_util
 
         util_pct, _ = resolve_util(args.util)
@@ -1317,13 +1474,17 @@ def main(argv: list[str] | None = None) -> int:
 
         def _queue_engine(run_id: str) -> tuple[Engine, AnyRunner]:
             """The ``EngineFactory`` for this drain (#281): a FRESH engine + runner
-            rooted at ``<--root>/<run_id>/``, so the derived run's StatusStore,
+            rooted at ``<--root>/<run_id>/`` (or the default dated layout without
+            ``--root``, #523), so the derived run's StatusStore,
             CostLedger, and stage logs never mix with another run's. Called by
             ``drive_queue`` once per claimed entry, only after the claim has fixed
             ``run_id``."""
-            root = Path(args.root) / run_id
-            root.mkdir(parents=True, exist_ok=True)
             project = load_project(args.project)
+            root = (
+                Path(args.root) / run_id if args.root
+                else _default_store_root(project.name, run_id, create=True)  # #523
+            )
+            root.mkdir(parents=True, exist_ok=True)
             provider = Provider(args.provider) if getattr(args, "provider", None) else None
             schema_provider = getattr(project, "schema_for", None)
             registry = build_registry(
@@ -1359,8 +1520,8 @@ def main(argv: list[str] | None = None) -> int:
         _emit(summary)
         return 0
 
-    if not args.root or not args.run or not args.project:
-        p.error(f"--root, --run and --project are required for {args.cmd}")
+    if not args.run or not args.project:
+        p.error(f"--run and --project are required for {args.cmd}")
     eng = _engine(args)
 
     # Resolve --util once: a number passes through; 'auto' probes the usage endpoint

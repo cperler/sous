@@ -23,11 +23,13 @@ terminal, and safe to re-run — it only ever surfaces issues that are still **o
 second pass skips everything already triaged.
 
 ## Constants
-- `ROOT` = the shared runs-root (top-level `runs/`). `RUN` = the run id to triage.
+- `RUN` = the run id to triage. Its logs are at
+  `~/Development/runs/<project name>/<YYYY-MM-DD>/<RUN>/` (#523; `status` prints the exact
+  dir on stderr) — the `<run dir>` the paths below refer to.
 - `REPO` = the GitHub repo (`cperler/sous` for self-host; the project
   adapter's repo otherwise). `PROJECT` = the project adapter module.
-- Read-only engine call shape (for the task list): `uv run orchestrator --root "$ROOT"
-  --shared-root --run "$RUN" --project "$PROJECT" status`.
+- Read-only engine call shape (for the task list): `uv run orchestrator --run "$RUN"
+  --project "$PROJECT" status`.
 
 ## Enumerate — the issues THIS run filed
 Do not guess from time windows. A run auto-files issues from **two** provenance sources,
@@ -75,7 +77,7 @@ Build each brief from three sources — this is the "under the hood" the human i
 1. **The issue** — title, labels, body (`gh issue view <n> -R "$REPO"`).
 2. **The source** — depends on provenance:
    - **Review-seam issue** — open the filing task's review record
-     `runs/<RUN>/stages/<task>/NN-review.json` (highest attempt) and find the matching
+     `<run dir>/stages/<task>/NN-review.json` (highest attempt) and find the matching
      entry: the `non_blocking[]` element whose `title` equals the issue title, or the
      `improvement` object. Show its full `detail` and, for a non-blocking finding, its
      `disposition` (`file`/`fixup`/`fix_now`/`drop`) — the reviewer's own words are far richer than
@@ -83,7 +85,7 @@ Build each brief from three sources — this is the "under the hood" the human i
    - **Scope-ledger deferral** — there is no review entry; the source IS the issue body's
      own `Source:` / why-deferred / trigger-to-revisit rationale (the implement agent
      authored it deliberately). Read it, and optionally the filing task's implement record
-     `runs/<RUN>/stages/<task>/NN-implement.json` for what shipped vs. what was cut, so you
+     `<run dir>/stages/<task>/NN-implement.json` for what shipped vs. what was cut, so you
      can judge whether the deferral still holds.
 3. **The code it points at** — if the finding names files/paths/lines/symbols, Read that
    code (at current `main`) and show the relevant few lines, so the human sees the *actual
@@ -140,10 +142,10 @@ them without a gate in the first place.
   the queue, check
   `orchestrator status --run <RUN>`'s `completion_notes` block: if `clean` is false, read
   each undelivered note's `unfiled` findings (also inline in the `completion_note_failed`
-  event, and the full note is at `runs/<RUN>/stages/<TASK>/completion-note.md`) and walk
+  event, and the full note is at `<run dir>/stages/<TASK>/completion-note.md`) and walk
   those with the human too — they have no other channel. `persist_failed` means even the
-  artifact is missing; fall back to `runs/<RUN>/stages/<TASK>/NN-review.json`.
-- **Never delete `runs/<RUN>/`** while reading it (the durable audit trail). This skill
+  artifact is missing; fall back to `<run dir>/stages/<TASK>/NN-review.json`.
+- **Never delete the run dir** while reading it (the durable audit trail). This skill
   only reads it.
 - This is a human-judgment loop — you present and recommend; the human decides. Do not
   auto-close a batch of issues on your own read, even ones you think are junk. One at a

@@ -57,6 +57,11 @@ class FakeTaskSource:
         self.pr_info: dict = {
             "state": "OPEN", "head_ref": "issue-42", "head_sha": None,
             "base_ref": "main",
+            # The #524 alert summary a real source returns from the same read.
+            "number": 1234, "title": "Fake PR", "additions": 12, "deletions": 3,
+            "changed_files": 1, "files": [{"path": "a.py", "additions": 12, "deletions": 3}],
+            "commits": [{"sha": "abc123def456", "title": "Do it"}],
+            "review_decision": None, "checks": "success", "merged_at": None, "draft": False,
         }
 
     def list_tasks(self, label: str | None = None, limit: int = 50) -> list[TaskSpec]:
@@ -190,6 +195,14 @@ def _isolate_learnings_kb(tmp_path, monkeypatch):
     harvested learnings across tests. Pin it to each test's own tmp_path so harvest/fold
     stay hermetic; tests that want a shared KB (the two-run flow) just use one tmp_path."""
     monkeypatch.setenv("ORCHESTRATOR_LEARNINGS_KB_PATH", str(tmp_path / "learnings-kb.jsonl"))
+
+
+@pytest.fixture(autouse=True)
+def _isolate_runs_root(tmp_path, monkeypatch):
+    """Pin the default runs root (#523) to each test's tmp_path. Without it, any CLI call
+    that omits ``--root`` would resolve to the REAL ``~/Development/runs`` and write a run
+    store into the developer's home directory."""
+    monkeypatch.setenv("ORCHESTRATOR_RUNS_ROOT", str(tmp_path / "default-runs-root"))
 
 
 def make_result(

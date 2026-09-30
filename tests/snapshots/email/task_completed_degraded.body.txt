@@ -1,0 +1,5 @@
+Next: review and merge https://github.com/acme/widgets/pull/530
+
+TRAIL
+Run batch-7.
+Full trail: /Users/me/Development/runs/widgets/2026-09-30/batch-7

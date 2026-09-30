@@ -515,14 +515,32 @@ never satisfy.
 
 ## Observability
 
-Every run is a self-contained directory (`runs/<run>/`, gitignored, **retained until the
-human deletes it** — cleanup never touches it). `--root runs` is the natural spelling
-everywhere: per-run commands auto-nest the store under `<root>/<run>/` when the root is a
-shared runs-root (holds other runs' stores or the learnings KB), so run dirs and the
-cross-run `learnings-kb.jsonl` share one parent:
+Every run is a self-contained directory, **retained until the human deletes it** —
+cleanup never touches it. Since #523 it lives OUTSIDE the project tree, grouped by project
+and creation date (`orchestrator/runs_layout.py`):
 
 ```
-  runs/<run>/
+  ~/Development/runs/                       $ORCHESTRATOR_RUNS_ROOT overrides the top level
+    <project name>/                         the adapter's `name`, never the checkout's dir
+      learnings-kb.jsonl, queue.json        per-PROJECT shared files live here
+      <YYYY-MM-DD>/<run>/                   the run's own store — the layout below
+```
+
+No `--root` is needed: the per-run commands key the path off the adapter's name, a fresh
+run lands under today's date, and every later command (`status`, `watch`, `abandon`, …)
+finds the run by `--run` alone by scanning the date dirs — the date is fixed at creation
+and also persisted as `Run.run_dir`, so nothing is recomputed against a different default
+root or day. An id claimed by two dirs is refused, never guessed. `--root <dir>` remains
+the override for scripts and pre-#523 runs: a runs-root still auto-nests `<root>/<run>/`
+(or `--shared-root` forces it), a dated project root nests by date, and the run is looked
+up under `<root>/<date>/<run>/` too. `dashboard`, `panel-report` and the KB backfill walk
+every shape through one walker (`iter_run_dirs`), so a bare `dashboard` spans every
+project under the default root. `orchestrator runs-migrate --from <project>/runs` previews
+moving legacy dirs into the dated layout; `--apply` only moves whole run dirs (never
+deletes or overwrites) and leaves the legacy KB in place with a note about its new home.
+
+```
+  <run dir>/
     status-<run>.json, status-<run>-<task>.json   run + per-task documents
     events.jsonl                                   append-only audit sidecar
     driver.jsonl                                   the DRIVER's own telemetry (#323):
@@ -573,7 +591,7 @@ cross-run `learnings-kb.jsonl` share one parent:
   `record`'s success path and the decomposition-parent path pass through, so it fires exactly
   once). Both carry `Engine._notification_facts`: pr_url/pr_number, title, per-stage outcomes,
   the task's metered cost (with #319's unmetered count alongside, never a confident $0), and
-  a pointer to the retained `runs/<run>/`; `task_completed` adds the `render_completion_note`
+  a pointer to the retained run dir; `task_completed` adds the `render_completion_note`
   markdown already published to the PR (reused, not re-authored — the engine never calls a
   model), and `run_finalized` adds a per-task roster so a batch digest is renderable. The
   derived blocks are best-effort and a thinned payload is evented
@@ -583,6 +601,20 @@ cross-run `learnings-kb.jsonl` share one parent:
   configured, kind-filterable, and always short-timeout — the engine's `notify_failed` guard
   covers a raising sink, but only a timeout covers one that HANGS. Wired into the selfhost
   adapter; before this it had no `notify` at all, so every dogfood batch was silent.
+- **What the mail says** (#524): the facts block also carries the issue link, labels and a
+  bounded excerpt of the ask (from the task doc's snapshot, including a `labels` field
+  stamped at `add_task`), the review outcome, and per-stage model/effort/tokens/cost/time;
+  the pure builders live in `orchestrator/notification_facts.py`. `task_completed` adds a
+  bounded PR summary (diffstat, files, commits, CI state) from the SAME `describe_pr` read
+  #378's delivery check makes, so completion reads the PR once and the failure/park paths
+  never read it. `run_finalized` adds per-state counts, duration and run cost. The sink
+  builds each mail once as a list of sections and renders it to a complete plain-text part
+  and an HTML alternative. Each fact shows once, decision first: the subject carries outcome,
+  task, title and PR number; the body opens with the next action (merge link, retry
+  guidance, or release commands), then issue, PR, review/stages/cost, and trail. For a
+  completion the review/stage/cost section IS the embedded completion note (which now has
+  token columns and a ledger-backed Total line), so the PR comment and the mail cannot
+  drift. `tests/test_email_snapshots.py` pins each kind's rendered subject and bodies.
 - **The human-gate alert** (#409): a park is the one transition that stops the run until a
   person acts, so `task_blocked` is built by one shared `Engine._blocked_notification` and
   carries the facts block PLUS what it takes to act — `stage`/`hold_before`/`gate`/`reason`,

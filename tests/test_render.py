@@ -87,8 +87,26 @@ def test_render_progress_carries_effort_column_and_engine_tag() -> None:
 
 def test_render_completion_note_carries_effort_column_and_engine_tag() -> None:
     md = render_completion_note(_task_with_attributed_stages())
-    assert "| # | Stage | Status | Model | Effort | Cost |" in md
+    assert "| # | Stage | Status | Model | Effort | In | Out | Cost |" in md
     assert "high" in md and "$0 (engine)" in md
+
+
+def test_render_completion_note_carries_tokens_and_a_total_line() -> None:
+    # #524: the note is the single source the completion mail embeds, so it carries the
+    # per-stage tokens and a task total — from the ledger roll-up when the engine has one.
+    task = _task_with_attributed_stages()
+    task.stages[Stage.SCOPE].input_tokens = 12_345
+    task.stages[Stage.SCOPE].output_tokens = 678
+    md = render_completion_note(task)
+    scope_row = next(ln for ln in md.splitlines() if "| scope |" in ln)
+    assert "12.3k" in scope_row and "678" in scope_row
+    assert "**Total:** $2.5000" in md  # summed from the stage records without a roll-up
+
+    md = render_completion_note(
+        task, cost_total={"usd": 3.0, "invocations": 4, "unmetered_calls": 1}
+    )
+    assert "**Total:** ≥$3.0000 over 4 model call(s)" in md
+    assert "1 call(s) unmetered, so the total is a floor" in md
 
 
 def test_render_stage_renders_structured_output_as_readable_markdown() -> None:

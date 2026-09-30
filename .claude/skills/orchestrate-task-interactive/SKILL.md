@@ -11,16 +11,16 @@ status, capacity) lives in the `orchestrator` engine CLI. Your only job is the l
 You never call a model directly and you never run `claude -p`.
 
 ## Constants
-- `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
-  each run's store under `runs/<run-id>/` so runs never comingle their files flat.
 - `RUN` = the run id. `TASK` = the task id (a GitHub issue, e.g. `#505`).
 - `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`, the reference; or your own).
-- Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
-  - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#91): it
-    forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet
-    recognize (no KB / sibling stores exist on day one). It's a no-op once nesting is
-    established, so it's safe to pass on every call. Omit it only if you point `ROOT`
-    directly at a pre-existing per-run dir (`runs/<run-id>`).
+- Engine call shape: `uv run orchestrator --run "$RUN" --project "$PROJECT" <cmd> ...`
+- No `ROOT` is needed (#523): the run's logs live at
+  `~/Development/runs/<project name>/<YYYY-MM-DD>/<run>/` (`ORCHESTRATOR_RUNS_ROOT` moves
+  the top level), the project name is the adapter's `name`, and every command finds the run
+  by `--run` alone. Each engine command prints `note: … run store at <dir>` on stderr — that
+  is the run dir (`RUN_DIR` / `<run dir>`) the paths below refer to. `--root <dir>` (with
+  `--shared-root` for a fresh legacy `runs/`) is only for pre-#523 runs or scripts that pin
+  a location.
 
 ## One-time setup
 1. `… init-run --lane full` (or `lite`/`micro`).

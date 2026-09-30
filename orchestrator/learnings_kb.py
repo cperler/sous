@@ -40,6 +40,7 @@ import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 
+from .runs_layout import AmbiguousRunDirError, find_run_dir
 from .schemas.enums import TERMINAL_TASK_STATES, FailureKind, Stage, TaskState
 
 # One entry's ``text`` ceiling. The DEFAULT mirrors the context-plane per-item bound so a
@@ -720,9 +721,10 @@ def select_entries(
 def outcome_from_run_logs(runs_root: str | Path, entry: dict) -> str | None:
     """The terminal ``task_outcome`` for one legacy entry, recovered from the run log (#480).
 
-    Reads the task doc the entry's ``run_id``/``task_id`` name
-    (``<runs-root>/<run>/status-<run>-<task>.json``, falling back to the flat
-    ``<runs-root>/status-<run>-<task>.json`` layout) and returns its state.
+    Reads the task doc the entry's ``run_id``/``task_id`` name (the dated
+    ``<runs-root>/<YYYY-MM-DD>/<run>/status-<run>-<task>.json`` layout of #523, the legacy
+    ``<runs-root>/<run>/…`` one, or the flat ``<runs-root>/status-<run>-<task>.json``
+    fallback) and returns its state.
 
     Returns None — leaving the row unstamped, which ``resolved_defect`` reads as still-live —
     for every uncertain case: an entry with no run/task ids, a run dir the human has since
@@ -740,7 +742,14 @@ def outcome_from_run_logs(runs_root: str | Path, entry: dict) -> str | None:
         return None
     root = Path(runs_root)
     name = f"status-{run_id}-{task_id}.json"
-    for candidate in (root / run_id / name, root / name):
+    candidates = [root / run_id / name, root / name]
+    try:  # the dated layout, <runs-root>/<YYYY-MM-DD>/<run>/ (#523)
+        dated = find_run_dir(root, run_id)
+    except AmbiguousRunDirError:
+        dated = None  # two claims on one id: unknown, never guessed
+    if dated is not None:
+        candidates.insert(0, dated / name)
+    for candidate in candidates:
         try:
             doc = json.loads(candidate.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
