@@ -27,6 +27,7 @@ import time
 from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import cast
 from urllib.parse import parse_qs, urlsplit
 
 from .dashboard import EngineFactory, Roots, dashboard_snapshot, resolve_run_root
@@ -53,8 +54,8 @@ _REVIEW_RECORD_RE = re.compile(r"(\d{2,})-review\.json")
 
 
 def _json(status: int, obj: object) -> tuple[int, str, bytes]:
-    """A (status, content-type, body) JSON triple. ``default=str`` is a belt-and-suspenders
-    guard so an unexpected non-serializable value degrades to its ``str`` instead of raising."""
+    """A (status, content-type, body) JSON triple. ``default=str`` handles an unexpected
+    non-serializable value gracefully, degrading it to its ``str`` instead of raising."""
     return status, _JSON_CT, json.dumps(obj, default=str).encode("utf-8")
 
 
@@ -126,11 +127,10 @@ def _review_findings(d: Path) -> dict | None:
         payload = json.loads(latest.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         return {"file": latest.name, "error": f"{type(exc).__name__}: {exc}"}
-    out = payload.get("structured_output") if isinstance(payload, dict) else None
-    out = out if isinstance(out, dict) else {}
+    out = payload.get("structured_output") or {}
     return {
         "file": latest.name,
-        "attempt": payload.get("attempt") if isinstance(payload, dict) else None,
+        "attempt": payload.get("attempt"),
         "approved": out.get("approved"),
         "issues": out.get("issues") or [],
         "non_blocking": out.get("non_blocking") or [],
@@ -143,9 +143,10 @@ def _task_detail(run_root: Path, task: str) -> dict:
     d = _task_stage_dir(run_root, task)
     files = []
     for p in sorted(d.iterdir(), key=lambda p: p.name):
+        # Only serve known stage-file names that are regular files; check symlink safety.
         if not _STAGE_FILE_RE.fullmatch(p.name) or not p.is_file():
             continue
-        if p.resolve().parent != d:
+        if p.resolve().parent != d:  # Symlink leading outside is refused.
             continue
         files.append({"name": p.name, "size": p.stat().st_size})
     return {"files": files, "review": _review_findings(d)}
@@ -225,8 +226,8 @@ def route_request(
         try:
             if path == "/api/task-detail":
                 return _json(200, {"run": run, "task": task, **_task_detail(run_root, task)})
-            assert name is not None  # checked above
-            body = _stage_file_path(run_root, task, name).read_bytes()
+            # At line 219, if path is "/api/stage-file", name is guaranteed non-None.
+            body = _stage_file_path(run_root, task, cast(str, name)).read_bytes()
         except _Refused as exc:
             return _json(exc.status, {"error": exc.error, "run": run, "task": task, "name": name})
         return 200, _TEXT_CT, body
