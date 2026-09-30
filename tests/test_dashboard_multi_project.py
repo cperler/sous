@@ -407,11 +407,20 @@ def test_cli_dashboard_collects_roots_from_flags_and_env(tmp_path, monkeypatch, 
     assert progress.count("a-run") == 1
 
 
-def test_cli_dashboard_needs_at_least_one_root(monkeypatch, capsys) -> None:
+def test_cli_dashboard_defaults_to_the_runs_root_spanning_projects(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """#523: with no --root/--also-root/env, the board covers EVERY project under the
+    default runs root — ``<root>/<project>/<date>/<run>/`` for two projects at once."""
     from orchestrator.cli import DASHBOARD_ROOTS_ENV, main
 
     monkeypatch.delenv(DASHBOARD_ROOTS_ENV, raising=False)
-    with pytest.raises(SystemExit) as exc:
-        main(["dashboard"])
-    assert exc.value.code != 0
-    assert "runs-root" in capsys.readouterr().err
+    default_root = tmp_path / "default-runs-root"  # pinned by conftest's autouse fixture
+    for rel in ("sous/2026-09-30/a-run", "family-finance/2026-09-29/b-run", "legacy-run"):
+        run_id = rel.rsplit("/", 1)[-1]  # legacy-run: a pre-#523 runs/<run> dir under the root
+        _engine(default_root / rel).create_run(run_id, project_ref=MODULE_ADAPTER)
+
+    rc = main(["dashboard"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "a-run" in out and "b-run" in out and "legacy-run" in out

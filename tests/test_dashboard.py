@@ -486,3 +486,22 @@ def test_default_engine_factory_degrades_an_unloadable_ref_instead_of_exiting(tm
     factory = default_engine_factory(None)
     with pytest.raises(AdapterUnresolved, match="did not load"):
         factory(tmp_path / "runs" / "r1", "no.such.adapter.module")
+
+
+def test_discover_walks_dated_and_legacy_layouts_under_one_root(tmp_path) -> None:
+    """#523: one root may hold <project>/<date>/<run>/ stores (several projects) beside a
+    legacy runs/<run>/ store; discovery sees all of them and each row's root is the run's
+    own store dir."""
+    from orchestrator.dashboard import _discover
+
+    dated = tmp_path / "sous" / "2026-09-30" / "r-dated"
+    other = tmp_path / "family-finance" / "2026-09-29" / "r-other"
+    legacy = tmp_path / "r-legacy"
+    for rr, name, mt in [(dated, "r-dated", 300.0), (other, "r-other", 200.0),
+                         (legacy, "r-legacy", 100.0)]:
+        _engine(rr).create_run(name)
+        _touch(rr, name, mt)
+    assert discover_runs(tmp_path) == ["r-dated", "r-other", "r-legacy"]
+    assert {loc.run_id: loc.root for loc in _discover(tmp_path)} == {
+        "r-dated": dated, "r-other": other, "r-legacy": legacy,
+    }

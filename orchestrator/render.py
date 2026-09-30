@@ -830,11 +830,59 @@ def unfiled_findings(
     return out
 
 
+def _tokens_cell(value: int | None) -> str:
+    """Token-count cell for the completion note's stage table (#524): compact (``12.3k``,
+    ``1.2M``) because the table is read in an email as well as on the PR. ``—`` when the
+    stage recorded no count (not run, the ENGINE lane, or a pre-token task doc)."""
+    if not isinstance(value, int) or value <= 0:
+        return "—"
+    if value >= 1_000_000:
+        return f"{value / 1_000_000:.1f}M"
+    if value >= 1_000:
+        return f"{value / 1_000:.1f}k"
+    return str(value)
+
+
+def _total_cost_line(task: Task, cost_total: dict | None) -> str:
+    """The note's one-line task total (#524), under the stage table.
+
+    Prefers ``cost_total`` — the ledger roll-up ``{usd, invocations, unmetered_calls}`` the
+    engine also puts in the notification payload — because the ledger sees EVERY attempt,
+    while a ``StageRecord`` keeps only its latest; the note and the alert therefore quote the
+    same figure. Without it (a hand-built task, a failed ledger read) the per-stage records
+    are summed instead. Either way an unmetered call makes the figure a floor and says so
+    (#319), never a confident total."""
+    if isinstance(cost_total, dict) and isinstance(cost_total.get("usd"), (int, float)):
+        calls = int(cost_total.get("invocations") or 0)
+        unmetered = int(cost_total.get("unmetered_calls") or 0)
+        line = f"**Total:** {aggregate_cost_cell(cost_total['usd'], unmetered, calls)}"
+        line += f" over {calls} model call(s)"
+        if unmetered:
+            line += f"; {unmetered} call(s) unmetered, so the total is a floor"
+        return line
+    total, measured, unmetered_stages = 0.0, 0, 0
+    for rec in task.stages.values():
+        if rec.lane is None:
+            continue
+        if rec.lane is ExecutionMode.INTERACTIVE or not rec.metered:
+            unmetered_stages += 1
+        elif isinstance(rec.cost_usd, (int, float)):
+            total += rec.cost_usd
+            measured += 1
+    if not measured and not unmetered_stages:
+        return "**Total:** —"
+    line = f"**Total:** {aggregate_cost_cell(total, unmetered_stages, measured + unmetered_stages)}"
+    if unmetered_stages:
+        line += f"; {unmetered_stages} stage(s) unmetered, so the total is a floor"
+    return line
+
+
 def render_completion_note(
     task: Task,
     followups: list[dict] | None = None,
     improvement_ref: str | None = None,
     optimize_refs: list[dict] | None = None,
+    cost_total: dict | None = None,
 ) -> str:
     """Render a run's completion evidence as Markdown — the note the engine publishes
     back to the task source (PR/issue comment) so the pipeline's reasoning outlives the
@@ -844,7 +892,13 @@ def render_completion_note(
     engine filed from the review's improvement idea (None if unfiled or suppressed).
     ``optimize_refs`` is what the engine decided about each architectural suggestion an
     OPTIMIZE pass returned (#519): ``{"title", "ref"}`` for a filing, ``{"title", "deduped"}``
-    for one suppressed as a duplicate of something already filed.
+    for one suppressed as a duplicate of something already filed. ``cost_total`` is the
+    task's ledger cost roll-up (#524) for the Total line under the stage table; see
+    ``_total_cost_line``.
+
+    This note is the single source for the review verdict, per-stage model/effort/tokens/
+    cost, and findings: the ``task_completed`` alert embeds it verbatim rather than
+    re-rendering those facts, so the PR comment and the mail cannot drift (#524).
 
     Nothing silently dropped (#188/#223):
 
@@ -875,16 +929,18 @@ def render_completion_note(
         f"- **PR:** {task.pr_url or '(none)'}",
         f"- **Review:** {verdict}",
         "",
-        "| # | Stage | Status | Model | Effort | Cost |",
-        "|---:|---|---|---|---|---:|",
+        "| # | Stage | Status | Model | Effort | In | Out | Cost |",
+        "|---:|---|---|---|---|---:|---:|---:|",
     ]
     for seq, stage in enumerate(STAGE_ORDER, start=1):
         rec = task.stages[stage]
         model = f"`{rec.model}`" if rec.model else "—"
         lines.append(
             f"| {seq:02d} | {stage.value} | {rec.status.value} | {model} | "
-            f"{_effort_cell(rec)} | {_cost_cell(rec)} |"
+            f"{_effort_cell(rec)} | {_tokens_cell(rec.input_tokens)} | "
+            f"{_tokens_cell(rec.output_tokens)} | {_cost_cell(rec)} |"
         )
+    lines += ["", _total_cost_line(task, cost_total)]
 
     blocking = [format_review_issue(i) for i in (review.get("issues") or [])]
     blocking = [i for i in blocking if i]

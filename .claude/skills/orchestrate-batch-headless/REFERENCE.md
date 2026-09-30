@@ -46,10 +46,10 @@ every non-terminal task to `superseded`, finalizes the run, and publishes NOTHIN
 issues (they are live in the successor run). Do NOT reach for `reject` / `abandon
 --disposition rejected` here: both post a "closed infeasible" note to a live issue.
 
-### Dating the death: `runs/<run>/driver.jsonl` (#323)
+### Dating the death: `<run dir>/driver.jsonl` (#323)
 
 The driver's own log — the record that did not exist when `batch-headless-2`'s driver died
-undiagnosably. `tail runs/<run>/driver.jsonl` (or `status`'s `driver` block) answers:
+undiagnosably. `tail <run dir>/driver.jsonl` (or `status`'s `driver` block) answers:
 
 - **when it started, as what** — `driver_start` carries pid, ppid, full argv and the
   RESOLVED settings (`max_concurrent`, `drain_wait_s`, `stale_after_s`, util mode/value);
@@ -85,10 +85,10 @@ model keeps its own context. This is where the high cache-read rates come from.
 
 **You cannot verify this from the timeline.** `stage_dispatched` does not carry `session_ref`
 (#314) — only `stage_recorded` does. Reading the dispatch events alone makes continuity look
-like it never engages, which is wrong and has already misled one audit. Check the task doc or,
-while the run is live, the process table:
+like it never engages, which is wrong and has already misled one audit. Check the task doc
+(RUN_DIR = the run dir `status` prints) or, while the run is live, the process table:
 ```
-python3 -c "import json;d=json.load(open('runs/RUN/status-RUN-#TASK.json'));print(d.get('session_ref'), d.get('session_provider'))"
+python3 -c "import json;d=json.load(open('RUN_DIR/status-RUN-#TASK.json'));print(d.get('session_ref'), d.get('session_provider'))"
 ps -eo pid,command | grep "[c]laude -p" | grep -o "\-\-resume [a-f0-9-]*"
 ```
 
@@ -97,8 +97,8 @@ reverse. It is also deliberately dropped after a failure — warm retry is off b
 
 ## Measuring what a run cost
 
-Real per-stage dollars land in `runs/<RUN>/stage-costs.jsonl`. Raw provider streams are under
-`runs/<RUN>/stages/<task>/<stage>-attempt<N>.stream.jsonl`; the final `result` event carries
+Real per-stage dollars land in `<run dir>/stage-costs.jsonl`. Raw provider streams are under
+`<run dir>/stages/<task>/<stage>-attempt<N>.stream.jsonl`; the final `result` event carries
 `session_id`, `total_cost_usd`, and `usage` (including `cache_read_input_tokens` /
 `cache_creation_input_tokens`) if you need to reason about cache behaviour.
 
@@ -108,7 +108,8 @@ prefix stability are not auditable after the fact.
 ## Related run modes
 
 - **`run-queue`** — drains a queue file, forcing HEADLESS with a fresh engine per claimed
-  entry (`--root <root>/<run_id>/`), so derived runs never comingle stores. Different entry
+  entry (its own dated run dir, or `<root>/<run_id>/` under an explicit `--root`), so
+  derived runs never comingle stores. Different entry
   point from `run-headless`; don't conflate them.
 - **`orchestrate-batch-interactive`** — the in-session lane. Slower, context-hungry, and
   records no cost, but lets a human watch each stage.

@@ -73,7 +73,7 @@ topological order. **Applying mutates a real run: the human confirms the plan be
    issue. Fix any reported error before continuing.
 5. **Show the human the plan and STOP.** `apply` adds tasks to a real run. Present the ordered
    plan with your rationales and **wait for confirmation.** Do not apply unprompted.
-6. **Apply.** `uv run orchestrator --root <dir> --run <R> --project "$PROJECT" batch-plan apply
+6. **Apply.** `uv run orchestrator --run <R> --project "$PROJECT" batch-plan apply
    <file>` (add `--dry-run` first to preview exactly what would be added). It adds each task in
    topological order with its edges, lane, `provider_tag`, `deterministic_stages`, and any
    `model`/`effort` pin, and emits a `batch_planned` event. The run must already exist (`init-run`).

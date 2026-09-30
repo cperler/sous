@@ -1,0 +1,22 @@
+Reason: pytest: 3 failed, 212 passed
+Next: read the stage logs in the run trail below, then retry or abandon the task.
+
+ISSUE
+Link: https://github.com/acme/widgets/issues/524
+Labels: enhancement, ux
+The completion emails are useful, but the body repeats itself and says less than it could.
+Acceptance:
+- A sample email shows the issue summary and PR diffstat.
+- Snapshot tests for each kind.
+
+STAGES AND COST
+Stage      Status     Model             Effort     In   Out             Cost     Time
+---------  ---------  ----------------  ------  -----  ----  ---------------  -------
+intake     completed  —                 —           —     —      $0 (engine)       1s
+scope      completed  claude-fable-5-1  high    88.0k  3.1k          $0.4200   1m 35s
+implement  failed     claude-opus-5-5   high        —     —  n/a (unmetered)  12m 34s
+Total: $0.4200 over 5 model call(s) — AT LEAST: 3 call(s) had unrecoverable usage and counted as $0
+
+TRAIL
+Run batch-7, attempt 3.
+Full trail: /Users/me/Development/runs/widgets/2026-09-30/batch-7
