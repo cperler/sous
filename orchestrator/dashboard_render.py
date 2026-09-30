@@ -18,13 +18,12 @@ public entry point is ``dashboard.render_dashboard``, which imports this module 
 
 from __future__ import annotations
 
-from datetime import datetime
-
 from .dashboard import (
     _TERMINAL_TASK,
     ADAPTER_UNRESOLVED_STATE,
     UNREADABLE_STATE,
     _error_text,
+    _iso_epoch,
     _progress_str,
 )
 from .render import aggregate_cost_cell
@@ -106,15 +105,6 @@ def _clip(text: str, width: int) -> str:
 
 def _plural(n: int, word: str) -> str:
     return f"{n} {word}" if n == 1 else f"{n} {word}s"
-
-
-def _epoch(ts: str | None) -> float | None:
-    if not ts:
-        return None
-    try:
-        return datetime.fromisoformat(ts).timestamp()
-    except (ValueError, TypeError):
-        return None
 
 
 def _short_model(model: str | None) -> str | None:
@@ -519,11 +509,11 @@ def _recent(header: dict, runs: list[dict], *, width: int, compact: bool) -> lis
     picked = events[-(_RECENT_COMPACT if compact else _RECENT_WIDE):]
     if not picked:
         return ["  (no events yet)"]
-    now = _epoch(header.get("generated_at"))
+    now = _iso_epoch(header.get("generated_at"))
     run_w = max(len(run) for _, run, _ in picked)
     lines: list[str] = []
     for ts, run, ev in picked:
-        then = _epoch(ts)
+        then = _iso_epoch(ts)
         age = f"{_fmt_age(max(0.0, now - then))} ago" if now and then else "?"
         lines.append(_clip(f"  {age:>7}  {run:<{run_w}}  {ev.get('sentence') or ''}", width))
     return lines
