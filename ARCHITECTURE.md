@@ -515,14 +515,32 @@ never satisfy.
 
 ## Observability
 
-Every run is a self-contained directory (`runs/<run>/`, gitignored, **retained until the
-human deletes it** — cleanup never touches it). `--root runs` is the natural spelling
-everywhere: per-run commands auto-nest the store under `<root>/<run>/` when the root is a
-shared runs-root (holds other runs' stores or the learnings KB), so run dirs and the
-cross-run `learnings-kb.jsonl` share one parent:
+Every run is a self-contained directory, **retained until the human deletes it** —
+cleanup never touches it. Since #523 it lives OUTSIDE the project tree, grouped by project
+and creation date (`orchestrator/runs_layout.py`):
 
 ```
-  runs/<run>/
+  ~/Development/runs/                       $ORCHESTRATOR_RUNS_ROOT overrides the top level
+    <project name>/                         the adapter's `name`, never the checkout's dir
+      learnings-kb.jsonl, queue.json        per-PROJECT shared files live here
+      <YYYY-MM-DD>/<run>/                   the run's own store — the layout below
+```
+
+No `--root` is needed: the per-run commands key the path off the adapter's name, a fresh
+run lands under today's date, and every later command (`status`, `watch`, `abandon`, …)
+finds the run by `--run` alone by scanning the date dirs — the date is fixed at creation
+and also persisted as `Run.run_dir`, so nothing is recomputed against a different default
+root or day. An id claimed by two dirs is refused, never guessed. `--root <dir>` remains
+the override for scripts and pre-#523 runs: a runs-root still auto-nests `<root>/<run>/`
+(or `--shared-root` forces it), a dated project root nests by date, and the run is looked
+up under `<root>/<date>/<run>/` too. `dashboard`, `panel-report` and the KB backfill walk
+every shape through one walker (`iter_run_dirs`), so a bare `dashboard` spans every
+project under the default root. `orchestrator runs-migrate --from <project>/runs` previews
+moving legacy dirs into the dated layout; `--apply` only moves whole run dirs (never
+deletes or overwrites) and leaves the legacy KB in place with a note about its new home.
+
+```
+  <run dir>/
     status-<run>.json, status-<run>-<task>.json   run + per-task documents
     events.jsonl                                   append-only audit sidecar
     driver.jsonl                                   the DRIVER's own telemetry (#323):
@@ -573,7 +591,7 @@ cross-run `learnings-kb.jsonl` share one parent:
   `record`'s success path and the decomposition-parent path pass through, so it fires exactly
   once). Both carry `Engine._notification_facts`: pr_url/pr_number, title, per-stage outcomes,
   the task's metered cost (with #319's unmetered count alongside, never a confident $0), and
-  a pointer to the retained `runs/<run>/`; `task_completed` adds the `render_completion_note`
+  a pointer to the retained run dir; `task_completed` adds the `render_completion_note`
   markdown already published to the PR (reused, not re-authored — the engine never calls a
   model), and `run_finalized` adds a per-task roster so a batch digest is renderable. The
   derived blocks are best-effort and a thinned payload is evented

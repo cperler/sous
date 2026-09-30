@@ -198,9 +198,16 @@ engine is the same CLI in every case (`orchestrator/cli.py`); what differs is wh
 the model calls. Set these once so the examples stay short:
 
 ```bash
-ROOT=runs/issue-42; RUN=issue-42; PROJECT=adapters.project.selfhost
-ORCH="uv run orchestrator --root $ROOT --run $RUN --project $PROJECT"
+RUN=issue-42; PROJECT=adapters.project.selfhost
+ORCH="uv run orchestrator --run $RUN --project $PROJECT"
 ```
+
+No `--root` is needed (#523): every run's logs live **outside the project**, at
+`~/Development/runs/<project name>/<YYYY-MM-DD>/<run>/` (override the top level with
+`ORCHESTRATOR_RUNS_ROOT`). The project name is the adapter's `name`, the date is fixed at
+`init-run`, and every later command finds the run by `--run` alone. `--root <dir>` still
+overrides the location for scripts and pre-#523 runs (`orchestrator runs-migrate --from
+<project>/runs` previews moving those into the dated layout; `--apply` moves, never deletes).
 
 `--lane full|lite|micro` picks the pipeline depth (how many stages); `--util N` is the
 current 5h utilization %, which the engine turns into the capacity-bounded dispatch limit.
@@ -229,12 +236,14 @@ up), and `run-queue` is the unattended entrypoint that drains it batch-by-batch,
 each derived run in-process to terminal.
 
 ```bash
-# a producer (cron, CI, or a human) appends batches — no engine/store touched:
-$ORCH enqueue --queue-file runs/queue.json --tasks "#42,#43" --branch batch-a
+# a producer (cron, CI, or a human) appends batches — no engine/store touched. The
+# queue file lives at the project level of the runs root, beside the learnings KB:
+QUEUE=~/Development/runs/sous/queue.json
+$ORCH enqueue --queue-file $QUEUE --tasks "#42,#43" --branch batch-a
 
 # the daemon drains the queue, deriving one run per batch (run id from enqueued_at):
-$ORCH --root runs --project adapters.project.selfhost \
-      run-queue --queue-file runs/queue.json --owner day-cron \
+uv run orchestrator --project adapters.project.selfhost \
+      run-queue --queue-file $QUEUE --owner day-cron \
       --wait --idle-timeout 300
 ```
 
@@ -262,7 +271,7 @@ If an owner is permanently retired or renamed while it holds the head, release t
 claim explicitly (the batch remains queued and can then be claimed by another consumer):
 
 ```bash
-$ORCH run-queue --queue-file runs/queue.json --release-claim
+$ORCH run-queue --queue-file $QUEUE --release-claim
 ```
 
 Release refuses when the claim records this host and that owner's consumer lock is still
@@ -329,7 +338,7 @@ The engine assigns a model **per stage by role** — it's never a CLI flag. Two 
 ```bash
 $ORCH status          # progress + cost summary + lane-attribution audit
 $ORCH cost-report     # per-stage / per-task breakdown + the session-reuse win
-$ORCH --root runs panel-report --limit 20  # cross-run panel yield + review cost
+$ORCH panel-report --limit 20  # cross-run panel yield + review cost (this project's runs)
 $ORCH retrospective   # failure patterns + what the retries learned (on a failed run)
 $ORCH util            # 5h/7d account utilization (JSON) — the --util sensor
 $ORCH statusline      # the same numbers as one line, for the status bar
