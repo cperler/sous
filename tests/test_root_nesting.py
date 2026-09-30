@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from orchestrator.cli import _is_shared_runs_root, _resolve_store_root, main
 from orchestrator.learnings_kb import resolve_kb_path
 
@@ -224,3 +226,141 @@ def test_trailing_slash_root_does_not_false_positive_nesting_note(tmp_path, caps
     # Store still lands flat at the given root — no surprise nesting from the slash.
     assert (tmp_path / "status-r1.json").exists()
     assert not (tmp_path / "r1").exists()
+
+
+# --- #523: the default runs location is OUTSIDE the project, dated, found by id ---------
+
+
+def _today() -> str:
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC).strftime("%Y-%m-%d")
+
+
+def test_no_root_lands_under_the_default_dated_layout(tmp_path, capsys, monkeypatch) -> None:
+    """A fresh run with NO --root lands at <runs root>/<project name>/<today>/<run>/ and
+    writes nothing under <cwd>/runs/. The project name is the adapter's (`fake`), not the
+    checkout's directory name."""
+    monkeypatch.chdir(tmp_path)  # a cwd with no runs/ at all — it must stay that way
+    default_root = tmp_path / "default-runs-root"  # conftest pins ORCHESTRATOR_RUNS_ROOT here
+    base = ["--run", "run-a", "--project", "tests.fakeproject"]
+    assert main([*base, "init-run", "--lane", "full"]) == 0
+    err = capsys.readouterr().err
+    assert "run store at" in err  # never silent about where the store landed
+
+    store = default_root / "fake" / _today() / "run-a"
+    assert (store / "status-run-a.json").exists()
+    assert not (tmp_path / "runs").exists()
+    assert not any(p.name.startswith("status-") for p in default_root.iterdir())
+
+
+def test_no_root_per_run_commands_find_the_run_by_id_alone(tmp_path, capsys, monkeypatch) -> None:
+    default_root = tmp_path / "default-runs-root"
+    base = ["--run", "run-a", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    # Move the run to an OLDER date dir: a later command must find it by scanning, not by
+    # recomputing today's path.
+    created = default_root / "fake" / _today() / "run-a"
+    older = default_root / "fake" / "2026-01-01" / "run-a"
+    older.parent.mkdir(parents=True)
+    created.rename(older)
+
+    _run(capsys, *base, "add-task", "--task", "#42")
+    status = _run(capsys, *base, "status")
+    assert status["run_id"] == "run-a"
+    assert (older / "status-run-a-#42.json").exists()
+    assert not created.exists()  # nothing re-created under today's date
+
+
+def test_run_doc_records_its_resolved_run_dir(tmp_path, capsys) -> None:
+    """The store dir is persisted on the Run doc (#206 norm), not recomputed from engine
+    defaults — a later process on another day or with another default root can read it."""
+    base = ["--run", "run-a", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    store = tmp_path / "default-runs-root" / "fake" / _today() / "run-a"
+    doc = json.loads((store / "status-run-a.json").read_text())
+    assert doc["run_dir"] == str(store.resolve())
+
+
+def test_explicit_root_still_overrides_the_default(tmp_path, capsys) -> None:
+    root = tmp_path / "custom"
+    base = ["--root", str(root), "--shared-root", "--run", "run-a",
+            "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    assert (root / "run-a" / "status-run-a.json").exists()
+    assert not (tmp_path / "default-runs-root").exists()
+
+
+def test_explicit_root_at_a_dated_project_root_resolves_and_nests_by_date(
+    tmp_path, capsys,
+) -> None:
+    """--root at <runs root>/<project> (the dated layout) finds an existing run under its
+    date dir and puts a fresh one under today's, never flat beside the date dirs."""
+    project_root = tmp_path / "default-runs-root" / "fake"
+    _run(capsys, "--run", "run-a", "--project", "tests.fakeproject", "init-run", "--lane", "full")
+    existing = project_root / _today() / "run-a"
+    assert _resolve_store_root(project_root, "run-a") == existing
+
+    base = ["--root", str(project_root), "--run", "run-b", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    assert (project_root / _today() / "run-b" / "status-run-b.json").exists()
+    assert not (project_root / "run-b").exists()
+    assert not (project_root / "status-run-b.json").exists()
+
+
+def test_legacy_runs_root_still_resolves_by_id(tmp_path, capsys) -> None:
+    parent = tmp_path / "runs"
+    _seed_shared_root(parent)
+    base = ["--root", str(parent), "--run", "run-a", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    assert _resolve_store_root(parent, "run-a") == parent / "run-a"
+    # and a dated resolver over the same root agrees
+    from orchestrator.runs_layout import find_run_dir
+
+    assert find_run_dir(parent, "run-a") == parent / "run-a"
+
+
+def test_ambiguous_run_id_exits_with_both_paths_named(tmp_path, capsys) -> None:
+    project_root = tmp_path / "default-runs-root" / "fake"
+    for day in ("2026-01-01", "2026-01-02"):
+        d = project_root / day / "run-a"
+        d.mkdir(parents=True)
+        (d / "status-run-a.json").write_text("{}")
+    with pytest.raises(SystemExit) as exc:
+        main(["--run", "run-a", "--project", "tests.fakeproject", "status"])
+    assert "2026-01-01" in str(exc.value) and "2026-01-02" in str(exc.value)
+
+
+def test_shared_root_without_root_warns(tmp_path, capsys) -> None:
+    assert main(["--shared-root", "--run", "run-a", "--project", "tests.fakeproject",
+                 "init-run", "--lane", "full"]) == 0
+    assert "--shared-root has no effect without --root" in capsys.readouterr().err
+
+
+def test_learnings_kb_lands_at_the_project_level_in_the_dated_layout(
+    tmp_path, monkeypatch,
+) -> None:
+    """The KB is about a PROJECT's runs, so in the dated layout it sits above the date dirs
+    (<runs root>/<project>/learnings-kb.jsonl); a legacy runs/<run> store keeps its parent."""
+    from orchestrator.cost_ledger import CostLedger
+    from orchestrator.engine import Engine
+    from orchestrator.status_store import StatusStore
+    from tests.conftest import FakeProject
+
+    monkeypatch.delenv("ORCHESTRATOR_LEARNINGS_KB_PATH", raising=False)
+    dated = tmp_path / "root" / "fake" / "2026-09-30" / "r1"
+    eng = Engine(StatusStore(dated), CostLedger(dated / "stage-costs.jsonl"), FakeProject())
+    assert eng._learnings_kb_path() == tmp_path / "root" / "fake" / "learnings-kb.jsonl"
+    legacy = tmp_path / "runs" / "r1"
+    eng = Engine(StatusStore(legacy), CostLedger(legacy / "stage-costs.jsonl"), FakeProject())
+    assert eng._learnings_kb_path() == tmp_path / "runs" / "learnings-kb.jsonl"
+
+
+def test_kb_and_tail_default_to_the_project_root(tmp_path, capsys, monkeypatch) -> None:
+    monkeypatch.delenv("ORCHESTRATOR_LEARNINGS_KB_PATH", raising=False)  # conftest pin
+    project_root = tmp_path / "default-runs-root" / "fake"
+    out = _run(capsys, "--project", "tests.fakeproject", "kb", "show")
+    assert out["path"] == str(project_root / "learnings-kb.jsonl")
+    _run(capsys, "--run", "run-a", "--project", "tests.fakeproject", "init-run", "--lane", "full")
+    assert main(["--run", "run-a", "--project", "tests.fakeproject", "tail", "#42"]) == 0
+    assert "no live stream" in capsys.readouterr().out
