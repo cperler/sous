@@ -42,6 +42,7 @@ from typing import TYPE_CHECKING, TypeAlias, TypedDict, Unpack
 
 from .alerting import _fmt_activity
 from .render import aggregate_cost_cell
+from .runs_layout import iter_run_dirs
 from .schemas.enums import TERMINAL_RUN_STATES
 from .stream_probe import find_current_stream
 
@@ -95,19 +96,20 @@ class _RunLoc:
 
 
 def _discover(root: str | Path) -> list[_RunLoc]:
-    """Every run directory under ``root`` (each a ``runs/<id>/`` StatusStore root), newest
-    first by run-doc mtime. A subdir with status files but no readable ``document_type=="run"``
-    doc is surfaced as an UNREADABLE run rather than dropped — a corrupt run must not vanish."""
+    """Every run directory under ``root``, newest first by run-doc mtime. ``root`` may be a
+    legacy runs-root (``runs/<id>/``), one project's root (``<project>/<date>/<id>/``), or
+    the top-level default root spanning every project (#523) — ``iter_run_dirs`` walks all
+    three shapes, so a bare ``dashboard`` covers several projects at once (#386). A run dir
+    with status files but no readable ``document_type=="run"`` doc is surfaced as an
+    UNREADABLE run rather than dropped — a corrupt run must not vanish."""
     root = Path(root)
     locs: list[_RunLoc] = []
     if not root.is_dir():
         return locs
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
+    for child in iter_run_dirs(root):
         candidates = sorted(child.glob("status-*.json"))
         if not candidates:
-            continue  # not a run dir
+            continue  # a docs-less log dir (stages/ or ledger only) is not a board row
         run_id: str | None = None
         project_ref: str | None = None
         mtime = child.stat().st_mtime

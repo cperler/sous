@@ -251,3 +251,15 @@ def test_panel_report_cli_needs_only_runs_root(tmp_path: Path, capsys) -> None:
     output = capsys.readouterr().out
     assert "Runs: 1 of 1 newest (limit 1)" in output
     assert "reviews: 1 (0 panel, 1 single)" in output
+
+
+def test_panel_report_discovers_the_dated_layout(tmp_path) -> None:
+    """#523: run stores under <project>/<YYYY-MM-DD>/<run>/ count, beside a legacy one."""
+    dated_parent = tmp_path / "sous" / "2026-09-30"
+    dated_parent.mkdir(parents=True)
+    dated = _run(dated_parent, "dated-run", 200.0)
+    legacy = _run(tmp_path, "legacy-run", 100.0)
+    _review(dated, task="t", work_item_id="wi-d", sub_results=False)
+    _review(legacy, task="t", work_item_id="wi-l", sub_results=False)
+    report = build_panel_report(tmp_path)
+    assert report["runs"]["run_ids"] == ["dated-run", "legacy-run"]

@@ -866,3 +866,15 @@ def test_cli_kb_backfill_outcomes_stamps_from_run_logs(tmp_path, capsys) -> None
     # the unresolvable row stays unstamped, so it keeps reading as still-live
     assert "task_outcome" not in entries[orphan["id"]]
     assert kb.resolved_defect(entries[orphan["id"]]) is False
+
+
+def test_outcome_from_run_logs_finds_the_dated_layout(tmp_path) -> None:
+    """#523: a run under <runs-root>/<YYYY-MM-DD>/<run>/ resolves too; an id claimed by two
+    date dirs is unknown (never guessed)."""
+    root = tmp_path / "fake"
+    _task_doc(root / "2026-09-30", "r1", "#12", "completed")
+    assert kb.outcome_from_run_logs(root, {"run_id": "r1", "task_id": "#12"}) == "completed"
+    _task_doc(root / "2026-09-29", "r1", "#12", "failed")
+    (root / "2026-09-29" / "r1" / "status-r1.json").write_text("{}", encoding="utf-8")
+    (root / "2026-09-30" / "r1" / "status-r1.json").write_text("{}", encoding="utf-8")
+    assert kb.outcome_from_run_logs(root, {"run_id": "r1", "task_id": "#12"}) is None

@@ -192,6 +192,14 @@ def _isolate_learnings_kb(tmp_path, monkeypatch):
     monkeypatch.setenv("ORCHESTRATOR_LEARNINGS_KB_PATH", str(tmp_path / "learnings-kb.jsonl"))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_runs_root(tmp_path, monkeypatch):
+    """Pin the default runs root (#523) to each test's tmp_path. Without it, any CLI call
+    that omits ``--root`` would resolve to the REAL ``~/Development/runs`` and write a run
+    store into the developer's home directory."""
+    monkeypatch.setenv("ORCHESTRATOR_RUNS_ROOT", str(tmp_path / "default-runs-root"))
+
+
 def make_result(
     work: WorkItem,
     *,

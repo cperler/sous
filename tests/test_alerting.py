@@ -433,3 +433,21 @@ def test_activity_lines_keep_the_dead_process_alert_for_a_pre_323_snapshot() -> 
 
     assert "NO LIVE DRIVER" in line and "424242" in line
     assert "DRIVER NOT LOOPING" not in line
+
+
+def test_release_commands_round_trip_through_the_dated_layout(tmp_path) -> None:
+    """#523: a run stored at <runs root>/<project>/<date>/<run>/ prints release commands
+    whose ``--root`` is that exact dir, and the CLI resolver maps the pair back to it."""
+    from orchestrator.cli import _resolve_store_root
+
+    store = tmp_path / "fake" / "2026-09-30" / "r1"
+    project, calls = _recording_project()
+    eng = _engine(store, project)
+    _park_at_scope(eng)
+    payload = next(p for k, p in calls if k == "task_blocked")
+    assert payload["run_dir"] == str(store)
+    for action in payload["actions"]:
+        assert action["command"].startswith(f"orchestrator --root {store} --run r1 ")
+    assert _resolve_store_root(store, "r1") == store
+    # ...and the same run is reachable from the project root by id alone
+    assert _resolve_store_root(tmp_path / "fake", "r1") == store

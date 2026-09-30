@@ -129,6 +129,7 @@ from .retrospective import build_retrospective
 from .retry import CircuitBreaker, error_signature
 from .review_workflow import issue_fingerprint, synthesize
 from .routing import DEFAULT_ROUTER, Router, engine_lane_required
+from .runs_layout import shared_root_for
 from .schemas.enums import (
     LANE_DETERMINISTIC_STAGES,
     LANE_STAGES,
@@ -611,9 +612,18 @@ class Engine:
             review_workflow=review_workflow,
             project_ref=normalize_project_ref(project_ref),
             serialize_file_contention=serialize_file_contention,
+            run_dir=self._run_dir_value(),
         )
         self.store.create_run_doc(run)
         return run
+
+    def _run_dir_value(self) -> str:
+        """The absolute store dir to stamp on a new run doc (#523). Resolved so the path
+        survives a later process started from another working directory."""
+        try:
+            return str(self.store.root.resolve())
+        except OSError:  # pragma: no cover - defensive (unresolvable path)
+            return str(self.store.root)
 
     #: The run-level settings ``create_or_reuse_run`` treats as IMMUTABLE — a reuse that
     #: asks for different values is a different run, so it raises instead of silently
@@ -8332,10 +8342,12 @@ class Engine:
         )
 
     def _learnings_kb_path(self) -> Path:
-        """The per-project KB file. Default ``<runs-root>/learnings-kb.jsonl`` (the run-log
-        root is this run's store-root parent); a project may override via ``learnings_kb_path``
-        and ops via the ``ORCHESTRATOR_LEARNINGS_KB_PATH`` env var (both in resolve_kb_path)."""
-        return resolve_kb_path(self.store.root.parent, self.project)
+        """The per-project KB file. Default ``<runs-root>/learnings-kb.jsonl``, where the
+        runs-root is this run's SHARED root (#523): the project level above the date dir
+        for a ``<project>/<date>/<run>`` store, the parent for a legacy ``runs/<run>`` one.
+        A project may override via ``learnings_kb_path`` and ops via the
+        ``ORCHESTRATOR_LEARNINGS_KB_PATH`` env var (both in resolve_kb_path)."""
+        return resolve_kb_path(shared_root_for(self.store.root), self.project)
 
     def _task_labels(self, task: Task) -> list[str]:
         """Best-effort issue labels for KB recall (enriches the title tokens). Wrapped: a

@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .runs_layout import iter_run_dirs
+
 LOW_PANEL_SAMPLE = 5
 
 
@@ -65,12 +67,12 @@ def _run_root(child: Path) -> _RunRoot | None:
 
 
 def _discover_runs(root: Path) -> list[_RunRoot]:
+    """Every run store beneath ``root`` — a legacy ``runs/<id>/`` root, one project's dated
+    root, or the top-level default root spanning projects (#523)."""
     if not root.is_dir():
         return []
     runs: list[_RunRoot] = []
-    for child in sorted(root.iterdir()):
-        if not child.is_dir():
-            continue
+    for child in iter_run_dirs(root):
         try:
             location = _run_root(child)
         except OSError:

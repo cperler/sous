@@ -21,19 +21,19 @@ moment its own invocation returns. A fast task's next stage dispatches while a s
 sibling is still mid-stage.
 
 ## Constants
-- `ROOT` = the shared runs-root (the top-level `runs/` dir). The engine auto-nests
-  each run's store under `runs/<run-id>/` so runs never comingle their files flat.
 - `RUN` = run id. `PROJECT` = `<your-project-adapter>` (e.g. `adapters.project.selfhost`).
-- Engine call shape: `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" <cmd> ...`
-  - **Always pass `--shared-root` when `ROOT` is the top-level `runs/` dir** (#102): it
-    forces the per-run nest even on a *fresh* `runs/` the auto-detect heuristic can't yet
-    recognize (no KB / sibling stores exist on day one). It's a no-op once nesting is
-    established, so it's safe to pass on every call. Omit it only if you point `ROOT`
-    directly at a pre-existing per-run dir (`runs/<run-id>`).
+- Engine call shape: `uv run orchestrator --run "$RUN" --project "$PROJECT" <cmd> ...`
+- No `ROOT` is needed (#523): the run's logs live at
+  `~/Development/runs/<project name>/<YYYY-MM-DD>/<run>/` (`ORCHESTRATOR_RUNS_ROOT` moves
+  the top level), the project name is the adapter's `name`, and every command finds the run
+  by `--run` alone. Each engine command prints `note: … run store at <dir>` on stderr — that
+  is the run dir (`RUN_DIR` / `<run dir>`) the paths below refer to. `--root <dir>` (with
+  `--shared-root` for a fresh legacy `runs/`) is only for pre-#523 runs or scripts that pin
+  a location.
 
 ## One-time setup
-1. `uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" init-run --lane full`.
-2. `… --shared-root … add-task --task "#NNN"` for each task in the batch (the task
+1. `uv run orchestrator --run "$RUN" --project "$PROJECT" init-run --lane full`.
+2. `… add-task --task "#NNN"` for each task in the batch (the task
    source supplies each task's `depends_on`; the engine builds the DAG).
 
 ## Capacity: bind across concurrent invocations
@@ -41,7 +41,7 @@ sibling is still mid-stage.
 remaining headroom yourself:
 
 ```
-D=$(uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" dispatchable --util auto --max-concurrent 3)
+D=$(uv run orchestrator --run "$RUN" --project "$PROJECT" dispatchable --util auto --max-concurrent 3)
 ```
 - `D.dispatchable` — DAG-ready, unleased tasks (EXCLUDES anything already in flight).
 - `D.limit` — the engine's capacity-derived dispatch cap (binding — never exceed it).
@@ -70,7 +70,7 @@ dispatch, then retry guarded `next`; only the lease-free retry may emit
 
 1. **Fill headroom.** Compute `slots = limit - in_flight_count` from a fresh
    `dispatchable`. For up to `slots` tasks from `D.dispatchable`:
-   - `WORK=$(… --shared-root … next --task "$T" --guard-supervisor-context
+   - `WORK=$(… next --task "$T" --guard-supervisor-context
      --supervisor-resume-command "start a fresh Claude Code session and invoke
      /orchestrate-batch-interactive for $RUN")` → one WorkItem (the engine drains
      any leading deterministic stage in-process and returns the first model WorkItem;
@@ -90,7 +90,7 @@ dispatch, then retry guarded `next`; only the lease-free retry may emit
      The shim runs the stage in-session and **returns** its StageResult (it cannot
      persist). Record `T`, the background handle, `WORK.timeout_s`, and the start time.
 2. **Reap returns.** As each background invocation returns, immediately:
-   - **record** its StageResult: write to a temp file → `… --shared-root … record --result <file>`.
+   - **record** its StageResult: write to a temp file → `… record --result <file>`.
      The engine advances that task, retries a failed stage with learnings, and
      cascade-blocks dependents of any task that fails — you don't manage that.
      A non-zero exit with `{"ok": false, "recorded": false, …}` means the result did not
@@ -104,11 +104,11 @@ dispatch, then retry guarded `next`; only the lease-free retry may emit
    one visibly exceeds ITS `timeout_s`, stop waiting on that one only, hand-craft its
    `StageResult` with `status: "timeout"` and a one-line `error`, and record it. Never
    leave a hung dispatch un-recorded, and never let one slow task block reaping others.
-4. Loop. Stop when `… --shared-root … status` shows `run_state` = `completed` or `failed`.
+4. Loop. Stop when `… status` shows `run_state` = `completed` or `failed`.
 
 ## Resumability
 All state is persisted. If the session dies mid-batch, just start this skill again on
-the same `ROOT`/`RUN`: `dispatchable` re-derives what's left, `in_flight` re-counts any
+the same `RUN`: `dispatchable` re-derives what's left, `in_flight` re-counts any
 still-leased tasks, and the engine re-emits any un-recorded stage (a crash-marked
 RUNNING stage re-dispatches at the same attempt — no double-execution). **Resume
 granularity is per task, not per round** — only the individual in-flight task's stage
@@ -120,7 +120,7 @@ timeline (#142): the re-dispatch's `stage_dispatched` carries `resume: true` /
 so a consumer counting `stage_dispatched` can discount the superseded one.
 
 ## Audit (every gate)
-`… --shared-root … status` → `lane_audit.clean == true`: every recorded call
+`… status` → `lane_audit.clean == true`: every recorded call
 `interactive:claude`, zero unattributed. The durable timeline is `events.jsonl`;
 per-stage records are under `stages/<task>/NN-<stage>.json`.
 
