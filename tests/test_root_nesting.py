@@ -364,3 +364,26 @@ def test_kb_and_tail_default_to_the_project_root(tmp_path, capsys, monkeypatch) 
     _run(capsys, "--run", "run-a", "--project", "tests.fakeproject", "init-run", "--lane", "full")
     assert main(["--run", "run-a", "--project", "tests.fakeproject", "tail", "#42"]) == 0
     assert "no live stream" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("cmd", [["status"], ["abandon", "--task", "#42", "--reason", "x"],
+                                 ["add-task", "--task", "#42"],
+                                 ["tail", "#42"]])
+def test_unknown_run_id_without_root_creates_no_directory(tmp_path, capsys, cmd) -> None:
+    """A per-run command on an unknown id (a typo) exits with a clear 'not found' error
+    and leaves NOTHING under the default runs root — only init-run may create today's
+    dated dir. Without this, every miss left an empty <today>/<typo>/ in ~/Development."""
+    default_root = tmp_path / "default-runs-root"
+    with pytest.raises(SystemExit) as exc:
+        main(["--run", "typo", "--project", "tests.fakeproject", *cmd])
+    assert "run 'typo' not found under" in str(exc.value)
+    assert not default_root.exists() or not any(default_root.rglob("typo"))
+
+
+def test_unknown_run_id_miss_leaves_existing_project_root_untouched(tmp_path, capsys) -> None:
+    project_root = tmp_path / "default-runs-root" / "fake"
+    _run(capsys, "--run", "run-a", "--project", "tests.fakeproject", "init-run", "--lane", "full")
+    before = sorted(p.relative_to(project_root) for p in project_root.rglob("*"))
+    with pytest.raises(SystemExit):
+        main(["--run", "typo", "--project", "tests.fakeproject", "status"])
+    assert sorted(p.relative_to(project_root) for p in project_root.rglob("*")) == before

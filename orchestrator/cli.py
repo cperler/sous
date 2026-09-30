@@ -183,14 +183,30 @@ def _resolve_store_root(root: Path, run: str | None, *, force_nest: bool = False
     return root
 
 
-def _default_store_root(project_name: str, run: str) -> Path:
+#: Commands allowed to CREATE a run's store dir under the default layout (#523). Every
+#: other per-run command must find an existing run: a typo'd id there would otherwise
+#: leave an empty ``<today>/<typo>/`` dir under ``~/Development/runs`` on every miss.
+#: (run-queue's factory creates via ``_default_store_root(..., create=True)`` directly.)
+_RUN_CREATING_COMMANDS = frozenset({"init-run"})
+
+
+def _default_store_root(project_name: str, run: str, *, create: bool = False) -> Path:
     """The per-run store dir when NO ``--root`` is given (#523):
     ``<default runs root>/<project name>/<YYYY-MM-DD>/<run>/``. An existing run is found by
-    id across the date dirs (its date was fixed at creation); a new one lands under today.
+    id across the date dirs (its date was fixed at creation). A miss yields today's dir
+    only when ``create`` is set (a run-creating command); otherwise it exits naming the
+    project root searched, so an unknown id never materializes a directory.
     Nothing here nests by heuristic and nothing touches ``<cwd>/runs/``."""
     project_root = project_runs_root(default_runs_root(), project_name)
     found = find_run_dir(project_root, run)
-    return found if found is not None else run_dir_for(project_root, run)
+    if found is not None:
+        return found
+    if not create:
+        raise SystemExit(
+            f"error: run {run!r} not found under {project_root!s} "
+            "(create it with init-run, or pass --root for a legacy runs dir)"
+        )
+    return run_dir_for(project_root, run)
 
 
 def _store_root_for(args: argparse.Namespace, project_name: str) -> Path:
@@ -214,7 +230,9 @@ def _store_root_for(args: argparse.Namespace, project_name: str) -> Path:
             return root
         if not run:
             raise SystemExit(f"error: --run is required for {args.cmd} without --root")
-        root = _default_store_root(project_name, run)
+        root = _default_store_root(
+            project_name, run, create=args.cmd in _RUN_CREATING_COMMANDS,
+        )
     except AmbiguousRunDirError as exc:
         raise SystemExit(f"error: {exc} (pass --root at the one you mean)") from None
     print(
@@ -1464,7 +1482,7 @@ def main(argv: list[str] | None = None) -> int:
             project = load_project(args.project)
             root = (
                 Path(args.root) / run_id if args.root
-                else _default_store_root(project.name, run_id)  # #523 dated layout
+                else _default_store_root(project.name, run_id, create=True)  # #523
             )
             root.mkdir(parents=True, exist_ok=True)
             provider = Provider(args.provider) if getattr(args, "provider", None) else None
