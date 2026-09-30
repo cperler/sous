@@ -240,7 +240,10 @@ def test_an_unresolvable_adapter_degrades_one_row_not_the_board(tmp_path) -> Non
     assert set(rows) == {"good", "broken"}
     assert rows["good"]["state"] == "running"  # the board survives intact
     broken = rows["broken"]
-    assert broken["unreadable"] is True
+    # #498: degraded, but NOT unreadable — its run doc parsed; only the adapter failed.
+    assert broken["degraded"] is True
+    assert broken["unreadable"] is False
+    assert broken["state"] == "<adapter-unresolved>"
     assert broken["attention"] is True
     # Clearly MARKED, and still identifiable: the row names the ref that failed.
     assert broken["flags"] == ["adapter unresolved: no.such.adapter.module"]
@@ -259,7 +262,8 @@ def test_a_run_with_no_ref_and_no_fallback_degrades_rather_than_raising(tmp_path
     snap = _snapshot(root)  # no --project fallback at all
 
     row = snap["runs"][0]
-    assert row["unreadable"] is True
+    assert row["degraded"] is True
+    assert row["unreadable"] is False
     assert row["flags"] == ["adapter unresolved: no project_ref"]
     assert row["project"] == "?"
 
@@ -372,7 +376,7 @@ def test_a_directory_ref_that_will_not_load_is_labelled_by_its_project_dir(tmp_p
     _make_run(root, "gone", project_ref="/nowhere/family-finance/.orchestration")
 
     row = _snapshot(root)["runs"][0]
-    assert row["unreadable"] is True
+    assert row["degraded"] is True
     assert row["project"] == "family-finance"
 
 

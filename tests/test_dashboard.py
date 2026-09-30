@@ -331,7 +331,13 @@ def test_partial_task_doc_becomes_unreadable_row(tmp_path) -> None:
     snap = _snapshot(tmp_path)
     row = snap["runs"][0]
     assert row["unreadable"] is True
-    assert "<unreadable status>" in render_dashboard(snap)
+    assert row["degraded"] is True
+    # #498: the caught exception is retained on the row and named in the board, instead of
+    # a bare "<unreadable status>" that could not be diagnosed after the fact.
+    assert row["error"]["type"]
+    out = render_dashboard(snap)
+    assert f"<unreadable status: {row['error']['type']}:" in out
+    assert f"UNREADABLE status — {row['error']['type']}:" in out
 
 
 # --- filtering ------------------------------------------------------------------------
