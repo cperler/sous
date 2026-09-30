@@ -27,7 +27,10 @@ ModelId = NewType("ModelId", str)
 # (ExecutionMode.ENGINE × Provider.NONE); additive — pre-v3 docs never name it.
 # v4: SIMPLIFY extends the stage vocabulary; v3 task maps gain a pending record while
 # retaining their exact stored pipeline.
-SCHEMA_VERSION = "4"
+# v5: OPTIMIZE extends it the same way (#519) — an opt-in measured-speed pass. Same additive
+# shape as v4: a v4 task map gains a pending ``optimize`` record and keeps its exact pipeline,
+# so a pre-#519 run never acquires the stage retroactively.
+SCHEMA_VERSION = "5"
 
 # ---- compatibility policy (#275) ------------------------------------------------------
 #
@@ -54,7 +57,7 @@ SCHEMA_VERSION = "4"
 # Status-doc versions this engine can read and migrate forward to SCHEMA_VERSION. "0" is the
 # synthetic name for a doc with NO ``schema_version`` key at all (the original pre-versioning
 # shape); every entry must have an explicit migration test (tests/test_schema_compat.py).
-MIGRATABLE_STATUS_VERSIONS = ("0", "1", "2", "3")
+MIGRATABLE_STATUS_VERSIONS = ("0", "1", "2", "3", "4")
 
 # Every status-doc version this engine accepts: the migratable ladder plus the current one.
 SUPPORTED_STATUS_VERSIONS = frozenset((*MIGRATABLE_STATUS_VERSIONS, SCHEMA_VERSION))
@@ -87,19 +90,22 @@ class Stage(StrEnum):
     SCOPE = "scope"
     IMPLEMENT = "implement"
     SIMPLIFY = "simplify"
+    OPTIMIZE = "optimize"
     TEST = "test"
     DELIVER = "deliver"
     REVIEW = "review"
 
 
 # Canonical display order for stage records. SIMPLIFY is opt-in through a decomposed
-# child's full quality tier; the standing FULL lane remains the deliberate six-stage
-# pipeline and is declared explicitly below.
+# child's full quality tier and OPTIMIZE through the project's agent roster (#519); the
+# standing FULL lane remains the deliberate six-stage pipeline and is declared explicitly
+# below.
 STAGE_ORDER: tuple[Stage, ...] = (
     Stage.INTAKE,
     Stage.SCOPE,
     Stage.IMPLEMENT,
     Stage.SIMPLIFY,
+    Stage.OPTIMIZE,
     Stage.TEST,
     Stage.DELIVER,
     Stage.REVIEW,
@@ -360,6 +366,32 @@ LANE_DETERMINISTIC_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
     )
     for lane, stages in LANE_STAGES.items()
 }
+
+
+# The stage OPTIMIZE follows when a project opts in (#519). SIMPLIFY when the pipeline has one
+# (the stage order the issue asks for), else IMPLEMENT — the change it measures must already
+# exist, and TEST must still run after it, so the slot is "last code-writing stage before the
+# verification tail" rather than a fixed index.
+_OPTIMIZE_AFTER: tuple[Stage, ...] = (Stage.SIMPLIFY, Stage.IMPLEMENT)
+
+
+def with_optimize(pipeline: tuple[Stage, ...]) -> tuple[Stage, ...]:
+    """``pipeline`` with OPTIMIZE inserted after SIMPLIFY (else after IMPLEMENT) — the
+    opt-in stage's position (#519).
+
+    Pure and idempotent, so the engine can apply it to a lane preset, a cost-routed preset,
+    and a decomposition child's quality-tier pipeline through one call site. Returns the
+    pipeline UNCHANGED when OPTIMIZE is already present (an explicit pin that names it wins)
+    or when neither anchor stage is in it — a pipeline that writes no code has nothing to
+    optimize, and inserting the stage there would dispatch an agent at a tree it never
+    changed."""
+    if Stage.OPTIMIZE in pipeline:
+        return pipeline
+    for anchor in _OPTIMIZE_AFTER:
+        if anchor in pipeline:
+            idx = pipeline.index(anchor) + 1
+            return (*pipeline[:idx], Stage.OPTIMIZE, *pipeline[idx:])
+    return pipeline
 
 
 class FailureKind(StrEnum):

@@ -192,6 +192,11 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.SCOPE: ("plan", "blocked_reason"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),
+    # #519: nothing folded. The suggestions the engine files are read from the stage
+    # RECORD at finalize, and its measurements are its own account of a pass a later
+    # stage does not act on — #520 makes them engine-run, which is when they become
+    # evidence worth carrying into a downstream prompt.
+    Stage.OPTIMIZE: (),
     Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),

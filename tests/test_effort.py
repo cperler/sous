@@ -78,6 +78,9 @@ def test_stage_spec_effort_defaults() -> None:
         Stage.SCOPE: Effort.HIGH,
         Stage.IMPLEMENT: Effort.HIGH,
         Stage.SIMPLIFY: Effort.MEDIUM,
+        # OPTIMIZE is implement-class reasoning, not review-class (#519): choosing between
+        # threads/processes/async over a whole call path, then measuring it.
+        Stage.OPTIMIZE: Effort.HIGH,
         Stage.TEST: Effort.MEDIUM,
         Stage.DELIVER: Effort.LOW,
         Stage.REVIEW: Effort.MEDIUM,

@@ -146,6 +146,23 @@ def test_v3_task_gains_the_simplify_stage_record_on_load(tmp_path) -> None:
     assert Stage.SIMPLIFY not in loaded.pipeline  # old runs keep their exact sequence
 
 
+def test_v4_task_gains_the_optimize_stage_record_on_load(tmp_path) -> None:
+    """v5 extends the stage vocabulary again (#519); a real v4 map lacks the new key.
+
+    The pipeline is the load-bearing half: a run planned before OPTIMIZE existed must not
+    acquire a paid stage retroactively just because the engine learned the word.
+    """
+    store = StatusStore(tmp_path)
+    doc = _task_doc()
+    doc["schema_version"] = "4"
+    doc["stages"].pop("optimize")
+    _write(tmp_path / "status-r1-t1.json", doc)
+
+    loaded = store.load_task("r1", "t1")
+    assert loaded.stages[Stage.OPTIMIZE].status is StageStatus.PENDING
+    assert Stage.OPTIMIZE not in loaded.pipeline  # old runs keep their exact sequence
+
+
 def test_the_ladder_covers_every_version_this_engine_accepts(tmp_path) -> None:
     """Guard against a future SCHEMA_VERSION bump that forgets the ladder: the supported
     set is exactly the migratable versions plus the current one, so a bump to "4" without

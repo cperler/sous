@@ -645,6 +645,61 @@ _FIXUP_APPLIED_REASON = "applied in place, not filed"
 _FIXUP_UNAPPLIED_REASON = "requested in-place fixup — not applied"
 _FIXUP_TITLE_CAP = 200  # keep in sync with Engine._review_fixups' title bound
 
+# An OPTIMIZE suggestion (#519) has no title field — its shape is
+# ``{description, rationale, disposition}`` — so the issue title and the note's line are both
+# the description's leading line, bounded. Shared by the engine's filing path and the note so
+# the two can never name the same suggestion differently, which is also what keeps the
+# engine's title-fingerprint dedupe meaningful for a description restated at length.
+_SUGGESTION_TITLE_CAP = 200
+
+
+def suggestion_title(description: str) -> str:
+    """One-line, bounded issue title for an OPTIMIZE suggestion's ``description`` (#519)."""
+    first = description.strip().splitlines()[0].strip() if description.strip() else ""
+    if len(first) <= _SUGGESTION_TITLE_CAP:
+        return first
+    return first[: _SUGGESTION_TITLE_CAP - 1].rstrip() + "…"
+
+
+def unfiled_suggestions(
+    optimize: dict | None, filed: list[dict] | None = None
+) -> list[dict]:
+    """The OPTIMIZE pass's architectural suggestions the engine did NOT file, as data (#519).
+
+    The same nothing-silently-dropped rule ``unfiled_findings`` implements for review
+    findings: a suggestion with no/``drop``/unrecognized disposition, or a ``file`` one past
+    the per-task cap, has no issue, so the completion note is its only channel to a human.
+
+    Pure (the fold/state-machine convention): computes and returns what was dropped; the
+    engine call site is what emits the events. ``filed`` is what the engine reports it decided
+    about — its real filings AND its suppressed duplicates (``deduped``) — matched by title,
+    since that is what both sides derive from the description.
+
+    Cap overflow is reported as such: a ``file`` suggestion the engine reports nothing about
+    was dropped by the cap, because every other reason to skip one is either a disposition
+    this function reads for itself or a decision the engine reported.
+    """
+    filed_titles = {str(f.get("title") or "").strip() for f in (filed or [])}
+    out: list[dict] = []
+    for suggestion in (optimize or {}).get("suggestions") or []:
+        if not isinstance(suggestion, dict):
+            continue
+        # coerce: a model may emit non-strings, and the interactive lane validates nothing
+        title = suggestion_title(str(suggestion.get("description") or ""))
+        if not title or title in filed_titles:
+            continue
+        disposition = str(suggestion.get("disposition") or "").strip().casefold()
+        if disposition == "file":
+            reason = "over per-task cap"
+        elif disposition == "drop":
+            reason = "noted, not tracked"
+        elif disposition:
+            reason = "unrecognized disposition — not filed"
+        else:
+            reason = "no disposition given — not filed"
+        out.append({"title": title, "disposition": disposition, "reason": reason})
+    return out
+
 
 def unfiled_findings(
     review: dict | None,
@@ -713,7 +768,10 @@ def unfiled_findings(
 
 
 def render_completion_note(
-    task: Task, followups: list[dict] | None = None, improvement_ref: str | None = None
+    task: Task,
+    followups: list[dict] | None = None,
+    improvement_ref: str | None = None,
+    optimize_refs: list[dict] | None = None,
 ) -> str:
     """Render a run's completion evidence as Markdown — the note the engine publishes
     back to the task source (PR/issue comment) so the pipeline's reasoning outlives the
@@ -721,6 +779,9 @@ def render_completion_note(
     filed; ``followups`` items are ``{"title", "ref"}`` (ref = the new issue URL/id, or
     None if filing failed). ``improvement_ref`` is the URL of the enhancement issue the
     engine filed from the review's improvement idea (None if unfiled or suppressed).
+    ``optimize_refs`` is what the engine decided about each architectural suggestion an
+    OPTIMIZE pass returned (#519): ``{"title", "ref"}`` for a filing, ``{"title", "deduped"}``
+    for one suppressed as a duplicate of something already filed.
 
     Nothing silently dropped (#188/#223):
 
@@ -731,6 +792,10 @@ def render_completion_note(
     * An improvement idea without an explicit ``file`` disposition is surfaced with its
       reason instead of an issue link, keeping the idea durable in the note even though
       no enhancement issue was opened.
+    * An OPTIMIZE suggestion the engine did not file (#519) gets the same treatment, for the
+      same reason: the stage deliberately did not APPLY it either, so the note is all that is
+      left of it. A suggestion SUPPRESSED as a duplicate says so, rather than reading as cap
+      overflow — that wording would send a human to file it a second time.
     * A ``fixup`` — whether it came from the improvement idea or from a non-blocking
       finding (#414) — is called applied only from ``task.review_fixups`` after its
       subsequent IMPLEMENT→…→REVIEW pass approved; disposition text alone is never treated
@@ -783,6 +848,33 @@ def render_completion_note(
     if noted:
         lines += ["", "### Noted, not filed"]
         lines += [f"- {n['title']} — {n['reason']}" for n in noted]
+
+    # #519: what the OPTIMIZE pass measured, and the architectural changes it deliberately
+    # did NOT make. The un-filed ones matter more than the filed ones here: the stage neither
+    # applied nor ticketed them, so this section is the only place they exist.
+    optimize = (task.stages[Stage.OPTIMIZE].output or {}) if Stage.OPTIMIZE in task.stages else {}
+    measurements = [m for m in (optimize.get("measurements") or []) if isinstance(m, dict)]
+    if measurements:
+        lines += ["", "### Speed measurements (stage-reported)"]
+        for m in measurements:
+            unit = f" {m['unit']}" if str(m.get("unit") or "").strip() else ""
+            lines.append(
+                f"- {m.get('name', '(unnamed)')}: {m.get('before', '?')}{unit} → "
+                f"{m.get('after', '?')}{unit}"
+            )
+    unfiled_opt = unfiled_suggestions(optimize, optimize_refs)
+    if optimize_refs or unfiled_opt:
+        lines += ["", "### Architectural suggestions (not applied here)"]
+        for decided in optimize_refs or []:
+            ref = decided.get("ref")
+            if decided.get("deduped"):
+                # The same idea the reviewer also raised, already filed above — saying
+                # "over per-task cap" here would invite a human to file it a second time.
+                suffix = " — already filed above (same idea as a review finding)"
+            else:
+                suffix = f" → {ref}" if ref else " → (filing failed)"
+            lines.append(f"- {decided.get('title', '(untitled)')}{suffix}")
+        lines += [f"- {n['title']} — {n['reason']}" for n in unfiled_opt]
 
     # Self-improvement loop: the run's own forward-looking idea + a
     # process lesson, so a completed run improves the project/process, not just ships a fix.

@@ -145,6 +145,40 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "Return: files_changed, summary, committed."
         ),
     ),
+    Stage.OPTIMIZE: StageSpec(
+        stage=Stage.OPTIMIZE,
+        model_role=Role.DEEP_REASON,
+        schema_ref="optimize",
+        agent_role="optimize",
+        # The roster role (#519) is also the OPT-IN: a project whose ``agent_for`` returns
+        # nothing for "optimize" never gets the stage in a pipeline at all, so this spec is
+        # inert there rather than conditionally defined.
+        timeout_s=1800,  # edit, measure, re-measure, commit — implement-shaped, not review-shaped
+        checkpoint=True,
+        # Choosing BETWEEN optimizations (threads vs processes vs async, where a lock belongs)
+        # is hypothesis work over the whole call path, not a local edit — the same reasoning
+        # class as IMPLEMENT, so it gets IMPLEMENT's role and effort rather than SIMPLIFY's.
+        effort=Effort.HIGH,
+        template=(
+            "Make a bounded, MEASURED speed pass over the implementation already in the "
+            "working tree, for a project where speed is part of the product. Profile or time "
+            "the real path first, change what the measurement implicates, then measure again "
+            "— threads vs processes vs async, lock scope and contention, batching and "
+            "caching, data layout, fast paths for small inputs. Commit what you keep; a "
+            "clean no-op is valid, and so is reverting your own change when it did not "
+            "actually help. Preserve behavior: a faster wrong answer is a regression.\n"
+            "Stay LOCAL. Do NOT restructure the architecture here — a process-pool "
+            "restructure, a shared-memory layout, a different lock strategy across "
+            "subsystems is NOT this stage's work, however clearly it is the right answer. "
+            "Return each one as a suggestion instead, with the disposition you would defend: "
+            "`file` to open an enhancement issue the engine files for you, `drop` if you "
+            "would not spend a maintainer's time on it. Choose `file` deliberately — a "
+            "suggestion a maintainer would not independently prioritize is a `drop`.\n"
+            "Return: files_changed, summary, committed, measurements (name/before/after/unit "
+            "per thing you timed — report what you actually ran, never an estimate), and "
+            "suggestions (list of {description, rationale, disposition})."
+        ),
+    ),
     Stage.TEST: StageSpec(
         stage=Stage.TEST,
         model_role=Role.CHEAP_SHELL,

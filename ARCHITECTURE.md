@@ -162,14 +162,27 @@ The standing six-stage pipeline, collapsed from the reference system's ~12–15:
    baseline)   feasible?) commit)     suite)   open PR)    reject → fix cycle)
 ```
 
-`simplify` is an additional stage-vocabulary member, not a seventh step in the standing
-FULL preset. SCOPE may opt a decomposed child with `quality_tier: full` into
-`intake → implement → simplify → test → deliver → review`; `light` omits simplify and
-`none` omits both simplify and review. The pass has its own WorkItem, checkpoint, agent,
-timeout, and ledger row, so its cost and failures are visible without restoring the old
-opaque quality loop.
+`simplify` and `optimize` are additional stage-vocabulary members, not extra steps in the
+standing FULL preset. Each has its own WorkItem, checkpoint, agent, timeout, and ledger row,
+so its cost and failures are visible without restoring the old opaque quality loop.
 
-- **Per-task pipeline (schema v2–v4).** `STAGE_ORDER` is the display order; the state
+- `simplify` is opted into per TASK: SCOPE may give a decomposed child `quality_tier: full`,
+  which runs `intake → implement → simplify → test → deliver → review`; `light` omits
+  simplify and `none` omits both simplify and review.
+- `optimize` is opted into per PROJECT (#519), for a project where speed is part of the
+  product. The opt-in is one roster entry — the project's `agent_for` answering an
+  `optimize` role — and `add_task` then inserts the stage after simplify (else after
+  implement) into whatever pipeline it persists, so lane presets, cost-routed presets and
+  decomposition children all pick it up from one place. A project that does not opt in gets a
+  byte-identical pipeline to a pre-#519 engine, and a `none` quality tier declines the stage
+  like any other quality pass. The stage makes LOCAL measured speed changes and commits them;
+  the architectural changes it deliberately does NOT make come back as `suggestions` with a
+  disposition, and the engine files the `file` ones as enhancement issues under the same
+  per-task cap and title dedupe as a review finding — so a task never turns into a redesign
+  and the idea is not lost. Its `measurements` are model-reported until #520 makes the engine
+  run the benchmark itself and keep the commit only on a measured win.
+
+- **Per-task pipeline (schema v2–v5).** `STAGE_ORDER` is the display order; the state
   machine (`orchestrator/state_machine.py`) walks each task's own
   `Task.pipeline`, never the constant. Lane presets `full | lite | micro` (`LANE_STAGES`)
   resolve to a concrete pipeline at `add_task`; e.g. `micro` drops scope and test.

@@ -164,6 +164,10 @@ class FakeProject:
         return self._engine_task_source
 
     def agent_for(self, stage: Stage, role: str | None = None):
+        # Deliberately NO "optimize" entry (#519): the roster entry is the opt-in, so the
+        # default fake project must run the pre-#519 pipeline and leave every other test's
+        # expected stage sequence byte-identical. tests/test_optimize_stage.py subclasses
+        # this to opt in.
         return {"implement": "impl-agent", "review": "code-reviewer", "docstring": "docstring-agent"}.get(role)
 
     def setup_task(self, task_id: str) -> dict:
@@ -246,6 +250,8 @@ def _default_output(stage: Stage) -> dict:
         Stage.SCOPE: {"feasible": True, "plan": ["subtask-1"]},
         Stage.IMPLEMENT: {"files_changed": ["a.py"], "summary": "done", "committed": True},
         Stage.SIMPLIFY: {"files_changed": [], "summary": "already simple", "committed": False},
+        Stage.OPTIMIZE: {"files_changed": ["a.py"], "summary": "batched the hot loop",
+                         "committed": True, "measurements": [], "suggestions": []},
         Stage.TEST: {"passed": True, "failures": [], "tests_meaningful": True,
                      "validation_notes": "asserts the changed behavior"},
         Stage.DELIVER: {"pr_number": 1234, "pr_url": "https://github.com/x/y/pull/1234"},

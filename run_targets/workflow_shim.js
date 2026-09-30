@@ -454,7 +454,7 @@ function toStageResult(wi, agentResult) {
     // by definition the engine that will record the result. The literal is only a fallback
     // for a WorkItem assembled without the field, and tests/test_schema_compat.py pins it
     // to SCHEMA_VERSION so it cannot silently rot the way '1' did.
-    schema_version: wi.schema_version || '4',
+    schema_version: wi.schema_version || '5',
     work_item_id: wi.id,
     content_hash: wi.content_hash,
     run_id: wi.run_id,

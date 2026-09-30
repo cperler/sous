@@ -195,7 +195,7 @@ the run log dir is the durable audit trail and is pruned only by a human, delibe
 **Merge PRs in dependency order.** They were built on a DAG.
 
 **An all-codex batch needs the global `--provider codex` flag.** A per-task `provider_tag`
-routes only IMPLEMENT/TEST/SIMPLIFY, and `lane_audit.clean` will not catch the miss. DELIVER
+routes only IMPLEMENT/SIMPLIFY/OPTIMIZE/TEST, and `lane_audit.clean` will not catch the miss. DELIVER
 is vetoed onto the deterministic engine lane regardless — the codex sandbox turns its
 `git push` into a keychain prompt no unattended batch can answer.
 
