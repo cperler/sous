@@ -549,7 +549,18 @@ cross-run `learnings-kb.jsonl` share one parent:
   `$ORCHESTRATOR_DASHBOARD_ROOTS`, each row resolves its own adapter from the `project_ref`
   persisted on its run doc — `--project` is only the fallback for pre-#386 docs — and
   selection, attention-first ordering and the account-wide utilization header stay global
-  across roots. A run whose adapter will not resolve degrades to one marked row), `cost-report`, `retrospective`,
+  across roots. A run whose adapter will not resolve degrades to one marked row, and every
+  degraded row keeps the exception that caused it (#498). Since #525 `dashboard_snapshot` is
+  the single structure both views read: each row carries per-task detail (title, issue and PR
+  links, current stage and time in it, model, stream active/stalled/none, a per-stage list with
+  status and cost, dependencies and what the task waits on), a plain-words driver summary, a
+  cost breakdown by task and stage with unmetered counts, and recent events as sentences;
+  attention items (blocked, parked, paused, failed task, budget, unreadable, stale) carry the
+  exact commands that resolve them. `dashboard_render.py` renders it for the console in the
+  order an operator asks — needs you, running now, progress by project, cost with account
+  headroom, recent — as COMPACT below 100 columns (one line per run, running tasks only, no
+  per-stage cost) or WIDE otherwise, picked from the terminal width; `--compact` / `--wide`
+  force one), `cost-report`, `retrospective`,
   `util` (probe the account's 5h/7d utilization, feeds `--util`), `statusline` (one-line
   utilization plus context-window capture for the Claude Code status bar),
   `supervisor-context` (read that fresh payload), and `resume-supervisor` (release a

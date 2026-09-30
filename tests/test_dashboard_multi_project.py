@@ -401,7 +401,10 @@ def test_cli_dashboard_collects_roots_from_flags_and_env(tmp_path, monkeypatch, 
     assert rc == 0
     out = capsys.readouterr().out
     assert "a-run" in out and "b-run" in out and "c-run" in out
-    assert out.count("a-run") == 1  # the repeated root did not duplicate the row
+    # The repeated root did not duplicate the row: the progress section (one line per run)
+    # names it once. Other sections name the run too, so count within that section only.
+    progress = out.split("── progress ──")[1].split("── cost ──")[0]
+    assert progress.count("a-run") == 1
 
 
 def test_cli_dashboard_needs_at_least_one_root(monkeypatch, capsys) -> None:
