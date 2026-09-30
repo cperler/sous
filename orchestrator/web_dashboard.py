@@ -668,6 +668,7 @@ INDEX_HTML = """<!doctype html>
     parked: "run parked, needs a fresh supervisor session",
     budget_exhausted: "budget used up",
     stale: "no progress",
+    failed: "task failed",
     unreadable: "run status could not be read",
     adapter_unresolved: "project adapter could not be loaded"
   };
@@ -677,6 +678,8 @@ INDEX_HTML = """<!doctype html>
       return "no update for " + fmtAge(it.seconds_since_update)
         + (it.stage ? " at " + String(it.stage).toUpperCase() : "")
         + " — check its live stream or stage logs below";
+    if (it.kind === "failed")
+      return (it.stage ? "failed at " + String(it.stage).toUpperCase() + ": " : "") + (it.reason || "");
     if (it.kind === "budget_exhausted") {
       var f = it.fraction;
       return "spend is at " + (typeof f === "number" ? Math.round(f * 100) + "%" : "?")

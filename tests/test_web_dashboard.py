@@ -351,6 +351,13 @@ def test_index_has_the_operator_sections_and_filters() -> None:
     assert 'getElementById("attention").innerHTML = ""' not in INDEX_HTML
 
 
+def test_index_renders_a_failed_task_with_its_stage() -> None:
+    # #535: a failed task's attention row names the stage that failed, not just "failed".
+    assert 'failed: "task failed"' in INDEX_HTML
+    assert 'it.kind === "failed"' in INDEX_HTML
+    assert '"failed at " + String(it.stage).toUpperCase()' in INDEX_HTML
+
+
 def test_unknown_path_is_404(tmp_path) -> None:
     status, _, body = _route("/nope", root=tmp_path)
     assert status == 404
