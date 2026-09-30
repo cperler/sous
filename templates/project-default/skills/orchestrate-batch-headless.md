@@ -19,23 +19,26 @@ sessions with `--resume` (measured 92–96% cache hits on long stages), and leav
 free. Use the interactive skill only when a human needs to watch each stage as it happens.
 
 ## Constants
-- `ROOT` = the shared runs-root (top-level `runs/`). `RUN` = run id. `PROJECT` = project
-  adapter module (e.g. `adapters.project.selfhost`).
-- **Always pass `--shared-root`** when `ROOT` is the top-level `runs/` (#91) — it forces the
-  per-run nest even on a fresh `runs/` the auto-detect heuristic can't recognize. No-op once
-  nesting exists, so it is safe on every call.
+- `RUN` = run id. `PROJECT` = project adapter module (e.g. `adapters.project.selfhost`).
+- No `ROOT` is needed (#523): the run's logs live at
+  `~/Development/runs/<project name>/<YYYY-MM-DD>/<run>/` (`ORCHESTRATOR_RUNS_ROOT` moves
+  the top level), the project name is the adapter's `name`, and every command finds the run
+  by `--run` alone. Each engine command prints `note: … run store at <dir>` on stderr — that
+  is the run dir (`RUN_DIR` / `<run dir>`) the paths below refer to. `--root <dir>` (with
+  `--shared-root` for a fresh legacy `runs/`) is only for pre-#523 runs or scripts that pin
+  a location.
 - No `--mode` flag is needed: `run-headless` forces `ExecutionMode.HEADLESS` itself
   (`cli.py:191-192`), regardless of the global default (`interactive`).
 
 ## 1. Scaffold (you do this, via Bash — it is cheap and deterministic)
 ```
-uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" init-run --lane full
-uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" add-task --task "#NNN"
+uv run orchestrator --run "$RUN" --project "$PROJECT" init-run --lane full
+uv run orchestrator --run "$RUN" --project "$PROJECT" add-task --task "#NNN"
 ```
 One `add-task` per issue; the task source supplies each task's `depends_on` and the engine
 builds the DAG. Then confirm the shape before handing over:
 ```
-uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" dispatchable --util auto --max-concurrent 3
+uv run orchestrator --run "$RUN" --project "$PROJECT" dispatchable --util auto --max-concurrent 3
 ```
 Check the DAG is what you intended (no accidental serialization, no missing edge) and that
 `limit > 0`. If `limit` is 0 you are capacity-stalled — say so rather than handing over a
@@ -49,7 +52,7 @@ later (every subcommand rebuilds the Engine from constructor defaults — see CL
 The driver command is the same in every case:
 
 ```
-uv run orchestrator --root runs --shared-root --run RUN --project PROJECT run-headless --wait
+uv run orchestrator --run RUN --project PROJECT run-headless --wait
 ```
 
 `--wait` sleeps through capacity stalls and rate-limit cooldowns instead of returning;
@@ -82,16 +85,16 @@ than ~25 minutes, do not use mode (a)** — use (c) or (b).
 
 **(c) Detached — on request, and the right default for any long batch.** Escapes the reaper by
 putting the driver in its own session and process group, so the group-kill cannot reach it.
-macOS has no `setsid` binary, so fork + `os.setsid()` in Python. Substitute RUN/PROJECT; it
-returns immediately, leaving the driver running with `PPID 1`:
+macOS has no `setsid` binary, so fork + `os.setsid()` in Python. Substitute RUN/PROJECT and
+RUN_DIR (the run dir `init-run` printed); it returns immediately, leaving the driver running with `PPID 1`:
 
 ```
 python3 -c "
 import os,sys,subprocess
 if os.fork(): sys.exit(0)
 os.setsid()
-log=open('runs/RUN/driver.log','a')
-subprocess.run(['uv','run','orchestrator','--root','runs','--shared-root','--run','RUN',
+log=open('RUN_DIR/driver.log','a')
+subprocess.run(['uv','run','orchestrator','--run','RUN',
                 '--project','PROJECT','run-headless','--wait'],
                stdout=log,stderr=log,stdin=subprocess.DEVNULL)
 "
@@ -104,7 +107,7 @@ must tell the human that, and verify liveness yourself rather than waiting to be
   `ps -o pid,ppid,pgid -p <pid>` — `PPID` must be `1` and `PGID` must differ from the session
   shell's. If `PPID` is not 1 it did not detach and the reaper still owns it.
 - Poll `status` when you want to know where it is; `driver.alive` + `heartbeat_age_s` (#323)
-  are authoritative, and `runs/<run>/driver.log` holds the stdout the notification would have
+  are authoritative, and `<run dir>/driver.log` holds the stdout the notification would have
   carried.
 - Killing it is now manual: `kill <pid>` from the `driver.jsonl` start record.
 
@@ -118,7 +121,7 @@ that terminal alone.
 In every mode, say these two things:
 
 1. **Monitor from a second terminal** — `dashboard --watch`, or `watch --activity`. The
-   driver also narrates itself to stderr and to `runs/<run>/driver.jsonl` (#323): heartbeats
+   driver also narrates itself to stderr and to `<run dir>/driver.jsonl` (#323): heartbeats
    carrying tick, utilization, dispatch limit, and — while it sleeps — the wait reason. A
    long silence there is a stalled or dead driver, not a quiet one.
 2. **What it will do outwardly** — how many PRs it may open, against which repo. For a live
@@ -127,7 +130,7 @@ In every mode, say these two things:
 
 ## 3. Read the result (on the driver's exit notification, or when the human reports it done)
 ```
-uv run orchestrator --root "$ROOT" --shared-root --run "$RUN" --project "$PROJECT" status
+uv run orchestrator --run "$RUN" --project "$PROJECT" status
 ```
 Gate on:
 - `run_state` is `completed` / `failed`.
@@ -142,7 +145,7 @@ Gate on:
   driver dies without an `exited` record, its last heartbeat bounds the time of death.
 
 Then per CLAUDE.md: merge the PRs in dependency order, verify each issue actually closed,
-clean worktrees/branches/checkpoint tags — but **never** `rm -rf runs/<RUN>/`. Run
+clean worktrees/branches/checkpoint tags — but **never** `rm -rf` the run dir. Run
 `trunk-gate` over the merged trunk. Offer `triage-followups` for the issues the run auto-filed.
 
 ## Recovery, resume, and lane details

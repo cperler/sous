@@ -118,7 +118,7 @@ tracker or fix-forward.
   the creation date is fixed at `init-run` (and persisted as `Run.run_dir`), and later
   commands find the run by `--run` alone. `ORCHESTRATOR_RUNS_ROOT` moves the top level;
   `--root <dir>` is the legacy override (pre-#523 runs, scripts) and `--shared-root` only
-  matters with it. The per-project learnings KB and queue file sit at
+  matters with it. The per-project learnings KB and other cross-run files sit at
   `~/Development/runs/<project>/`. `runs-migrate --from <project>/runs` moves old dirs in
   (preview by default, never deletes).
 - **Tasks that declare the same file are serialized, not fanned out** (#377). SCOPE names

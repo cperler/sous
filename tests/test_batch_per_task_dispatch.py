@@ -36,10 +36,16 @@ def _engine(tmp_path, project) -> Engine:
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
 
 
-# --- #102: every engine call in the batch skill carries --shared-root ----------
+# --- #102 → #523: the batch skill's engine calls resolve the per-run store -------
+#
+# #102 made every call carry `--root "$ROOT" --shared-root`, because a fresh `runs/` could
+# not be auto-detected as a shared root and the first run's store landed flat. #523 moved
+# the default runs location outside the project to a dated per-project layout that never
+# nests by heuristic, so the calls now pass NO --root at all. The guardrail that survives:
+# a call that still pins --root must also assert --shared-root, or the #102 bug is back.
 
 
-def test_batch_skill_engine_calls_pass_shared_root() -> None:
+def test_batch_skill_engine_calls_resolve_the_per_run_store() -> None:
     text = _SKILL.read_text()
     calls = [
         line for line in text.splitlines()
@@ -50,17 +56,21 @@ def test_batch_skill_engine_calls_pass_shared_root() -> None:
     # future rewrite that silently drops every concrete example).
     assert calls, "batch SKILL.md has no concrete `uv run orchestrator` engine call"
     for line in calls:
-        assert "--shared-root" in line, (
-            f"batch SKILL.md engine call missing --shared-root (#102): {line!r}"
-        )
+        assert "--run" in line, f"batch SKILL.md engine call without --run: {line!r}"
+        if "--root" in line:
+            assert "--shared-root" in line, (
+                f"batch SKILL.md engine call pins --root without --shared-root (#102): "
+                f"{line!r}"
+            )
 
 
-def test_batch_skill_documents_shared_root_rationale() -> None:
-    # The skill must explain WHY --shared-root is always passed (mirrors the task skill),
-    # not just show it — so a reader knows it's deliberate and safe on every call.
+def test_batch_skill_documents_the_default_runs_location() -> None:
+    # The skill must explain WHERE the run lives now that no ROOT is passed (#523), and
+    # keep --shared-root documented for the legacy --root case (#102).
     text = _SKILL.read_text()
+    assert "~/Development/runs/<project name>/<YYYY-MM-DD>/<run>/" in text
+    assert "#523" in text
     assert "--shared-root" in text
-    assert "#102" in text
 
 
 # --- #97: per-task interleaving + in_flight capacity accounting ----------------
