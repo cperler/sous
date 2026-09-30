@@ -179,8 +179,22 @@ so its cost and failures are visible without restoring the old opaque quality lo
   the architectural changes it deliberately does NOT make come back as `suggestions` with a
   disposition, and the engine files the `file` ones as enhancement issues under the same
   per-task cap and title dedupe as a review finding — so a task never turns into a redesign
-  and the idea is not lost. Its `measurements` are model-reported until #520 makes the engine
-  run the benchmark itself and keep the commit only on a measured win.
+  and the idea is not lost. Its speed claim is checked by the harness, not the prompt (#520):
+  the engine runs the project adapter's declared `benchmark_cmd` argv ITSELF — at the
+  last-good checkpoint and again at the stage's commit, back to back in the task worktree so
+  the two numbers are comparable — and compares them through the pure
+  `orchestrator/benchmark_gate.py` layer against an adapter-declared `benchmark_tolerance`
+  (default 5%). A win means at least one metric improved past the tolerance and none
+  regressed past it. Anything else — no win, a regression, a red or unparseable benchmark, no
+  benchmark declared at all, a dirty worktree — does NOT keep the commit: the engine
+  hard-resets the worktree to the anchor and drops the stage's `checkpoint`, so
+  `task.last_checkpoint` keeps naming the last VERIFIED commit and a later retry resets to it.
+  The stage still records SUCCESS (reverting a pass that did not pay off is an outcome of the
+  pass, not a failure to retry), and every path emits exactly one event
+  (`optimize_benchmark_verified` / `_no_win` / `_failed` / `_unavailable` / `_skipped`) plus a
+  verdict block on the stage output, because a gate that could not run must never read like
+  one that passed. The model's own `measurements` stay in the output as profiling detail and
+  decide nothing.
 
 - **Per-task pipeline (schema v2–v5).** `STAGE_ORDER` is the display order; the state
   machine (`orchestrator/state_machine.py`) walks each task's own

@@ -10,7 +10,7 @@
     "committed": {"type": "boolean"},
     "measurements": {
       "type": "array",
-      "description": "what was actually timed, before and after. Required (an empty array is the honest answer for a no-op pass) because an unmeasured speed claim is not a speed claim. MODEL-REPORTED today: the engine does not yet verify these numbers, so a reader must treat them as the stage's own account. #520 replaces them with before/after numbers the engine runs itself from an adapter-declared benchmark command, and keeps the stage's commit only on a measured win.",
+      "description": "what you actually timed, before and after. Required (an empty array is the honest answer for a no-op pass) because an unmeasured speed claim is not a speed claim. MODEL-REPORTED profiling detail — useful for WHY the change was made, but no longer what decides anything: since #520 the engine runs the project adapter's declared benchmark itself, before and after this stage's commit, and keeps the commit only on a measured win (see `benchmark`). Report what you ran, never an estimate.",
       "items": {
         "type": "object",
         "required": ["name", "before", "after"],
@@ -22,6 +22,28 @@
         },
         "additionalProperties": true
       }
+    },
+    "benchmark": {
+      "type": "object",
+      "description": "ENGINE-OWNED verdict (#520) — do NOT author this key: whatever a stage returns here is overwritten by the engine's own before/after run of the project adapter's declared benchmark command, taken at the last-good checkpoint and at this stage's commit. `status` is `verified` (a win beyond the tolerance, commit kept), `no_win` (measured, nothing beyond the tolerance, or a regression — commit reverted), `failed` (the benchmark ran red or printed unreadable output — reverted), `unavailable` (nothing runnable to measure with: no adapter benchmark, a dirty worktree, no anchor — reverted) or `skipped` (the pass committed nothing, so there was nothing to keep or revert).",
+      "properties": {
+        "status": {
+          "type": "string",
+          "enum": ["verified", "no_win", "failed", "unavailable", "skipped"]
+        },
+        "reason": {"type": "string"},
+        "reverted": {"type": "boolean", "description": "was the stage's commit dropped"},
+        "tolerance": {"type": "number", "description": "the minimum relative improvement this verdict required"},
+        "metrics": {
+          "type": "array",
+          "description": "one row per metric measured on both sides: name/before/after/unit/lower_is_better/delta_fraction (signed so positive is better)/direction/judged",
+          "items": {"type": "object", "additionalProperties": true}
+        },
+        "summary": {"type": "array", "items": {"type": "string"}},
+        "notices": {"type": "array", "items": {"type": "object", "additionalProperties": true}},
+        "legs": {"type": "array", "items": {"type": "object", "additionalProperties": true}}
+      },
+      "additionalProperties": true
     },
     "suggestions": {
       "type": "array",

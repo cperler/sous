@@ -215,6 +215,28 @@ class ProjectConfig(Protocol):
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
     #
+    # Optional OPTIMIZE benchmark hooks (#520; duck-typed via ``getattr``, NOT part of the
+    # versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
+    #   benchmark_cmd() -> list[str]
+    #       The project's own speed benchmark, as argv. The ENGINE runs it (twice: at the
+    #       last-good checkpoint and at the OPTIMIZE stage's commit) and keeps that commit
+    #       only when the numbers improve beyond the tolerance below — so the stage's speed
+    #       claim is checked by the harness rather than reported by the model. The engine
+    #       never picks a profiler: no argv means no verification, and the stage's changes are
+    #       then NOT kept (unverified must not read as green). Output contract: the LAST
+    #       non-empty stdout line is a JSON object mapping a metric name to a bare number or
+    #       to ``{"value": <number>, "unit": "ms", "lower_is_better": true}``; anything above
+    #       that line is ignored, so a benchmark may print its usual table first.
+    #       ``lower_is_better`` defaults to true (a duration) — a throughput metric must say
+    #       false. Same ``['true']``/empty no-op sentinel handling as the other command
+    #       getters, and the benchmark should be deterministic enough that a real win clears
+    #       the tolerance on one run: the gate measures once per side, not N times.
+    #   benchmark_tolerance: float
+    #       Minimum relative improvement that counts as a win, as a fraction (0.05 = 5%), as
+    #       a float attribute or a zero-arg callable. Default
+    #       ``benchmark_gate.DEFAULT_BENCHMARK_TOLERANCE`` (0.05). A non-finite or negative
+    #       value is replaced by the default and reported as a notice on the verdict.
+    #
     # Optional engine-tracker source (duck-typed, no contract-version bump):
     #   engine_task_source: TaskSource
     #       Dedicated task source for engine-owned meta-authoring proposals. Composition roots

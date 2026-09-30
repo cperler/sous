@@ -8,6 +8,7 @@ so they are trivially testable and the engine just writes their output.
 
 from __future__ import annotations
 
+from .benchmark_gate import format_metric_rows
 from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
 from .schemas.status import ReviewFixup, StageRecord, Task
 from .stream_probe import looks_like_event_stream, readable_text_from_stream
@@ -701,6 +702,48 @@ def unfiled_suggestions(
     return out
 
 
+# What the engine's OPTIMIZE benchmark verdict means to a human reading the PR (#520). The
+# heading has to answer "did this pass ship?" without a glossary, because the stage's own
+# `files_changed` is misleading on every status but `verified`.
+_BENCHMARK_HEADINGS = {
+    "verified": "### Speed verified (engine-measured, commit kept)",
+    "no_win": "### Speed pass REVERTED — no measured win (engine-measured)",
+    "failed": "### Speed pass REVERTED — the benchmark could not be read",
+    "unavailable": "### Speed pass REVERTED — nothing to verify it with",
+    "skipped": "### Speed pass committed nothing",
+}
+
+
+def _benchmark_lines(benchmark: object) -> list[str]:
+    """The engine-measured before/after block for the completion note (#520).
+
+    Renders the verdict the engine wrote into the OPTIMIZE output: the per-metric numbers via
+    the shared ``benchmark_gate.format_metric_rows`` (so the note and ``events.jsonl`` cannot
+    disagree), the tolerance the verdict required, and whether the stage's commit survived.
+    An OPTIMIZE output with no verdict block at all (a run recorded before #520) renders
+    nothing rather than implying a check that never ran."""
+    if not isinstance(benchmark, dict) or not benchmark.get("status"):
+        return []
+    status = str(benchmark.get("status"))
+    lines = ["", _BENCHMARK_HEADINGS.get(status, f"### Speed pass ({status})")]
+    rows = [r for r in (benchmark.get("metrics") or []) if isinstance(r, dict)]
+    lines += [f"- {line}" for line in format_metric_rows(rows)]
+    tolerance = benchmark.get("tolerance")
+    if isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool):
+        lines.append(f"- required improvement: more than {float(tolerance) * 100:.1f}%")
+    detail = str(benchmark.get("detail") or "").strip()
+    reason = str(benchmark.get("reason") or "").strip()
+    if status != "verified" and (detail or reason):
+        lines.append(f"- reason: {detail or reason}")
+    if benchmark.get("revert_error"):
+        # A revert the engine could not perform must not read as one it did.
+        lines.append(f"- WARNING: the revert itself failed: {benchmark['revert_error']}")
+    for notice in benchmark.get("notices") or []:
+        if isinstance(notice, dict) and notice.get("detail"):
+            lines.append(f"- note: {notice['detail']}")
+    return lines
+
+
 def unfiled_findings(
     review: dict | None,
     followups: list[dict] | None = None,
@@ -853,9 +896,14 @@ def render_completion_note(
     # did NOT make. The un-filed ones matter more than the filed ones here: the stage neither
     # applied nor ticketed them, so this section is the only place they exist.
     optimize = (task.stages[Stage.OPTIMIZE].output or {}) if Stage.OPTIMIZE in task.stages else {}
+    # #520: the engine's OWN before/after run of the project's declared benchmark is the
+    # measurement of record, and it says whether the stage's commit survived — so it leads,
+    # and a reverted pass says so in the heading rather than leaving a reader to read its
+    # `files_changed` as landed work.
+    lines += _benchmark_lines(optimize.get("benchmark"))
     measurements = [m for m in (optimize.get("measurements") or []) if isinstance(m, dict)]
     if measurements:
-        lines += ["", "### Speed measurements (stage-reported)"]
+        lines += ["", "### What the pass profiled (stage-reported)"]
         for m in measurements:
             unit = f" {m['unit']}" if str(m.get("unit") or "").strip() else ""
             lines.append(
