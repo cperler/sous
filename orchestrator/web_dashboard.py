@@ -226,7 +226,7 @@ def route_request(
         try:
             if path == "/api/task-detail":
                 return _json(200, {"run": run, "task": task, **_task_detail(run_root, task)})
-            # At line 219, if path is "/api/stage-file", name is guaranteed non-None.
+            # The 400 guard above guarantees name is set on the stage-file path.
             body = _stage_file_path(run_root, task, cast(str, name)).read_bytes()
         except _Refused as exc:
             return _json(exc.status, {"error": exc.error, "run": run, "task": task, "name": name})
