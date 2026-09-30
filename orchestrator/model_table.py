@@ -36,9 +36,10 @@ ENGINE_MODEL = "engine"
 class Role:
     """Stage role -> model. The engine asks for a role; the table resolves the id."""
 
-    DEEP_REASON = "deep_reason"  # research/plan/implement/fix
-    REVIEW = "review"  # evaluate/review/test/docs/pr — cheaper
-    CHEAP_SHELL = "cheap_shell"  # setup/intake
+    FRONTIER = "frontier"  # scope/implement — the two stages that decide the outcome
+    DEEP_REASON = "deep_reason"  # review — independent judgment of the finished change
+    REVIEW = "review"  # docs/pr — mid-tier prose and mechanics
+    CHEAP_SHELL = "cheap_shell"  # setup/intake, plus simplify/test
 
 
 # Current model pins (single source). Update here on a model bump. Keyed by id and
@@ -47,23 +48,27 @@ class Role:
 # on a provider price change the same as the claude rows.
 _MODELS: dict[str, ModelInfo] = {
     # claude
-    # Mythos-tier, above Opus — reachable ONLY via an explicit per-task pin (#84), never a
-    # role default. Price is the published Anthropic API rate ($10/$50 per Mtok, 2x Opus 5),
-    # source: platform.claude.com/docs/en/about-claude/models/overview (Claude Fable 5 row,
-    # re-confirmed 2026-07-25 with the Opus 5 / Sonnet 5 bump).
-    "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0),
-    "claude-opus-5": ModelInfo(id="claude-opus-5", input_per_mtok=5.0, output_per_mtok=25.0),
-    # Sonnet 5 carries an INTRODUCTORY rate of $2/$10 per Mtok through 2026-08-31, after
-    # which it reverts to the $3/$15 pinned here. We deliberately price at the standard
-    # rate rather than the discount: the ledger feeds the `--budget-usd` hard-PAUSE gate,
-    # so over-estimating spend fails safe (an early pause), while pricing the discount
-    # would silently under-report every row once the intro window closes. Revisit after
-    # 2026-08-31 only to confirm — no edit should be needed.
-    "claude-sonnet-5": ModelInfo(id="claude-sonnet-5", input_per_mtok=3.0, output_per_mtok=15.0),
+    # Frontier tier — the default for scope/implement (Role.FRONTIER), and still pinnable per
+    # task (#84). Price is the published Anthropic API rate ($10/$50 per Mtok); cache reads
+    # bill at 0.025x input on 5.1 (not the 0.1x default). Source: platform.claude.com/docs/
+    # en/about-claude/pricing, confirmed 2026-09-30.
+    "claude-fable-5-1": ModelInfo(
+        id="claude-fable-5-1", input_per_mtok=10.0, output_per_mtok=50.0, cache_read_mult=0.025
+    ),
+    # Opus 5.5 cache reads bill at 0.05x input ($0.20/Mtok), not the 0.1x default.
+    "claude-opus-5-5": ModelInfo(
+        id="claude-opus-5-5", input_per_mtok=4.0, output_per_mtok=20.0, cache_read_mult=0.05
+    ),
+    "claude-sonnet-5-5": ModelInfo(id="claude-sonnet-5-5", input_per_mtok=2.0, output_per_mtok=10.0),
     "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
     # Superseded claude tiers — retained for PRICING historical ledger rows (runs dispatched
     # before the Opus 5 / Sonnet 5 bump), not for dispatch. Removing them would make every
     # prior row unpriced (`priced=False`) and corrupt historical cost reports.
+    "claude-fable-5": ModelInfo(id="claude-fable-5", input_per_mtok=10.0, output_per_mtok=50.0),
+    "claude-opus-5": ModelInfo(id="claude-opus-5", input_per_mtok=5.0, output_per_mtok=25.0),
+    # Sonnet 5's introductory $2/$10 became its standard price (the $3/$15 step-up was
+    # cancelled), so the old $3/$15 pin here would over-price it.
+    "claude-sonnet-5": ModelInfo(id="claude-sonnet-5", input_per_mtok=2.0, output_per_mtok=10.0),
     "claude-opus-4-8": ModelInfo(id="claude-opus-4-8", input_per_mtok=5.0, output_per_mtok=25.0),
     "claude-sonnet-4-6": ModelInfo(id="claude-sonnet-4-6", input_per_mtok=3.0, output_per_mtok=15.0),
     # codex (OpenAI) — the ids passed to `codex exec -m`. Re-probed live 2026-07-31 against
@@ -95,8 +100,9 @@ _MODELS: dict[str, ModelInfo] = {
 # codex-routed stage resolves to a codex id, not a claude one shelled to `codex exec -m`.
 _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
     Provider.CLAUDE: {
-        Role.DEEP_REASON: "claude-opus-5",
-        Role.REVIEW: "claude-sonnet-5",
+        Role.FRONTIER: "claude-fable-5-1",
+        Role.DEEP_REASON: "claude-opus-5-5",
+        Role.REVIEW: "claude-sonnet-5-5",
         Role.CHEAP_SHELL: "claude-haiku-4-5",
     },
     # The 5.6 ladder maps 1:1 onto the three roles, mirroring the claude tiering: sol is the
@@ -104,6 +110,7 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
     # This replaces the degenerate all-gpt-5.5 map that existed only because the plan used to
     # expose a single tier (#84).
     Provider.CODEX: {
+        Role.FRONTIER: "gpt-5.6-sol",
         Role.DEEP_REASON: "gpt-5.6-sol",
         Role.REVIEW: "gpt-5.6-terra",
         Role.CHEAP_SHELL: "gpt-5.6-luna",
@@ -115,15 +122,16 @@ _ROLE_TO_MODEL: dict[Provider, dict[str, str]] = {
 # cross-provider fallthrough (codex -> claude, #7) lives in the engine, not this table: it is
 # a LANE swap once the same-provider chain is exhausted, not another entry in the chain.
 _MODEL_CHAINS: dict[Provider, tuple[str, ...]] = {
-    # fable sits at the HEAD (above opus) so a rate-limited fable pin degrades to opus
-    # naturally (fallback_after('claude-fable-5') == 'claude-opus-5'). Nothing dispatches
-    # chain[0] by default — the role defaults below stay opus/sonnet/haiku, and both the
-    # capacity downgrade and rate-limit fallback only walk DOWN the chain, never up into
-    # fable — so fable is reachable only through the per-task model pin (#84).
+    # fable sits at the HEAD (above opus), and is now the role default for scope/implement
+    # (Role.FRONTIER), so a rate-limited fable degrades to opus naturally
+    # (fallback_after('claude-fable-5-1') == 'claude-opus-5-5'). Both the capacity downgrade
+    # and the rate-limit fallback only walk DOWN the chain.
     # Superseded tiers (opus-4-8, sonnet-4-6) are deliberately NOT in the chain: they stay
-    # priceable in _MODELS for historical rows, but a rate-limited Opus 5 degrades straight
-    # to Sonnet 5 rather than sideways into a previous generation.
-    Provider.CLAUDE: ("claude-fable-5", "claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"),
+    # priceable in _MODELS for historical rows, but a rate-limited Opus 5.5 degrades straight
+    # to Sonnet 5.5 rather than sideways into a previous generation.
+    Provider.CLAUDE: (
+        "claude-fable-5-1", "claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-4-5",
+    ),
     # A REAL descending chain now that the plan exposes tiers: a rate-limited sol degrades to
     # terra, terra to luna, and only luna (the floor) goes to cooldown or the #7 cross-provider
     # fallthrough. gpt-5.5/5.4/5.4-mini are deliberately NOT in the chain — like the superseded
@@ -187,9 +195,9 @@ class ModelTable:
 # they are now a real ladder, not the single tier that made an alias pointless. Older codex ids
 # (gpt-5.5/5.4/5.4-mini) stay alias-free and pass through by their exact id.
 _MODEL_ALIASES: dict[str, str] = {
-    "fable": "claude-fable-5",
-    "opus": "claude-opus-5",
-    "sonnet": "claude-sonnet-5",
+    "fable": "claude-fable-5-1",
+    "opus": "claude-opus-5-5",
+    "sonnet": "claude-sonnet-5-5",
     "haiku": "claude-haiku-4-5",
     "sol": "gpt-5.6-sol",
     "terra": "gpt-5.6-terra",

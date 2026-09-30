@@ -291,8 +291,8 @@ def _engine(tmp_path, project) -> Engine:
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"), project)
 
 
-# scope runs on opus at $5/Mtok input, so 200k input tokens == exactly $1.00.
-_ONE_USD = TokenUsage(input=200_000, output=0)
+# scope runs on fable at $10/Mtok input, so 100k input tokens == exactly $1.00.
+_ONE_USD = TokenUsage(input=100_000, output=0)
 
 
 def test_budget_trips_on_spend_from_failed_attempts(tmp_path) -> None:
@@ -537,7 +537,7 @@ def test_a_measured_stage_stays_metered_on_the_task_doc(tmp_path) -> None:
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))
     scope = eng.next_work("r1", "t1")
-    eng.record("r1", make_result(scope, tokens=TokenUsage(input=200_000, output=0),
+    eng.record("r1", make_result(scope, tokens=TokenUsage(input=100_000, output=0),
                                  mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE))
 
     task = eng.store.load_task("r1", "t1")
@@ -601,7 +601,7 @@ def test_cost_report_calls_out_unmetered_rows(tmp_path) -> None:
     # complete while quietly including calls of unknown cost at $0.
     eng, _ = _failed_unmetered_task(tmp_path)
     implement = eng.next_work("r1", "t1")  # SCOPE failed -> retry is dispatched
-    eng.record("r1", make_result(implement, tokens=TokenUsage(input=200_000, output=0)))
+    eng.record("r1", make_result(implement, tokens=TokenUsage(input=100_000, output=0)))
 
     analysis = eng.ledger.analysis()
     assert analysis["unmetered_calls"] == 1
@@ -628,7 +628,7 @@ def test_cost_report_is_unchanged_when_every_call_is_metered(tmp_path) -> None:
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))
     eng.record("r1", make_result(eng.next_work("r1", "t1"),
-                                 tokens=TokenUsage(input=200_000, output=0)))
+                                 tokens=TokenUsage(input=100_000, output=0)))
 
     md = render_cost_report("r1", eng.ledger.analysis())
     assert "Total cost: **$1.0000**" in md

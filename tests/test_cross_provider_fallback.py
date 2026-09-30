@@ -13,6 +13,7 @@ from adapters.execution.codex import CodexRunner
 from adapters.execution.transport import RawResult, is_provider_unavailable
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
+from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.routing import Router
 from orchestrator.schemas.enums import (
     ExecutionLane,
@@ -25,6 +26,18 @@ from orchestrator.schemas.work import LanePolicy, WorkItem
 from orchestrator.stages import STAGE_SPECS
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
+
+
+def _claude_chain(stage: Stage) -> list[str]:
+    """The stage's claude role default followed by every step down the claude chain."""
+    chain = [DEFAULT_MODEL_TABLE.model_for_role(STAGE_SPECS[stage].model_role)]
+    while (nxt := DEFAULT_MODEL_TABLE.fallback_after(chain[-1])) is not None:
+        chain.append(nxt)
+    return chain
+
+
+def _claude_default(stage: Stage) -> str:
+    return _claude_chain(stage)[0]
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -137,7 +150,7 @@ def test_provider_unavailable_falls_through_to_claude(tmp_path, project) -> None
     nxt = eng.next_work("r1", "t1")
     assert nxt.stage is Stage.IMPLEMENT
     assert nxt.lane_policy.provider is Provider.CLAUDE
-    assert nxt.model == "claude-opus-5"           # claude DEEP_REASON default
+    assert nxt.model == _claude_default(Stage.IMPLEMENT)  # claude FRONTIER default
     assert nxt.attempt == w.attempt                 # provider was out, not the task — no burn
 
 
@@ -239,7 +252,7 @@ def test_rate_limit_floor_exhausted_falls_through(tmp_path, project) -> None:
     ev = _fallthrough_events(eng)
     assert len(ev) == 1 and "cooldown budget exhausted" in ev[0]["reason"]
     nxt = eng.next_work("r1", "t1")
-    assert nxt.lane_policy.provider is Provider.CLAUDE and nxt.model == "claude-opus-5"
+    assert nxt.lane_policy.provider is Provider.CLAUDE and nxt.model == _claude_default(Stage.IMPLEMENT)
 
 
 # --- no ping-pong: claude never falls through, one-way only ------------------
@@ -251,10 +264,12 @@ def test_claude_failure_never_falls_through(tmp_path, project) -> None:
     eng.create_run("r1", ExecutionLane.FULL, cross_provider_fallback=True)
     eng.add_task("r1", "t1")  # no codex tag -> all claude
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
-    w = eng.next_work("r1", "t1")  # scope (claude, opus)
+    w = eng.next_work("r1", "t1")  # scope (claude, fable)
     assert w.lane_policy.provider is Provider.CLAUDE
-    # rate-limit claude down its OWN chain to the floor (opus -> sonnet -> haiku)
-    for expect in ("claude-sonnet-5", "claude-haiku-4-5"):
+    # rate-limit claude down its OWN chain to the floor (fable -> opus -> sonnet -> haiku)
+    chain = _claude_chain(Stage.SCOPE)
+    assert w.model == chain[0]
+    for expect in chain[1:]:
         eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
         w = eng.next_work("r1", "t1")
         assert w.model == expect

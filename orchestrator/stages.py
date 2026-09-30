@@ -69,7 +69,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.SCOPE: StageSpec(
         stage=Stage.SCOPE,
-        model_role=Role.DEEP_REASON,
+        model_role=Role.FRONTIER,
         schema_ref="scope",
         agent_role="scope",
         timeout_s=600,  # deep reasoning, no file edits
@@ -110,7 +110,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.IMPLEMENT: StageSpec(
         stage=Stage.IMPLEMENT,
-        model_role=Role.DEEP_REASON,
+        model_role=Role.FRONTIER,
         schema_ref="implement",
         agent_role="implement",
         timeout_s=1800,  # the heavy stage: multi-file edits + commits
@@ -131,7 +131,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.SIMPLIFY: StageSpec(
         stage=Stage.SIMPLIFY,
-        model_role=Role.REVIEW,
+        model_role=Role.CHEAP_SHELL,
         schema_ref="simplify",
         agent_role="simplify",
         timeout_s=900,
@@ -147,7 +147,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.TEST: StageSpec(
         stage=Stage.TEST,
-        model_role=Role.REVIEW,
+        model_role=Role.CHEAP_SHELL,
         schema_ref="test",
         agent_role="test",
         timeout_s=1200,  # test/fix iterate-until-green loop
@@ -192,7 +192,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
     ),
     Stage.REVIEW: StageSpec(
         stage=Stage.REVIEW,
-        model_role=Role.REVIEW,
+        model_role=Role.DEEP_REASON,
         schema_ref="review",
         agent_role="review",
         timeout_s=600,  # read the PR + judge

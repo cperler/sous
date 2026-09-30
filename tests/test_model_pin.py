@@ -1,4 +1,4 @@
-"""Per-task model pin (#84): a task can pin a model (e.g. claude-fable-5) that overrides the
+"""Per-task model pin (#84): a task can pin a model (e.g. claude-sonnet-5-5) that overrides the
 role default on model-lane stages, is honored by the capacity downgrade (pins win), still
 degrades down the rate-limit chain, and is validated against the task's provider at add time.
 """
@@ -10,8 +10,9 @@ import pytest
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import ContractError
-from orchestrator.model_table import ENGINE_MODEL
+from orchestrator.model_table import DEFAULT_MODEL_TABLE, ENGINE_MODEL, resolve_model_alias
 from orchestrator.schemas.enums import ExecutionMode, ResultStatus, Stage
+from orchestrator.stages import STAGE_SPECS
 from orchestrator.status_store import StatusStore
 from tests.conftest import make_result
 
@@ -30,9 +31,9 @@ def test_add_task_stores_resolved_pin_from_alias(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     task = eng.add_task("r1", "t1", model="fable")
-    assert task.model_pin == "claude-fable-5"  # alias resolved to the canonical id
+    assert task.model_pin == "claude-fable-5-1"  # alias resolved to the canonical id
     # and it round-trips through the store
-    assert eng.store.load_task("r1", "t1").model_pin == "claude-fable-5"
+    assert eng.store.load_task("r1", "t1").model_pin == "claude-fable-5-1"
 
 
 def test_codex_task_cannot_pin_a_claude_model(tmp_path, project) -> None:
@@ -66,11 +67,12 @@ def test_unknown_pin_raises_at_add_time(tmp_path, project) -> None:
 # --- next_work honors the pin ------------------------------------------------
 
 def test_pinned_model_wins_over_role_default_across_stages(tmp_path, project) -> None:
-    """The pin overrides the role default on EVERY model-lane stage — a deep_reason stage
-    (scope) and a review-role stage (test) both dispatch on the pinned tier, not opus/sonnet."""
+    """The pin overrides the role default on EVERY model-lane stage — a frontier stage
+    (scope), a cheap_shell stage (test) and a deep_reason stage (review) all dispatch on the
+    pinned tier, not their role defaults. The pin is a mid-chain model so it differs from all three."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1", model="fable")
+    eng.add_task("r1", "t1", model="sonnet")
     seen: dict[Stage, str] = {}
     while (w := eng.next_work("r1", "t1")) is not None:
         seen[w.stage] = w.model
@@ -78,9 +80,11 @@ def test_pinned_model_wins_over_role_default_across_stages(tmp_path, project) ->
     # intake is deterministic (ENGINE lane) — the pin never touches it
     assert seen[Stage.INTAKE] == ENGINE_MODEL
     # every model-lane stage ran on the pin, regardless of its role
-    assert seen[Stage.SCOPE] == "claude-fable-5"  # deep_reason (default opus)
-    assert seen[Stage.TEST] == "claude-fable-5"  # review role (default sonnet)
-    assert seen[Stage.REVIEW] == "claude-fable-5"
+    pin = resolve_model_alias("sonnet")
+    for stage in (Stage.SCOPE, Stage.TEST, Stage.REVIEW):
+        default = DEFAULT_MODEL_TABLE.model_for_role(STAGE_SPECS[stage].model_role)
+        assert default != pin  # the pin is distinguishable from the role default
+        assert seen[stage] == pin
 
 
 def test_unpinned_task_uses_role_default(tmp_path, project) -> None:
@@ -90,7 +94,9 @@ def test_unpinned_task_uses_role_default(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1")  # scope
-    assert w.stage is Stage.SCOPE and w.model == "claude-opus-5"
+    assert w.stage is Stage.SCOPE and w.model == DEFAULT_MODEL_TABLE.model_for_role(
+        STAGE_SPECS[Stage.SCOPE].model_role
+    )
 
 
 def test_deterministic_stage_ignores_the_pin(tmp_path, project) -> None:
@@ -107,21 +113,25 @@ def test_deterministic_stage_ignores_the_pin(tmp_path, project) -> None:
 
 # --- interplay: rate-limit chain still degrades from the pin ------------------
 
-def test_pinned_task_rate_limited_degrades_to_opus(tmp_path, project) -> None:
-    """A pin is a STARTING tier, not an anti-fallback lock — a rate-limited fable dispatch
-    re-queues on opus (fallback_after('claude-fable-5')), and that degrade takes precedence
-    over the pin for the re-dispatch."""
+def test_pinned_task_rate_limited_degrades_down_the_chain(tmp_path, project) -> None:
+    """A pin is a STARTING tier, not an anti-fallback lock — a rate-limited opus dispatch
+    re-queues on sonnet (fallback_after(opus)), and that degrade takes precedence over the
+    pin for the re-dispatch. (Opus, not fable: fable is scope's own default now, so pinning
+    it would not show the pin doing anything.)"""
+    pin = resolve_model_alias("opus")
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1", model="fable")
+    eng.add_task("r1", "t1", model="opus")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
-    w = eng.next_work("r1", "t1")  # scope, on the pinned fable
-    assert w.stage is Stage.SCOPE and w.model == "claude-fable-5"
+    w = eng.next_work("r1", "t1")  # scope, on the pinned opus
+    assert w.stage is Stage.SCOPE and w.model == pin
+    below = DEFAULT_MODEL_TABLE.fallback_after(pin)
+    assert below == resolve_model_alias("sonnet")
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_rate_limited_fallback"
-    assert eng.store.load_task("r1", "t1").pending_fallback_model == "claude-opus-5"
+    assert eng.store.load_task("r1", "t1").pending_fallback_model == below
     nxt = eng.next_work("r1", "t1")  # the queued degrade wins over the pin
-    assert nxt.stage is Stage.SCOPE and nxt.model == "claude-opus-5"
+    assert nxt.stage is Stage.SCOPE and nxt.model == below
 
 
 # --- interplay: capacity downgrade skips a pinned task -----------------------
@@ -131,8 +141,8 @@ def test_capacity_downgrade_skips_pinned_task(tmp_path, project) -> None:
     route_by_capacity run at high util, an unpinned task drops a tier but a pinned one holds."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", route_by_capacity=True)
-    eng.add_task("r1", "t1", model="fable")
+    eng.add_task("r1", "t1", model="opus")
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     w = eng.next_work("r1", "t1", util_pct=75)  # high band
-    assert w.stage is Stage.SCOPE and w.model == "claude-fable-5"  # held, not downgraded
+    assert w.stage is Stage.SCOPE and w.model == resolve_model_alias("opus")  # held, not downgraded
     assert _downgrade_events(eng) == []

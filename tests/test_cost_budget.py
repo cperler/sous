@@ -58,8 +58,8 @@ def _advance(eng, *, tokens: TokenUsage | None = None, run="r1", task="t1"):
     return work, rec
 
 
-# scope runs on opus (deep_reason) at $5/Mtok input, so 200k input tokens == exactly $1.00.
-_SCOPE_1USD = TokenUsage(input=200_000, output=0)
+# scope runs on fable (frontier) at $10/Mtok input, so 100k input tokens == exactly $1.00.
+_SCOPE_1USD = TokenUsage(input=100_000, output=0)
 
 
 # --- estimate table + router (pure) ---------------------------------------------
@@ -265,7 +265,7 @@ def test_routing_thin_budget_downgrades_next_task(tmp_path) -> None:
     eng.add_task("r1", "t1")  # routed FULL at add (remaining 1.0)
     _advance(eng, task="t1")  # intake $0
     # spend $0.95 -> remaining fraction 0.05 -> LITE band for the next task
-    _advance(eng, tokens=TokenUsage(input=190_000, output=0), task="t1")
+    _advance(eng, tokens=TokenUsage(input=95_000, output=0), task="t1")
 
     t2 = eng.add_task("r1", "t2")
     assert t2.pipeline == LANE_STAGES[ExecutionLane.LITE]
@@ -288,7 +288,7 @@ def test_routing_decision_overrides_lane_preset_deterministic_default(tmp_path) 
     eng.create_run("r1", ExecutionLane.FULL, budget_usd=1.0, route_by_cost=True)
     eng.add_task("r1", "t1")
     _advance(eng, task="t1")  # intake $0
-    _advance(eng, tokens=TokenUsage(input=190_000, output=0), task="t1")  # spend $0.95 -> LITE band
+    _advance(eng, tokens=TokenUsage(input=95_000, output=0), task="t1")  # spend $0.95 -> LITE band
 
     t2 = eng.add_task("r1", "t2", ExecutionLane.FULL)  # explicit FULL lane, but budget is thin
     assert t2.pipeline == LANE_STAGES[ExecutionLane.LITE]  # routing still downgrades the pipeline
@@ -308,7 +308,7 @@ def test_explicit_deterministic_stages_override_the_routing_decision(tmp_path) -
     eng.create_run("r1", ExecutionLane.FULL, budget_usd=1.0, route_by_cost=True)
     eng.add_task("r1", "t1")
     _advance(eng, task="t1")  # intake $0
-    _advance(eng, tokens=TokenUsage(input=190_000, output=0), task="t1")  # spend $0.95 -> LITE band
+    _advance(eng, tokens=TokenUsage(input=95_000, output=0), task="t1")  # spend $0.95 -> LITE band
 
     t2 = eng.add_task("r1", "t2", deterministic_stages=[Stage.DELIVER])
     assert t2.deterministic_stages == (Stage.DELIVER,)  # caller pin wins over routing's {TEST, DELIVER}

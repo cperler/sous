@@ -443,10 +443,10 @@ def test_a_thinning_budget_falls_back_to_the_single_reviewer(tmp_path, project) 
     eng = _panel_engine(tmp_path / "thin", project)
     eng.create_run("r1", review_workflow=True, budget_usd=1.0)
     eng.add_task("r1", "t1")
-    # SCOPE runs on the deep-reason tier at $5/Mtok input: 190k input tokens ≈ $0.95, which
+    # SCOPE runs on the frontier tier at $10/Mtok input: 95k input tokens ≈ $0.95, which
     # leaves 5% of the budget — the cost router's cheapest band.
     while (w := eng.next_work("r1", "t1")) is not None and w.stage is not Stage.REVIEW:
-        tokens = TokenUsage(input=190_000, output=0) if w.stage is Stage.SCOPE else None
+        tokens = TokenUsage(input=95_000, output=0) if w.stage is Stage.SCOPE else None
         eng.record("r1", make_result(w, tokens=tokens))
     assert 0 < eng.ledger.metered_spend() < 1.0  # thinned, but not hard-stopped
     assert w is not None and w.plan is None

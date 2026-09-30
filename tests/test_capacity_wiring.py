@@ -15,8 +15,10 @@ import orchestrator.scheduler as scheduler_module
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.errors import CapacityExhausted
+from orchestrator.model_table import DEFAULT_MODEL_TABLE
 from orchestrator.scheduler import EXIT_MAX_TICKS, Scheduler
 from orchestrator.schemas.enums import ResultStatus, Stage
+from orchestrator.stages import STAGE_SPECS
 from orchestrator.status_store import StatusStore
 from orchestrator.usage_probe import Usage, fetch_usage, read_usage, resolve_util
 from tests.conftest import make_result
@@ -72,12 +74,23 @@ def _engine(tmp_path, project, **kw) -> Engine:
     return Engine(StatusStore(tmp_path), CostLedger(tmp_path / "stage-costs.jsonl"), project, **kw)
 
 
+def _scope_chain() -> list[str]:
+    """SCOPE's dispatch chain: its role default, then every step down to the floor."""
+    chain = [DEFAULT_MODEL_TABLE.model_for_role(STAGE_SPECS[Stage.SCOPE].model_role)]
+    while (nxt := DEFAULT_MODEL_TABLE.fallback_after(chain[-1])) is not None:
+        chain.append(nxt)
+    return chain
+
+
+SCOPE_MODEL = _scope_chain()[0]
+
+
 def _walk_to_floor(eng, run="r1", task="t1"):
-    """Drive scope to the fallback floor: opus -> sonnet -> haiku, all rate-limited."""
+    """Drive scope to the fallback floor: fable -> opus -> sonnet -> haiku, all rate-limited."""
     eng.create_run(run)
     eng.add_task(run, task)
     eng.record(run, make_result(eng.next_work(run, task)))  # intake (deterministic)
-    for expected in ("claude-opus-5", "claude-sonnet-5", "claude-haiku-4-5"):
+    for expected in _scope_chain():
         w = eng.next_work(run, task)
         assert w.stage is Stage.SCOPE and w.model == expected
         out = eng.record(run, make_result(w, status=ResultStatus.RATE_LIMITED,
@@ -94,7 +107,7 @@ def test_floor_rate_limit_cooldowns_then_retries_original_model(tmp_path, projec
     # cooldown elapsed (0s): the SAME stage re-dispatches on the ORIGINAL role model
     # (not the floor model) at the SAME attempt — the old wait-then-retry semantics.
     w = eng.next_work("r1", "t1")
-    assert w.stage is Stage.SCOPE and w.model == "claude-opus-5" and w.attempt == 0
+    assert w.stage is Stage.SCOPE and w.model == SCOPE_MODEL and w.attempt == 0
     assert eng.store.load_task("r1", "t1").not_before is None  # stamp cleared on dispatch
 
 
@@ -112,12 +125,11 @@ def test_cooldown_budget_exhaustion_degrades_to_failure(tmp_path, project) -> No
     eng = _engine(tmp_path, project, rate_limit_cooldown_s=0, max_rate_limit_waits=1,
                   breaker_threshold=9)
     _walk_to_floor(eng)  # wait #1 consumed
-    w = eng.next_work("r1", "t1")  # back on opus after the (0s) cooldown
-    # walk the chain to the floor again: opus -> sonnet -> haiku
-    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
-    w = eng.next_work("r1", "t1")
-    eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
-    w = eng.next_work("r1", "t1")
+    w = eng.next_work("r1", "t1")  # back on the role default after the (0s) cooldown
+    # walk the chain to the floor again: fable -> opus -> sonnet -> haiku
+    for _ in _scope_chain()[:-1]:
+        eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
+        w = eng.next_work("r1", "t1")
     out = eng.record("r1", make_result(w, status=ResultStatus.RATE_LIMITED, structured_output={}))
     assert out["outcome"] == "stage_failed_will_retry"  # budget spent -> real failure
     assert "cooldown budget exhausted" in (eng.store.load_task("r1", "t1").last_error or "")
