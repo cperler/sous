@@ -66,6 +66,7 @@ _COMMAND_METHODS: list[tuple[str, str, bool]] = [
     ("typecheck_cmd", "lint", False),
     ("types_cmd", "typecheck", False),
     ("infra_reset", "infra_reset", False),
+    ("benchmark_cmd", "bench", False),
 ]
 
 # Comments rendered above a generated method, so the leg/name mismatch above is explained
@@ -81,7 +82,17 @@ _METHOD_NOTES: dict[str, str] = {
         "    # distinct from the linter above so a merge gate runs BOTH. A project with only one\n"
         "    # static-analysis tool puts it on typecheck_cmd and leaves this a no-op.\n"
     ),
+    "benchmark_cmd": (
+        "    # The project's speed benchmark (#529): profile.toml's `bench` command. The engine's\n"
+        "    # OPTIMIZE gate (#520) runs it before and after the stage and reads a one-line JSON\n"
+        "    # metrics object from the LAST stdout line (rc 0 on both runs); the REVIEW gate\n"
+        "    # below runs it too (rc 1 blocks, anything else that is not rc 0 is advisory).\n"
+    ),
 }
+
+# A Profile's task source when nothing says otherwise. A re-run's incoming profile carries
+# it by default, so merge_profiles must not read it as a choice (#529).
+_DEFAULT_TASK_SOURCE = "local-file"
 
 # The generic roster used when no stack-specific agents are selected (no-profile default).
 _DEFAULT_ROSTER: dict[str, str] = {
@@ -104,7 +115,7 @@ class Profile:
 
     name: str
     languages: list[str] = field(default_factory=list)
-    task_source: str = "local-file"
+    task_source: str = _DEFAULT_TASK_SOURCE
     commands: dict[str, list[str]] = field(default_factory=dict)
     roster: dict[str, str] = field(default_factory=dict)
     layers: dict[str, bool] = field(default_factory=dict)
@@ -286,12 +297,39 @@ def _overrides(
     return cmd, roster, worktree
 
 
+def _keep_local_agents(
+    seed: dict[str, list[str]], manifest: dict, *sources: dict[str, list[str]]
+) -> dict[str, list[str]]:
+    """Add back the seed agents the kit does not ship (#529).
+
+    ``select_kit_assets`` rebuilds ``seed`` from the kit manifest, so an agent the project
+    wrote itself (one in its own ``.claude/agents``, not ``templates/project-default/agents``)
+    would vanish on every regeneration. Agents named in ``sources`` that the manifest does
+    not know are unioned into ``seed['agents']``; kit agents still follow the stack.
+    """
+    kit = manifest["agents"]
+    local = {a for src in sources for a in src.get("agents", []) if a not in kit}
+    if local:
+        seed["agents"] = sorted({*seed.get("agents", []), *local})
+    return seed
+
+
 def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Profile:
     """Additive merge for a re-run: union the languages, re-derive defaults for the union,
-    then re-apply hand-overrides (incoming's win over existing's). Nothing is removed."""
+    then re-apply hand-overrides (incoming's win over existing's). Nothing is removed.
+
+    Consequences for an existing profile (#529): ``task_source`` keeps the existing value
+    unless the incoming profile names a non-default one, since a defaulted incoming profile
+    carries ``local-file`` without choosing it. Project-local seed agents survive. A command
+    the existing profile LACKS but its languages default (e.g. a python profile with no
+    ``typecheck``) is re-added: absence cannot be told apart from never-derived, so to
+    disable a default leg, set it to ``["true"]`` (the no-op) rather than deleting it.
+    """
     languages = list(dict.fromkeys([*existing.languages, *incoming.languages]))
     merged = profile_from_languages(existing.name, languages, manifest)
-    merged.task_source = incoming.task_source or existing.task_source
+    merged.task_source = (incoming.task_source
+                          if incoming.task_source != _DEFAULT_TASK_SOURCE
+                          else existing.task_source)
     ex_cmd, ex_roster, ex_worktree = _overrides(existing, manifest)
     in_cmd, in_roster, in_worktree = _overrides(incoming, manifest)
     merged.commands.update({**ex_cmd, **in_cmd})
@@ -301,7 +339,9 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
     merged.worktree = derive_worktree(merged.languages, merged.commands, manifest)
     merged.worktree.update({**ex_worktree, **in_worktree})
     merged.layers = {**existing.layers, **incoming.layers}
-    merged.seed = select_kit_assets(merged, manifest)
+    merged.seed = _keep_local_agents(
+        select_kit_assets(merged, manifest), manifest, existing.seed, incoming.seed
+    )
     return merged
 
 
@@ -496,7 +536,7 @@ def read_profile(path: Path) -> Profile:
     return Profile(
         name=proj.get("name", path.parent.name),
         languages=list(proj.get("languages", [])),
-        task_source=proj.get("task_source", "local-file"),
+        task_source=proj.get("task_source", _DEFAULT_TASK_SOURCE),
         commands={k: list(v) for k, v in raw.get("commands", {}).items()},
         roster=dict(raw.get("roster", {})),
         layers=dict(raw.get("layers", {})),
@@ -797,6 +837,17 @@ _NOOP = ["true"]
 # allowing a noisy tool to consume the review context, and never wait forever on a gate.
 _GATE_TIMEOUT_S = 300
 _GATE_OUTPUT_CAP = 2000
+# A benchmark runs far longer than a linter; matched to the engine's OPTIMIZE benchmark bound.
+_BENCH_TIMEOUT_S = 1800
+
+
+def _output_tail(proc: subprocess.CompletedProcess[str]) -> str:
+    """A gate's combined output, capped to its END (where the error or timings are)."""
+    detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
+    if len(detail) > _GATE_OUTPUT_CAP:
+        detail = "…\\n" + detail[-_GATE_OUTPUT_CAP:]
+    return detail
+
 
 # Optional per-stage schema overrides live next to this file (CWD-independent); absent
 # a <ref>.json the engine's canonical stage contract is used (codex full-validation).
@@ -836,7 +887,7 @@ class {cls}:
         return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
     def review_findings(self, *, worktree: str | None = None) -> list[dict]:
-        """Run profile-declared lint/typecheck policy gates in the task worktree.
+        """Run profile-declared lint/typecheck/benchmark policy gates in the task worktree.
 
         A red command blocks REVIEW. A command that cannot run is advisory instead: the
         gate is visibly UNVERIFIED without deadlocking a task on a missing tool or timeout.
@@ -844,6 +895,7 @@ class {cls}:
         The methods are the ENGINE's leg names, not the tools' (#412): ``typecheck_cmd`` is
         the lint leg, ``types_cmd`` the static-typing leg. Calling exactly the pair both
         merge gates call is what keeps REVIEW and merge from checking different things.
+        The benchmark leg (``benchmark_cmd``, profile.toml's ``bench``) is REVIEW-only.
         """
         if not worktree or not os.path.isdir(worktree):
             return []
@@ -852,6 +904,8 @@ class {cls}:
                             ("typecheck", self.types_cmd())):
             if (finding := self._gate(worktree, label, argv)) is not None:
                 findings.append(finding)
+        if (finding := self._bench_gate(worktree, self.benchmark_cmd())) is not None:
+            findings.append(finding)
         return findings
 
     def _gate(self, worktree: str, label: str, argv: list[str]) -> dict | None:
@@ -871,15 +925,51 @@ class {cls}:
             }}
         if proc.returncode == 0:
             return None
-        detail = ((proc.stdout or "") + (proc.stderr or "")).strip()
-        if len(detail) > _GATE_OUTPUT_CAP:
-            detail = "…\\n" + detail[-_GATE_OUTPUT_CAP:]
         return {{
             "description": f"{{label}} gate is RED on this change — profile.toml declares "
-                           f"`{{command}}` as a project gate. Output:\\n{{detail}}",
+                           f"`{{command}}` as a project gate. Output:\\n{{_output_tail(proc)}}",
             "severity": "critical",
             "suggested_fix": f"Run `{{command}}` in the worktree and fix what it reports.",
             "blocking": True,
+        }}
+
+    def _bench_gate(self, worktree: str, argv: list[str]) -> dict | None:
+        """Run the benchmark leg: rc 0 passes, rc 1 blocks, anything else is advisory.
+
+        rc 1 is the benchmark reporting a regression, so its finding carries the output
+        tail (the timings). Any other rc, a timeout, or a failure to start means the
+        benchmark did not judge the change: advisory UNVERIFIED, never green.
+        """
+        if not argv or argv == _NOOP:
+            return None
+        command = " ".join(argv)
+        try:
+            proc = self._run_bench(argv, worktree)
+        except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
+            return {{
+                "description": f"benchmark gate could not run in the task worktree "
+                               f"({{type(exc).__name__}}: {{exc}}). The gate is UNVERIFIED "
+                               "for this change.",
+                "severity": "important",
+                "blocking": False,
+            }}
+        if proc.returncode == 0:
+            return None
+        if proc.returncode == 1:
+            return {{
+                "description": f"benchmark gate is RED on this change — profile.toml declares "
+                               f"`{{command}}` as the project benchmark and it reported a "
+                               f"regression. Output:\\n{{_output_tail(proc)}}",
+                "severity": "critical",
+                "suggested_fix": f"Run `{{command}}` in the worktree and recover the timings.",
+                "blocking": True,
+            }}
+        return {{
+            "description": f"benchmark gate exited {{proc.returncode}} (not a pass/fail verdict) "
+                           f"running `{{command}}`. The gate is UNVERIFIED for this change. "
+                           f"Output:\\n{{_output_tail(proc)}}",
+            "severity": "important",
+            "blocking": False,
         }}
 
     @staticmethod
@@ -887,6 +977,13 @@ class {cls}:
         """Injectable subprocess seam for deterministic review-gate tests."""
         return subprocess.run(
             argv, cwd=cwd, capture_output=True, text=True, timeout=_GATE_TIMEOUT_S, check=False
+        )
+
+    @staticmethod
+    def _run_bench(argv: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
+        """The benchmark leg's subprocess seam: same shape, a benchmark-sized timeout."""
+        return subprocess.run(
+            argv, cwd=cwd, capture_output=True, text=True, timeout=_BENCH_TIMEOUT_S, check=False
         )
 
     def notify(self, kind: str, payload: dict) -> None:
@@ -906,7 +1003,7 @@ class {cls}:
 
     # --- optional seams the engine duck-types (add methods here to opt in) -----------
     #
-    # review_findings above wires profile.toml's lint/typecheck commands by default. Extend
+    # review_findings above wires profile.toml's lint/typecheck/bench commands by default. Extend
     # it here for project-specific policies (for example, "frontend changes need e2e specs").
     #
     # def publish_progress(self, ...) / publish_note(self, ...) /
@@ -948,9 +1045,17 @@ def seed_kit(assets: dict[str, list[str]], into: Path) -> list[str]:
     claude = Path(into) / ".claude"
     seeded: list[str] = []
     for agent in assets.get("agents", []):
-        dst = claude / "agents" / f"{agent}.md"
+        src, dst = KIT_DIR / "agents" / f"{agent}.md", claude / "agents" / f"{agent}.md"
+        if not src.exists():
+            # A project-local agent (#529): not the kit's to copy, already in the project.
+            if not dst.exists():
+                raise FileNotFoundError(
+                    f"seed agent {agent!r} is neither a kit agent ({src}) nor present in "
+                    f"the project ({dst})"
+                )
+            continue
         dst.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(KIT_DIR / "agents" / f"{agent}.md", dst)
+        shutil.copyfile(src, dst)
         seeded.append(f"agents/{agent}.md")
     for skill in assets.get("skills", []):
         # Seed as .claude/skills/<name>/SKILL.md so the project gets a real, invocable
@@ -1038,7 +1143,9 @@ def scaffold_adapter(
     if profile_path.exists():
         incoming = merge_profiles(read_profile(profile_path), incoming, manifest)
     else:
-        incoming.seed = select_kit_assets(incoming, manifest)
+        incoming.seed = _keep_local_agents(
+            select_kit_assets(incoming, manifest), manifest, incoming.seed
+        )
 
     # Generated-from-profile (always (re)written).
     write_profile(incoming, profile_path)

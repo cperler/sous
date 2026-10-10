@@ -2,8 +2,8 @@
 
 The bootstrap interview maps a project's stack to the project-config adapter's command
 methods (`install_cmd`, `test_unit_cmd`, `test_e2e_cmd`, `typecheck_cmd`, `types_cmd`,
-`infra_reset`). The generated adapter runs lint and typecheck as deterministic REVIEW gates,
-and both merge gates (batch integration + trunk) run the same pair.
+`infra_reset`, `benchmark_cmd`). The generated adapter runs lint and typecheck as
+deterministic REVIEW gates, and both merge gates (batch integration + trunk) run the same pair.
 The machine-readable version is the `[commands.*]` tables in `manifest.toml`; this is the
 human reference. Commands are a `list[str]` (argv), never a shell string.
 
@@ -23,6 +23,14 @@ puts it on `typecheck_cmd` and leaves `types_cmd` a no-op. Mapping `typecheck` �
 | **rust** | `cargo fetch` | `cargo test` | — | `cargo clippy` | — |
 
 Notes:
+- **`bench`** (optional, no stack default) generates `benchmark_cmd()` (#529). The generated
+  REVIEW gate runs it after lint/typecheck: rc 0 passes, rc 1 is a BLOCKING finding carrying
+  the output tail (the timings), and any other rc, a timeout (1800s) or a failure to start
+  is an advisory UNVERIFIED finding, never green. The engine's OPTIMIZE gate (#520) runs the
+  same argv and needs rc 0 and a ONE-LINE JSON metrics object as the last stdout line, so a
+  benchmark that pretty-prints multi-line JSON needs a compact mode. Without `bench` the
+  method is the no-op and neither gate runs. `benchmark_tolerance` is not generated, so the
+  OPTIMIZE gate uses its 5% default.
 - A stage's command method should **fail closed** (exit non-zero) until set, so an
   unconfigured run doesn't vacuously pass — see the generated adapter's `test_unit_cmd`.
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).

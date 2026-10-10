@@ -7,6 +7,8 @@ import json
 import subprocess
 import sys
 
+import pytest
+
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.ports.execution import (
@@ -25,6 +27,7 @@ from orchestrator.scaffold import (
     profile_from_languages,
     read_profile,
     scaffold_adapter,
+    seed_kit,
     select_kit_assets,
 )
 from orchestrator.schemas.enums import Stage
@@ -662,3 +665,119 @@ def test_single_static_analysis_command_stays_on_the_primary_leg(tmp_path) -> No
 
     assert cfg.typecheck_cmd() == ["pnpm", "exec", "tsc", "--noEmit"]
     assert cfg.types_cmd() == ["true"]  # no-op sentinel; the gate records it as skipped
+
+
+# --- benchmark gate + local seed agents (#529) -------------------------------
+
+def _bench_adapter(tmp_path, name: str, bench: list[str] | None):
+    prof = profile_from_languages(name, ["python"], MANIFEST)
+    if bench is not None:
+        prof.commands["bench"] = bench
+    scaffold_adapter(name, tmp_path, profile=prof)
+    return _import_adapter(tmp_path, name).get_config()
+
+
+def test_profile_bench_renders_benchmark_cmd_and_absent_bench_is_a_noop(tmp_path) -> None:
+    bench = ["uv", "run", "python", "-m", "taker.bench", "--json"]
+    cfg = _bench_adapter(tmp_path / "a", "bench-svc", bench)
+    assert cfg.benchmark_cmd() == bench
+    # The profile entry survives regeneration (it was kept before, but never rendered).
+    rp = read_profile(tmp_path / "a" / "bench_svc" / "profile.toml")
+    assert rp.commands["bench"] == bench
+    assert _bench_adapter(tmp_path / "b", "nobench-svc", None).benchmark_cmd() == ["true"]
+
+
+def test_generated_benchmark_leg_is_three_way(tmp_path, monkeypatch) -> None:
+    cfg = _bench_adapter(tmp_path, "bench3-svc", ["bench", "--json"])
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    outcome: list[object] = []
+    calls: list[list[str]] = []
+
+    def fake_bench(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
+        calls.append(argv)
+        if isinstance(outcome[0], BaseException):
+            raise outcome[0]
+        return outcome[0]
+
+    monkeypatch.setattr(cfg, "_run_bench", fake_bench)
+
+    def findings_for(result: object) -> list[dict]:
+        outcome[:] = [result]
+        return cfg.review_findings(worktree=str(tmp_path))
+
+    # rc 0 passes.
+    assert findings_for(subprocess.CompletedProcess(["bench"], 0, "ok", "")) == []
+    assert calls == [["bench", "--json"]]
+
+    # rc 1 blocks and carries the timings at the END of noisy output.
+    noise = "x" * 3000 + "\nsolve_ms: 412 (budget 300)"
+    (blocking,) = findings_for(subprocess.CompletedProcess(["bench"], 1, noise, ""))
+    assert blocking["blocking"] is True and blocking["severity"] == "critical"
+    assert "benchmark gate is RED" in blocking["description"]
+    assert "solve_ms: 412 (budget 300)" in blocking["description"]
+    assert len(blocking["description"]) < 2400
+
+    # Any other rc, a timeout, or a failure to start is advisory, never green.
+    for result in (
+        subprocess.CompletedProcess(["bench"], 2, "", "usage: bench"),
+        subprocess.TimeoutExpired(["bench"], 1800),
+        FileNotFoundError("bench missing"),
+    ):
+        (advisory,) = findings_for(result)
+        assert advisory["blocking"] is False, result
+        assert advisory["severity"] == "important"
+        assert "UNVERIFIED" in advisory["description"]
+
+
+def test_benchmark_leg_is_skipped_without_a_bench_command(tmp_path, monkeypatch) -> None:
+    cfg = _bench_adapter(tmp_path, "skip-svc", None)
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+
+    def never(argv, cwd):  # noqa: ANN001, ARG001
+        raise AssertionError("no bench command, so the benchmark must not run")
+
+    monkeypatch.setattr(cfg, "_run_bench", never)
+    assert cfg.review_findings(worktree=str(tmp_path)) == []
+
+
+def test_local_seed_agent_survives_regeneration_and_seeding(tmp_path) -> None:
+    dest, proj = tmp_path / "adapters", tmp_path / "proj"
+    local = proj / ".claude" / "agents" / "performance-optimizer.md"
+    local.parent.mkdir(parents=True)
+    local.write_text("---\nname: performance-optimizer\n---\nproject-local\n")
+
+    prof = profile_from_languages("svc", ["python"], MANIFEST)
+    prof.seed["agents"].append("performance-optimizer")
+    scaffold_adapter("svc", dest, profile=prof, into=proj)  # first scaffold keeps it
+    assert "performance-optimizer" in read_profile(dest / "svc" / "profile.toml").seed["agents"]
+
+    # A re-run with a defaulted profile must not drop it, nor raise while seeding.
+    scaffold_adapter("svc", dest, profile=profile_from_languages("svc", ["python"], MANIFEST),
+                     into=proj)
+    seed = read_profile(dest / "svc" / "profile.toml").seed["agents"]
+    assert "performance-optimizer" in seed and "code-reviewer" in seed
+    assert local.read_text().endswith("project-local\n")  # never overwritten
+    assert (proj / ".claude" / "agents" / "python-backend-developer.md").exists()
+
+
+def test_seed_kit_rejects_an_agent_that_exists_nowhere(tmp_path) -> None:
+    with pytest.raises(FileNotFoundError, match="typo-agent"):
+        seed_kit({"agents": ["typo-agent"]}, tmp_path)
+
+
+def test_rerun_keeps_existing_task_source_against_a_defaulted_profile(tmp_path) -> None:
+    prof = profile_from_languages("svc", ["python"], MANIFEST)
+    prof.task_source = "github-issues"
+    scaffold_adapter("svc", tmp_path, profile=prof)
+    scaffold_adapter("svc", tmp_path, profile=profile_from_languages("svc", ["python"], MANIFEST))
+    assert read_profile(tmp_path / "svc" / "profile.toml").task_source == "github-issues"
+
+    # An explicit non-default incoming choice still wins.
+    existing = profile_from_languages("svc", ["python"], MANIFEST)
+    incoming = profile_from_languages("svc", ["python"], MANIFEST)
+    incoming.task_source = "github-issues"
+    assert merge_profiles(existing, incoming, MANIFEST).task_source == "github-issues"
