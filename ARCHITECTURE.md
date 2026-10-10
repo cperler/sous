@@ -204,6 +204,13 @@ so its cost and failures are visible without restoring the old opaque quality lo
   flag, so it cannot print "REVERTED" over a commit still on the branch. The model's own
   `measurements` stay in the output as profiling detail and decide nothing.
 
+- **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
+  made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs
+  the diff made stale). This needs no prompt text: in 156 post-#381 tasks, IMPLEMENT wrote
+  99.7% of rationale docstrings unprompted. A measured null result is also why IMPLEMENT has
+  no "front-load the why" clause: rationale density did not change review time or cost
+  (`docs/reviews/2026-10-10-design-rationale-docstrings-review-speed.md`).
+
 - **Per-task pipeline (schema v2–v5).** `STAGE_ORDER` is the display order; the state
   machine (`orchestrator/state_machine.py`) walks each task's own
   `Task.pipeline`, never the constant. Lane presets `full | lite | micro` (`LANE_STAGES`)

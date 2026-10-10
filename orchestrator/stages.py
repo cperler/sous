@@ -116,6 +116,11 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         timeout_s=1800,  # the heavy stage: multi-file edits + commits
         checkpoint=True,
         effort=Effort.HIGH,  # the heavy reasoning stage (#96)
+        # #382: IMPLEMENT owns design-rationale docstrings (the "why" of a choice). DELIVER's
+        # docstring pass owns API description. There is deliberately NO "front-load the why"
+        # clause here: IMPLEMENT already writes 99.7% of rationale docstrings unprompted, and
+        # rationale density measured no effect on review time or cost. Data in
+        # docs/reviews/2026-10-10-design-rationale-docstrings-review-speed.md.
         template=(
             "Implement the change and commit it. Follow the scope plan in the context "
             "above if present; if none (lite/micro), implement the task spec directly "
@@ -213,7 +218,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         stage=Stage.DELIVER,
         model_role=Role.REVIEW,
         schema_ref="deliver",
-        agent_role="docstring",  # generic docstring agent (fix D13, no phpdoc-writer)
+        # Generic docstring agent (fix D13, no phpdoc-writer). It owns API description and
+        # stale-doc refresh, not design rationale, which IMPLEMENT owns (#382).
+        agent_role="docstring",
         timeout_s=600,  # docstrings + open a PR
         checkpoint=True,
         effort=Effort.LOW,  # mechanical prose + `gh pr create` — the cheap stage (#96)
