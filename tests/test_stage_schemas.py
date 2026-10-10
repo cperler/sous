@@ -43,6 +43,18 @@ def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
     assert "retrospective ({title, detail, target?}" in prompt
 
 
+def test_test_prompt_probes_hazards_the_implementer_summary_does_not_name() -> None:
+    """#392: TEST derives its meaningfulness probes from the diff, not the implementer's summary.
+
+    Evidence (ff-v1-b19 #94): the TEST stage's mutation list mirrored IMPLEMENT's own
+    summary, so a real coverage gap outside that list was only found at REVIEW.
+    """
+    prompt = STAGE_SPECS[Stage.TEST].template
+    assert "`git diff <base_sha>..HEAD`" in prompt
+    assert "NOT from the implementer's `summary` above" in prompt
+    assert "behavior the diff changes that the summary does NOT mention" in prompt
+
+
 def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> None:
     prompt = STAGE_SPECS[Stage.DELIVER].template
     assert "gh pr view <url> --json state,headRefName,baseRefName" in prompt
