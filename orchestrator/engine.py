@@ -840,7 +840,15 @@ class Engine:
         ``spec_source_updated_at`` from ``spec.updated_at`` when the source reports one,
         ``spec_fingerprint``), so a later ``refresh_spec``/``spec_staleness`` call has
         something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
-        audited way to move the snapshot mid-run."""
+        audited way to move the snapshot mid-run.
+
+        A task whose resolved pipeline has no SCOPE stage (micro, lite, a decomposition
+        child) cannot declare files for the contention gate (#377), so it registers with
+        the paths its issue title and body name (#428): ``scope_files`` is filled by
+        ``file_contention.infer_claims_from_text``, ``scope_files_inferred`` is set, and a
+        ``file_claims_inferred`` receipt is evented (with an empty list when the text names
+        no file). A pipeline that has SCOPE gets no guess; its SCOPE result is the only
+        source of its claims."""
         spec = self.project.task_source.resolve(task_id)
         if hold_before is None and any(
             str(label).strip().casefold() == "meta-authoring" for label in spec.labels
@@ -1224,6 +1232,10 @@ class Engine:
         DERIVED "already implementing" signal would hand the claim back mid-task. Release
         is by reaching a terminal state — including FAILED, so a waiter is never starved
         behind a task that will never finish.
+
+        Claims come from the approved SCOPE, or — for a pipeline with no SCOPE stage —
+        from the guess made at registration (``Task.scope_files_inferred``, #428); the
+        gate treats both the same.
 
         Only tasks in ``eligible`` are considered as waiters. An admitted task that this
         pass would not dispatch anyway (leased, parked, cooling down) must not take a
@@ -6136,6 +6148,11 @@ class Engine:
           ``force=True`` overrides this one, for the operator who knows the leased stage's
           output will be discarded anyway; the override is stamped ``leased_dispatch`` on
           the event rather than being silent.
+
+        A task whose claims were guessed from its issue text (``scope_files_inferred``, #428)
+        and has not yet been admitted by the contention gate re-guesses them from the new
+        text and events ``file_claims_inferred`` again; a task already holding its claim
+        keeps it.
 
         Whether or not anything changed, a SUCCESSFUL (non-dry-run) refresh emits
         ``task_spec_refreshed`` — a no-op refresh is a receipt that the snapshot was
