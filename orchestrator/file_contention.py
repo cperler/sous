@@ -8,8 +8,9 @@ damage: five branches each claiming "the next" SCHEMA_VERSION, a 2-tuple→3-tup
 change auto-merging cleanly against new 2-value call sites, a CLI subcommand registered
 twice). #370's batch integration gate DETECTS that late; this prevents it.
 
-This module is the pure half: normalizing what a SCOPE result declared, and deciding
-which gate-waiters must wait for whom. It has no clock, no I/O and no event sink — the
+This module is the pure half: normalizing what a SCOPE result declared (or, for a
+pipeline with no SCOPE, guessing it from the issue text — #428), and deciding which
+gate-waiters must wait for whom. It has no clock, no I/O and no event sink — the
 same rules the ``state_machine`` fold layer follows — so both halves are deterministic and
 replayable, and the engine call site owns every write and every emitted event.
 
@@ -46,6 +47,7 @@ predates #426, omits the mode, or gets the mode wrong behaves exactly as it did 
 from __future__ import annotations
 
 import posixpath
+import re
 from collections.abc import Mapping, Sequence
 from typing import NamedTuple
 
@@ -237,6 +239,81 @@ def normalize_claims(raw: object) -> ClaimDeclaration:
     kept = set(claims)
     appends = {p: m for p, m in modes.items() if m == MODE_APPEND and p in kept}
     return ClaimDeclaration(tuple(claims), appends, notices)
+
+
+#: A URL is removed before path extraction, so ``https://host/a/b.py`` never yields a claim.
+_URL_RE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S+")
+
+#: A path-like token: word characters, dots, dashes and slashes. Backticks, quotes,
+#: brackets, ``:line`` suffixes and ``#N`` refs all fall outside it, so the token stops at
+#: them and markdown decoration needs no special handling.
+_TOKEN_RE = re.compile(r"[\w.\-/]+")
+
+#: A file basename: a non-empty stem, then one extension that starts with a letter. The
+#: letter rule keeps version numbers (``v1.2``, ``0.5.0``) out.
+_BASENAME_RE = re.compile(r"^[\w.\-]*[\w\-]\.([A-Za-z][A-Za-z0-9]{0,7})$")
+
+#: Extensions accepted on a BARE filename (one with no directory part). Prose is full of
+#: dotted names that are not files — ``spec.body``, ``self.store``, ``e.g.`` — and only a
+#: bare name has nothing else to tell them apart. A token with a ``/`` is already shaped
+#: like a path, so it may carry any extension. This is a list of common file types, not
+#: project policy: missing an extension only means a bare mention goes unclaimed.
+_BARE_FILE_EXTENSIONS = frozenset({
+    "c", "cc", "cfg", "cjs", "cpp", "cs", "css", "csv", "go", "h", "hpp", "html", "ini",
+    "ipynb", "java", "js", "json", "jsonl", "jsx", "kt", "lock", "md", "mjs", "php", "py",
+    "pyi", "rb", "rs", "rst", "scss", "sh", "sql", "swift", "toml", "ts", "tsx", "txt",
+    "xml", "yaml", "yml",
+})
+
+
+def _path_candidate(token: str) -> str | None:
+    """One prose token → a path-shaped candidate, or ``None`` when it is not a file."""
+    # Trailing punctuation only: a sentence-ending ``.`` is not part of the path, but a
+    # leading dot is (``.github/``). A token that is absolute or climbs out of the repo is
+    # prose, not a declaration, so it is skipped here rather than noticed as a bad claim.
+    token = token.rstrip(".-/")
+    if not token or token.startswith("/") or ".." in token.split("/"):
+        return None
+    segments = token.split("/")
+    match = _BASENAME_RE.match(segments[-1])
+    if match is None:
+        return None
+    if len(segments) == 1:
+        return token if match.group(1).lower() in _BARE_FILE_EXTENSIONS else None
+    # A first segment with an inner dot is a host (``github.com/owner/x.py``), not a
+    # directory; a leading dot (``.github/workflows/ci.yml``) is an ordinary directory.
+    if "." in segments[0].lstrip("."):
+        return None
+    return token
+
+
+def infer_claims_from_text(title: str, body: str) -> ClaimDeclaration:
+    """Guess a task's edit surface from its issue text, for a pipeline with no SCOPE (#428).
+
+    The contention gate reads claims from an approved SCOPE result, so a task on a lane
+    without SCOPE (``micro``, ``lite``, a decomposition child) used to declare nothing: it
+    was never deferred and never blocked anything. This gives such a task the paths its
+    title and body name, so it takes part in the gate like any other task.
+
+    The guess only knows what the issue text names. A file the text does not mention is not
+    claimed, and an exact-path gate cannot match ``engine.py`` against
+    ``orchestrator/engine.py``. A miss leaves the task as it was before #428 (ungated on
+    that file), and the #370 batch integration gate still catches the collision at merge.
+    Every inferred path is a ``rewrite``: prose cannot say an edit is append-only, so the
+    conservative default applies.
+
+    Pure: no clock, no I/O. Every candidate runs through :func:`normalize_claims`, so the
+    same path rules and the same ``MAX_CLAIMS`` cap apply, and any drop comes back as a
+    notice.
+    """
+    text = _URL_RE.sub(" ", f"{title}\n{body}")
+    candidates = [
+        candidate
+        for token in _TOKEN_RE.findall(text)
+        if (candidate := _path_candidate(token)) is not None
+    ]
+    declaration = normalize_claims(candidates)
+    return ClaimDeclaration(declaration.claims, {}, declaration.notices)
 
 
 def plan_deferrals(entries: Sequence[ClaimEntry]) -> ContentionPlan:

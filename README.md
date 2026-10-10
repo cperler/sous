@@ -211,6 +211,9 @@ overrides the location for scripts and pre-#523 runs (`orchestrator runs-migrate
 
 `--lane full|lite|micro` picks the pipeline depth (how many stages); `--util N` is the
 current 5h utilization %, which the engine turns into the capacity-bounded dispatch limit.
+`lite` and `micro` skip SCOPE, so for the file-contention gate their tasks claim the file
+paths their issue text names (#428): name the files a small fix touches in the issue body
+if you want it serialized against other tasks editing them.
 
 ### 1. From a terminal — headless, in-process (self-contained)
 

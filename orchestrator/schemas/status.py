@@ -279,9 +279,15 @@ class Task(_StatusModel):
     # ``scope_file_modes`` (#426) is the per-path edit mode SCOPE declared, stored ONLY for
     # the non-default (append) paths: an absent entry means ``rewrite``, so a pre-#426 doc
     # and a task that declared no modes both contend on every path exactly as before.
+    # ``scope_files_inferred`` (#428) marks ``scope_files`` as GUESSED from the issue text
+    # at registration rather than declared by an approved SCOPE: a pipeline with no SCOPE
+    # stage (micro, lite, a decomposition child) has no other source of claims, and without
+    # one it would neither wait for nor block anybody. The flag tells a status reader a
+    # guess from a declaration, and lets ``refresh_spec`` re-guess before the claim is held.
     # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
     scope_files: list[str] = Field(default_factory=list)
     scope_file_modes: dict[str, str] = Field(default_factory=dict)
+    scope_files_inferred: bool = False
     file_claim_acquired_at: str | None = None
     file_contention_deferred_on: list[str] = Field(default_factory=list)
     pr_number: int | None = None

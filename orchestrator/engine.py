@@ -62,10 +62,12 @@ from .errors import (
 from .file_contention import (
     MODE_APPEND,
     MODE_REWRITE,
+    ClaimDeclaration,
     ClaimEntry,
     ContentionPlan,
     Deferral,
     describe,
+    infer_claims_from_text,
     plan_deferrals,
     summarize_contention,
 )
@@ -290,6 +292,29 @@ def _claim_modes(task: Task, paths: Sequence[str]) -> dict[str, str]:
     is exactly what the audit needs to do.
     """
     return {path: task.scope_file_modes.get(path, MODE_REWRITE) for path in paths}
+
+
+def _claims_inferred_events(
+    run_id: str, task_id: str, declaration: ClaimDeclaration, *, ts: str
+) -> list[dict]:
+    """The receipt for claims GUESSED from a SCOPE-less task's issue text (#428).
+
+    Emitted even when the guess is empty: "looked and the text names no file" and "never
+    looked" must not read alike, and only the first one means the task is ungated on
+    purpose. A path the guess had to drop is evented the same way a SCOPE-declared one is,
+    with ``stage`` None and ``source`` saying where the path came from.
+    """
+    events: list[dict] = [{
+        "ts": ts, "type": "file_claims_inferred", "run_id": run_id, "task_id": task_id,
+        "source": "issue_text", "files": list(declaration.claims),
+        "modes": {path: MODE_REWRITE for path in declaration.claims},
+    }]
+    events.extend(
+        {"ts": ts, "type": "scope_file_claim_dropped", "run_id": run_id, "task_id": task_id,
+         "stage": None, "source": "issue_text", **notice}
+        for notice in declaration.notices
+    )
+    return events
 
 
 def _validated_budget(value: float | None, *, field: str, run_id: str) -> float | None:
@@ -815,7 +840,15 @@ class Engine:
         ``spec_source_updated_at`` from ``spec.updated_at`` when the source reports one,
         ``spec_fingerprint``), so a later ``refresh_spec``/``spec_staleness`` call has
         something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
-        audited way to move the snapshot mid-run."""
+        audited way to move the snapshot mid-run.
+
+        A task whose resolved pipeline has no SCOPE stage (micro, lite, a decomposition
+        child) cannot declare files for the contention gate (#377), so it registers with
+        the paths its issue title and body name (#428): ``scope_files`` is filled by
+        ``file_contention.infer_claims_from_text``, ``scope_files_inferred`` is set, and a
+        ``file_claims_inferred`` receipt is evented (with an empty list when the text names
+        no file). A pipeline that has SCOPE gets no guess; its SCOPE result is the only
+        source of its claims."""
         spec = self.project.task_source.resolve(task_id)
         if hold_before is None and any(
             str(label).strip().casefold() == "meta-authoring" for label in spec.labels
@@ -890,6 +923,14 @@ class Engine:
             optimize_agent = self._optimize_agent()
             if optimize_agent is not None:
                 resolved_pipeline = with_optimize(resolved_pipeline)
+        # #428: the contention gate reads claims from an approved SCOPE, so a pipeline with
+        # no SCOPE stage would declare nothing and slip past it. Such a task gets a
+        # model-free guess from its issue text instead; a pipeline WITH SCOPE is left alone,
+        # because its SCOPE fold is the only source of its claims.
+        inferred_claims = (
+            infer_claims_from_text(spec.title, spec.body)
+            if Stage.SCOPE not in resolved_pipeline else None
+        )
         # Register the task ref + dependency edge as a locked read-modify-write so a
         # concurrent add can't lose a ref or graph entry, and reject a duplicate add.
         # Done BEFORE writing the task doc so a duplicate never clobbers an existing
@@ -980,6 +1021,8 @@ class Engine:
                 hold_before=hold_before,
                 max_attempts=self.max_attempts,
                 max_filed_followups=max_filed_followups,
+                scope_files=list(inferred_claims.claims) if inferred_claims else [],
+                scope_files_inferred=inferred_claims is not None,
             )
             self.store.write_task_locked(task)
         if repair_reason is not None:
@@ -1011,6 +1054,9 @@ class Engine:
                  "reason": "project roster declares an 'optimize' agent",
                  "pipeline": [stage.value for stage in resolved_pipeline]},
             )
+        if inferred_claims is not None:
+            for event in _claims_inferred_events(run_id, task_id, inferred_claims, ts=_now()):
+                self.store.append_event(run_id, event)
         return task
 
     def _optimize_agent(self) -> str | None:
@@ -1186,6 +1232,10 @@ class Engine:
         DERIVED "already implementing" signal would hand the claim back mid-task. Release
         is by reaching a terminal state — including FAILED, so a waiter is never starved
         behind a task that will never finish.
+
+        Claims come from the approved SCOPE, or — for a pipeline with no SCOPE stage —
+        from the guess made at registration (``Task.scope_files_inferred``, #428); the
+        gate treats both the same.
 
         Only tasks in ``eligible`` are considered as waiters. An admitted task that this
         pass would not dispatch anyway (leased, parked, cooling down) must not take a
@@ -6099,6 +6149,11 @@ class Engine:
           output will be discarded anyway; the override is stamped ``leased_dispatch`` on
           the event rather than being silent.
 
+        A task whose claims were guessed from its issue text (``scope_files_inferred``, #428)
+        and has not yet been admitted by the contention gate re-guesses them from the new
+        text and events ``file_claims_inferred`` again; a task already holding its claim
+        keeps it.
+
         Whether or not anything changed, a SUCCESSFUL (non-dry-run) refresh emits
         ``task_spec_refreshed`` — a no-op refresh is a receipt that the snapshot was
         verified against the source, and "verified identical" must not read like "never
@@ -6147,9 +6202,10 @@ class Engine:
         # Both are therefore re-decided inside the mutator against the doc actually being
         # overwritten, and ``applied_diff`` (not the pre-lock one) is what the event reports.
         applied_diff = diff
+        reinferred: ClaimDeclaration | None = None
 
         def _refresh(t: Task) -> None:
-            nonlocal applied_diff
+            nonlocal applied_diff, reinferred
             # Re-validate under the lock (#311's shape): raising here aborts the transaction
             # before any event append or doc write, so a refused refresh leaves no trace but
             # the caller's error — same outcome as the pre-check, just race-free.
@@ -6175,6 +6231,13 @@ class Engine:
             # distinguishes a refreshed snapshot from an original add_task capture.
             t.spec_captured_at = refreshed_at
             t.spec_refreshed_at = refreshed_at
+            # #428: claims GUESSED from the old text follow the new text, but only until
+            # the gate has admitted the task — a held claim never changes, so a refresh can
+            # neither hand back a path mid-task nor grab one another task is waiting for.
+            if t.scope_files_inferred and t.file_claim_acquired_at is None:
+                reinferred = infer_claims_from_text(new_title, new_body)
+                t.scope_files = list(reinferred.claims)
+                t.scope_file_modes = {}
 
         # #199 pattern: commit the doc mutation and its audit event as one unit under the
         # per-task lock, so a refreshed snapshot can never exist without its event. The
@@ -6190,7 +6253,10 @@ class Engine:
                 "stage": t.current_stage.value if t.current_stage else None,
                 "source_updated_at": source_updated_at,
                 "diff": applied_diff,
-            }],
+            }] + (
+                _claims_inferred_events(run_id, task_id, reinferred, ts=refreshed_at)
+                if reinferred is not None else []
+            ),
         )
         report["applied"] = True
         report["changed"] = applied_diff["changed"]
@@ -6509,6 +6575,12 @@ class Engine:
                     "files": list(task.scope_files),
                     "modes": _claim_modes(task, task.scope_files),
                 }
+            # #428: a claim guessed from the issue text says so, so an operator can tell it
+            # from a SCOPE declaration. Added only when true, leaving a declared claim's
+            # block exactly as it was.
+            for block in ("file_contention", "file_claim"):
+                if task.scope_files_inferred and block in task_status:
+                    task_status[block]["inferred"] = True
             # A human-closed-infeasible task surfaces WHY it was closed — read back from the
             # durable rejection artifact (#52), so status output is self-explanatory.
             if task.state is TaskState.CLOSED_INFEASIBLE:
