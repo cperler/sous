@@ -22,6 +22,7 @@ from orchestrator.file_contention import (
     MAX_CLAIMS,
     MAX_PATH_LEN,
     ClaimEntry,
+    infer_claims_from_text,
     normalize_claims,
     plan_deferrals,
     summarize_contention,
@@ -749,3 +750,142 @@ def test_two_concurrent_direct_dispatches_cannot_both_claim_the_file(
     )
     assert len(holders) == 1  # only one racer may believe it owns schema.py
     assert dispatched == holders  # ...and whoever dispatched is exactly who holds it
+
+
+# --- SCOPE-less pipelines declare a guess from the issue text (#428) -----------
+#
+# The gate reads claims from an approved SCOPE, so a micro/lite task (or a decomposition
+# child) used to declare nothing: never deferred, never blocking. These pin the
+# deterministic, model-free guess that closes that hole, and that it stays out of the way
+# of a pipeline that has a real SCOPE.
+
+
+def test_inference_finds_backticked_bare_and_root_paths() -> None:
+    claims, modes, notices = infer_claims_from_text(
+        "Fix `orchestrator/engine.py`",
+        "Touch README.md, tests/test_x.py::test_a and orchestrator/engine.py:1210. "
+        "Also `.github/workflows/ci.yml` and ./docs/notes.md.",
+    )
+    assert claims == (
+        "orchestrator/engine.py", "README.md", "tests/test_x.py",
+        ".github/workflows/ci.yml", "docs/notes.md",
+    )
+    # Prose cannot say an edit is append-only, so every guess is a REWRITE.
+    assert modes == {}
+    assert notices == []
+
+
+def test_inference_skips_text_that_is_not_a_repo_path() -> None:
+    claims, _modes, notices = infer_claims_from_text(
+        "Follow-up to #377",
+        "See https://github.com/cperler/sous/blob/main/x.py and github.com/a/b.py. "
+        "Read spec.body and self.store, e.g. v1.2 or 0.5.0; not *.py, ../up.py, "
+        "/abs/y.py, or the tests/ directory.",
+    )
+    assert claims == ()
+    assert notices == []
+
+
+def test_inference_dedupes_and_respects_the_claim_cap() -> None:
+    body = " ".join(f"pkg/f{i}.py" for i in range(MAX_CLAIMS + 2)) + " pkg/f0.py"
+    claims, _modes, notices = infer_claims_from_text("t", body)
+    assert len(claims) == MAX_CLAIMS
+    assert claims[0] == "pkg/f0.py"
+    assert [n["reason"] for n in notices] == ["claim_cap"]
+
+
+def _scopeless(eng: Engine, project, task: str, body: str, lane: ExecutionLane) -> None:
+    project.task_source.spec_overrides[task] = {"body": body}
+    eng.add_task("r1", task, lane)
+
+
+def test_a_micro_task_registers_claims_from_its_issue_text(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Edit `orchestrator/schema.py`.", ExecutionLane.MICRO)
+
+    doc = eng.store.load_task("r1", "t1")
+    assert doc.scope_files == ["orchestrator/schema.py"]
+    assert doc.scope_files_inferred is True
+    inferred = [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
+    assert [(e["task_id"], e["files"], e["modes"]) for e in inferred] == [
+        ("t1", ["orchestrator/schema.py"], {"orchestrator/schema.py": "rewrite"}),
+    ]
+
+
+def test_two_scopeless_tasks_naming_one_file_are_serialized(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Fix schema.py's version bump.", ExecutionLane.MICRO)
+    _scopeless(eng, project, "t2", "Also touches schema.py and cli.py.", ExecutionLane.LITE)
+
+    assert eng.dispatchable("r1") == ["t1"]
+    assert eng.store.load_task("r1", "t2").file_contention_deferred_on == ["t1"]
+    assert eng.status("r1")["tasks"]["t2"]["file_contention"]["inferred"] is True
+
+
+def test_a_micro_task_waits_behind_a_scoped_task_s_claim(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    _scopeless(eng, project, "t2", "Small fix in `schema.py`.", ExecutionLane.MICRO)
+    _drive_to_scope(eng, "r1", "t1", ["schema.py"])
+
+    assert eng.next_work("r1", "t1") is not None  # t1 takes the claim at IMPLEMENT
+    assert eng.dispatchable("r1") == []
+    assert eng.store.load_task("r1", "t2").file_contention_deferred_on == ["t1"]
+
+
+def test_a_scoped_task_waits_behind_a_micro_task_s_claim(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Small fix in `schema.py`.", ExecutionLane.MICRO)
+    eng.add_task("r1", "t2")
+
+    assert eng.next_work("r1", "t1") is not None  # the micro task claims schema.py
+    _drive_to_scope(eng, "r1", "t2", ["schema.py"])
+    assert eng.next_work("r1", "t2") is None  # IMPLEMENT would race t1 to the file
+    assert eng.store.load_task("r1", "t2").file_contention_deferred_on == ["t1"]
+
+
+def test_a_scopeless_task_naming_no_file_still_dispatches(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Tidy the wording.", ExecutionLane.MICRO)
+    _scopeless(eng, project, "t2", "Tidy other wording.", ExecutionLane.MICRO)
+
+    assert eng.dispatchable("r1") == ["t1", "t2"]
+    # Looked and found nothing is a receipt, not an absence.
+    inferred = [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
+    assert [(e["task_id"], e["files"]) for e in inferred] == [("t1", []), ("t2", [])]
+
+
+def test_a_pipeline_with_scope_gets_no_inferred_claims(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    project.task_source.spec_overrides["t1"] = {"body": "Edit `schema.py`."}
+    eng.add_task("r1", "t1")
+
+    doc = eng.store.load_task("r1", "t1")
+    assert doc.scope_files == []
+    assert doc.scope_files_inferred is False
+    assert not [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
+
+
+def test_refresh_spec_re_infers_only_until_the_claim_is_held(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Edit `a.py`.", ExecutionLane.MICRO)
+
+    project.task_source.spec_overrides["t1"] = {"body": "Actually edit `b.py`."}
+    eng.refresh_spec("r1", "t1")
+    assert eng.store.load_task("r1", "t1").scope_files == ["b.py"]
+
+    work = eng.next_work("r1", "t1")  # admitted: the claim on b.py is now held
+    assert work is not None
+    eng.record("r1", make_result(work))
+    project.task_source.spec_overrides["t1"] = {"body": "Now edit `c.py`."}
+    eng.refresh_spec("r1", "t1")
+    assert eng.store.load_task("r1", "t1").scope_files == ["b.py"]
+    inferred = [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
+    assert [e["files"] for e in inferred] == [["a.py"], ["b.py"]]

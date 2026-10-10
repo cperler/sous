@@ -491,8 +491,15 @@ never satisfy.
   strictness stays re-judgeable from any finished run instead of by hand-grepping
   `events.jsonl` — #377 shipped deliberately over-strict pending exactly that data, and
   `docs/reviews/2026-08-29-file-contention-measurement.md` records the first read of it. A
-  task whose lane has no SCOPE stage, or whose SCOPE declares nothing, neither defers nor
-  blocks. Run-level and on by default (`Run.serialize_file_contention`,
+  task whose pipeline has no SCOPE stage (the `micro`/`lite` presets, a decomposition child)
+  gets a model-free guess instead (#428): `add_task` runs `infer_claims_from_text` over the
+  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims,
+  marks them `scope_files_inferred`, and records a `file_claims_inferred` receipt (empty
+  when the text names no file). `refresh_spec` re-guesses until the claim is held. The guess
+  only knows what the text names and the gate matches exact paths, so a miss leaves that
+  file ungated as before and the integration gate below still catches the collision at
+  merge. A task whose SCOPE declares nothing neither defers nor blocks. Run-level and on by
+  default (`Run.serialize_file_contention`,
   `init-run --no-serialize-file-contention`). Complement to the integration gate below:
   that one DETECTS the collision late, this prevents it.
 - **Pre-merge batch integration gate.** At the all-tasks-terminal boundary, the engine
