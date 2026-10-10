@@ -122,7 +122,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         # rationale density measured no effect on review time or cost. Data in
         # docs/reviews/2026-10-10-design-rationale-docstrings-review-speed.md.
         template=(
-            "Implement the change and commit it.Follow the scope plan in the context "
+            "Implement the change and commit it. Follow the scope plan in the context "
             "above if present; if none (lite/micro), implement the task spec directly "
             "as a single change.\n"
             "Boy-scout, bounded: fix TRIVIAL issues WITHIN the blast radius of your own "
