@@ -192,6 +192,8 @@ from .state_machine import (
 from .status_store import StatusStore
 from .stream_probe import probe_current_stream, prompt_filename, prompt_relpath
 from .supervisor_context import DEFAULT_MIN_REMAINING_PCT, SupervisorContext
+from .test_selection import changed_files as test_changed_files
+from .test_selection import select_tests
 
 
 def _now() -> str:
@@ -1801,6 +1803,12 @@ class Engine:
             # check — the `worktree_origin_verification_skipped` notice is emitted from both
             # places. False everywhere else, so no other prompt changes a byte.
             worktree_origin_unverified=review_origin_unverified,
+            # #558: a model-lane TEST is told which tests the adapter maps from the diff.
+            # The deterministic lane selects for itself inside the runner.
+            impacted_tests=(
+                self._impacted_tests_for_prompt(task)
+                if stage is Stage.TEST and not deterministic else None
+            ),
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -2206,6 +2214,25 @@ class Engine:
             return self.registry.describe(lane).permission_posture
         except NoRunnerError:
             return PermissionPosture.BYPASS
+
+    def _impacted_tests_for_prompt(self, task: Task) -> list[str] | None:
+        """The impacted test files for a model-lane TEST prompt (#558), or None.
+
+        Same engine-side selection the deterministic runner uses (the engine's own git read
+        of ``base_sha``..worktree, then the adapter's optional ``impacted_tests`` hook), so
+        the two lanes cannot disagree about what "the tests for the changed files" are.
+        Advisory only: any error, or any full-suite fallback, yields None and the prompt is
+        unchanged."""
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        if not (base_sha and worktree and Path(str(worktree)).is_dir()):
+            return None
+        try:
+            changed = test_changed_files(str(worktree), str(base_sha))
+            selection = select_tests(self.project, changed, cwd=str(worktree))
+        except Exception:  # noqa: BLE001 - a prompt hint must never fail the dispatch
+            return None
+        return list(selection.files) if selection.scope == "impacted" else None
 
     # --- multi-agent REVIEW plan (#73) -----------------------------------------
     def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:
@@ -6542,6 +6569,13 @@ class Engine:
                     and run.state is not RunState.PARKED
                 ),
             }
+            # #558: which tests TEST actually ran, so a green on an impacted subset never
+            # reads as a full-suite green. Present only once a TEST result recorded a scope.
+            test_rec = task.stages.get(Stage.TEST)
+            test_out = (test_rec.output if test_rec is not None else None) or {}
+            if test_out.get("test_scope"):
+                task_status["test_scope"] = test_out["test_scope"]
+                task_status["tests_selected"] = test_out.get("tests_selected")
             if task.quality_tier is not None:
                 task_status.update({
                     "agent_role": task.agent_role,

@@ -197,7 +197,8 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     # stage does not act on — #520 makes them engine-run, which is when they become
     # evidence worth carrying into a downstream prompt.
     Stage.OPTIMIZE: (),
-    Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class"),
+    Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class",
+                 "test_scope"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
 }
@@ -214,7 +215,9 @@ ENGINE_INJECTED_KEYS: tuple[str, ...] = ("prior_learnings",)
 # missing-tests rejection), so a MODEL claiming ``change_class: docs-only`` must be ignored —
 # only a git-diff by the engine lane may set it. A non-ENGINE result carrying such a key has
 # it dropped at the fold, closing the loophole at the single choke point.
-DETERMINISTIC_ONLY_KEYS: frozenset[str] = frozenset({"change_class"})
+# #558: ``test_scope`` likewise — an "impacted" scope tells REVIEW the green was on a
+# subset, so only the engine-lane runner that actually chose it may record it.
+DETERMINISTIC_ONLY_KEYS: frozenset[str] = frozenset({"change_class", "test_scope"})
 
 # Bounds so the context (fed into every later prompt) stays bounded regardless of what a
 # model returns. Deterministic (no wall-clock/random) → replay reproduces the same fold.

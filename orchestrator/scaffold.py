@@ -872,6 +872,18 @@ class {cls}:
 
 {commands}
 {worktree_methods}
+    # Impacted-test selection (#558). The TEST stage runs ``test_unit_cmd(files)`` with the
+    # tests this hook maps from the task's changed files, instead of the whole suite. None
+    # means "can't tell — run everything", and it is the safe default: to adopt, map each
+    # changed source file to the test files that exercise it (``cwd`` is the task worktree,
+    # so you can check which exist) and return None for any file you can't map. Touching a
+    # ``test_global_paths`` glob (conftest, dependency/config files) always runs the full
+    # suite. The TEST result records ``test_scope`` (impacted|full) either way.
+    def impacted_tests(self, changed: list[str], *, cwd: str | None = None) -> list[str] | None:
+        return None
+
+    test_global_paths: tuple[str, ...] = ()  # e.g. ("conftest.py", "pyproject.toml", "*.lock")
+
     @property
     def classifier(self) -> {cls}Classifier:
         return self._classifier

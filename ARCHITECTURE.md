@@ -222,6 +222,14 @@ so its cost and failures are visible without restoring the old opaque quality lo
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
+- **Impacted-only TEST (#558).** An adapter may declare `impacted_tests(changed)` (and
+  `test_global_paths`); `orchestrator/test_selection.py` then narrows the unit command to
+  `test_unit_cmd(files)` for the tests mapped from the task's diff. Every case it cannot
+  vouch for runs the full suite: no hook, a raising hook, `None`, an empty set, or a touched
+  global path. The TEST result records `test_scope` (impacted|full), `tests_selected` and
+  the reason; `status` and the dashboard show it, and the model TEST prompt gets the same
+  list. Known gap: a regression the mapping misses passes TEST and is caught only by the
+  batch-integration gate's full run, which reports and files but does not block the PR.
 - **Dispatch/record contract.** `Engine.next_work()` emits an immutable `WorkItem` whose
   `content_hash` (over stage+prompt+schema+model+lane+attempt) is its idempotency key; the
   task holds a **dispatch lease** (`pending_work_item_id`) so an in-flight or crashed-mid-stage

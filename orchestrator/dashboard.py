@@ -50,7 +50,7 @@ from .driver_log import (
     STATE_WAITING_COOLDOWN,
 )
 from .runs_layout import iter_run_dirs
-from .schemas.enums import TERMINAL_RUN_STATES, TERMINAL_TASK_STATES
+from .schemas.enums import TERMINAL_RUN_STATES, TERMINAL_TASK_STATES, Stage
 from .stream_probe import find_current_stream
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -666,22 +666,27 @@ def _stage_progress(task: Task, stage_costs: dict, *, now_epoch: float) -> list[
         else:
             cost, metered = rec.cost_usd, rec.metered
             calls, unmetered = 0, 0
-        out.append(
-            {
-                "stage": name,
-                "status": status,
-                "attempt": rec.attempt,
-                "model": rec.model,
-                "cost_usd": cost,
-                "metered": metered,
-                "calls": calls,
-                "unmetered_calls": unmetered,
-                "duration_s": duration,
-                # What a failed stage reported, first line only (#525) — the cause the
-                # "needs you" band prints for a failed task.
-                "error": _first_line(rec.error),
-            }
-        )
+        entry: dict = {
+            "stage": name,
+            "status": status,
+            "attempt": rec.attempt,
+            "model": rec.model,
+            "cost_usd": cost,
+            "metered": metered,
+            "calls": calls,
+            "unmetered_calls": unmetered,
+            "duration_s": duration,
+            # What a failed stage reported, first line only (#525) — the cause the
+            # "needs you" band prints for a failed task.
+            "error": _first_line(rec.error),
+        }
+        # #558: a TEST that ran only the impacted tests says so, so its green never reads
+        # as a full-suite green. Absent until a TEST result recorded a scope.
+        scope = (rec.output or {}).get("test_scope") if stage is Stage.TEST else None
+        if scope:
+            entry["test_scope"] = scope
+            entry["tests_selected"] = (rec.output or {}).get("tests_selected")
+        out.append(entry)
     return out
 
 

@@ -24,6 +24,13 @@ already present in intake's ``baseline_failures`` was RED at base — inherited,
 so it is excluded from the caused-failure verdict and only noted. A nonzero exit with
 caused failures fails the stage with a classified error so the engine's retry / infra-reset
 loops engage; a green (or only-inherited) run succeeds.
+
+Impacted-only runs (#558): when the project adapter declares the optional
+``impacted_tests`` hook, the UNIT command runs only the tests it maps from the task's diff
+(``test_unit_cmd(files)``); e2e/shell always run whole. Every fallback — hook missing,
+raising, returning None, a global test input touched, an empty set — runs the full suite
+(``orchestrator.test_selection``), and the result records ``test_scope`` (impacted|full),
+``tests_selected`` and ``test_scope_reason`` so a green subset never reads as a full green.
 """
 
 from __future__ import annotations
@@ -34,8 +41,9 @@ from pathlib import Path, PurePosixPath
 from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
+from orchestrator.test_selection import TestSelection, changed_files, select_tests
 
-from .transport import RawResult, _git, _tag_head, subprocess_env, to_stage_result
+from .transport import RawResult, _tag_head, subprocess_env, to_stage_result
 from .worktree_origin import verify_worktree_origin
 
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
@@ -60,19 +68,10 @@ def _is_doc_file(path: str) -> bool:
     return not p.suffix and p.stem.lower() in _DOC_STEMS
 
 
-def _changed_files(cwd: str, base_sha: str) -> list[str] | None:
-    """Files changed between ``base_sha`` and the current worktree — committed AND
-    uncommitted tracked changes (``git diff --name-only <base>``) plus untracked new files
-    (``git ls-files --others``). Returns None on any git error (detection simply doesn't
-    fire; the full test run proceeds — a read we can't do is never a false docs-only tag)."""
-    diff = _git(cwd, "diff", "--name-only", base_sha)
-    if diff.returncode != 0:
-        return None
-    files = [ln.strip() for ln in diff.stdout.splitlines() if ln.strip()]
-    others = _git(cwd, "ls-files", "--others", "--exclude-standard")
-    if others.returncode == 0:
-        files += [ln.strip() for ln in others.stdout.splitlines() if ln.strip()]
-    return files
+# The git read moved engine-side with impacted-test selection (#558) so the model TEST
+# lane's prompt and this runner share one implementation; the private alias keeps the
+# name this module (and its tests) always used.
+_changed_files = changed_files
 
 
 def classify_change(cwd: str | None, base_sha: str | None) -> str | None:
@@ -84,7 +83,11 @@ def classify_change(cwd: str | None, base_sha: str | None) -> str | None:
     yields ``"code"``."""
     if not cwd or not base_sha:
         return None
-    files = _changed_files(cwd, base_sha)
+    return _class_of(_changed_files(cwd, base_sha))
+
+
+def _class_of(files: list[str] | None) -> str | None:
+    """``classify_change`` over an already-read changed-file list."""
     if not files:  # None (git error) or [] (nothing changed) → undetermined
         return None
     return "docs-only" if all(_is_doc_file(f) for f in files) else "code"
@@ -140,7 +143,6 @@ class DeterministicTestRunner:
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
         baseline = set(_as_ids((work.context or {}).get("baseline_failures")))
-        commands = self._commands()
         caused: list[str] = []
         caused_kinds: set[str] = set()
         inherited_count = 0
@@ -154,7 +156,9 @@ class DeterministicTestRunner:
         # short-circuit to an HONEST skip (marked skipped: docs-only, never a faked green).
         # The tag also flows into the context plane (ENGINE-lane-only fold) so REVIEW skips
         # test-coverage criteria and the engine won't reject it for lacking new tests.
-        change_class = classify_change(work.cwd, (work.context or {}).get("base_sha"))
+        base_sha = (work.context or {}).get("base_sha")
+        changed = _changed_files(work.cwd, base_sha) if work.cwd and base_sha else None
+        change_class = _class_of(changed)
         if change_class == "docs-only":
             out = {
                 "passed": True,
@@ -173,6 +177,11 @@ class DeterministicTestRunner:
         # log; "code" is the normal path — it changes no downstream behavior).
         extra = {"change_class": change_class} if change_class else {}
 
+        # #558: narrow the UNIT command to the tests the adapter maps from this diff, or run
+        # the full suite on every fallback. Resolved after the docs-only skip, so an empty
+        # impacted set here always means "no mapping" (→ full), never "nothing to test".
+        commands, selection = self._commands(select_tests(self._project, changed, cwd=work.cwd))
+
         if not commands:
             out = {
                 "passed": True,
@@ -184,6 +193,17 @@ class DeterministicTestRunner:
                 **extra,
             }
             return out, None, True
+
+        scope = {
+            "test_scope": selection.scope,
+            "tests_selected": len(selection.files),
+            "test_scope_reason": selection.reason,
+        }
+        if selection.scope == "impacted":
+            notes.append(f"unit: ran {len(selection.files)} impacted test file(s), NOT the "
+                         f"full suite ({selection.reason})")
+        else:
+            notes.append(f"unit: full suite ({selection.reason})")
 
         for label, argv in commands:
             try:
@@ -238,6 +258,7 @@ class DeterministicTestRunner:
             "tests_meaningful": None,  # see module docstring: no claim, never a fake true
             "validation_notes": "; ".join(notes),
             **extra,
+            **scope,
         }
         error = None if passed else (
             f"test stage red: {len(caused)} caused failure(s) "
@@ -245,20 +266,41 @@ class DeterministicTestRunner:
         )
         return out, error, passed
 
-    def _commands(self) -> list[tuple[str, list[str]]]:
+    def _commands(
+        self, selection: TestSelection
+    ) -> tuple[list[tuple[str, list[str]]], TestSelection]:
         """The project's runnable test commands, skipping the ``['true']`` no-op sentinel
         and undefined/empty surfaces (a project without e2e/shell simply omits them —
-        mirrors ``engine._project_commands`` and ``deterministic_setup``)."""
+        mirrors ``engine._project_commands`` and ``deterministic_setup``).
+
+        An ``impacted`` selection narrows ONLY the unit command, via
+        ``test_unit_cmd(files)``. If that call raises, yields no runnable argv, or ignores
+        ``files`` (same argv as the no-arg call), the unit command falls back to the full suite and the returned selection says so — the
+        recorded scope is always the scope that actually ran."""
         out: list[tuple[str, list[str]]] = []
+        unit = getattr(self._project, "test_unit_cmd", None)
+        if selection.scope == "impacted":
+            argv = _argv_of(unit, list(selection.files))
+            if argv and argv != _argv_of(unit):
+                out.append(("unit", argv))
+            else:
+                # No runnable argv, or the adapter ignored ``files`` and returned its
+                # full-suite argv — either way the full suite is what runs.
+                selection = TestSelection(
+                    scope="full", files=(),
+                    reason="test_unit_cmd(files) gave no narrowed command for the "
+                           "impacted set",
+                )
+        if selection.scope == "full" and (argv := _argv_of(unit)):
+            out.append(("unit", argv))
         for label, getter in (
-            ("unit", getattr(self._project, "test_unit_cmd", None)),
             ("e2e", getattr(self._project, "test_e2e_cmd", None)),
             ("shell", getattr(self._project, "test_shell_cmd", None)),
         ):
             argv = _argv_of(getter)
             if argv:
                 out.append((label, argv))
-        return out
+        return out, selection
 
     def _classify(self, test_output: str) -> list[Failure]:
         """Structured failures from raw output via the project classifier (best-effort)."""
@@ -271,11 +313,11 @@ class DeterministicTestRunner:
             return []
 
 
-def _argv_of(getter: object) -> list[str] | None:
+def _argv_of(getter: object, files: list[str] | None = None) -> list[str] | None:
     if not callable(getter):
         return None
     try:
-        argv = getter()
+        argv = getter(files) if files else getter()
     except Exception:  # noqa: BLE001 - a project command surface must never crash the stage
         return None
     if not argv or argv == ["true"]:  # the no-op sentinel means "skip"
