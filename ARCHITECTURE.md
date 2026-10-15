@@ -216,6 +216,23 @@ so its cost and failures are visible without restoring the old opaque quality lo
   never read like one that passed — and the completion note's heading comes off that block's
   real `reverted` flag, so it cannot print "REVERTED" over a commit still on the branch. The
   model's own `measurements` stay in the output as profiling detail and decide nothing.
+  Because the opt-in inserts OPTIMIZE into EVERY task's pipeline, a task that changed only
+  non-code files would still pay a high-effort dispatch to hear `impact: none`. So at
+  dispatch time `next_work` reads the task's own change (`base_sha`..worktree — `base_sha`
+  is taken after dependency composition, so dep code is excluded) and, when every path
+  matches a non-code glob, records OPTIMIZE as `skipped` on the engine lane at $0 with an
+  info-grade `optimize_skipped_non_code` event (changed files, capped, plus count and the
+  globs) and moves on — no WorkItem, no `stage_dispatched`, so `events_audit` and
+  `lane_audit` have nothing to balance. The classifier is pure (`orchestrator/non_code.py`)
+  and conservative: an unmatched path is code, the defaults are documentation and prose
+  only (no json/yaml/toml, no `*.txt`), and an empty change counts as non-code. A project
+  replaces the globs through the optional `non_code_globs` adapter hook (extend by
+  prepending `DEFAULT_NON_CODE_GLOBS`). Uncertainty never skips: no `base_sha`, no
+  worktree, or a failed git read dispatches OPTIMIZE normally with an
+  `optimize_skip_check_failed` notice. The SKIPPED record IS the decision, so resume reads
+  it back instead of recomputing; only a fresh PENDING record is ever considered, and a
+  review fix cycle's fresh records reconsider it against the new diff. The completion note
+  says "Speed pass skipped — only non-code files changed".
 
 - **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
   made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs

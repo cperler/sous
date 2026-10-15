@@ -721,6 +721,8 @@ _BENCHMARK_IMPROVED_HEADING = "### Speed pass kept — measured faster, no regre
 _BENCHMARK_SKIPPED_NO_IMPACT_HEADING = (
     "### Speed pass committed nothing — not on a latency-sensitive path"
 )
+# OPTIMIZE never dispatched: every changed file matched a non-code glob (orchestrator/non_code.py).
+_OPTIMIZE_SKIPPED_NON_CODE_HEADING = "### Speed pass skipped — only non-code files changed"
 # Statuses whose commit the engine did NOT keep: only these claim a revert in their heading.
 _BENCHMARK_NOT_KEPT = frozenset({"regressed", "failed", "no_win", "unavailable"})
 # Pre-redesign verdicts measured against a required-improvement bar, not a regression band.
@@ -1003,6 +1005,20 @@ def render_completion_note(
     # and a reverted pass says so in the heading rather than leaving a reader to read its
     # `files_changed` as landed work.
     lines += _benchmark_lines(optimize.get("benchmark"))
+    # The engine skipped the pass without a model call because the task changed only
+    # non-code files — said outright, so a missing speed section never reads as forgotten.
+    if (
+        Stage.OPTIMIZE in task.stages
+        and task.stages[Stage.OPTIMIZE].status is StageStatus.SKIPPED
+        and optimize.get("skipped_reason") == "non_code"
+    ):
+        count = optimize.get("changed_files_count")
+        lines += ["", _OPTIMIZE_SKIPPED_NON_CODE_HEADING]
+        if isinstance(count, int) and not isinstance(count, bool):
+            lines.append(
+                f"- {count} changed file(s), all matching the project's non-code globs; "
+                "no model was called"
+            )
     # The reasoning pass's own account: each fix with its one-line why, under the impact
     # class it judged the change to have (absent on outputs recorded before the redesign).
     changes = [c for c in (optimize.get("changes") or []) if isinstance(c, dict)]

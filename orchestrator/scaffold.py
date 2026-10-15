@@ -884,6 +884,11 @@ class {cls}:
 
     test_global_paths: tuple[str, ...] = ()  # e.g. ("conftest.py", "pyproject.toml", "*.lock")
 
+    # Optional: files that are not code. When a task changes ONLY these, OPTIMIZE is skipped
+    # with no model call. Omit to use orchestrator.non_code.DEFAULT_NON_CODE_GLOBS (docs and
+    # prose); declaring it REPLACES the defaults, so to extend them write e.g.
+    #   non_code_globs = (*DEFAULT_NON_CODE_GLOBS, "experiments/**")
+
     @property
     def classifier(self) -> {cls}Classifier:
         return self._classifier

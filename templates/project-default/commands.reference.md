@@ -33,6 +33,11 @@ Notes:
   a pass that leaves the numbers flat is kept. Without `bench` the method is the no-op,
   neither gate runs, and an OPTIMIZE commit is kept marked UNVERIFIED. `benchmark_tolerance`
   is not generated, so the OPTIMIZE gate uses its 5% noise band.
+- **`non_code_globs`** (optional, not generated): when every file a task changed matches one,
+  the engine skips OPTIMIZE with no model call. Unset, it uses
+  `orchestrator.non_code.DEFAULT_NON_CODE_GLOBS` (Markdown/reST/AsciiDoc, `docs/**`,
+  LICENSE/CHANGELOG-style files); a declared value replaces the defaults, so extend with
+  `(*DEFAULT_NON_CODE_GLOBS, "experiments/**")`. Keep config and data files out of it.
 - A stage's command method should **fail closed** (exit non-zero) until set, so an
   unconfigured run doesn't vacuously pass — see the generated adapter's `test_unit_cmd`.
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).

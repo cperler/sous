@@ -280,6 +280,18 @@ class ProjectConfig(Protocol):
     #       a float attribute or a zero-arg callable. Default
     #       ``benchmark_gate.DEFAULT_BENCHMARK_TOLERANCE`` (0.05). A non-finite or negative
     #       value is replaced by the default and reported as a notice on the verdict.
+    #   non_code_globs: Sequence[str]
+    #       Globs naming files that are NOT code, as a list attribute or a zero-arg callable.
+    #       When EVERY file a task changed (``base_sha``..worktree, the task's own change)
+    #       matches one, the engine records OPTIMIZE as skipped with no model call
+    #       (``optimize_skipped_non_code``). The value REPLACES the defaults
+    #       (``orchestrator.non_code.DEFAULT_NON_CODE_GLOBS`` — Markdown/reST/AsciiDoc,
+    #       ``docs/**``, LICENSE/CHANGELOG-style files); to EXTEND them, return
+    #       ``[*DEFAULT_NON_CODE_GLOBS, "experiments/**"]``. An empty list means nothing is
+    #       non-code, so OPTIMIZE always runs. Same glob semantics as ``test_global_paths``.
+    #       Keep it to files whose change cannot alter runtime behaviour — config and data
+    #       formats are deliberately not in the defaults. A hook that raises or returns a
+    #       non-list falls back to the defaults with a warning-grade ``non_code_globs_invalid``.
     #
     # Optional engine-tracker source (duck-typed, no contract-version bump):
     #   engine_task_source: TaskSource

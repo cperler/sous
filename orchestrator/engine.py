@@ -106,6 +106,7 @@ from .model_table import (
     provider_for_model,
     resolve_model_alias,
 )
+from .non_code import classify_non_code, resolve_non_code_globs
 from .notification_facts import (
     cost_rollup,
     issue_facts,
@@ -346,6 +347,15 @@ _TRUNK_GATE_TAIL_LINES = 40
 # walking it would turn a cheap audit into an unbounded git read. Truncation is never silent
 # — the scan event carries ``capped``.
 _ATTRIBUTION_SCAN_COMMIT_CAP = 50
+
+# How many changed paths an OPTIMIZE non-code skip names on its event and stage record; the
+# full count always travels alongside, so a long docs sweep stays bounded but never lies.
+_NON_CODE_FILES_CAP = 50
+
+
+class _SkipRaced(Exception):  # noqa: N818 - private control-flow signal, not an error
+    """The OPTIMIZE skip's locked re-check saw the stage move; abort without writing."""
+
 
 # Per-run wall-clock bound for ONE benchmark leg of the OPTIMIZE gate (#520); the gate runs
 # two. The benchmark is the PROJECT's, not the stage's, so this is sized to a slow project
@@ -1552,6 +1562,28 @@ class Engine:
                     reason=f"held at the {gate} checkpoint",
                 )
                 return None
+        # Deterministic OPTIMIZE skip: a task that changed only non-code files has nothing
+        # to speed up, so the stage records SKIPPED with no model call instead of paying a
+        # high-effort dispatch to hear "impact: none". Only a FRESH first attempt is
+        # considered — a RUNNING/FAILED record was already dispatched, and a resume
+        # recovers that lease — and the decision is persisted as the SKIPPED record itself,
+        # so a crash or replay reads it back rather than recomputing it. Placed after the
+        # hold gate (a hold before OPTIMIZE still parks) and before the contention gate (a
+        # skipped stage needs no file claim); the re-entry then resolves the next stage
+        # through every gate above as usual.
+        if (
+            stage is Stage.OPTIMIZE
+            and not resume
+            and task.stages[stage].status is StageStatus.PENDING
+            and self._skip_optimize_if_non_code(run_id, task)
+        ):
+            return self.next_work(
+                run_id, task_id,
+                util_pct=util_pct,
+                supervisor_context=supervisor_context,
+                supervisor_min_remaining_pct=supervisor_min_remaining_pct,
+                supervisor_resume_command=supervisor_resume_command,
+            )
         # Declared-file contention (#377). `dispatchable` already filters a deferred
         # waiter out of the ready set, but — as with the terminal and BLOCKED_ON_HUMAN
         # guards above — next_work must be self-safe for direct callers: `orchestrator
@@ -2226,6 +2258,102 @@ class Engine:
             return self.registry.describe(lane).permission_posture
         except NoRunnerError:
             return PermissionPosture.BYPASS
+
+    def _skip_optimize_if_non_code(self, run_id: str, task: Task) -> bool:
+        """Record OPTIMIZE as SKIPPED when every file the task changed is non-code.
+
+        The changed files are the task's OWN change: ``base_sha`` is captured by INTAKE
+        AFTER any dependency branches are composed in (#216), so ``base_sha``..worktree
+        excludes dep code. Read with the same helper the TEST stage's impacted-test
+        selection uses (committed + uncommitted tracked changes + untracked files), then
+        classified by the pure ``non_code.classify_non_code`` against the project's
+        ``non_code_globs`` (or the defaults).
+
+        Never skips on uncertainty: a missing ``base_sha``/worktree or a failed git read
+        returns False — OPTIMIZE dispatches normally — and emits an
+        ``optimize_skip_check_failed`` notice saying why. A broken ``non_code_globs``
+        declaration falls back to the defaults and is evented (``non_code_globs_invalid``).
+        Returns True only once the SKIPPED record and its ``optimize_skipped_non_code`` event
+        are committed together; if the stage moved under us (a concurrent dispatch), nothing
+        is written and the normal path takes over."""
+        globs, glob_notice = resolve_non_code_globs(self.project)
+        if glob_notice is not None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "non_code_globs_invalid", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "detail": glob_notice,
+                 "globs": list(globs)},
+            )
+        if not globs:
+            # The project declared that nothing is non-code: it opted out of the skip, so
+            # OPTIMIZE always dispatches (even over an empty change) and there is no read.
+            return False
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        why: str | None = None
+        changed: list[str] | None = None
+        if not base_sha:
+            why = "no base_sha in the task context"
+        elif not worktree or not Path(str(worktree)).is_dir():
+            why = "task worktree missing"
+        else:
+            try:
+                changed = test_changed_files(str(worktree), str(base_sha))
+            except Exception as exc:  # noqa: BLE001 - uncertainty dispatches, never skips
+                why = f"git read raised {type(exc).__name__}: {exc}"
+            else:
+                if changed is None:
+                    why = f"git diff against base_sha {str(base_sha)[:12]} failed"
+        if changed is None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "optimize_skip_check_failed", "level": "info",
+                 "run_id": run_id, "task_id": task.task_id, "stage": Stage.OPTIMIZE.value,
+                 "reason": why or "changed files unknown",
+                 "detail": "could not tell whether the change is code; dispatching OPTIMIZE"},
+            )
+            return False
+        verdict = classify_non_code(changed, globs)
+        if not verdict.all_non_code:
+            return False
+        shown = list(verdict.non_code[:_NON_CODE_FILES_CAP])
+        output = {
+            "skipped_reason": "non_code",
+            "changed_files": shown,
+            "changed_files_count": len(verdict.non_code),
+            "non_code_globs": list(globs),
+        }
+        now = _now()
+
+        def _skip(t: Task) -> None:
+            rec = t.stages[Stage.OPTIMIZE]
+            if (
+                rec.status is not StageStatus.PENDING
+                or t.pending_work_item_id is not None
+                or next_stage(t) is not Stage.OPTIMIZE
+            ):
+                raise _SkipRaced
+            rec.status = StageStatus.SKIPPED
+            rec.started_at = now
+            rec.completed_at = now
+            rec.model = ENGINE_MODEL
+            rec.provider = Provider.NONE
+            rec.lane = ExecutionMode.ENGINE
+            rec.cost_usd = 0.0
+            rec.output = dict(output)
+
+        event = {
+            "ts": now, "type": "optimize_skipped_non_code", "level": "info",
+            "run_id": run_id, "task_id": task.task_id, "stage": Stage.OPTIMIZE.value,
+            "changed_files": shown, "changed_files_count": len(verdict.non_code),
+            "changed_files_truncated": len(verdict.non_code) > len(shown),
+            "non_code_globs": list(globs),
+        }
+        try:
+            self.store.commit_task_events(run_id, task.task_id, _skip, [event])
+        except _SkipRaced:
+            return False
+        return True
 
     def _impacted_tests_for_prompt(self, task: Task) -> list[str] | None:
         """The impacted test files for a model-lane TEST prompt (#558), or None.

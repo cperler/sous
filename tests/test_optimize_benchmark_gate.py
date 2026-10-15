@@ -221,6 +221,10 @@ class BenchmarkingProject(FakeProject):
 
     benchmark_argv: list[str] | None = [sys.executable, "-c", _BENCH]
     declared_tolerance: object = None
+    # These fixtures reach OPTIMIZE with an EMPTY task diff (base_sha is HEAD), which the
+    # non-code skip would treat as nothing-to-optimize. Opt out so the gate is exercised;
+    # the skip has its own tests in test_optimize_non_code_skip.py.
+    non_code_globs: tuple[str, ...] = ()
 
     def agent_for(self, stage: Stage, role: str | None = None):
         return (
