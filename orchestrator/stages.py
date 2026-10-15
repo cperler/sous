@@ -401,6 +401,20 @@ def _impacted_tests_directive(files: Sequence[str]) -> str:
     )
 
 
+# The model-lane TEST stage's verdict comes from the engine's own run of the declared test
+# commands (``adapters/execution/test_verdict.py``). Saying so removes the model's reason to
+# run the whole suite itself, which is how a serial run of a parallel-declared suite timed a
+# green task out twice on prediction run batch-s-420-233-421-422-423.
+_TEST_VERDICT_VERIFIED_DIRECTIVE = (
+    "\n\n## Who decides pass/fail\n"
+    "When this stage returns, the engine runs the project's declared test commands (listed "
+    "under Project commands) over this worktree, and that run decides whether TEST passes. "
+    "Do not run the whole suite yourself: run the specific tests you need to find and fix "
+    "regressions and to check the tests are meaningful, then commit and return. If you do "
+    "need a wide run, use the declared command exactly as written."
+)
+
+
 # The #41 docs-only directive, verbatim. Hoisted to a constant so the single-reviewer
 # prompt (``render_prompt``) and a workflow finder prompt (``render_review_plan``) say the
 # SAME thing about a deterministically-classified docs-only change — one source of truth,
@@ -798,6 +812,7 @@ def render_prompt(
     tool_posture_unenforced: bool = False,
     worktree_origin_unverified: bool = False,
     impacted_tests: Sequence[str] | None = None,
+    test_verdict_verified: bool = False,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -823,6 +838,12 @@ def render_prompt(
       the changed files. The caller passes what the engine resolved from its own git read
       and the adapter hook (``orchestrator.test_selection``); empty/None leaves the prompt
       byte-identical to the pre-#558 one.
+
+    - TEST on a lane that re-runs the declared commands (``test_verdict_verified``): says
+      the engine runs the project's declared test commands after the stage and that run
+      decides pass/fail, so the model runs only targeted tests and never the whole suite
+      itself. The caller passes the RESOLVED lane's ``verifies_test_verdict`` capability;
+      default False keeps every other prompt byte-identical.
 
     - REVIEW (all tasks, #168/#261): tells the reviewer to JUDGE ``tests_meaningful``
       whenever there are tests to read, and to OMIT it — rather than answer ``false`` —
@@ -882,6 +903,8 @@ def render_prompt(
     # rather than leave "the tests for the changed files" to the model's guess.
     if stage is Stage.TEST and impacted_tests:
         instruction += _impacted_tests_directive(impacted_tests)
+    if stage is Stage.TEST and test_verdict_verified:
+        instruction += _TEST_VERDICT_VERIFIED_DIRECTIVE
     # #168: belt-and-suspenders with the engine's fail-open-on-omit gate — tell the reviewer
     # to OMIT `tests_meaningful` (rather than answer `false`) when there is no test surface to
     # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal

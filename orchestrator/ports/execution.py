@@ -73,6 +73,11 @@ class CapabilityDescriptor(BaseModel):
     # wrap REVIEW in ReviewIsolation and declare True; the engine uses this as a capability
     # requirement whenever the project opts into fresh-install/origin hooks.
     verifies_worktree_origin: bool = False
+    # Does this cell let the project's DECLARED test commands decide a model TEST stage's
+    # verdict (``adapters/execution/test_verdict.py``)? Read by ``render_prompt`` so the
+    # TEST prompt promises the engine's re-run only on a lane that performs it. False for
+    # the external interactive cell, whose shim cannot run the commands after the model.
+    verifies_test_verdict: bool = False
     # #304: the PERMISSION gate this cell dispatches under when the stage declares no tool
     # posture — lane-declared vocabulary rather than a constant buried in ``transport.py``,
     # which is what "usually right" (headless dispatch has no human to answer a prompt) was

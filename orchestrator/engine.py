@@ -1853,6 +1853,12 @@ class Engine:
                 self._impacted_tests_for_prompt(task)
                 if stage is Stage.TEST and not deterministic else None
             ),
+            # A model-lane TEST on a cell that re-runs the declared test commands is told
+            # that run decides pass/fail (the cell's ``verifies_test_verdict`` capability).
+            test_verdict_verified=(
+                stage is Stage.TEST and not deterministic
+                and self._lane_verifies_test_verdict(lane)
+            ),
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -2181,6 +2187,13 @@ class Engine:
         makes the gap visible rather than assuming protection the lane may not have."""
         try:
             return self.registry.describe(lane).enforces_tool_policy
+        except NoRunnerError:
+            return False
+
+    def _lane_verifies_test_verdict(self, lane: LanePolicy) -> bool:
+        """Whether the resolved cell lets the declared test commands decide a TEST verdict."""
+        try:
+            return self.registry.describe(lane).verifies_test_verdict
         except NoRunnerError:
             return False
 

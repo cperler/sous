@@ -252,6 +252,14 @@ so its cost and failures are visible without restoring the old opaque quality lo
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
+- **The declared commands decide a model TEST's verdict.** On the in-process model lanes
+  (headless×claude, any×codex), `test_verdict.py` re-runs the ENGINE lane's evaluation
+  (`DeterministicTestRunner.evaluate`) after the model: a claimed green that the declared
+  commands fail becomes a FAILURE with the real failures, and a timeout over a clean
+  worktree is settled by a green declared run (`tests_meaningful` null, left to REVIEW)
+  instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
+  does the TEST prompt tell the model to skip whole-suite runs. Motivated by a model that
+  ran a parallel-declared suite serially and timed out green code twice.
 - **Impacted-only TEST (#558).** An adapter may declare `impacted_tests(changed)` (and
   `test_global_paths`); `orchestrator/test_selection.py` then narrows the unit command to
   `test_unit_cmd(files)` for the tests mapped from the task's diff. Every case it cannot

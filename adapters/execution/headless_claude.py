@@ -21,6 +21,7 @@ from orchestrator.schemas.work import StageResult, WorkItem
 
 from .review_isolation import ReviewIsolation
 from .review_panel import run_review_panel
+from .test_verdict import verify_test_verdict
 from .transport import (
     RawResult,
     Transport,
@@ -39,6 +40,8 @@ class HeadlessClaudeRunner:
         # injected transport is the caller's choice (tests wrap explicitly).
         self._transport = transport or checkpointing_transport(claude_cli_transport())
         self._review_isolation = ReviewIsolation(review_project)
+        # The project whose declared test commands decide a TEST stage's verdict.
+        self._project = review_project
 
     def capabilities(self) -> list[CapabilityDescriptor]:
         return [
@@ -55,6 +58,7 @@ class HeadlessClaudeRunner:
                 # absent from the toolset, not merely prompted for).
                 enforces_tool_policy=True,
                 verifies_worktree_origin=True,
+                verifies_test_verdict=self._project is not None,
                 status=SUPPORTED,
             )
         ]
@@ -69,4 +73,5 @@ class HeadlessClaudeRunner:
                 return run_review_panel(work, transport)
             raw: RawResult = transport(work)
         status = classify_raw(raw)  # engine retries RATE_LIMITED on a cheaper model
+        raw, status = verify_test_verdict(work, raw, status, self._project)
         return to_stage_result(work, raw, status, mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE)

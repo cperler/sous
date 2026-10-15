@@ -36,6 +36,7 @@ raising, returning None, a global test input touched, an empty set — runs the 
 from __future__ import annotations
 
 import subprocess
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from orchestrator.failure_classifier import Failure
@@ -93,6 +94,19 @@ def _class_of(files: list[str] | None) -> str | None:
     return "docs-only" if all(_is_doc_file(f) for f in files) else "code"
 
 
+@dataclass(frozen=True)
+class TestRun:
+    """One evaluation of the declared test commands (see ``DeterministicTestRunner.evaluate``)."""
+
+    __test__ = False  # not a pytest class, despite the name
+
+    out: dict | None
+    error: str | None
+    ok: bool
+    notices: tuple[dict[str, object], ...] = ()
+    refused: bool = False
+
+
 class DeterministicTestRunner:
     """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell)."""
 
@@ -101,45 +115,43 @@ class DeterministicTestRunner:
         self._timeout_s = timeout_s
 
     def dispatch(self, work: WorkItem) -> StageResult:
+        run = self.evaluate(work)
+        # A TEST stage is checkpointed (StageSpec.checkpoint) — anchor HEAD on success so a
+        # later stage's reset has an anchor even when the deterministic run made no commit.
+        checkpoint = (
+            _tag_head(work.cwd, work.checkpoint_tag)
+            if run.ok and work.checkpoint_tag and work.cwd else None
+        )
+        status = ResultStatus.SUCCESS if run.ok else ResultStatus.FAILURE
+        raw = RawResult(
+            run.out, exit_code=0 if run.ok else 1, error=run.error,
+            invocation="engine:test", checkpoint=checkpoint,
+            execution_notices=run.notices,
+        )
+        return to_stage_result(work, raw, status,
+                               mode=ExecutionMode.ENGINE, provider=Provider.NONE)
+
+    def evaluate(self, work: WorkItem) -> TestRun:
+        """Run the project's declared test commands over ``work.cwd`` and return the verdict
+        without building a StageResult or touching git refs. Shared by :meth:`dispatch` and
+        by the model lanes' verdict check (``test_verdict``), so a model TEST stage and the
+        ENGINE lane judge pass/fail with the same commands and the same baseline rules.
+        ``refused`` marks a verdict that never ran a command (no worktree, untrusted
+        toolchain origin, a raising run) — distinct from a suite that ran and went red."""
         if not work.cwd:
-            raw = RawResult(
-                None, exit_code=1,
-                error="test worktree is unspecified; refusing to run verification commands",
-                invocation="engine:test",
-            )
-            return to_stage_result(work, raw, ResultStatus.FAILURE,
-                                   mode=ExecutionMode.ENGINE, provider=Provider.NONE)
+            return TestRun(None, "test worktree is unspecified; refusing to run verification "
+                                 "commands", False, refused=True)
         origin = verify_worktree_origin(self._project, Path(work.cwd))
         if not origin.trusted:
-            raw = RawResult(
-                None, exit_code=1,
-                error="worktree toolchain origin mismatch; refusing to trust test results",
-                invocation="engine:test", execution_notices=origin.notices,
-            )
-            return to_stage_result(work, raw, ResultStatus.FAILURE,
-                                   mode=ExecutionMode.ENGINE, provider=Provider.NONE)
+            return TestRun(None, "worktree toolchain origin mismatch; refusing to trust test "
+                                 "results", False, notices=origin.notices, refused=True)
         try:
             out, error, ok = self._run_tests(work)
         except Exception as exc:  # noqa: BLE001 - every dispatch MUST yield a StageResult,
             # never an escaped exception (which would leave the dispatch lease held with no
             # path to clear it). Mirror deterministic_setup's convert-to-FAILURE contract.
-            raw = RawResult(None, exit_code=1, error=str(exc), invocation="engine:test")
-            return to_stage_result(work, raw, ResultStatus.FAILURE,
-                                   mode=ExecutionMode.ENGINE, provider=Provider.NONE)
-        # A TEST stage is checkpointed (StageSpec.checkpoint) — anchor HEAD on success so a
-        # later stage's reset has an anchor even when the deterministic run made no commit.
-        checkpoint = (
-            _tag_head(work.cwd, work.checkpoint_tag)
-            if ok and work.checkpoint_tag and work.cwd else None
-        )
-        status = ResultStatus.SUCCESS if ok else ResultStatus.FAILURE
-        raw = RawResult(
-            out, exit_code=0 if ok else 1, error=error,
-            invocation="engine:test", checkpoint=checkpoint,
-            execution_notices=origin.notices,
-        )
-        return to_stage_result(work, raw, status,
-                               mode=ExecutionMode.ENGINE, provider=Provider.NONE)
+            return TestRun(None, str(exc), False, notices=origin.notices, refused=True)
+        return TestRun(out, error, ok, notices=origin.notices)
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
         baseline = set(_as_ids((work.context or {}).get("baseline_failures")))
