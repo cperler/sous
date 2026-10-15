@@ -592,25 +592,104 @@ def test_an_impact_none_pass_never_runs_the_benchmark(tmp_path, worktree) -> Non
     assert "not on a latency-sensitive path" in note
 
 
-def test_uncommitted_leftovers_are_not_measured_over_and_the_commit_is_kept(
+def _leftover_events(eng: Engine) -> list[dict]:
+    return [e for e in eng.store.read_events("r1")
+            if str(e["type"]).startswith("optimize_leftovers_")]
+
+
+def test_uncommitted_leftovers_are_discarded_and_the_commit_is_measured(
     tmp_path, worktree
 ) -> None:
-    """Measuring the anchor means resetting the tree, which would delete them — so refuse to
-    measure. The commit stays (unverified) and the leftovers are left alone."""
+    """Leftovers would otherwise ride into TEST/DELIVER as code the commit does not contain.
+    They are discarded — a tracked edit restored, an untracked file removed, the paths
+    named in a warning event — and the now-clean tree is measured normally."""
     wt, base = worktree
+    (wt / "tracked.txt").write_text("original")
+    _git(wt, "add", "tracked.txt")
+    _git(wt, "commit", "-qm", "add tracked")
+    base = _head(wt)
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
-    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 1.0}))
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 40.0}))
     (wt / "scratch.txt").write_text("half-finished work")
+    (wt / "tracked.txt").write_text("stray edit")
 
     eng.record("r1", make_result(work, structured_output=_optimize_output(),
                                  checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
 
+    assert _head(wt) == sha  # the commit is kept
+    assert not (wt / "scratch.txt").exists()
+    assert (wt / "tracked.txt").read_text() == "original"
+    assert _git(wt, "status", "--porcelain").stdout == ""
+    (discarded,) = _leftover_events(eng)
+    assert discarded["type"] == "optimize_leftovers_discarded"
+    assert discarded["level"] == "warning"
+    assert sorted(discarded["paths"]) == ["scratch.txt", "tracked.txt"]
+    assert discarded["path_count"] == 2 and discarded["paths_truncated"] is False
+    (gate,) = _gate_events(eng)
+    assert gate["type"] == "optimize_benchmark_verified" and gate["reason"] == "improved"
+
+
+def test_leftovers_are_discarded_even_when_nothing_was_committed(tmp_path, worktree) -> None:
+    """An ``impact: none`` / no-op pass that still scribbled on the tree must not hand the
+    scribbles to TEST either."""
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    (wt / "notes.tmp").write_text("x")
+
+    eng.record("r1", make_result(
+        work, structured_output=_optimize_output(impact="none", files_changed=[],
+                                                  committed=False),
+        checkpoint={"tag": "task/r1/t1/optimize/0", "sha": base},
+    ))
+
+    assert not (wt / "notes.tmp").exists()
+    (discarded,) = _leftover_events(eng)
+    assert discarded["paths"] == ["notes.tmp"]
+    (gate,) = _gate_events(eng)
+    assert gate["type"] == "optimize_benchmark_skipped"
+
+
+def test_a_clean_tree_emits_no_discard_event(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    _record_optimize(eng, work, wt, after={"hot": 99.0})
+
+    assert _leftover_events(eng) == []
+
+
+def test_a_discard_git_refuses_is_evented_and_keeps_the_commit_unverified(
+    tmp_path, worktree
+) -> None:
+    """A held index lock blocks the restore: the failure is evented, nothing is measured
+    over the leftovers, and the commit stays (unverified)."""
+    wt, base = worktree
+    (wt / "tracked.txt").write_text("original")
+    _git(wt, "add", "tracked.txt")
+    _git(wt, "commit", "-qm", "add tracked")
+    base = _head(wt)
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 1.0}))
+    (wt / "tracked.txt").write_text("stray edit")
+    (wt / ".git" / "index.lock").write_text("")
+
+    try:
+        eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                     checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
+    finally:
+        (wt / ".git" / "index.lock").unlink(missing_ok=True)
+
     assert _head(wt) == sha
-    assert (wt / "scratch.txt").read_text() == "half-finished work"
-    (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unverified"
-    assert event["reason"] == "worktree_dirty"
+    (failed,) = _leftover_events(eng)
+    assert failed["type"] == "optimize_leftovers_discard_failed"
+    assert failed["paths"] == ["tracked.txt"] and "reset" in failed["detail"]
+    (gate,) = _gate_events(eng)
+    assert gate["type"] == "optimize_benchmark_unverified"
+    assert gate["reason"] == "worktree_dirty"
 
 
 def test_a_missing_worktree_degrades_loudly_instead_of_raising(tmp_path) -> None:

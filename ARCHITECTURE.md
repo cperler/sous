@@ -195,8 +195,12 @@ so its cost and failures are visible without restoring the old opaque quality lo
   commit is KEPT unless a comparable metric regressed past the tolerance, or the benchmark
   was green at the anchor and broke at the commit; a win is reported, not required, because
   the pass's fixes often sit off the one path the benchmark exercises and a win-required gate
-  reverted them on noise. When nothing can be measured — no benchmark declared, one already
-  broken at the anchor, no shared metric, a dirty worktree, unreadable git plumbing — the
+  reverted them on noise. Before any verdict, whatever the pass left UNCOMMITTED is discarded
+  (tracked files reset to the stage's commit, untracked non-ignored files cleaned, the paths
+  named in a warning-grade `optimize_leftovers_discarded`), so TEST and DELIVER never run or
+  ship code the commit does not contain, and the measurement then proceeds on the clean tree.
+  When nothing can be measured — no benchmark declared, one already broken at the anchor, no
+  shared metric, leftovers git would not discard, unreadable git plumbing — the
   commit is kept but marked UNVERIFIED (warning event, explicit PR heading); keeping needs no
   proof now, and the project's review-time gates still run. A not-kept pass hard-resets the
   worktree to the anchor and drops the stage's `checkpoint`, so `task.last_checkpoint` keeps

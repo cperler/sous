@@ -202,7 +202,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "The engine CHECKS this stage for regressions: it runs the project's declared "
             "benchmark before and after your commit and reverts the commit only if a metric "
             "gets slower beyond the project's tolerance (or the change breaks the benchmark). "
-            "Leave the worktree clean — uncommitted leftovers make that check impossible.\n"
+            "Commit everything you mean to keep: the engine discards uncommitted leftovers.\n"
             "Return: impact (none|local|hot_path), files_changed, summary, committed, "
             "changes (list of {description, rationale}), optional measurements "
             "(name/before/after/unit per thing you actually timed — never an estimate), and "

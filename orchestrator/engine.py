@@ -3839,7 +3839,7 @@ class Engine:
         * the benchmark was readable and green at the anchor but red or unreadable at the
           stage's commit → NOT kept, ``failed``: the change broke the measurement itself;
         * nothing could be measured (no benchmark declared, a benchmark already broken at
-          the anchor, no shared metric, a dirty tree, git plumbing the gate could not read)
+          the anchor, no shared metric, leftovers git would not discard, unreadable git plumbing)
           → KEPT but ``unverified``, warning-grade. Unverified is no longer a reason to
           revert, because keeping no longer needs proof — the project's review-time gates
           still run over the change, and the warning keeps it from reading as green.
@@ -3869,6 +3869,10 @@ class Engine:
                 detail=f"task worktree {worktree or '(unset)'} is not a directory, so the "
                        "benchmark could not run",
             )
+        # Before ANY verdict: the stage's commit is what it delivers, so uncommitted
+        # leftovers are discarded (evented), never carried into TEST/DELIVER as code the
+        # commit does not contain — and a clean tree is what makes the measurement possible.
+        self._discard_optimize_leftovers(run_id, task, result, worktree)
         if not anchor:
             return self._optimize_gate_unverified(
                 run_id, task, result, reason="no_anchor",
@@ -3906,13 +3910,12 @@ class Engine:
 
         dirty = run_git(worktree, "status", "--porcelain")
         if dirty.returncode == 0 and dirty.stdout.strip():
-            # Measuring the anchor means hard-resetting the tree, which would destroy
-            # uncommitted leftovers. Refuse to measure rather than quietly delete them; the
-            # commit stays (keeping needs no proof) and the leftovers are left untouched.
+            # Leftovers survived the discard above (git refused it; the failure is already
+            # evented). Measuring would hard-reset over them, so do not; the commit stays.
             return self._optimize_gate_unverified(
                 run_id, task, result, reason="worktree_dirty",
-                detail="the worktree has uncommitted changes, so the before/after "
-                       "measurement cannot be taken without destroying them",
+                detail="uncommitted changes could not be discarded, so the before/after "
+                       "measurement cannot be taken",
             )
 
         getter = getattr(self.project, "benchmark_cmd", None)
@@ -4035,6 +4038,58 @@ class Engine:
             block={"status": "verified", **block}, strip_checkpoint=False,
         )
 
+    def _discard_optimize_leftovers(
+        self, run_id: str, task: Task, result: StageResult, worktree: str
+    ) -> None:
+        """Discard whatever the OPTIMIZE pass left UNCOMMITTED in the task worktree.
+
+        The stage's contract is its commit. Leftover edits would otherwise ride into the
+        deterministic TEST run and DELIVER's push as code the commit does not contain — the
+        worst mix next to a kept-unverified commit — and they also block the benchmark,
+        whose anchor measurement hard-resets the tree. So tracked files are restored to HEAD
+        (``reset --hard HEAD``, which keeps the commit) and untracked, non-ignored files are
+        removed (``clean -fd``, run in the worktree only; ignored build/dependency dirs are
+        untouched). Never silent: a warning-grade ``optimize_leftovers_discarded`` names the
+        paths, and a discard git refuses emits ``optimize_leftovers_discard_failed`` — the
+        gate then sees the tree still dirty and keeps the commit unverified."""
+        status = run_git(worktree, "status", "--porcelain", "-z", "--untracked-files=all")
+        if status.returncode != 0 or not status.stdout.strip("\0").strip():
+            return  # unreadable (the gate's own probes report that) or already clean
+        paths: list[str] = []
+        tokens = status.stdout.split("\0")
+        i = 0
+        while i < len(tokens):
+            entry = tokens[i]
+            i += 1
+            if len(entry) < 4:
+                continue
+            paths.append(entry[3:])
+            if entry[0] in "RC":
+                i += 1  # a rename/copy's ORIGINAL path follows as its own token
+        reset = run_git(worktree, "reset", "--hard", "HEAD")
+        clean = run_git(worktree, "clean", "-fd")
+        cap = 100
+        event: dict = {
+            "ts": _now(), "level": "warning", "run_id": run_id, "task_id": task.task_id,
+            "stage": Stage.OPTIMIZE.value, "attempt": result.attempt,
+            "paths": paths[:cap], "path_count": len(paths),
+            "paths_truncated": len(paths) > cap,
+        }
+        failures = [
+            f"git {' '.join(argv)}: {(proc.stderr or '').strip()[:200]}"
+            for argv, proc in ((("reset", "--hard", "HEAD"), reset), (("clean", "-fd"), clean))
+            if proc.returncode != 0
+        ]
+        if failures:
+            event.update(type="optimize_leftovers_discard_failed", detail="; ".join(failures))
+        else:
+            event.update(
+                type="optimize_leftovers_discarded",
+                detail="uncommitted changes the OPTIMIZE pass left behind were discarded; "
+                       "only the stage's commit carries forward",
+            )
+        self.store.append_event(run_id, event)
+
     def _optimize_gate_unverified(
         self, run_id: str, task: Task, result: StageResult, *,
         reason: str, detail: str, notices: list[dict[str, str]] | None = None,
@@ -4057,11 +4112,11 @@ class Engine:
         veto: str | None = None
         if restore_head is not None:
             worktree, head = restore_head
-            confirmed, why = self._optimize_revert_confirmed(
+            confirmed, why = self._optimize_head_confirmed(
                 worktree, head, label="stage commit")
             if confirmed is False:
                 run_git(worktree, "reset", "--hard", head)
-                confirmed, why = self._optimize_revert_confirmed(
+                confirmed, why = self._optimize_head_confirmed(
                     worktree, head, label="stage commit")
             if confirmed is False:
                 block["head_unconfirmed"] = why
@@ -4072,14 +4127,15 @@ class Engine:
         )
 
     @staticmethod
-    def _optimize_revert_confirmed(
+    def _optimize_head_confirmed(
         worktree: str | None, anchor: str, *, label: str = "anchor"
     ) -> tuple[bool | None, str]:
-        """Is the not-kept OPTIMIZE commit CONFIRMED off the worktree's HEAD? (#520 review.)
+        """Is the worktree's HEAD CONFIRMED at ``anchor``? (#520 review.)
 
-        Equally "is HEAD confirmed at ``anchor``": the unverified-keep path reuses it with
-        the stage's own commit as the target (``label="stage commit"``) to confirm a failed
-        measurement reset left the kept commit checked out.
+        Two uses: on a not-kept verdict, ``anchor`` is the last-good commit and a True means
+        the stage's commit is really off HEAD; on the unverified-keep path after a failed
+        measurement reset, ``anchor`` is the stage's own commit (``label="stage commit"``)
+        and a True means the kept commit is still checked out.
 
         Returns ``(confirmed, detail)`` with three states, because "it is gone", "it may
         still be there" and "there is no tree to look in" are three different facts:
@@ -4138,7 +4194,7 @@ class Engine:
             if reset.returncode != 0:
                 block["revert_error"] = (reset.stderr or "").strip()[:200]
         if strip_checkpoint:
-            confirmed, why = self._optimize_revert_confirmed(worktree, anchor)
+            confirmed, why = self._optimize_head_confirmed(worktree, anchor)
             block["reverted"] = confirmed is True
             if confirmed is not True:
                 block["revert_unconfirmed"] = why
