@@ -186,7 +186,7 @@ def test_the_live_streaming_path_tees_each_sub_call_to_its_phase_file(
     ]
     names: list[str] = []
 
-    def fake_teed(argv, *, timeout, cwd, tee_path, env=None):
+    def fake_teed(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         stdout = streams[min(len(names), len(streams) - 1)]
         tee_path.parent.mkdir(parents=True, exist_ok=True)
         tee_path.write_text(stdout, encoding="utf-8")

@@ -57,7 +57,7 @@ def _codex_wi() -> WorkItem:
 
 
 def _patch_claude(monkeypatch, stdout: str, stderr: str = "", returncode: int = 0) -> None:
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(stdout, encoding="utf-8")
         return returncode, stdout, stderr
@@ -159,7 +159,7 @@ def _codex_stream(agent_text: str | None) -> str:
 
 def _patch_codex(monkeypatch, stdout: str, *, last_message: str | None = None,
                  returncode: int = 0) -> None:
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(stdout, encoding="utf-8")
         if last_message is not None and "--output-last-message" in argv:

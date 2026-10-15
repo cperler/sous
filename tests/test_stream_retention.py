@@ -140,7 +140,7 @@ def _fake_teed_claude(monkeypatch, calls: list[tuple[str, str]]) -> list[str]:
     sticks). Records the tee_path basenames in call order so a test can assert the naming."""
     names: list[str] = []
 
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         stdout, stderr = calls[min(len(names), len(calls) - 1)]
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(stdout, encoding="utf-8")
@@ -228,7 +228,7 @@ def test_streaming_retry_tee_failure_is_swallowed(tmp_path, monkeypatch) -> None
     streams = [_claude_stream({"wrong": 1}), _claude_stream({"ok": True})]
     names: list[str] = []
 
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         i = len(names)
         names.append(Path(tee_path).name)
         if i == 0:  # first call tees fine
@@ -268,7 +268,7 @@ def test_codex_streaming_retry_retains_both_sub_call_streams(tmp_path, monkeypat
     ]
     names: list[str] = []
 
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         p = payloads[min(len(names), len(payloads) - 1)]
         Path(tee_path).parent.mkdir(parents=True, exist_ok=True)
         Path(tee_path).write_text(p["stdout"], encoding="utf-8")

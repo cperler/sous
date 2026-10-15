@@ -102,7 +102,7 @@ def _failed_stream() -> str:
 
 
 def _patch_teed(monkeypatch, stdout: str, *, stderr: str = "", returncode: int = 0) -> None:
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         tee_path.parent.mkdir(parents=True, exist_ok=True)
         tee_path.write_text(stdout, encoding="utf-8")
         return returncode, stdout, stderr
@@ -111,7 +111,7 @@ def _patch_teed(monkeypatch, stdout: str, *, stderr: str = "", returncode: int =
 
 def _patch_teed_timeout(monkeypatch, partial: str) -> None:
     """``_run_teed`` killed the call on the watchdog, carrying the partial stdout out."""
-    def fake(argv, *, timeout, cwd, tee_path, env=None):
+    def fake(argv, *, timeout, cwd, tee_path, env=None, **_kw):
         raise subprocess.TimeoutExpired(argv, timeout or 0, output=partial, stderr="")
     monkeypatch.setattr(T, "_run_teed", fake)
 

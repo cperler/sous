@@ -13,9 +13,11 @@ import contextlib
 import json
 import os
 import re
+import signal
 import subprocess
 import tempfile
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta, tzinfo
@@ -508,8 +510,12 @@ def _schema_retry_loop(
         corrective = _corrective_prompt(
             errors, schema_json, raw.structured_output, continued=bool(resume_ref)
         )
+        earlier_notices = raw.execution_notices
         raw = call(work.model_copy(update={"prompt": corrective}), resume_ref, retries)
-        raw = replace(raw, schema_retries=retries)
+        # A superseded sub-call's execution notices (e.g. #556's terminated-after-result)
+        # describe something that really happened in this dispatch — keep them.
+        raw = replace(raw, schema_retries=retries,
+                      execution_notices=earlier_notices + raw.execution_notices)
 
 
 # --- raw provider stream retention (#56) -------------------------------------------------
@@ -584,22 +590,119 @@ def stream_teeing_transport(inner: Transport, run_log_root: str | Path | None) -
 # its stdout to the stream file LINE-BY-LINE as it arrives (flushed), while still capturing the
 # full stdout/stderr for parsing. The tee is best-effort: a tee-file write error drops teeing
 # and keeps capturing — retaining/observing evidence must NEVER break the model call. Timeout
-# is enforced with a watchdog that kills the process even when it emits no output, then re-raised
-# as ``subprocess.TimeoutExpired`` so the callers' existing timeout handling is unchanged.
+# is enforced by the supervising loop, which kills the process tree even when it emits no
+# output, then re-raised as ``subprocess.TimeoutExpired`` so the callers' existing timeout
+# handling is unchanged.
+#
+# #556: a ``claude -p`` process does NOT necessarily exit after printing its terminal ``result``
+# event. While the agent has background shells or Monitors outstanding, the CLI stays alive and
+# re-invokes the model when they report, so a stage that had already answered sat idle until the
+# stage timeout and was recorded as a TIMEOUT (live: result at ~635s, recorded timeout at 900s).
+# A caller that passes ``settle`` names the lines that mean "the stage has answered"; once one
+# has been seen, the process is given ``POST_RESULT_GRACE_S`` of stdout SILENCE to exit on its
+# own and is then terminated with its descendants. Silence, not wall-clock since the result: a
+# wake-up turn streams events, and it is left to finish (it emits a fresh, complete ``result``)
+# rather than cut off mid-turn. The supervisor also stops waiting on stdout EOF a bounded time
+# after the process itself has exited, so a background child that inherited the pipe can no
+# longer wedge the dispatch thread forever.
+
+# Seconds of stdout silence after a settling ``result`` before a still-running provider
+# process is terminated (#556). Generous next to the CLI's normal sub-second exit; small next
+# to the 15-30 min stage timeouts it used to burn.
+POST_RESULT_GRACE_S = 30.0
+# SIGTERM -> SIGKILL escalation window. SIGTERM first so the CLI can stop its own background
+# tasks the way it does on an ordinary session end.
+_TERM_GRACE_S = 5.0
+# How long to keep reading stdout after the process has exited before giving up on EOF (an
+# orphaned grandchild may still hold the pipe).
+_EOF_DRAIN_S = 5.0
+
+
+def _descendant_pids(root_pid: int) -> list[int]:
+    """Every live descendant of ``root_pid`` (children, grandchildren, ...), from one ``ps``
+    snapshot. Taken BEFORE the root is signalled, because once it dies its children are
+    re-parented and no longer reachable from it. Never includes this process (the harness is
+    the root's parent, not its descendant — the guard is belt and braces). Best-effort: a
+    failed snapshot returns ``[]`` and the caller still terminates the root."""
+    try:
+        out = subprocess.run(  # noqa: S603
+            ["ps", "-A", "-o", "pid=,ppid="],  # noqa: S607
+            capture_output=True, text=True, timeout=5,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    children: dict[int, list[int]] = {}
+    for row in out.splitlines():
+        cols = row.split()
+        if len(cols) != 2:
+            continue
+        try:
+            pid, ppid = int(cols[0]), int(cols[1])
+        except ValueError:
+            continue
+        children.setdefault(ppid, []).append(pid)
+    me = os.getpid()
+    found: list[int] = []
+    seen = {root_pid, me}
+    stack = [root_pid]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            if child not in seen:
+                seen.add(child)
+                found.append(child)
+                stack.append(child)
+    return found
+
+
+def _terminate_tree(proc: subprocess.Popen[str], *, term_grace_s: float | None = None) -> int:
+    """Terminate ``proc`` and every descendant it has (SIGTERM, then SIGKILL for whatever is
+    still alive after ``term_grace_s``). Signals pids individually rather than a process group:
+    the provider runs in the harness's own group so a terminal Ctrl-C still reaches it, which
+    makes ``killpg`` unusable here (it would hit the harness). Returns how many descendants the
+    snapshot found, for the caller's notice."""
+    if term_grace_s is None:
+        term_grace_s = _TERM_GRACE_S
+    descendants = _descendant_pids(proc.pid)
+    for pid in descendants:
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGTERM)
+    with contextlib.suppress(OSError):
+        proc.terminate()
+    try:
+        proc.wait(timeout=term_grace_s)
+    except subprocess.TimeoutExpired:
+        with contextlib.suppress(OSError):
+            proc.kill()
+    for pid in descendants:
+        with contextlib.suppress(OSError):
+            os.kill(pid, 0)  # still there? (raises ProcessLookupError when gone)
+            os.kill(pid, signal.SIGKILL)
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=term_grace_s)
+    return len(descendants)
 
 
 def _run_teed(
     argv: list[str], *, timeout: float | None, cwd: str | None, tee_path: Path,
     env: dict[str, str] | None = None,
+    settle: Callable[[str], bool] | None = None,
+    notices: list[dict[str, object]] | None = None,
 ) -> tuple[int, str, str]:
     """Run ``argv`` (Popen), teeing stdout to ``tee_path`` as it streams in. Returns
     ``(returncode, full_stdout, full_stderr)``. Raises ``subprocess.TimeoutExpired`` on
-    timeout (process killed), and ``FileNotFoundError`` if the binary is missing — matching
-    ``subprocess.run`` so the transports' existing except-clauses apply unchanged."""
+    timeout (process tree killed), and ``FileNotFoundError`` if the binary is missing —
+    matching ``subprocess.run`` so the transports' existing except-clauses apply unchanged.
+
+    ``settle`` (#556): a predicate over stdout lines marking the stage's answer. After a
+    settling line, a process that stays silent for ``POST_RESULT_GRACE_S`` is terminated (with
+    its descendants), and so is one still running when the timeout fires — neither raises,
+    because the answer is already in the returned stdout. Each such termination appends a
+    notice to ``notices`` (the caller's "never silent" evidence); the returncode is then the
+    killed process's own, so the caller decides what an answered-then-terminated call means."""
     tee = None
     try:  # best-effort: teeing must never break the call
         tee_path.parent.mkdir(parents=True, exist_ok=True)
-        tee = open(tee_path, "w", encoding="utf-8")  # noqa: SIM115 - closed in finally
+        tee = open(tee_path, "w", encoding="utf-8")  # noqa: SIM115 - closed by the reader
     except OSError:
         tee = None
     # Popen raises FileNotFoundError here for a missing binary (as subprocess.run does).
@@ -607,50 +710,119 @@ def _run_teed(
         argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, cwd=cwd, env=env
     )
     stderr_box: dict[str, str] = {"data": ""}
+    parts: list[str] = []
+    state: dict[str, float | int | bool] = {
+        "last_line": time.monotonic(), "settled_lines": 0, "stop": False,
+    }
 
     def _drain_stderr() -> None:
         # stderr is post-mortem evidence, not control flow — a read hiccup must not matter.
         with contextlib.suppress(Exception):
             stderr_box["data"] = proc.stderr.read() or ""  # type: ignore[union-attr]
 
+    def _read_stdout() -> None:
+        nonlocal tee
+        try:
+            for line in proc.stdout:  # type: ignore[union-attr]
+                if state["stop"]:  # the supervisor gave up on EOF; stop recording
+                    break
+                parts.append(line)
+                state["last_line"] = time.monotonic()
+                if settle is not None:
+                    with contextlib.suppress(Exception):  # a predicate bug must not drop output
+                        if settle(line):
+                            state["settled_lines"] = int(state["settled_lines"]) + 1
+                if tee is not None:
+                    try:
+                        tee.write(line)
+                        tee.flush()
+                    except OSError:  # tee target went away — keep capturing, stop teeing
+                        tee.close()
+                        tee = None
+        except (OSError, ValueError):  # pragma: no cover - pipe torn down under us
+            pass
+        finally:
+            if tee is not None:
+                with contextlib.suppress(OSError):
+                    tee.close()
+
     et = threading.Thread(target=_drain_stderr, daemon=True)
     et.start()
-    killed = {"timeout": False}
+    reader = threading.Thread(target=_read_stdout, daemon=True)
+    reader.start()
 
-    def _kill_on_timeout() -> None:
-        killed["timeout"] = True
-        proc.kill()
-
-    watchdog = threading.Timer(timeout, _kill_on_timeout) if timeout else None
-    if watchdog is not None:
-        watchdog.start()
-    parts: list[str] = []
+    grace = POST_RESULT_GRACE_S
+    poll = min(0.2, max(grace / 4, 0.01))
+    started = time.monotonic()
+    timed_out = False
+    terminated = False
+    exited_at: float | None = None
     try:
-        for line in proc.stdout:  # type: ignore[union-attr]
-            parts.append(line)
-            if tee is not None:
-                try:
-                    tee.write(line)
-                    tee.flush()
-                except OSError:  # tee target went away — keep capturing, stop teeing
-                    tee.close()
-                    tee = None
+        while reader.is_alive():
+            reader.join(poll)
+            now = time.monotonic()
+            running = proc.poll() is None
+            if not running:
+                exited_at = exited_at if exited_at is not None else now
+                if now - exited_at >= _EOF_DRAIN_S:
+                    break  # exited, but something it spawned still holds stdout open
+                continue
+            if terminated:  # already signalled; wait for it to go
+                continue
+            settled = int(state["settled_lines"]) > 0
+            idle = now - float(state["last_line"])
+            hit_timeout = bool(timeout) and now - started >= float(timeout or 0)
+            if settled and (idle >= grace or hit_timeout):
+                terminated = True
+                n = _terminate_tree(proc)
+                if notices is not None:
+                    reason = "idle_after_result" if idle >= grace else "timeout_after_result"
+                    notices.append({
+                        "notice": "provider_terminated_after_result",
+                        "reason": reason,
+                        "grace_s": grace,
+                        "idle_s": round(idle, 1),
+                        "elapsed_s": round(now - started, 1),
+                        "result_events": int(state["settled_lines"]),
+                        "descendants_signalled": n,
+                        "detail": (
+                            "the provider printed its result but did not exit "
+                            f"({'idle' if reason == 'idle_after_result' else 'still active'} "
+                            f"{idle:.0f}s after its last output); the harness terminated it "
+                            f"and {n} descendant process(es) and kept the result"
+                        ),
+                    })
+            elif hit_timeout:
+                timed_out = terminated = True
+                _terminate_tree(proc)
     finally:
+        if proc.poll() is None:  # an exception unwound the loop: never leak the provider
+            with contextlib.suppress(Exception):
+                _terminate_tree(proc)
         proc.wait()
-        if watchdog is not None:
-            watchdog.cancel()
+        state["stop"] = True
+        reader.join(timeout=1)
         et.join(timeout=1)
-        if tee is not None:
-            tee.close()
-    if killed["timeout"]:
+    stdout = "".join(list(parts))
+    if exited_at is not None and reader.is_alive() and notices is not None:
+        notices.append({
+            "notice": "provider_stdout_held_after_exit",
+            "drain_s": _EOF_DRAIN_S,
+            "detail": (
+                "the provider exited but its stdout never reached EOF (a background child "
+                "still holds the pipe); the harness stopped reading after "
+                f"{_EOF_DRAIN_S:.0f}s"
+            ),
+        })
+    if timed_out:
         # #319: carry the partial stdout/stderr already buffered onto the exception, the same
         # way `subprocess.run` does. A timed-out call may have printed a terminal usage report
         # before the watchdog killed it, and the transports recover spend from it — dropping
         # the buffer here would make every timeout look free.
         raise subprocess.TimeoutExpired(
-            argv, timeout or 0, output="".join(parts), stderr=stderr_box["data"]
+            argv, timeout or 0, output=stdout, stderr=stderr_box["data"]
         )
-    return proc.returncode, "".join(parts), stderr_box["data"]
+    return proc.returncode, stdout, stderr_box["data"]
 
 
 def _streaming_stream_files(
@@ -1276,6 +1448,30 @@ def _envelope_to_raw(
                      session_ref=session_id if isinstance(session_id, str) else None)
 
 
+_TERMINATED_AFTER_RESULT = "provider_terminated_after_result"
+
+
+def _settles_claude_stage(line: str) -> bool:
+    """Does this ``stream-json`` line mean the stage has ANSWERED (#556)? A ``result`` event
+    that did real work — it carries ``structured_output``, ran at least one turn, or is an
+    error envelope. NOT the zero-turn, output-less ``result`` a resumed session prints first
+    (live: line 3 of a resumed deliver stream, ``num_turns: 0``, flushed by the previous
+    session's leftover background-task notification) — arming on that would terminate a stage
+    before it had started its work."""
+    if '"result"' not in line:  # cheap pre-filter; most lines are assistant/user events
+        return False
+    try:
+        ev = json.loads(line)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(ev, dict) or ev.get("type") != "result":
+        return False
+    if ev.get("is_error") is True or "structured_output" in ev:
+        return True
+    turns = ev.get("num_turns")
+    return isinstance(turns, int) and turns > 0
+
+
 def _last_result_event(stdout: str) -> dict | None:
     """The final ``{"type":"result", ...}`` event from a claude ``stream-json`` stdout — the
     envelope carrying the model's answer/usage/session. ``None`` if the stream ended without
@@ -1378,6 +1574,17 @@ def claude_cli_transport(
     root = Path(run_log_root) if run_log_root is not None else None
 
     def _call(work: WorkItem, session_ref: str | None, retry: int = 0) -> RawResult:
+        # #556: whatever the call ends as, a provider the harness had to terminate after its
+        # result rides out on `execution_notices` so the engine events it (never silent).
+        notices: list[dict[str, object]] = []
+        raw = _call_once(work, session_ref, retry, notices)
+        if notices:
+            raw = replace(raw, execution_notices=raw.execution_notices + tuple(notices))
+        return raw
+
+    def _call_once(
+        work: WorkItem, session_ref: str | None, retry: int, notices: list[dict[str, object]]
+    ) -> RawResult:
         # #66: with a run dir, stream `stream-json` and tee stdout as it arrives so the stage
         # is tailable live; otherwise the single-shot `json` path. `retry` (>=1, #70) names a
         # schema-retry sub-call's own `.retry<K>` stream so it doesn't clobber the first call's.
@@ -1424,8 +1631,17 @@ def claude_cli_transport(
                     work.stage.value, work.attempt, retry, phase=work.phase
                 )
                 returncode, stdout, stderr = _run_teed(
-                    argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env
+                    argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env,
+                    settle=_settles_claude_stage, notices=notices,
                 )
+                if any(n.get("notice") == _TERMINATED_AFTER_RESULT for n in notices):
+                    # #556: the stage answered, then the CLI lingered on its background tasks
+                    # and the harness ended it. Its exit status is the kill signal's, not the
+                    # stage's — report the exit the CLI gives that result on its own (1 for an
+                    # `is_error` envelope, so a provider limit notice still classifies), and
+                    # read the answer from the stream below exactly as for a clean exit.
+                    final = _last_result_event(stdout)
+                    returncode = 1 if final is not None and final.get("is_error") else 0
                 stream_files = _streaming_stream_files(root, work, stdout, stderr, retry)
             else:
                 proc = subprocess.run(argv, capture_output=True, text=True,  # noqa: S603
