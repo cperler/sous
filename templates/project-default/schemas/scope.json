@@ -12,6 +12,10 @@
       "items": {"type": "string"},
       "description": "ordered subtasks for the implement stage"
     },
+    "performance": {
+      "type": "string",
+      "description": "a short design note on speed, folded into the implement (and later) prompts: does the work touch a latency-sensitive path; the design choices that decide its speed (waits/polling, blocking calls, round trips, how components hand data to each other, what can run in parallel); what to avoid. One line for work off the hot path ('not on a latency-sensitive path' is a complete note). Optional, so outputs recorded before it existed still parse."
+    },
     "files": {
       "type": "array",
       "items": {

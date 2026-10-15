@@ -201,6 +201,75 @@ def test_implement_prompt_carries_the_full_scope_plan(tmp_path, project) -> None
     raise AssertionError("implement stage never dispatched")
 
 
+# --- SCOPE's speed-design note reaches the stages that build with it ------------------
+_PERFORMANCE_NOTE = (
+    "On the request hot path: the scorer runs per incoming quote. Batch the model calls "
+    "instead of one round trip per row; hand the feature frame to the scorer by reference, "
+    "not a serialized copy; run the two independent lookups concurrently. "
+    + ("Keep the cache warm across requests. " * 25)
+    + "AVOID: a sleep-based poll on the result queue — block on the queue instead."
+)
+
+
+def test_scope_performance_note_folds_uncut() -> None:
+    """A prose note several times the 500-char incidental-item cap folds byte-identical —
+    it is a string, bounded by the prose-sized whole-value cap, and its last sentence (the
+    "what to avoid" half) is exactly what an item-sized cap would have deleted."""
+    from orchestrator.schemas.status import Task
+
+    assert _MAX_ITEM_STR < len(_PERFORMANCE_NOTE) < _MAX_STR
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.SCOPE, {"plan": ["one"], "performance": _PERFORMANCE_NOTE}))
+    assert task.context["performance"] == _PERFORMANCE_NOTE
+    assert notices.truncations == []
+
+
+def test_a_list_shaped_performance_note_gets_prose_sized_items() -> None:
+    """Off-schema but survivable: a model that returns the note as sentences keeps them."""
+    from orchestrator.schemas.status import Task
+
+    sentence = "p" * (_MAX_ITEM_STR + 300)
+    task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
+    notices = _absorb_outputs(task, make_result_stub(
+        Stage.SCOPE, {"performance": [sentence]}))
+    assert task.context["performance"] == [sentence] and notices.truncations == []
+
+
+def test_implement_prompt_carries_the_scope_performance_note(tmp_path, project) -> None:
+    """End to end: the note SCOPE wrote is in the DISPATCHED implement prompt, whole, next
+    to the instruction to build to it — the point of asking SCOPE for it at all."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    while (w := eng.next_work("r1", "t1")) is not None:
+        if w.stage is Stage.IMPLEMENT:
+            assert f"- performance: {_PERFORMANCE_NOTE}" in w.prompt
+            assert "[truncated]" not in w.prompt
+            assert "`performance` note, build to it" in w.prompt
+            return
+        output = ({"feasible": True, "plan": ["do it"], "performance": _PERFORMANCE_NOTE}
+                  if w.stage is Stage.SCOPE else None)
+        eng.record("r1", make_result(w, structured_output=output))
+    raise AssertionError("implement stage never dispatched")
+
+
+def test_scope_schema_accepts_the_performance_note_and_old_outputs() -> None:
+    import jsonschema
+    import pytest
+
+    from orchestrator.schemas.stage_schemas import resolve_stage_schema
+
+    schema = resolve_stage_schema("scope")
+    jsonschema.validate({"feasible": True, "plan": ["x"]}, schema)  # pre-field output
+    jsonschema.validate(
+        {"feasible": True, "plan": ["x"], "performance": "not on a latency-sensitive path"},
+        schema,
+    )
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate({"feasible": True, "plan": ["x"], "performance": 3}, schema)
+
+
 def test_string_and_list_values_are_capped() -> None:
     from orchestrator.schemas.status import Task
 

@@ -189,7 +189,11 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
                    # dead run. Folded for the same reason baseline_failures is — it is
                    # state the stage would otherwise discover by destroying it.
                    "inherited_changes", "inherited_changes_note"),
-    Stage.SCOPE: ("plan", "blocked_reason"),
+    # ``performance``: SCOPE's speed-design note, so IMPLEMENT builds with it and OPTIMIZE
+    # classifies impact from it. It is a prose STRING, so it is bounded by the whole-value
+    # cap (``_MAX_STR``, sized for prose), never by the 500-char incidental-list-item cap;
+    # ``_ITEM_CAP_BY_KEY`` still names it so a list-shaped note gets prose-sized items too.
+    Stage.SCOPE: ("plan", "blocked_reason", "performance"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),
     # #519: nothing folded. The suggestions the engine files are read from the stage
@@ -235,7 +239,12 @@ _MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice 
 # ceiling). Plan items get a cap sized to the ceiling instead; the whole-context ceiling
 # below still binds, so this is not unbounded growth.
 _MAX_PLAN_ITEM_STR = 4000
-_ITEM_CAP_BY_KEY: dict[str, int] = {"plan": _MAX_PLAN_ITEM_STR}
+_ITEM_CAP_BY_KEY: dict[str, int] = {
+    "plan": _MAX_PLAN_ITEM_STR,
+    # SCOPE's speed-design note is prose too. The schema says string (bounded by _MAX_STR);
+    # this keeps a model that returns it as a list of sentences from losing their tails.
+    "performance": _MAX_STR,
+}
 
 
 def _item_cap(key: str) -> int:

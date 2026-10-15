@@ -27,10 +27,12 @@ Notes:
   REVIEW gate runs it after lint/typecheck: rc 0 passes, rc 1 is a BLOCKING finding carrying
   the output tail (the timings), and any other rc, a timeout (1800s) or a failure to start
   is an advisory UNVERIFIED finding, never green. The engine's OPTIMIZE gate (#520) runs the
-  same argv and needs rc 0 and a ONE-LINE JSON metrics object as the last stdout line, so a
-  benchmark that pretty-prints multi-line JSON needs a compact mode. Without `bench` the
-  method is the no-op and neither gate runs. `benchmark_tolerance` is not generated, so the
-  OPTIMIZE gate uses its 5% default.
+  same argv before and after the speed pass and needs rc 0 and a ONE-LINE JSON metrics object
+  as the last stdout line, so a benchmark that pretty-prints multi-line JSON needs a compact
+  mode. It reverts the pass only on a measured regression (or a benchmark the change broke);
+  a pass that leaves the numbers flat is kept. Without `bench` the method is the no-op,
+  neither gate runs, and an OPTIMIZE commit is kept marked UNVERIFIED. `benchmark_tolerance`
+  is not generated, so the OPTIMIZE gate uses its 5% noise band.
 - A stage's command method should **fail closed** (exit non-zero) until set, so an
   unconfigured run doesn't vacuously pass — see the generated adapter's `test_unit_cmd`.
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).

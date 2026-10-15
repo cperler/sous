@@ -1,17 +1,19 @@
-"""The OPTIMIZE benchmark gate (#520): the engine measures the speed claim itself.
+"""The OPTIMIZE benchmark gate (#520): the engine checks the speed pass for regressions.
 
 #519 shipped OPTIMIZE with model-reported ``measurements`` — a claim no check could falsify.
 This gate is the check CLAUDE.md asks for in place of firmer prose: the engine runs the
 PROJECT ADAPTER's declared benchmark argv at the last-good checkpoint and again at the
-stage's commit, and keeps the commit only when the numbers improve beyond the tolerance.
+stage's commit, and keeps the commit UNLESS a metric regresses beyond the tolerance (the
+redesign: a win is reported, not required, and an unmeasurable pass is kept UNVERIFIED).
 
 Two halves, tested separately:
 
 * the pure decision layer (``orchestrator.benchmark_gate``) — what a benchmark's output is
-  allowed to look like, and what counts as a win;
+  allowed to look like, and what counts as a regression;
 * the engine wiring, against a REAL git worktree, because "not kept" is a git reset and a
-  dropped checkpoint, not a flag. The four outcomes the issue names each get a case: win
-  kept, no win reverted, the benchmark red/unreadable, and no benchmark declared at all.
+  dropped checkpoint, not a flag. Each outcome gets a case: improvement kept and reported,
+  flat kept, regression reverted, the change breaking the benchmark reverted, a benchmark
+  already broken (or absent) kept unverified, and a no-op / ``impact: none`` pass skipped.
 """
 
 from __future__ import annotations
@@ -96,52 +98,60 @@ def _verdict(before: dict, after: dict, **kw) -> dict:
     )
 
 
-def test_a_real_speedup_is_a_win() -> None:
+def test_a_real_speedup_is_kept_and_reported_as_improved() -> None:
     verdict = _verdict({"hot": 100.0}, {"hot": 50.0})
-    assert verdict["kept"] and verdict["reason"] == "win"
+    assert verdict["kept"] and verdict["reason"] == "improved"
     assert verdict["metrics"][0]["delta_fraction"] == pytest.approx(0.5)
     assert verdict["metrics"][0]["direction"] == "improved"
 
 
-def test_higher_is_better_reads_a_throughput_gain_as_a_win() -> None:
+def test_higher_is_better_reads_a_throughput_gain_as_improved() -> None:
     verdict = _verdict({"tps": (100.0, "ops/s", False)}, {"tps": (200.0, "ops/s", False)})
     assert verdict["kept"] and verdict["metrics"][0]["delta_fraction"] == pytest.approx(1.0)
     # The same numbers under the default direction would be a doubling of a duration.
     assert _verdict({"tps": 100.0}, {"tps": 200.0})["reason"] == "regressed"
 
 
-def test_noise_inside_the_tolerance_is_not_a_win() -> None:
-    assert _verdict({"hot": 100.0}, {"hot": 97.0})["reason"] == "no_win"
-    assert _verdict({"hot": 100.0}, {"hot": 100.0})["reason"] == "no_win"
+def test_noise_inside_the_tolerance_is_kept_as_no_regression() -> None:
+    """The redesign's core rule: a pass need not move the benchmark, only not slow it. A
+    flat or slightly-noisy result in EITHER direction keeps the commit."""
+    for after in (97.0, 100.0, 103.0):
+        verdict = _verdict({"hot": 100.0}, {"hot": after})
+        assert verdict["kept"] and verdict["reason"] == "no_regression"
 
 
-def test_the_tolerance_is_a_strict_threshold() -> None:
+def test_the_tolerance_is_a_strict_threshold_both_ways() -> None:
     """Exactly the tolerance is not "beyond" it — the boundary belongs to the noise band."""
-    assert _verdict({"hot": 100.0}, {"hot": 95.0}, tolerance=0.05)["reason"] == "no_win"
-    assert _verdict({"hot": 100.0}, {"hot": 94.9}, tolerance=0.05)["reason"] == "win"
-    # A looser project tolerance keeps the same 5% measurement from clearing the bar.
-    assert _verdict({"hot": 100.0}, {"hot": 90.0}, tolerance=0.2)["reason"] == "no_win"
+    assert _verdict({"hot": 100.0}, {"hot": 95.0}, tolerance=0.05)["reason"] == "no_regression"
+    assert _verdict({"hot": 100.0}, {"hot": 94.9}, tolerance=0.05)["reason"] == "improved"
+    assert _verdict({"hot": 100.0}, {"hot": 105.0}, tolerance=0.05)["kept"] is True
+    slower = _verdict({"hot": 100.0}, {"hot": 105.1}, tolerance=0.05)
+    assert not slower["kept"] and slower["reason"] == "regressed"
+    # A looser project tolerance absorbs a 10% slowdown as noise.
+    assert _verdict({"hot": 100.0}, {"hot": 110.0}, tolerance=0.2)["kept"] is True
 
 
-def test_a_regression_beats_a_win_in_the_report() -> None:
-    """Halving one path while doubling another has earned nothing, and the regression is the
-    more serious half of that finding, so it is what the verdict names."""
+def test_a_regression_beats_an_improvement_in_the_report() -> None:
+    """Halving one path while tripling another has not kept the system fast, and the
+    regression is the more serious half of that finding, so it is what the verdict names."""
     verdict = _verdict({"a": 100.0, "b": 100.0}, {"a": 10.0, "b": 300.0})
     assert not verdict["kept"] and verdict["reason"] == "regressed"
 
 
 def test_a_metric_only_one_side_measured_is_reported_and_not_judged() -> None:
     verdict = _verdict({"gone": 10.0, "both": 100.0}, {"new": 1.0, "both": 10.0})
-    assert verdict["reason"] == "win"  # `both` still carries the verdict
+    assert verdict["reason"] == "improved"  # `both` still carries the verdict
     assert {n["notice"] for n in verdict["notices"]} == {
         "metric_missing_after", "metric_missing_before"
     }
     assert [r["name"] for r in verdict["metrics"]] == ["both"]
 
 
-def test_no_shared_metric_is_not_a_win() -> None:
+def test_no_shared_metric_is_not_a_regression_but_names_itself() -> None:
+    """Nothing regressed, so nothing to revert — but nothing was measured either, and the
+    reason says so, so the engine can report UNVERIFIED rather than verified."""
     verdict = _verdict({"a": 1.0}, {"b": 1.0})
-    assert not verdict["kept"] and verdict["reason"] == "no_metrics_compared"
+    assert verdict["kept"] and verdict["reason"] == "no_metrics_compared"
 
 
 def test_a_changed_unit_is_excluded_from_the_verdict() -> None:
@@ -165,8 +175,8 @@ def test_a_zero_baseline_has_no_ratio_but_still_has_a_direction() -> None:
     regressed = _verdict({"hot": 0.0}, {"hot": 3.0})
     assert regressed["reason"] == "regressed"
     assert regressed["metrics"][0]["delta_fraction"] is None
-    assert _verdict({"hot": 0.0}, {"hot": 0.0})["reason"] == "no_win"
-    assert _verdict({"tps": (0.0, "", False)}, {"tps": (5.0, "", False)})["reason"] == "win"
+    assert _verdict({"hot": 0.0}, {"hot": 0.0})["reason"] == "no_regression"
+    assert _verdict({"tps": (0.0, "", False)}, {"tps": (5.0, "", False)})["reason"] == "improved"
 
 
 def test_metric_lines_state_the_numbers_and_the_change() -> None:
@@ -196,10 +206,13 @@ def _head(cwd) -> str:
 
 # A benchmark stand-in: prints the JSON object for whichever revision is checked out, read
 # from the worktree itself, so the engine's before/after resets are what change the numbers.
+# A revision whose bench.json says CRASH makes the benchmark exit red — the stand-in for a
+# change that breaks the measurement.
 _BENCH = (
     "import pathlib,sys;"
+    "t=pathlib.Path('bench.json').read_text();"
     "sys.stdout.write('warming up\\n');"
-    "sys.stdout.write(pathlib.Path('bench.json').read_text())"
+    "sys.exit(3) if t.startswith('CRASH') else sys.stdout.write(t)"
 )
 
 
@@ -272,8 +285,10 @@ def _gate_events(eng: Engine) -> list[dict]:
 
 
 def _record_optimize(eng: Engine, work, wt, *, after: object, message: str = "Optimize the loop"):
-    """Commit a benchmark result standing in for the stage's own speed change, then record."""
-    sha = _commit(wt, message, name="bench.json", body=json.dumps(after))
+    """Commit a benchmark result standing in for the stage's own speed change, then record.
+    A str ``after`` is written verbatim (``CRASH``, or output that is not JSON)."""
+    body = after if isinstance(after, str) else json.dumps(after)
+    sha = _commit(wt, message, name="bench.json", body=body)
     outcome = eng.record(
         "r1",
         make_result(work, structured_output=_optimize_output(),
@@ -282,7 +297,7 @@ def _record_optimize(eng: Engine, work, wt, *, after: object, message: str = "Op
     return sha, outcome
 
 
-def test_a_measured_win_keeps_the_commit(tmp_path, worktree) -> None:
+def test_a_measured_improvement_keeps_the_commit_and_says_so(tmp_path, worktree) -> None:
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
@@ -293,7 +308,8 @@ def test_a_measured_win_keeps_the_commit(tmp_path, worktree) -> None:
     task = eng.store.load_task("r1", "t1")
     assert task.last_checkpoint == {"tag": "task/r1/t1/optimize/0", "sha": sha}
     block = task.stages[Stage.OPTIMIZE].output["benchmark"]
-    assert (block["status"], block["reason"], block["reverted"]) == ("verified", "win", False)
+    assert (block["status"], block["reason"], block["reverted"]) == (
+        "verified", "improved", False)
     assert block["metrics"][0]["before"] == 100.0 and block["metrics"][0]["after"] == 40.0
     (event,) = _gate_events(eng)
     assert event["type"] == "optimize_benchmark_verified" and event["level"] == "info"
@@ -302,26 +318,46 @@ def test_a_measured_win_keeps_the_commit(tmp_path, worktree) -> None:
     assert [leg["phase"] for leg in block["legs"]] == ["before", "after"]
 
 
-def test_no_measured_win_reverts_to_the_last_checkpoint(tmp_path, worktree) -> None:
-    """The heart of the issue: an unmeasurable claim costs the commit."""
+def test_a_pass_that_does_not_move_the_benchmark_is_kept(tmp_path, worktree) -> None:
+    """The heart of the redesign (prediction #397): a speed fix off the benchmarked path
+    leaves the numbers flat — or a little noisy — and must NOT be reverted for it."""
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    sha, outcome = _record_optimize(eng, work, wt, after={"hot": 98.0})
+    sha, outcome = _record_optimize(eng, work, wt, after={"hot": 103.0})
+
+    assert _head(wt) == sha
+    task = eng.store.load_task("r1", "t1")
+    assert task.last_checkpoint == {"tag": "task/r1/t1/optimize/0", "sha": sha}
+    assert task.stages[Stage.OPTIMIZE].status.value == "completed"
+    assert outcome["outcome"] != "stage_failed"
+    (event,) = _gate_events(eng)
+    assert event["type"] == "optimize_benchmark_verified" and event["level"] == "info"
+    assert event["status"] == "verified" and event["reason"] == "no_regression"
+    assert event["reverted"] is False
+    assert "hot: 100.0 -> 103.0" in event["summary"][0]
+
+
+def test_a_measured_regression_reverts_to_the_last_checkpoint(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    sha, outcome = _record_optimize(eng, work, wt, after={"hot": 130.0})
 
     assert _head(wt) == base and _head(wt) != sha  # reset to the last-good checkpoint
     task = eng.store.load_task("r1", "t1")
-    assert task.last_checkpoint is None  # the unverified commit never becomes the anchor
+    assert task.last_checkpoint is None  # the slower commit never becomes the anchor
     assert task.stages[Stage.OPTIMIZE].status.value == "completed"  # not a failure to retry
     assert outcome["outcome"] != "stage_failed"
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_no_win"
+    assert event["type"] == "optimize_benchmark_regressed"
+    assert event["status"] == "regressed" and event["reason"] == "regressed"
     assert event["level"] == "warning" and event["reverted"] is True
     # The event NAMES the measured numbers, so the revert is arguable from the run log alone.
-    assert event["metrics"][0]["before"] == 100.0 and event["metrics"][0]["after"] == 98.0
+    assert event["metrics"][0]["before"] == 100.0 and event["metrics"][0]["after"] == 130.0
     assert event["tolerance"] == DEFAULT_BENCHMARK_TOLERANCE
-    assert "hot: 100.0 -> 98.0" in event["summary"][0]
 
 
 def test_a_regression_reverts_even_though_something_improved(tmp_path, worktree) -> None:
@@ -336,21 +372,21 @@ def test_a_regression_reverts_even_though_something_improved(tmp_path, worktree)
 
     assert _head(wt) == base
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_no_win" and event["reason"] == "regressed"
+    assert event["type"] == "optimize_benchmark_regressed" and event["reason"] == "regressed"
 
 
-def test_an_adapter_tolerance_overrides_the_default(tmp_path, worktree) -> None:
+def test_an_adapter_tolerance_widens_the_noise_band(tmp_path, worktree) -> None:
     wt, base = worktree
     project = BenchmarkingProject()
-    project.declared_tolerance = 0.5  # this project's benchmark is noisy; 10% proves nothing
+    project.declared_tolerance = 0.5  # this project's benchmark is noisy; +20% proves nothing
     eng = _engine(tmp_path, project)
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 85.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 120.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_no_win" and event["tolerance"] == 0.5
+    assert event["type"] == "optimize_benchmark_verified" and event["tolerance"] == 0.5
 
 
 @pytest.mark.parametrize(
@@ -368,62 +404,95 @@ def test_a_nonsense_tolerance_falls_back_to_the_default_loudly(
     eng = _engine(tmp_path, project)
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 10.0})
+    _record_optimize(eng, work, wt, after={"hot": 150.0})
 
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_verified"  # a 90% win clears any sane bar
+    assert event["type"] == "optimize_benchmark_regressed"  # +50% is past any sane band
     assert event["tolerance"] == DEFAULT_BENCHMARK_TOLERANCE
     assert event["notices"][0]["notice"] == notice
 
 
-def test_a_red_benchmark_reverts_and_reports_its_output(tmp_path, worktree) -> None:
+def test_a_change_that_breaks_the_benchmark_reverts(tmp_path, worktree) -> None:
+    """Green and readable at the anchor, red at the stage's commit: the benchmark DID see
+    the pass — it crashed on it. That is a regression, not an absence of evidence."""
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    sha, _ = _record_optimize(eng, work, wt, after="CRASH")
+
+    assert _head(wt) == base and _head(wt) != sha
+    (event,) = _gate_events(eng)
+    assert event["type"] == "optimize_benchmark_failed" and event["level"] == "warning"
+    assert event["status"] == "failed" and event["reason"] == "benchmark_red"
+    assert event["reverted"] is True
+    assert [leg["rc"] for leg in event["legs"]] == [0, 3]
+    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+
+
+def test_a_change_that_garbles_the_benchmark_output_reverts(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    _record_optimize(eng, work, wt, after="much faster, trust me")
+
+    assert _head(wt) == base
+    (event,) = _gate_events(eng)
+    assert event["type"] == "optimize_benchmark_failed"
+    assert event["reason"] == "unreadable_output" and "not JSON" in event["detail"]
+
+
+def test_a_benchmark_already_red_at_the_anchor_keeps_the_pass_unverified(
+    tmp_path, worktree
+) -> None:
+    """Red on both sides says nothing about THIS pass, so the reasoned change is kept —
+    marked unverified, with the benchmark's own output in the event."""
     wt, base = worktree
     project = BenchmarkingProject()
     project.benchmark_argv = [sys.executable, "-c", "import sys;sys.stderr.write('boom');sys.exit(3)"]
     eng = _engine(tmp_path, project)
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 1.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 1.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_failed" and event["level"] == "warning"
-    assert event["reason"] == "benchmark_red" and event["reverted"] is True
+    assert event["type"] == "optimize_benchmark_unverified" and event["level"] == "warning"
+    assert event["status"] == "unverified" and event["reason"] == "benchmark_red"
+    assert event["reverted"] is False
     assert [leg["rc"] for leg in event["legs"]] == [3, 3]
     assert "boom" in event["legs"][0]["output_tail"]
-    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+    assert eng.store.load_task("r1", "t1").last_checkpoint["sha"] == sha
 
 
-def test_a_benchmark_that_cannot_be_invoked_reverts(tmp_path, worktree) -> None:
-    """A missing binary is a red leg, not an exception out of record()."""
+def test_a_benchmark_that_cannot_be_invoked_keeps_the_pass_unverified(tmp_path, worktree) -> None:
+    """A missing binary is a red leg on both sides, not an exception out of record()."""
     wt, base = worktree
     project = BenchmarkingProject()
     project.benchmark_argv = ["./definitely-not-a-real-benchmark-binary"]
     eng = _engine(tmp_path, project)
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 1.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 1.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_failed"
+    assert event["type"] == "optimize_benchmark_unverified"
     assert event["legs"][0]["rc"] == -1 and "error (" in event["legs"][0]["output_tail"]
 
 
-def test_unreadable_benchmark_output_reverts(tmp_path, worktree) -> None:
-    """Unverified must never read as green — including when the numbers are unparseable."""
+def test_no_shared_metric_keeps_the_pass_unverified(tmp_path, worktree) -> None:
     wt, base = worktree
-    project = BenchmarkingProject()
-    project.benchmark_argv = [sys.executable, "-c", "print('much faster, trust me')"]
-    eng = _engine(tmp_path, project)
+    eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 1.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"renamed": 1.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_failed"
-    assert event["reason"] == "unreadable_output" and "not JSON" in event["detail"]
+    assert event["type"] == "optimize_benchmark_unverified"
+    assert event["reason"] == "no_metrics_compared"
 
 
 @pytest.mark.parametrize(
@@ -434,28 +503,32 @@ def test_unreadable_benchmark_output_reverts(tmp_path, worktree) -> None:
         (lambda p: setattr(p, "benchmark_argv", []), "noop"),
     ],
 )
-def test_an_undeclared_benchmark_is_advisory_and_keeps_nothing(
+def test_an_undeclared_benchmark_keeps_the_pass_unverified(
     tmp_path, worktree, mutate, reason
 ) -> None:
+    """Keeping no longer needs proof, so "nothing to check with" keeps the reasoned change —
+    loudly: warning-grade, status ``unverified``, never ``verified``."""
     wt, base = worktree
     project = BenchmarkingProject()
     mutate(project)
     eng = _engine(tmp_path, project)
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 1.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 1.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unavailable"
+    assert event["type"] == "optimize_benchmark_unverified"
     assert event["level"] == "warning" and event["reason"] == reason
-    assert event["reverted"] is True
-    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+    assert event["status"] == "unverified" and event["reverted"] is False
+    task = eng.store.load_task("r1", "t1")
+    assert task.last_checkpoint["sha"] == sha
+    assert task.stages[Stage.OPTIMIZE].status.value == "completed"
 
 
-def test_a_project_with_no_benchmark_hook_at_all_is_advisory(tmp_path, worktree) -> None:
-    """The first user of OPTIMIZE wires its benchmark separately; until it does, the stage is
-    unverified and therefore cannot keep anything."""
+def test_a_project_with_no_benchmark_hook_at_all_keeps_the_pass_unverified(
+    tmp_path, worktree
+) -> None:
     wt, base = worktree
 
     class NoBenchmark(BenchmarkingProject):
@@ -464,11 +537,11 @@ def test_a_project_with_no_benchmark_hook_at_all_is_advisory(tmp_path, worktree)
     eng = _engine(tmp_path, NoBenchmark())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
 
-    _record_optimize(eng, work, wt, after={"hot": 1.0})
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 1.0})
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unavailable" and event["reason"] == "absent"
+    assert event["type"] == "optimize_benchmark_unverified" and event["reason"] == "absent"
 
 
 def test_a_no_op_pass_is_skipped_with_a_receipt(tmp_path, worktree) -> None:
@@ -486,13 +559,44 @@ def test_a_no_op_pass_is_skipped_with_a_receipt(tmp_path, worktree) -> None:
     assert _head(wt) == base
     (event,) = _gate_events(eng)
     assert event["type"] == "optimize_benchmark_skipped" and event["reason"] == "no_changes"
+    assert "impact" not in event  # an output without the field is unclassified, not "none"
     # A no-op pass did not invalidate the anchor, so the checkpoint is absorbed as usual.
     assert eng.store.load_task("r1", "t1").last_checkpoint["sha"] == base
 
 
-def test_uncommitted_leftovers_are_not_silently_measured_over(tmp_path, worktree) -> None:
+def test_an_impact_none_pass_never_runs_the_benchmark(tmp_path, worktree) -> None:
+    """Offline tools, docs, tests: the pass classifies ``impact: none``, commits nothing, and
+    the engine must not spend two benchmark runs confirming nothing changed."""
+    wt, base = worktree
+    project = BenchmarkingProject()
+    calls: list[int] = []
+
+    def counting_benchmark_cmd() -> list[str]:
+        calls.append(1)
+        return [sys.executable, "-c", _BENCH]
+
+    project.benchmark_cmd = counting_benchmark_cmd  # type: ignore[method-assign]
+    eng = _engine(tmp_path, project)
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    eng.record("r1", make_result(
+        work,
+        structured_output=_optimize_output(impact="none", files_changed=[], committed=False),
+        checkpoint={"tag": "task/r1/t1/optimize/0", "sha": base},
+    ))
+
+    assert calls == []
+    (event,) = _gate_events(eng)
+    assert event["type"] == "optimize_benchmark_skipped" and event["impact"] == "none"
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+    assert "not on a latency-sensitive path" in note
+
+
+def test_uncommitted_leftovers_are_not_measured_over_and_the_commit_is_kept(
+    tmp_path, worktree
+) -> None:
     """Measuring the anchor means resetting the tree, which would delete them — so refuse to
-    measure, and revert exactly as a retry would."""
+    measure. The commit stays (unverified) and the leftovers are left alone."""
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
@@ -502,9 +606,10 @@ def test_uncommitted_leftovers_are_not_silently_measured_over(tmp_path, worktree
     eng.record("r1", make_result(work, structured_output=_optimize_output(),
                                  checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
 
-    assert _head(wt) == base
+    assert _head(wt) == sha
+    assert (wt / "scratch.txt").read_text() == "half-finished work"
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unavailable"
+    assert event["type"] == "optimize_benchmark_unverified"
     assert event["reason"] == "worktree_dirty"
 
 
@@ -516,61 +621,114 @@ def test_a_missing_worktree_degrades_loudly_instead_of_raising(tmp_path) -> None
                                  checkpoint={"tag": "task/r1/t1/optimize/0", "sha": "b" * 40}))
 
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unavailable"
+    assert event["type"] == "optimize_benchmark_unverified"
     assert event["reason"] == "worktree_missing" and event["reverted"] is False
-    assert eng.store.load_task("r1", "t1").last_checkpoint is None
+    assert _optimize_stage(eng).status.value == "completed"
 
 
-def test_the_completion_note_reports_the_verdict_not_the_claim(tmp_path, worktree) -> None:
+@pytest.mark.parametrize(
+    ("after", "heading", "tolerance_line"),
+    [
+        ({"hot": 40.0}, "Speed pass kept — measured faster", "more than 5.0% worse"),
+        ({"hot": 101.0}, "Speed pass kept — no regression measured", "more than 5.0% worse"),
+        ({"hot": 130.0}, "Speed pass REVERTED — it measured slower", "more than 5.0% worse"),
+        ("CRASH", "Speed pass REVERTED — the change broke the benchmark", None),
+    ],
+)
+def test_the_completion_note_reports_the_verdict_not_the_claim(
+    tmp_path, worktree, after, heading, tolerance_line
+) -> None:
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
-    _record_optimize(eng, work, wt, after={"hot": 98.0})
+    _record_optimize(eng, work, wt, after=after)
 
     note = render_completion_note(eng.store.load_task("r1", "t1"))
 
-    assert "REVERTED — no measured win" in note
-    assert "hot: 100.0 -> 98.0" in note
-    assert "required improvement: more than 5.0%" in note
+    assert heading in note
+    if tolerance_line:
+        assert tolerance_line in note
+    assert "required improvement" not in note  # the old win-required wording is gone
 
 
-# --- a revert the gate could not perform (#520 review) -------------------------------------
+def test_the_completion_note_flags_an_unverified_keep(tmp_path, worktree) -> None:
+    wt, base = worktree
+    project = BenchmarkingProject()
+    project.benchmark_argv = ["true"]
+    eng = _engine(tmp_path, project)
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    _record_optimize(eng, work, wt, after={"hot": 1.0})
+
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+
+    assert "Speed pass kept UNVERIFIED" in note and "REVERTED" not in note
+
+
+def test_the_completion_note_lists_the_passes_changes_with_their_rationale(
+    tmp_path, worktree
+) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize", name="bench.json", body=json.dumps({"hot": 99.0}))
+    eng.record("r1", make_result(
+        work,
+        structured_output=_optimize_output(
+            impact="hot_path",
+            changes=[{"description": "dict lookup per row", "rationale": "O(N^2) -> O(N)"}],
+        ),
+        checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha},
+    ))
+
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+
+    assert "Speed changes (stage-reported, impact: hot_path)" in note
+    assert "dict lookup per row — O(N^2) -> O(N)" in note
+
+
+def test_a_pre_redesign_verdict_still_renders_truthfully() -> None:
+    """Runs recorded under the win-required rule carry ``no_win``/``unavailable`` blocks;
+    their notes must keep saying what happened then (a revert), not the new wording."""
+    from orchestrator.render import _benchmark_lines
+
+    lines = _benchmark_lines({"status": "no_win", "reason": "no_win", "reverted": True,
+                              "tolerance": 0.05, "metrics": []})
+    assert "REVERTED — no measured win" in lines[1]
+    assert "- required improvement: more than 5.0%" in lines
+    old_win = _benchmark_lines({"status": "verified", "reason": "win", "reverted": False})
+    assert "measured faster" in old_win[1]
+
+
+# --- a revert (or restore) the gate could not perform (#520 review) ------------------------
 #
-# Every not-kept path above ends in a git reset. When the git plumbing itself breaks first,
-# the gate used to drop the checkpoint and report SUCCESS with the unverified commit STILL on
-# HEAD — and nothing between here and DELIVER re-reads the tree, so it shipped as if measured.
-# The revert is now confirmed against HEAD, and an unconfirmed one fails the stage.
+# A not-kept path ends in a git reset. When the git plumbing itself breaks first, the gate
+# used to drop the checkpoint and report SUCCESS with the commit STILL on HEAD — and nothing
+# between here and DELIVER re-reads the tree. The revert is confirmed against HEAD, and an
+# unconfirmed one fails the stage. Plumbing that breaks BEFORE anything was measured now
+# keeps the commit unverified instead (keeping needs no proof), so those cases stay green.
 
 
 def _optimize_stage(eng: Engine):
     return eng.store.load_task("r1", "t1").stages[Stage.OPTIMIZE]
 
 
-def test_a_missing_anchor_cannot_revert_so_the_stage_fails(tmp_path, worktree) -> None:
-    """The reviewer's reproduction: no base_sha and no prior checkpoint means no commit to
-    reset to, so the unverified commit stays on HEAD — which must not read as a green pass."""
+def test_a_missing_anchor_keeps_the_pass_unverified(tmp_path, worktree) -> None:
+    """No base_sha and no prior checkpoint: nothing to measure against, so nothing to judge
+    a regression by — the commit stays, marked unverified, and the stage completes."""
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha="")
 
     sha, outcome = _record_optimize(eng, work, wt, after={"hot": 10.0})
 
-    assert _head(wt) == sha  # the commit really is still there — the gate says so, not guesses
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["type"] == "optimize_benchmark_unavailable" and event["reason"] == "no_anchor"
-    assert event["reverted"] is False and "no anchor commit" in event["revert_unconfirmed"]
-    stage = _optimize_stage(eng)
-    assert stage.status.value == "failed"  # not a SUCCESS carrying an unverified commit
-    assert "could not be removed from the worktree" in (stage.error or "")
-    assert eng.store.load_task("r1", "t1").last_checkpoint is None
-    assert outcome["outcome"] != "stage_completed"
+    assert event["type"] == "optimize_benchmark_unverified" and event["reason"] == "no_anchor"
+    assert _optimize_stage(eng).status.value == "completed"
+    assert eng.store.load_task("r1", "t1").last_checkpoint["sha"] == sha
 
 
-def test_an_unresolvable_anchor_fails_the_stage_rather_than_claiming_a_revert(
-    tmp_path, worktree
-) -> None:
-    """A checkpoint sha that no longer resolves (a pruned tag, a recreated worktree) makes
-    both the range read and the reset fail; the commit survives, so the stage must not."""
+def test_an_unresolvable_anchor_keeps_the_pass_unverified(tmp_path, worktree) -> None:
     wt, _ = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha="a" * 40)
@@ -579,15 +737,11 @@ def test_an_unresolvable_anchor_fails_the_stage_rather_than_claiming_a_revert(
 
     assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["reason"] == "range_unreadable" and event["reverted"] is False
-    assert event["revert_error"]  # the reset was attempted and git refused the anchor
-    assert "rev-parse aaaa" in event["revert_unconfirmed"]
-    assert _optimize_stage(eng).status.value == "failed"
+    assert event["reason"] == "range_unreadable" and event["status"] == "unverified"
+    assert _optimize_stage(eng).status.value == "completed"
 
 
-def test_an_unreadable_head_fails_the_stage(tmp_path) -> None:
-    """A worktree directory that is not a git repo: HEAD is unresolvable, so the gate cannot
-    know what it would be reverting and cannot confirm it did."""
+def test_an_unreadable_head_is_reported_unverified(tmp_path) -> None:
     wt = tmp_path / "not-a-repo"
     wt.mkdir()
     eng = _engine(tmp_path, BenchmarkingProject())
@@ -597,51 +751,52 @@ def test_an_unreadable_head_fails_the_stage(tmp_path) -> None:
                                  checkpoint={"tag": "task/r1/t1/optimize/0", "sha": ""}))
 
     (event,) = _gate_events(eng)
-    assert event["reason"] == "head_unresolved" and event["reverted"] is False
-    assert "rev-parse HEAD failed" in event["revert_unconfirmed"]
-    assert _optimize_stage(eng).status.value == "failed"
+    assert event["reason"] == "head_unresolved" and event["status"] == "unverified"
 
 
-def test_no_worktree_to_inspect_is_reported_but_does_not_fail_the_stage(tmp_path) -> None:
-    """The third state: with no worktree there is nothing the engine could have cleaned and
-    nothing a retry's reset would fix, so the warning plus the dropped checkpoint is the whole
-    remedy — a veto would only turn an already-broken setup into a retry loop."""
+def test_a_regression_whose_revert_git_refuses_fails_the_stage(tmp_path, worktree) -> None:
+    """The not-kept path's safety net, unchanged by the redesign: a regressed commit the
+    engine cannot take off HEAD must not ride forward as a green pass."""
+    wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
-    work = _to_optimize(eng, worktree=str(tmp_path / "gone"), base_sha="a" * 40)
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 500.0}))
 
-    eng.record("r1", make_result(work, structured_output=_optimize_output(),
-                                 checkpoint={"tag": "task/r1/t1/optimize/0", "sha": "b" * 40}))
+    real_reset = Engine._optimize_gate_result
 
+    def lock_then_apply(self, *args, **kwargs):
+        # Measurement is done; hold the index just before the gate's REVERT reset.
+        if kwargs.get("revert"):
+            (wt / ".git" / "index.lock").write_text("")
+        return real_reset(self, *args, **kwargs)
+
+    Engine._optimize_gate_result = lock_then_apply  # type: ignore[method-assign]
+    try:
+        eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                     checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
+    finally:
+        Engine._optimize_gate_result = real_reset  # type: ignore[method-assign]
+        (wt / ".git" / "index.lock").unlink(missing_ok=True)
+
+    assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["reason"] == "worktree_missing" and event["reverted"] is False
-    assert "not a directory to inspect" in event["revert_unconfirmed"]
-    assert _optimize_stage(eng).status.value == "completed"
-    assert eng.store.load_task("r1", "t1").last_checkpoint is None
-
-
-def test_the_completion_note_never_claims_a_revert_that_did_not_happen(
-    tmp_path, worktree
-) -> None:
-    """The PR-facing half of the same bug: the heading came off the verdict's status, so an
-    unreverted pass printed "REVERTED" over a commit still sitting on the branch — a false
-    statement in the artifact a human merges from."""
-    wt, _ = worktree
-    eng = _engine(tmp_path, BenchmarkingProject())
-    work = _to_optimize(eng, worktree=str(wt), base_sha="")
-    _record_optimize(eng, work, wt, after={"hot": 10.0})
+    assert event["type"] == "optimize_benchmark_regressed" and event["reverted"] is False
+    assert f"HEAD is still {sha[:12]}" in event["revert_unconfirmed"]
+    stage = _optimize_stage(eng)
+    assert stage.status.value == "failed"
+    assert "could not be removed from the worktree" in (stage.error or "")
 
     note = render_completion_note(eng.store.load_task("r1", "t1"))
-
-    assert "NOT VERIFIED and NOT REVERTED" in note
-    assert "REVERTED — nothing to verify it with" not in note
+    assert "NOT KEPT and NOT REVERTED" in note
+    assert "REVERTED — it measured slower" not in note
     assert "could not confirm the commit was removed" in note
 
 
-def test_a_reset_git_refuses_fails_the_stage_instead_of_reporting_a_revert(
+def test_a_measurement_reset_git_refuses_keeps_the_pass_when_head_is_intact(
     tmp_path, worktree
 ) -> None:
-    """The anchor and HEAD both resolve, so the gate knows exactly which commit is still on
-    the branch after git declined to move the tree (here: a held index lock)."""
+    """git declined to move the tree to the anchor (a held index lock), so nothing was
+    measured — and the commit is confirmed still checked out, so it is kept unverified."""
     wt, base = worktree
     eng = _engine(tmp_path, BenchmarkingProject())
     work = _to_optimize(eng, worktree=str(wt), base_sha=base)
@@ -653,6 +808,38 @@ def test_a_reset_git_refuses_fails_the_stage_instead_of_reporting_a_revert(
 
     assert _head(wt) == sha
     (event,) = _gate_events(eng)
-    assert event["reason"] == "anchor_checkout_failed" and event["reverted"] is False
-    assert f"HEAD is still {sha[:12]}" in event["revert_unconfirmed"]
-    assert _optimize_stage(eng).status.value == "failed"
+    assert event["reason"] == "anchor_checkout_failed" and event["status"] == "unverified"
+    assert "head_unconfirmed" not in event
+    assert _optimize_stage(eng).status.value == "completed"
+
+
+def test_a_failed_measurement_reset_that_moved_head_fails_the_stage(
+    tmp_path, worktree, monkeypatch
+) -> None:
+    """The keep-side twin of the unconfirmed revert: if the tree is NOT at the stage's
+    commit after a failed reset and cannot be put back, "kept" would be a false verdict."""
+    import orchestrator.engine as engine_mod
+
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 1.0}))
+    real_run_git = engine_mod.run_git
+
+    def broken_reset(cwd, *args, **kwargs):
+        if args[:2] == ("reset", "--hard"):
+            # Move HEAD off the commit, then report failure — a reset that half-happened.
+            real_run_git(cwd, "reset", "--hard", base)
+            return subprocess.CompletedProcess(args, 1, "", "simulated failure")
+        return real_run_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(engine_mod, "run_git", broken_reset)
+    eng.record("r1", make_result(work, structured_output=_optimize_output(),
+                                 checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}))
+
+    (event,) = _gate_events(eng)
+    assert event["reason"] == "anchor_checkout_failed"
+    assert "stage commit" in event["head_unconfirmed"]
+    stage = _optimize_stage(eng)
+    assert stage.status.value == "failed"
+    assert "could not be restored" in (stage.error or "")

@@ -704,20 +704,33 @@ def unfiled_suggestions(
 
 # What the engine's OPTIMIZE benchmark verdict means to a human reading the PR (#520). The
 # heading has to answer "did this pass ship?" without a glossary, because the stage's own
-# `files_changed` is misleading on every status but `verified`.
+# `files_changed` is misleading on a reverted status. The keep rule is "no measured
+# regression", so a kept pass says that, and a measured speedup says so on top.
 _BENCHMARK_HEADINGS = {
-    "verified": "### Speed verified (engine-measured, commit kept)",
-    "no_win": "### Speed pass REVERTED — no measured win (engine-measured)",
-    "failed": "### Speed pass REVERTED — the benchmark could not be read",
-    "unavailable": "### Speed pass REVERTED — nothing to verify it with",
+    "verified": "### Speed pass kept — no regression measured",
+    "regressed": "### Speed pass REVERTED — it measured slower (engine-measured)",
+    "failed": "### Speed pass REVERTED — the change broke the benchmark",
+    "unverified": "### Speed pass kept UNVERIFIED — the benchmark could not check it",
     "skipped": "### Speed pass committed nothing",
+    # Pre-redesign statuses: runs recorded when a win was required and unmeasurable meant
+    # reverted. Kept so an old run's note still renders truthfully.
+    "no_win": "### Speed pass REVERTED — no measured win (engine-measured)",
+    "unavailable": "### Speed pass REVERTED — nothing to verify it with",
 }
+_BENCHMARK_IMPROVED_HEADING = "### Speed pass kept — measured faster, no regression"
+_BENCHMARK_SKIPPED_NO_IMPACT_HEADING = (
+    "### Speed pass committed nothing — not on a latency-sensitive path"
+)
+# Statuses whose commit the engine did NOT keep: only these claim a revert in their heading.
+_BENCHMARK_NOT_KEPT = frozenset({"regressed", "failed", "no_win", "unavailable"})
+# Pre-redesign verdicts measured against a required-improvement bar, not a regression band.
+_BENCHMARK_LEGACY = frozenset({"no_win", "unavailable"})
 
 # A not-kept verdict whose revert the engine could NOT confirm. The headings above all claim a
 # revert, so reading one off ``status`` alone would print "REVERTED" over a commit still
 # sitting on the branch — a false statement in the artifact a human merges from.
 _BENCHMARK_UNREVERTED_HEADING = (
-    "### Speed pass NOT VERIFIED and NOT REVERTED — its commit is still on the branch"
+    "### Speed pass NOT KEPT and NOT REVERTED — its commit is still on the branch"
 )
 
 
@@ -726,7 +739,7 @@ def _benchmark_lines(benchmark: object) -> list[str]:
 
     Renders the verdict the engine wrote into the OPTIMIZE output: the per-metric numbers via
     the shared ``benchmark_gate.format_metric_rows`` (so the note and ``events.jsonl`` cannot
-    disagree), the tolerance the verdict required, and whether the stage's commit survived.
+    disagree), the noise band the verdict used, and whether the stage's commit survived.
     An OPTIMIZE output with no verdict block at all (a run recorded before #520) renders
     nothing rather than implying a check that never ran.
 
@@ -736,19 +749,32 @@ def _benchmark_lines(benchmark: object) -> list[str]:
     if not isinstance(benchmark, dict) or not benchmark.get("status"):
         return []
     status = str(benchmark.get("status"))
+    reason = str(benchmark.get("reason") or "").strip()
     heading = _BENCHMARK_HEADINGS.get(status, f"### Speed pass ({status})")
-    if status not in ("verified", "skipped") and not benchmark.get("reverted"):
+    if status == "verified" and reason in ("improved", "win"):  # "win": pre-redesign runs
+        heading = _BENCHMARK_IMPROVED_HEADING
+    elif status == "skipped" and benchmark.get("impact") == "none":
+        heading = _BENCHMARK_SKIPPED_NO_IMPACT_HEADING
+    elif status in _BENCHMARK_NOT_KEPT and not benchmark.get("reverted"):
         heading = _BENCHMARK_UNREVERTED_HEADING
     lines = ["", heading]
     rows = [r for r in (benchmark.get("metrics") or []) if isinstance(r, dict)]
     lines += [f"- {line}" for line in format_metric_rows(rows)]
     tolerance = benchmark.get("tolerance")
     if isinstance(tolerance, (int, float)) and not isinstance(tolerance, bool):
-        lines.append(f"- required improvement: more than {float(tolerance) * 100:.1f}%")
+        pct = f"{float(tolerance) * 100:.1f}%"
+        lines.append(
+            f"- required improvement: more than {pct}" if status in _BENCHMARK_LEGACY
+            else f"- reverts only if a metric gets more than {pct} worse"
+        )
     detail = str(benchmark.get("detail") or "").strip()
-    reason = str(benchmark.get("reason") or "").strip()
     if status != "verified" and (detail or reason):
         lines.append(f"- reason: {detail or reason}")
+    if benchmark.get("head_unconfirmed"):
+        lines.append(
+            "- WARNING: the engine could not confirm the kept commit is still checked out "
+            f"({benchmark['head_unconfirmed']})"
+        )
     if benchmark.get("revert_error"):
         # A revert the engine could not perform must not read as one it did.
         lines.append(f"- WARNING: the revert itself failed: {benchmark['revert_error']}")
@@ -977,6 +1003,17 @@ def render_completion_note(
     # and a reverted pass says so in the heading rather than leaving a reader to read its
     # `files_changed` as landed work.
     lines += _benchmark_lines(optimize.get("benchmark"))
+    # The reasoning pass's own account: each fix with its one-line why, under the impact
+    # class it judged the change to have (absent on outputs recorded before the redesign).
+    changes = [c for c in (optimize.get("changes") or []) if isinstance(c, dict)]
+    if changes:
+        impact = optimize.get("impact")
+        lines += ["", "### Speed changes (stage-reported"
+                      + (f", impact: {impact})" if isinstance(impact, str) else ")")]
+        for c in changes:
+            why = str(c.get("rationale") or "").strip()
+            lines.append(f"- {c.get('description', '(undescribed)')}"
+                         + (f" — {why}" if why else ""))
     measurements = [m for m in (optimize.get("measurements") or []) if isinstance(m, dict)]
     if measurements:
         lines += ["", "### What the pass profiled (stage-reported)"]

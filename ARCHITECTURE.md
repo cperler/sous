@@ -175,34 +175,43 @@ so its cost and failures are visible without restoring the old opaque quality lo
   implement) into whatever pipeline it persists, so lane presets, cost-routed presets and
   decomposition children all pick it up from one place. A project that does not opt in gets a
   byte-identical pipeline to a pre-#519 engine, and a `none` quality tier declines the stage
-  like any other quality pass. The stage makes LOCAL measured speed changes and commits them;
-  the architectural changes it deliberately does NOT make come back as `suggestions` with a
+  like any other quality pass. Speed is designed in before it is optimized: SCOPE returns a
+  short `performance` note (is the work on a latency-sensitive path; the waits, blocking
+  calls, round trips, hand-offs and parallelism that decide its speed; what to avoid), folded
+  into the context plane so IMPLEMENT builds with it. OPTIMIZE is then a REASONING pass, not a
+  measure-edit-measure loop: it first classifies the change's `impact` (`none` / `local` /
+  `hot_path`) and on `none` (offline tools, docs, tests) commits nothing and stops; otherwise
+  it reads the change for where time goes — complexity, repeated work, needless waits and
+  polling, I/O in loops, blocking where batching fits, needless copies — and commits the clear
+  LOCAL fixes, each with a one-line rationale (`changes`). Measuring is welcome, not required.
+  The cross-cutting changes it deliberately does NOT make come back as `suggestions` with a
   disposition, and the engine files the `file` ones as enhancement issues under the same
   per-task cap and title dedupe as a review finding — so a task never turns into a redesign
-  and the idea is not lost. Its speed claim is checked by the harness, not the prompt (#520):
-  the engine runs the project adapter's declared `benchmark_cmd` argv ITSELF — at the
-  last-good checkpoint and again at the stage's commit, back to back in the task worktree so
-  the two numbers are comparable — and compares them through the pure
-  `orchestrator/benchmark_gate.py` layer against an adapter-declared `benchmark_tolerance`
-  (default 5%). A win means at least one metric improved past the tolerance and none
-  regressed past it. Anything else — no win, a regression, a red or unparseable benchmark, no
-  benchmark declared at all, a dirty worktree — does NOT keep the commit: the engine
-  hard-resets the worktree to the anchor and drops the stage's `checkpoint`, so
-  `task.last_checkpoint` keeps naming the last VERIFIED commit and a later retry resets to it.
-  The stage still records SUCCESS (reverting a pass that did not pay off is an outcome of the
-  pass, not a failure to retry) — with one exception: dropping the checkpoint does not by
-  itself take a commit off HEAD, and nothing between OPTIMIZE and DELIVER re-reads the tree,
-  so the revert is CONFIRMED against HEAD rather than assumed from the reset's exit code. A
-  real worktree whose HEAD is still not the anchor (no anchor to reset to, an unreadable HEAD,
-  a reset git refused) downgrades the result to FAILURE, which both reports honestly and puts
-  the stage on the retry path whose dispatch resets the worktree. With no worktree at all
-  there is nothing to clean and nothing a reset would fix, so that one stays a warning.
-  Every path emits exactly one event
-  (`optimize_benchmark_verified` / `_no_win` / `_failed` / `_unavailable` / `_skipped`) plus a
-  verdict block on the stage output, because a gate that could not run must never read like
-  one that passed — and the completion note's heading comes off that block's real `reverted`
-  flag, so it cannot print "REVERTED" over a commit still on the branch. The model's own
-  `measurements` stay in the output as profiling detail and decide nothing.
+  and the idea is not lost. The harness checks the pass for REGRESSIONS (#520): the engine
+  runs the project adapter's declared `benchmark_cmd` argv ITSELF — at the last-good
+  checkpoint and again at the stage's commit, back to back in the task worktree so the two
+  numbers are comparable — and compares them through the pure `orchestrator/benchmark_gate.py`
+  layer against an adapter-declared `benchmark_tolerance` (a 5% noise band by default). The
+  commit is KEPT unless a comparable metric regressed past the tolerance, or the benchmark
+  was green at the anchor and broke at the commit; a win is reported, not required, because
+  the pass's fixes often sit off the one path the benchmark exercises and a win-required gate
+  reverted them on noise. When nothing can be measured — no benchmark declared, one already
+  broken at the anchor, no shared metric, a dirty worktree, unreadable git plumbing — the
+  commit is kept but marked UNVERIFIED (warning event, explicit PR heading); keeping needs no
+  proof now, and the project's review-time gates still run. A not-kept pass hard-resets the
+  worktree to the anchor and drops the stage's `checkpoint`, so `task.last_checkpoint` keeps
+  naming the last good commit and a later retry resets to it. The stage still records SUCCESS
+  through a revert — with one exception: dropping the checkpoint does not by itself take a
+  commit off HEAD, and nothing between OPTIMIZE and DELIVER re-reads the tree, so the revert
+  is CONFIRMED against HEAD rather than assumed from the reset's exit code, and an
+  unconfirmed one (or, on the keep side, a failed measurement reset whose commit cannot be
+  confirmed back on HEAD) downgrades the result to FAILURE, which reports honestly and puts
+  the stage on the retry path whose dispatch resets the worktree. Every path emits exactly one
+  event (`optimize_benchmark_verified` / `_regressed` / `_failed` / `_unverified` /
+  `_skipped`) plus a verdict block on the stage output, because a gate that could not run must
+  never read like one that passed — and the completion note's heading comes off that block's
+  real `reverted` flag, so it cannot print "REVERTED" over a commit still on the branch. The
+  model's own `measurements` stay in the output as profiling detail and decide nothing.
 
 - **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
   made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs

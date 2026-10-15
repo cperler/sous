@@ -348,21 +348,33 @@ _TRUNK_GATE_TAIL_LINES = 40
 _ATTRIBUTION_SCAN_COMMIT_CAP = 50
 
 # Per-run wall-clock bound for ONE benchmark leg of the OPTIMIZE gate (#520); the gate runs
-# two. Matched to the OPTIMIZE stage's own 1800s timeout: a benchmark that outlives the stage
-# that produced it is hung, and the gate then degrades to advisory (the commit is dropped)
-# rather than wedging record().
+# two. The benchmark is the PROJECT's, not the stage's, so this is sized to a slow project
+# benchmark rather than to the (shorter) OPTIMIZE stage timeout, and it matches the scaffolded
+# REVIEW benchmark gate's bound so one argv is not given two budgets. A leg that runs past it
+# is a red leg: at the anchor that leaves the pass unverified (kept); at the stage's commit,
+# after a green anchor run, it reads as the pass having broken the benchmark (reverted) —
+# either way record() is never wedged.
 _BENCHMARK_TIMEOUT_S = 1800
 
 # The veto an OPTIMIZE result gets when the gate decided NOT to keep its commit but could not
 # confirm the commit is off the worktree's HEAD (#520 review). Dropping the checkpoint alone
 # does not undo a commit: nothing between here and DELIVER re-checks HEAD against
-# ``last_checkpoint``, so an unreverted commit would ride into the PR as verified work. A
+# ``last_checkpoint``, so an unreverted commit would ride into the PR as checked work. A
 # FAILURE is the honest report — it also puts the stage on the retry path, whose dispatch
 # resets the worktree to the last-good checkpoint before re-running it. Stable (it feeds
 # ``error_signature`` and the breaker's identical-failure streak): enrich the detail, not this.
 _OPTIMIZE_UNREVERTED_VETO = (
-    "optimize benchmark gate: the pass was not verified and its commit could not be removed "
-    "from the worktree, so the unverified change must not ride forward"
+    "optimize benchmark gate: the pass measured slower or broke the benchmark and its commit "
+    "could not be removed from the worktree, so the change must not ride forward"
+)
+
+# The keep-side twin: the gate tried to move the tree to measure the anchor, the move failed,
+# and it could not confirm the stage's commit is still what is checked out. The verdict says
+# "kept", so a tree sitting anywhere else would hand TEST/DELIVER something the verdict does
+# not describe. Stable, for the same error_signature reason as above.
+_OPTIMIZE_UNRESTORED_VETO = (
+    "optimize benchmark gate: a failed measurement reset left the worktree off the stage's "
+    "commit and it could not be restored"
 )
 
 
@@ -2728,12 +2740,13 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
-        # #520: the OPTIMIZE stage's speed claim, checked by the harness instead of trusted.
-        # The engine runs the project adapter's declared benchmark before and after the
-        # stage's commit and strips the checkpoint (plus hard-resets the worktree) unless the
-        # numbers show a win — so "it got faster" is a measurement, not prose. A revert it
-        # cannot CONFIRM fails the stage, because a stripped checkpoint alone still leaves the
-        # unverified commit on HEAD for TEST/DELIVER to ship. Placed here,
+        # #520: the OPTIMIZE pass, checked by the harness for REGRESSIONS. The engine runs
+        # the project adapter's declared benchmark before and after the stage's commit and
+        # strips the checkpoint (plus hard-resets the worktree) when the numbers got slower or
+        # the change broke the benchmark — so "it did not slow anything down" is a
+        # measurement, not prose. A revert it cannot CONFIRM fails the stage, because a
+        # stripped checkpoint alone still leaves the commit on HEAD for TEST/DELIVER to ship.
+        # Placed here,
         # BEFORE the locked transition absorbs ``effective.checkpoint`` into
         # ``task.last_checkpoint``, which is the whole mechanism for not keeping the commit.
         if effective.stage is Stage.OPTIMIZE and effective.status is ResultStatus.SUCCESS:
@@ -3754,7 +3767,8 @@ class Engine:
     # --- OPTIMIZE benchmark gate (#520) -------------------------------------------------
 
     def _benchmark_tolerance(self) -> tuple[float, dict[str, str] | None]:
-        """The adapter's declared win threshold, or the documented default.
+        """The adapter's declared noise band (how far a metric must move to count as
+        regressed or improved), or the documented default.
 
         Duck-typed like every other optional adapter hook: a float attribute, a zero-arg
         callable, or nothing at all. A value that is not a finite number >= 0 is REPLACED by
@@ -3806,7 +3820,7 @@ class Engine:
         self, run_id: str, task: Task, result: StageResult, *,
         prior_checkpoint_sha: str | None,
     ) -> StageResult:
-        """Keep a successful OPTIMIZE commit only on an engine-MEASURED win (#520).
+        """Keep a successful OPTIMIZE commit unless the engine MEASURES a regression (#520).
 
         #519 shipped the stage with model-reported ``measurements``, i.e. a speed claim no
         check could falsify. This is the check: the engine runs the project adapter's
@@ -3815,43 +3829,50 @@ class Engine:
         two numbers are comparable, and compares them with the pure
         ``orchestrator.benchmark_gate`` layer.
 
-        Not a win (or not measurable) means the commit is NOT kept: the worktree is
-        hard-reset to the anchor and the returned result carries no ``checkpoint``, so
-        ``task.last_checkpoint`` keeps naming the last VERIFIED commit and a later retry
-        resets to it. The stage stays SUCCESS through a revert — reverting a speed pass that
-        did not pay off is a valid outcome of the pass, not a failure to retry, and the stage
-        prompt already says so.
+        The keep rule is "no regression", not "a measured win". OPTIMIZE is a reasoning pass
+        whose fixes (an O(N) lookup made O(1), a needless poll removed) often sit off the one
+        path the benchmark exercises, and a win-required gate reverted them on noise. So:
 
-        The ONE case that does fail the stage is a revert the gate cannot confirm: the git
-        plumbing itself broke (no anchor, an unreadable HEAD, a reset that failed), so the
-        unverified commit may still be on HEAD. Dropping the checkpoint does not undo a
-        commit and nothing downstream re-reads the tree, so reporting SUCCESS there would
-        ship the unverified change as if it had been measured. See ``_optimize_gate_result``.
+        * no judged metric regressed past the tolerance → KEPT, ``verified`` (``reason``
+          says ``improved`` or ``no_regression``, so a measured speedup still reads as one);
+        * a judged metric regressed → NOT kept, ``regressed``;
+        * the benchmark was readable and green at the anchor but red or unreadable at the
+          stage's commit → NOT kept, ``failed``: the change broke the measurement itself;
+        * nothing could be measured (no benchmark declared, a benchmark already broken at
+          the anchor, no shared metric, a dirty tree, git plumbing the gate could not read)
+          → KEPT but ``unverified``, warning-grade. Unverified is no longer a reason to
+          revert, because keeping no longer needs proof — the project's review-time gates
+          still run over the change, and the warning keeps it from reading as green.
+
+        Not kept means the worktree is hard-reset to the anchor and the returned result
+        carries no ``checkpoint``, so ``task.last_checkpoint`` keeps naming the last good
+        commit and a later retry resets to it. The stage stays SUCCESS through a revert — a
+        pass that slowed things down is an outcome of the pass, not a failure to retry. The
+        ONE case that fails the stage is a revert (or, after a failed measurement reset, a
+        restore) the gate cannot confirm: the tree may then hold a commit the verdict says
+        it does not, and nothing downstream re-reads it. See ``_optimize_gate_result``.
 
         Every path writes a verdict block into ``structured_output['benchmark']`` and emits
         exactly one event, because "verified green" and "never measured" must not read alike:
-        ``optimize_benchmark_verified`` (info, kept), or warning-grade
-        ``optimize_benchmark_no_win`` / ``optimize_benchmark_failed`` (the benchmark ran and
-        was red or unreadable) / ``optimize_benchmark_unavailable`` (there was nothing
-        runnable to measure with) / ``optimize_benchmark_skipped`` (the pass committed
-        nothing, so there is nothing to keep or revert).
+        ``optimize_benchmark_verified`` (info, kept), ``optimize_benchmark_skipped`` (info,
+        the pass committed nothing — the stage's ``impact: none`` exit lands here), or
+        warning-grade ``optimize_benchmark_regressed`` / ``optimize_benchmark_failed``
+        (reverted) / ``optimize_benchmark_unverified`` (kept, unmeasured).
         """
         worktree = str(task.context.get("worktree") or "").strip()
         anchor = (prior_checkpoint_sha or str(task.context.get("base_sha") or "")).strip()
+        impact = (result.structured_output or {}).get("impact")
 
         if not worktree or not Path(worktree).is_dir():
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="worktree_missing",
-                detail=f"task worktree {worktree or '(unset)'} is not a directory; "
-                       "the benchmark could not run and the commit could not be reverted",
-                worktree=None, anchor=anchor,
+                detail=f"task worktree {worktree or '(unset)'} is not a directory, so the "
+                       "benchmark could not run",
             )
         if not anchor:
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="no_anchor",
-                detail="no prior checkpoint or base_sha to measure against, so the pass "
-                       "can be neither verified nor undone",
-                worktree=worktree, anchor="",
+                detail="no prior checkpoint or base_sha to measure against",
             )
 
         head = str((result.checkpoint or {}).get("sha") or "").strip()
@@ -3859,63 +3880,58 @@ class Engine:
             probe = run_git(worktree, "rev-parse", "HEAD")
             head = probe.stdout.strip() if probe.returncode == 0 else ""
         if not head:
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="head_unresolved",
                 detail="could not resolve the stage's HEAD commit",
-                worktree=worktree, anchor=anchor,
             )
 
         counted = run_git(worktree, "rev-list", "--count", f"{anchor}..{head}")
         if counted.returncode != 0:
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="range_unreadable",
                 detail=f"git rev-list {anchor}..{head} failed: "
                        f"{(counted.stderr or '').strip()[:200]}",
-                worktree=worktree, anchor=anchor,
             )
         if counted.stdout.strip() in ("", "0"):
-            # A clean no-op pass. Nothing to keep, nothing to revert, nothing to measure —
-            # but the receipt still fires, so a skipped gate never reads as a verified one.
+            # A clean no-op pass — including the stage's own ``impact: none`` exit. Nothing
+            # to keep, nothing to revert, nothing to measure, so the benchmark is not run at
+            # all; but the receipt still fires, so a skipped gate never reads as verified.
             return self._optimize_gate_result(
                 run_id, task, result, event="optimize_benchmark_skipped", level="info",
                 block={"status": "skipped", "reason": "no_changes", "reverted": False,
-                       "anchor": anchor, "head": head},
+                       "anchor": anchor, "head": head,
+                       **({"impact": impact} if isinstance(impact, str) else {})},
                 strip_checkpoint=False,
             )
 
         dirty = run_git(worktree, "status", "--porcelain")
         if dirty.returncode == 0 and dirty.stdout.strip():
             # Measuring the anchor means hard-resetting the tree, which would destroy
-            # uncommitted leftovers. Refuse to measure rather than quietly delete them on the
-            # win path; the revert then discards them exactly as a retry reset would.
-            return self._optimize_gate_unavailable(
+            # uncommitted leftovers. Refuse to measure rather than quietly delete them; the
+            # commit stays (keeping needs no proof) and the leftovers are left untouched.
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="worktree_dirty",
                 detail="the worktree has uncommitted changes, so the before/after "
                        "measurement cannot be taken without destroying them",
-                worktree=worktree, anchor=anchor,
             )
 
         getter = getattr(self.project, "benchmark_cmd", None)
         if not callable(getter):
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="absent",
-                detail="the project adapter declares no benchmark_cmd, so an OPTIMIZE "
-                       "claim cannot be verified",
-                worktree=worktree, anchor=anchor,
+                detail="the project adapter declares no benchmark_cmd to check the pass with",
             )
         try:
             argv = list(getter() or [])
         except Exception as exc:  # noqa: BLE001 - an adapter getter cannot break record()
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="getter_raised",
                 detail=f"benchmark_cmd raised ({type(exc).__name__}: {exc})",
-                worktree=worktree, anchor=anchor,
             )
         if not argv or argv == ["true"]:
-            return self._optimize_gate_unavailable(
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="noop",
                 detail="benchmark_cmd is the no-op sentinel",
-                worktree=worktree, anchor=anchor,
             )
 
         tolerance, tolerance_notice = self._benchmark_tolerance()
@@ -3923,14 +3939,14 @@ class Engine:
 
         reset = run_git(worktree, "reset", "--hard", anchor)
         if reset.returncode != 0:
-            return self._optimize_gate_unavailable(
+            # Nothing was measured, so the commit is kept unverified — but the gate just
+            # tried to move the tree, so it must CONFIRM the commit is still checked out
+            # before calling it kept (``restore_head``).
+            return self._optimize_gate_unverified(
                 run_id, task, result, reason="anchor_checkout_failed",
                 detail=f"git reset --hard {anchor} failed: "
                        f"{(reset.stderr or '').strip()[:200]}",
-                # The reset just failed; re-running it would only fail again. The
-                # post-condition check below is what decides whether the commit is really
-                # still there (a reset can fail with the tree already at the anchor).
-                worktree=worktree, anchor=anchor, revert=False, notices=notices,
+                notices=notices, restore_head=(worktree, head),
             )
         before_leg = self._run_benchmark(worktree, argv, timeout_s=_BENCHMARK_TIMEOUT_S)
         before_metrics, before_error = parse_benchmark_output(before_leg["stdout"])
@@ -3938,7 +3954,7 @@ class Engine:
         restore = run_git(worktree, "reset", "--hard", head)
         if restore.returncode != 0:
             # The tree is stuck at the anchor: the commit is already not kept, and saying so
-            # honestly beats reporting a revert we did not choose.
+            # honestly beats reporting a keep that did not happen.
             return self._optimize_gate_result(
                 run_id, task, result, event="optimize_benchmark_failed", level="warning",
                 block={"status": "failed", "reason": "head_restore_failed", "reverted": True,
@@ -3966,20 +3982,33 @@ class Engine:
                 ([f"benchmark exited non-zero on the {'/'.join(red)} run"] if red else [])
                 + errors
             ) or "the benchmark produced no readable metrics"
+            base_block = {
+                "reason": "benchmark_red" if red else "unreadable_output",
+                "anchor": anchor, "head": head, "argv": argv, "tolerance": tolerance,
+                "notices": notices, "detail": detail, "legs": legs,
+            }
+            before_ok = before_leg["rc"] == 0 and before_metrics is not None
+            if before_ok:
+                # Green and readable at the anchor, broken at the stage's commit: the pass
+                # broke the measurement itself (a crash, a hang past the bound, garbled
+                # output). That is a regression the benchmark DID observe — not kept.
+                return self._optimize_gate_result(
+                    run_id, task, result,
+                    event="optimize_benchmark_failed", level="warning",
+                    block={"status": "failed", "reverted": False, **base_block},
+                    strip_checkpoint=True, worktree=worktree, anchor=anchor, revert=True,
+                )
+            # Already broken at the anchor: the benchmark cannot judge this pass either way,
+            # so the reasoned change is kept, marked unverified.
             return self._optimize_gate_result(
                 run_id, task, result,
-                event="optimize_benchmark_failed", level="warning",
-                block={"status": "failed",
-                       "reason": "benchmark_red" if red else "unreadable_output",
-                       "reverted": False, "anchor": anchor, "head": head, "argv": argv,
-                       "tolerance": tolerance, "notices": notices, "detail": detail,
-                       "legs": legs},
-                strip_checkpoint=True, worktree=worktree, anchor=anchor, revert=True,
+                event="optimize_benchmark_unverified", level="warning",
+                block={"status": "unverified", "reverted": False, **base_block},
+                strip_checkpoint=False,
             )
 
         verdict = compare_benchmarks(before_metrics, after_metrics, tolerance=tolerance)
         block = {
-            "status": "verified" if verdict["kept"] else "no_win",
             "reason": verdict["reason"], "reverted": not verdict["kept"],
             "anchor": anchor, "head": head, "argv": argv,
             "tolerance": tolerance, "metrics": verdict["metrics"],
@@ -3987,42 +4016,70 @@ class Engine:
             "summary": format_metric_rows(verdict["metrics"]),
             "legs": legs,
         }
-        if verdict["kept"]:
+        if not verdict["kept"]:
             return self._optimize_gate_result(
-                run_id, task, result, event="optimize_benchmark_verified", level="info",
-                block=block, strip_checkpoint=False,
+                run_id, task, result, event="optimize_benchmark_regressed", level="warning",
+                block={"status": "regressed", **block}, strip_checkpoint=True,
+                worktree=worktree, anchor=anchor, revert=True,
+            )
+        if verdict["reason"] == "no_metrics_compared":
+            return self._optimize_gate_result(
+                run_id, task, result, event="optimize_benchmark_unverified", level="warning",
+                block={"status": "unverified",
+                       "detail": "the before and after runs share no comparable metric",
+                       **block},
+                strip_checkpoint=False,
             )
         return self._optimize_gate_result(
-            run_id, task, result, event="optimize_benchmark_no_win", level="warning",
-            block=block, strip_checkpoint=True,
-            worktree=worktree, anchor=anchor, revert=True,
+            run_id, task, result, event="optimize_benchmark_verified", level="info",
+            block={"status": "verified", **block}, strip_checkpoint=False,
         )
 
-    def _optimize_gate_unavailable(
+    def _optimize_gate_unverified(
         self, run_id: str, task: Task, result: StageResult, *,
-        reason: str, detail: str, worktree: str | None, anchor: str,
-        revert: bool = True, notices: list[dict[str, str]] | None = None,
+        reason: str, detail: str, notices: list[dict[str, str]] | None = None,
+        restore_head: tuple[str, str] | None = None,
     ) -> StageResult:
-        """The advisory path: nothing runnable to measure with, so nothing is kept.
+        """The advisory path: nothing could be measured, so the commit is KEPT, unverified.
 
-        ``worktree``/``anchor`` are what the revert and the post-condition check in
-        ``_optimize_gate_result`` need — pass them on EVERY outcome, including the ones that
-        bailed out before running anything, because dropping the checkpoint does not by
-        itself take the stage's commit off the branch. ``revert=False`` suppresses only the
-        reset attempt (the caller already tried it and it failed); the check still runs."""
+        Keeping no longer needs proof — only a measured regression reverts — so an
+        unmeasurable pass keeps its reasoned change and says loudly that nobody checked it
+        (warning event, ``unverified`` status, an explicit PR heading). The project's
+        review-time policy gates still run over the change.
+
+        ``restore_head=(worktree, head)`` is for the one caller that already TRIED to move the
+        tree (a failed measurement reset): the commit is only "kept" if HEAD is confirmed at
+        ``head``, so the gate re-asserts it and, if it cannot, fails the stage — calling a
+        commit kept while the tree sits somewhere else would hand TEST/DELIVER a different
+        tree than the verdict describes."""
+        block: dict = {"status": "unverified", "reason": reason, "detail": detail,
+                       "reverted": False, "notices": notices or []}
+        veto: str | None = None
+        if restore_head is not None:
+            worktree, head = restore_head
+            confirmed, why = self._optimize_revert_confirmed(
+                worktree, head, label="stage commit")
+            if confirmed is False:
+                run_git(worktree, "reset", "--hard", head)
+                confirmed, why = self._optimize_revert_confirmed(
+                    worktree, head, label="stage commit")
+            if confirmed is False:
+                block["head_unconfirmed"] = why
+                veto = f"{_OPTIMIZE_UNRESTORED_VETO} ({why})"
         return self._optimize_gate_result(
-            run_id, task, result, event="optimize_benchmark_unavailable", level="warning",
-            block={"status": "unavailable", "reason": reason, "detail": detail,
-                   "reverted": False, "anchor": anchor, "notices": notices or []},
-            strip_checkpoint=True, worktree=worktree, anchor=anchor,
-            revert=revert and bool(worktree and anchor),
+            run_id, task, result, event="optimize_benchmark_unverified", level="warning",
+            block=block, strip_checkpoint=False, veto=veto,
         )
 
     @staticmethod
     def _optimize_revert_confirmed(
-        worktree: str | None, anchor: str
+        worktree: str | None, anchor: str, *, label: str = "anchor"
     ) -> tuple[bool | None, str]:
-        """Is the unverified OPTIMIZE commit CONFIRMED off the worktree's HEAD? (#520 review.)
+        """Is the not-kept OPTIMIZE commit CONFIRMED off the worktree's HEAD? (#520 review.)
+
+        Equally "is HEAD confirmed at ``anchor``": the unverified-keep path reuses it with
+        the stage's own commit as the target (``label="stage commit"``) to confirm a failed
+        measurement reset left the kept commit checked out.
 
         Returns ``(confirmed, detail)`` with three states, because "it is gone", "it may
         still be there" and "there is no tree to look in" are three different facts:
@@ -4049,7 +4106,7 @@ class Engine:
             return False, (f"git rev-parse {anchor} failed: "
                            f"{(target.stderr or '').strip()[:200]}")
         if head.stdout.strip() != target.stdout.strip():
-            return False, (f"HEAD is still {head.stdout.strip()[:12]}, not the anchor "
+            return False, (f"HEAD is still {head.stdout.strip()[:12]}, not the {label} "
                            f"{target.stdout.strip()[:12]}")
         return True, ""
 
@@ -4057,6 +4114,7 @@ class Engine:
         self, run_id: str, task: Task, result: StageResult, *,
         event: str, level: str, block: dict, strip_checkpoint: bool,
         worktree: str | None = None, anchor: str = "", revert: bool = False,
+        veto: str | None = None,
     ) -> StageResult:
         """Apply one gate outcome: revert if asked, CONFIRM the revert, emit its single event,
         and fold the verdict block into the stage output.
@@ -4066,8 +4124,9 @@ class Engine:
         command's exit code. An unconfirmed revert additionally DOWNGRADES the result to a
         FAILURE (``_OPTIMIZE_UNREVERTED_VETO``): stripping the checkpoint keeps the unverified
         commit from becoming the anchor, but it does not take the commit off HEAD, and nothing
-        between here and DELIVER re-reads the tree — so without the veto an unmeasurable pass
-        whose revert failed would ship as if it had been verified.
+        between here and DELIVER re-reads the tree — so without the veto a regressing pass
+        whose revert failed would ship as if it had been checked. A kept outcome can carry a
+        caller-decided ``veto`` too (``_optimize_gate_unverified``'s unconfirmed restore).
 
         The event is appended directly rather than collected into ``record``'s atomic batch
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
@@ -4078,7 +4137,6 @@ class Engine:
             reset = run_git(worktree, "reset", "--hard", anchor)
             if reset.returncode != 0:
                 block["revert_error"] = (reset.stderr or "").strip()[:200]
-        veto: str | None = None
         if strip_checkpoint:
             confirmed, why = self._optimize_revert_confirmed(worktree, anchor)
             block["reverted"] = confirmed is True

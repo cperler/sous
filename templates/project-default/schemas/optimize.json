@@ -1,16 +1,35 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "optimize",
-  "description": "Stage output contract: one bounded, measured speed pass, plus the architectural changes it deliberately did NOT make.",
+  "description": "Stage output contract: one reasoned speed pass over the change (impact classification, clear local fixes with their rationale), plus the cross-cutting changes it deliberately did NOT make.",
   "type": "object",
-  "required": ["files_changed", "summary", "committed", "measurements"],
+  "required": ["files_changed", "summary", "committed"],
   "properties": {
+    "impact": {
+      "type": "string",
+      "enum": ["none", "local", "hot_path"],
+      "description": "how close the change sits to a latency-sensitive path: `hot_path` (it changes one), `local` (near one, or code where speed still matters), `none` (offline tools, docs, tests only — the pass commits nothing and stops). Optional so outputs recorded before it existed still parse; an absent value reads as unclassified, never as `none`."
+    },
     "files_changed": {"type": "array", "items": {"type": "string"}},
     "summary": {"type": "string"},
     "committed": {"type": "boolean"},
+    "changes": {
+      "type": "array",
+      "description": "each speed fix this pass committed, with its one-line rationale (e.g. 'dict lookup instead of a list scan per row: O(N^2) -> O(N)'). Optional; empty or omitted for a no-op pass.",
+      "items": {
+        "type": "object",
+        "required": ["description"],
+        "properties": {
+          "description": {"type": "string", "description": "the change, one line"},
+          "rationale": {"type": "string", "description": "why it is faster, one line"},
+          "file": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
     "measurements": {
       "type": "array",
-      "description": "what you actually timed, before and after. Required (an empty array is the honest answer for a no-op pass) because an unmeasured speed claim is not a speed claim. MODEL-REPORTED profiling detail — useful for WHY the change was made, but no longer what decides anything: since #520 the engine runs the project adapter's declared benchmark itself, before and after this stage's commit, and keeps the commit only on a measured win (see `benchmark`). Report what you ran, never an estimate.",
+      "description": "what you actually timed, before and after, if you timed anything. Optional — measuring is welcome when cheap but not required to keep a change. MODEL-REPORTED profiling detail: it decides nothing; the engine runs the project adapter's declared benchmark itself and reverts only on a measured regression (see `benchmark`). Report what you ran, never an estimate.",
       "items": {
         "type": "object",
         "required": ["name", "before", "after"],
@@ -25,16 +44,18 @@
     },
     "benchmark": {
       "type": "object",
-      "description": "ENGINE-OWNED verdict (#520) — do NOT author this key: whatever a stage returns here is overwritten by the engine's own before/after run of the project adapter's declared benchmark command, taken at the last-good checkpoint and at this stage's commit. `status` is `verified` (a win beyond the tolerance, commit kept), `no_win` (measured, nothing beyond the tolerance, or a regression — commit reverted), `failed` (the benchmark ran red or printed unreadable output — reverted), `unavailable` (nothing runnable to measure with: no adapter benchmark, a dirty worktree, no anchor — reverted) or `skipped` (the pass committed nothing, so there was nothing to keep or revert).",
+      "description": "ENGINE-OWNED verdict (#520) — do NOT author this key: whatever a stage returns here is overwritten by the engine's own before/after run of the project adapter's declared benchmark command, taken at the last-good checkpoint and at this stage's commit. The keep rule is NO REGRESSION, not a measured win. `status` is `verified` (measured, no comparable metric regressed past the tolerance — commit kept; `reason` is `improved` or `no_regression`), `regressed` (a metric got slower past the tolerance — reverted), `failed` (the benchmark was green at the anchor but red or unreadable at the stage's commit, i.e. the change broke it, or the tree could not be put back after measuring — reverted), `unverified` (nothing could be measured: no adapter benchmark, a benchmark already broken at the anchor, no shared metric, a dirty worktree, no anchor — commit KEPT, warning-grade) or `skipped` (the pass committed nothing, e.g. `impact: none`, so the benchmark did not run). `no_win` and `unavailable` are the pre-redesign statuses (a win was required then, and unmeasurable meant reverted); they appear only on runs recorded before the change.",
       "properties": {
         "status": {
           "type": "string",
-          "enum": ["verified", "no_win", "failed", "unavailable", "skipped"]
+          "enum": ["verified", "regressed", "failed", "unverified", "skipped", "no_win", "unavailable"]
         },
         "reason": {"type": "string"},
+        "impact": {"type": "string", "description": "the stage's own impact classification, echoed on a skipped verdict"},
         "reverted": {"type": "boolean", "description": "whether the engine CONFIRMED the stage's commit is off the worktree HEAD — not merely that a reset was attempted. False on a not-kept verdict means the commit may still be on the branch, `revert_unconfirmed` names why, and the stage is failed rather than reported green."},
         "revert_unconfirmed": {"type": "string", "description": "why the engine could not confirm the commit was removed; present only on a not-kept verdict whose revert it could not verify"},
-        "tolerance": {"type": "number", "description": "the minimum relative improvement this verdict required"},
+        "head_unconfirmed": {"type": "string", "description": "on an unverified verdict whose measurement reset failed: why the engine could not confirm the kept commit is still checked out (the stage is then failed)"},
+        "tolerance": {"type": "number", "description": "the noise band: a metric must move by more than this fraction to count as regressed (reverts) or improved (reported)"},
         "metrics": {
           "type": "array",
           "description": "one row per metric measured on both sides: name/before/after/unit/lower_is_better/delta_fraction (signed so positive is better)/direction/judged",
@@ -48,13 +69,13 @@
     },
     "suggestions": {
       "type": "array",
-      "description": "architectural changes this stage judged out of its own scope and did NOT apply (a process-pool restructure, a shared-memory layout, a different lock strategy) — so a task never turns into a redesign and the idea is not lost. Optional; omit or return an empty array when there are none. The engine files one as an enhancement issue at finalize only when it carries an explicit `file` disposition, subject to the same per-task cap and title dedupe as a review finding.",
+      "description": "cross-cutting or architectural changes this stage judged out of its own scope and did NOT apply (a process-pool restructure, a shared-memory layout, a different lock strategy) — so a task never turns into a redesign and the idea is not lost. Optional; omit or return an empty array when there are none. The engine files one as an enhancement issue at finalize only when it carries an explicit `file` disposition, subject to the same per-task cap and title dedupe as a review finding.",
       "items": {
         "type": "object",
         "required": ["description"],
         "properties": {
           "description": {"type": "string", "description": "the change itself, one sentence first — its leading line becomes the enhancement issue title"},
-          "rationale": {"type": "string", "description": "why it would pay off, and what this pass measured that points at it — the issue body"},
+          "rationale": {"type": "string", "description": "why it would pay off, and what this pass found that points at it — the issue body"},
           "disposition": {
             "type": "string",
             "enum": ["file", "drop"],

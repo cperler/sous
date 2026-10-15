@@ -102,8 +102,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "`append` on a file run in parallel; any `rewrite` on a path serializes "
             "everything else on it. When in doubt, say `rewrite`: over-serializing costs "
             "some parallelism, while a wrong `append` costs a broken merge.\n"
+            "Design with speed in mind, and say how in `performance`: a short note on "
+            "whether the work touches a latency-sensitive path and, if it does, the choices "
+            "that decide its speed — waits and polling, blocking calls, round trips, how "
+            "components hand data to each other, what can run in parallel — and what to "
+            "avoid. Keep it to a line when the work is off the hot path (\"not on a "
+            "latency-sensitive path\" is a complete note).\n"
             "Return: feasible, blocked_reason, plan (list of prose subtasks), files (list "
-            "of repo-relative paths, or {path, mode} objects), and optional subtasks (list "
+            "of repo-relative paths, or {path, mode} objects), performance (string), and "
+            "optional subtasks (list "
             "of {id, description, agent, quality_tier: full|light|none, "
             "implementation_budget: standard|short, depends_on: [local ids]})."
         ),
@@ -124,7 +131,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         template=(
             "Implement the change and commit it. Follow the scope plan in the context "
             "above if present; if none (lite/micro), implement the task spec directly "
-            "as a single change.\n"
+            "as a single change. If the context carries a `performance` note, build to it.\n"
             "Boy-scout, bounded: fix TRIVIAL issues WITHIN the blast radius of your own "
             "change in place — a docstring your edit made stale, a guard or type on a "
             "line you are already touching — and do NOT file them as follow-ups. But stay "
@@ -158,34 +165,47 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         # The roster role (#519) is also the OPT-IN: a project whose ``agent_for`` returns
         # nothing for "optimize" never gets the stage in a pipeline at all, so this spec is
         # inert there rather than conditionally defined.
-        timeout_s=1800,  # edit, measure, re-measure, commit — implement-shaped, not review-shaped
+        # A REASONING pass, not a measure-edit-measure loop: classify impact, read the change
+        # for where time goes, make the clear local fixes. Measuring is optional, so the old
+        # 1800s (sized for repeated profiling runs) is more than the work needs; 1200 matches
+        # TEST's bound for a pass that edits, runs focused checks, and commits, while still
+        # leaving room for a cheap timing run. An ``impact: none`` pass exits in a minute or two.
+        timeout_s=1200,
         checkpoint=True,
-        # Choosing BETWEEN optimizations (threads vs processes vs async, where a lock belongs)
-        # is hypothesis work over the whole call path, not a local edit — the same reasoning
-        # class as IMPLEMENT, so it gets IMPLEMENT's role and effort rather than SIMPLIFY's.
+        # Judging where time goes across a call path (an O(N) scan in a loop, a blocking call
+        # where batching fits) is the same reasoning class as IMPLEMENT, so it gets
+        # IMPLEMENT's role and effort rather than SIMPLIFY's.
         effort=Effort.HIGH,
         template=(
-            "Make a bounded, MEASURED speed pass over the implementation already in the "
-            "working tree, for a project where speed is part of the product. Profile or time "
-            "the real path first, change what the measurement implicates, then measure again "
-            "— threads vs processes vs async, lock scope and contention, batching and "
-            "caching, data layout, fast paths for small inputs. Commit what you keep; a "
-            "clean no-op is valid, and so is reverting your own change when it did not "
-            "actually help. Preserve behavior: a faster wrong answer is a regression.\n"
-            "Stay LOCAL. Do NOT restructure the architecture here — a process-pool "
-            "restructure, a shared-memory layout, a different lock strategy across "
-            "subsystems is NOT this stage's work, however clearly it is the right answer. "
-            "Return each one as a suggestion instead, with the disposition you would defend: "
-            "`file` to open an enhancement issue the engine files for you, `drop` if you "
-            "would not spend a maintainer's time on it. Choose `file` deliberately — a "
-            "suggestion a maintainer would not independently prioritize is a `drop`.\n"
-            "The engine VERIFIES this stage: it runs the project's own declared benchmark "
-            "before and after your commit and drops the commit unless the numbers improve "
-            "beyond the project's tolerance, so a change you cannot measure costs the commit "
-            "rather than shipping. Leave the worktree clean — uncommitted leftovers make the "
-            "measurement impossible and lose the pass.\n"
-            "Return: files_changed, summary, committed, measurements (name/before/after/unit "
-            "per thing you timed — report what you actually ran, never an estimate), and "
+            "Make a speed pass over the change already in the working tree, for a project "
+            "where speed is part of the product. Your job is to keep the whole system from "
+            "getting slower, not to chase a benchmark number.\n"
+            "First classify the change's `impact`: `hot_path` (it changes a latency-sensitive "
+            "path), `local` (it sits near one, or is code where speed still matters), or "
+            "`none` (offline tools, docs, tests only, one-off scripts). Use the scope "
+            "`performance` note in the context above if present. If `none`, commit nothing "
+            "and return right away.\n"
+            "Otherwise reason about where time goes in the changed code: algorithmic "
+            "complexity (an O(N) lookup that could be O(1)), repeated work, needless "
+            "waits/sleeps/polling, I/O inside loops, blocking calls where async or batching "
+            "fits, needless copies. Fix the clear local wins directly and commit them, each "
+            "with a one-line rationale in `changes`. Measure when it is cheap and helps you "
+            "decide; it is not required to keep a change. A clean no-op is valid. Preserve "
+            "behavior: a faster wrong answer is a regression.\n"
+            "Fix locally; for anything cross-cutting, suggest. Do NOT restructure across "
+            "subsystems here — a process-pool restructure, a shared-memory layout, a "
+            "different lock strategy — however clearly it is the right answer. Return each "
+            "one as a suggestion instead, with the disposition you would defend: `file` to "
+            "open an enhancement issue the engine files for you, `drop` if you would not "
+            "spend a maintainer's time on it. Choose `file` deliberately — a suggestion a "
+            "maintainer would not independently prioritize is a `drop`.\n"
+            "The engine CHECKS this stage for regressions: it runs the project's declared "
+            "benchmark before and after your commit and reverts the commit only if a metric "
+            "gets slower beyond the project's tolerance (or the change breaks the benchmark). "
+            "Leave the worktree clean — uncommitted leftovers make that check impossible.\n"
+            "Return: impact (none|local|hot_path), files_changed, summary, committed, "
+            "changes (list of {description, rationale}), optional measurements "
+            "(name/before/after/unit per thing you actually timed — never an estimate), and "
             "suggestions (list of {description, rationale, disposition})."
         ),
     ),

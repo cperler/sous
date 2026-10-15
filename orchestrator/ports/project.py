@@ -262,19 +262,21 @@ class ProjectConfig(Protocol):
     #   benchmark_cmd() -> list[str]
     #       The project's own speed benchmark, as argv. The ENGINE runs it (twice: at the
     #       last-good checkpoint and at the OPTIMIZE stage's commit) and keeps that commit
-    #       only when the numbers improve beyond the tolerance below — so the stage's speed
-    #       claim is checked by the harness rather than reported by the model. The engine
-    #       never picks a profiler: no argv means no verification, and the stage's changes are
-    #       then NOT kept (unverified must not read as green). Output contract: the LAST
+    #       UNLESS a metric regresses beyond the tolerance below (or the change breaks the
+    #       benchmark) — so "the pass did not slow anything down" is checked by the harness
+    #       rather than reported by the model. A win is reported but not required. The engine
+    #       never picks a profiler: no argv means no check, and the stage's changes are then
+    #       kept but marked UNVERIFIED (a warning event, never green). Output contract: the LAST
     #       non-empty stdout line is a JSON object mapping a metric name to a bare number or
     #       to ``{"value": <number>, "unit": "ms", "lower_is_better": true}``; anything above
     #       that line is ignored, so a benchmark may print its usual table first.
     #       ``lower_is_better`` defaults to true (a duration) — a throughput metric must say
     #       false. Same ``['true']``/empty no-op sentinel handling as the other command
-    #       getters, and the benchmark should be deterministic enough that a real win clears
+    #       getters, and the benchmark should be deterministic enough that noise stays inside
     #       the tolerance on one run: the gate measures once per side, not N times.
     #   benchmark_tolerance: float
-    #       Minimum relative improvement that counts as a win, as a fraction (0.05 = 5%), as
+    #       The noise band: a metric must get worse by MORE than this fraction to revert the
+    #       commit (and better by more than it to be reported as improved), (0.05 = 5%), as
     #       a float attribute or a zero-arg callable. Default
     #       ``benchmark_gate.DEFAULT_BENCHMARK_TOLERANCE`` (0.05). A non-finite or negative
     #       value is replaced by the default and reported as a notice on the verdict.

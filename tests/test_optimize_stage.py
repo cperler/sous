@@ -1,4 +1,4 @@
-"""The optional OPTIMIZE stage (#519): a measured speed pass, for a project where speed is
+"""The optional OPTIMIZE stage (#519): a reasoning speed pass, for a project where speed is
 part of the product.
 
 The whole opt-in is one roster entry. A project whose ``agent_for`` answers nothing for the
@@ -187,11 +187,12 @@ def test_the_stage_dispatches_with_its_spec_and_checkpoints(tmp_path, optimizing
                                  checkpoint=CHECKPOINT))
     task = eng.store.load_task("r1", "t1")
     assert task.stages[Stage.OPTIMIZE].status is StageStatus.COMPLETED
-    # #520: absorbing the checkpoint is now CONDITIONAL on the engine's own benchmark. This
-    # project declares no benchmark_cmd, so the commit is unverified and therefore not kept —
-    # tests/test_optimize_benchmark_gate.py owns the verified path.
-    assert task.last_checkpoint is None
-    assert task.stages[Stage.OPTIMIZE].output["benchmark"]["status"] == "unavailable"
+    # #520: the engine's benchmark gate decides whether the checkpoint is absorbed. This
+    # fake declares no benchmark_cmd (and has no real worktree), so nothing can be measured:
+    # the reasoned pass is KEPT, marked unverified — keeping needs no proof, only a measured
+    # regression reverts. tests/test_optimize_benchmark_gate.py owns the measured paths.
+    assert task.last_checkpoint == CHECKPOINT
+    assert task.stages[Stage.OPTIMIZE].output["benchmark"]["status"] == "unverified"
 
 
 def test_the_resolved_pipeline_survives_a_rebuilt_engine(tmp_path, optimizing) -> None:
@@ -231,12 +232,28 @@ def test_the_stage_output_contract_validates(tmp_path) -> None:
                            "rationale": "the GIL bounds it", "disposition": "file"}]),
         schema,
     )
-    # measurements is required: an unmeasured speed claim is not a speed claim (an empty
-    # array is the honest answer for a no-op pass).
+    # The redesign: measuring is optional, so an output without measurements validates —
+    # and one without `impact` too, so outputs recorded before the field existed still parse.
     bare = _optimize_output()
     bare.pop("measurements")
+    jsonschema.validate(bare, schema)
+    # The new reasoning-pass fields.
+    jsonschema.validate(
+        _optimize_output(impact="hot_path", changes=[
+            {"description": "dict lookup instead of a list scan", "rationale": "O(N) -> O(1)"},
+        ]),
+        schema,
+    )
+    jsonschema.validate(_optimize_output(impact="none", files_changed=[], committed=False),
+                        schema)
     with pytest.raises(jsonschema.ValidationError):
-        jsonschema.validate(bare, schema)
+        jsonschema.validate(_optimize_output(impact="somewhat"), schema)
+    with pytest.raises(jsonschema.ValidationError):
+        jsonschema.validate(_optimize_output(changes=[{"rationale": "no description"}]), schema)
+    # The engine-owned verdict accepts both the new statuses and pre-redesign ones.
+    for status in ("verified", "regressed", "failed", "unverified", "skipped",
+                   "no_win", "unavailable"):
+        jsonschema.validate(_optimize_output(benchmark={"status": status}), schema)
 
 
 # --- the suggestions the stage did not apply ----------------------------------------

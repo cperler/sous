@@ -58,10 +58,12 @@ clean resume-after-kill.
 The **6 stages** (`STAGE_ORDER`): `intake` → `scope` → `implement` → `test` → `deliver`
 → `review`, collapsed from the reference system's ~12–15. Two more are additional
 stage-vocabulary members rather than standing steps: `simplify`, which SCOPE can opt a
-decomposed child into, and `optimize`, a measured speed pass a PROJECT opts into with one
-agent-roster entry (it files the architectural changes it declines to make as enhancement
-issues). The engine verifies `optimize` rather than trusting it: it runs the project's own
-declared benchmark before and after the stage and reverts the commit without a measured win.
+decomposed child into, and `optimize`, a reasoning speed pass a PROJECT opts into with one
+agent-roster entry (it skips work off the hot path, fixes clear local slowness, and files the
+cross-cutting changes it declines to make as enhancement issues). SCOPE feeds it a short
+`performance` design note. The engine checks `optimize` rather than trusting it: it runs the
+project's own declared benchmark before and after the stage and reverts the commit only on a
+measured regression.
 
 ## The load-bearing idea: engine / adapter split
 

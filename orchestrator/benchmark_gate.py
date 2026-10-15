@@ -1,11 +1,11 @@
 """The pure half of the OPTIMIZE benchmark gate (#520): read a benchmark's numbers and
-decide whether the stage earned its commit.
+decide whether the stage's commit may stay.
 
 #519 shipped the OPTIMIZE stage with MODEL-REPORTED ``measurements``, which is a speed
 claim nobody checked — exactly the shape CLAUDE.md says wants a check the harness runs
 rather than firmer prose. This module is that check's decision layer: the engine runs the
 project adapter's declared benchmark argv before and after the stage's commit, hands the two
-stdout blobs here, and keeps the commit only when this module says there was a win.
+stdout blobs here, and keeps the commit unless this module says something got slower.
 
 Everything here is pure (no wall-clock, no subprocess, no event sink), per the fold
 convention: it RETURNS what it could not judge and why, and ``Engine`` emits the events.
@@ -17,10 +17,14 @@ defaults to true because the common metric is a duration; a throughput metric (o
 say ``false`` or a speedup reads as a regression. Anything else is unreadable and the gate
 degrades to advisory — an unparseable benchmark must never read as green.
 
-The win rule (``compare_benchmarks``): at least one comparable metric improves by more than
-the tolerance AND no comparable metric regresses by more than it. Both halves matter — a
-pass that halves one hot path while doubling another has not earned anything, and a pass
-whose numbers all sit inside the noise band has not measured a win at all.
+The keep rule (``compare_benchmarks``): the commit stays UNLESS a comparable metric
+regresses by more than the tolerance. It does NOT have to prove a win. OPTIMIZE is a
+reasoning pass over the whole change (an O(N) scan made O(1), a needless sleep removed), and
+much of what it fixes sits off whatever path the project's one benchmark exercises — a
+win-required rule reverted exactly those changes on noise from a benchmark that never ran
+their code (prediction #397). So the benchmark does the job it can actually do: catch a pass
+that made the measured path slower. An improvement beyond the tolerance is still reported
+(``improved``); it is just no longer the price of keeping the commit.
 """
 
 from __future__ import annotations
@@ -29,10 +33,12 @@ import json
 import math
 from dataclasses import dataclass
 
-# The minimum relative improvement that counts as a win. 5% is the documented default: below
-# it a single benchmark run on a shared machine cannot distinguish a real gain from load
-# noise, so keeping a commit on a 1% "win" would make the gate a rubber stamp. A project
-# whose benchmark is quieter (or noisier) than that overrides it with ``benchmark_tolerance``.
+# The noise band, as a relative change: a metric must move by MORE than this to count as
+# regressed (which reverts the commit) or improved (which is reported). 5% is the documented
+# default: below it a single benchmark run on a shared machine cannot tell a real change from
+# load noise, so reverting on a 1% "regression" would throw away reasoned work on a coin
+# flip. A project whose benchmark is quieter (or noisier) overrides it with
+# ``benchmark_tolerance``.
 DEFAULT_BENCHMARK_TOLERANCE = 0.05
 
 
@@ -106,10 +112,18 @@ def compare_benchmarks(
     ``delta_fraction`` is signed so that POSITIVE always means better regardless of the
     metric's direction, and ``judged`` says whether the row counted toward the verdict.
 
-    Reasons: ``win``, ``regressed`` (something got materially worse — reported in preference
-    to ``no_win``, since it is the more serious finding), ``no_win`` (nothing moved beyond
-    the noise band), ``no_metrics_compared`` (the two runs share no judgeable metric, so
-    there is no measurement to stand on).
+    ``kept`` is False ONLY for ``regressed``. Reasons:
+
+    * ``regressed`` — a judged metric got worse beyond the tolerance. Reported even when
+      another metric improved: a pass that halves one hot path while doubling another has
+      not kept the system fast.
+    * ``improved`` — nothing regressed and at least one metric got better beyond the
+      tolerance.
+    * ``no_regression`` — every judged metric sits inside the noise band. Kept: the pass is
+      not required to move this benchmark, only not to slow it.
+    * ``no_metrics_compared`` — the two runs share no judgeable metric. Nothing regressed,
+      so ``kept`` is True, but nothing was measured either; the engine reports the commit
+      as UNVERIFIED rather than verified.
 
     A metric is EXCLUDED from the verdict when its unit changed between runs: comparing
     milliseconds to seconds is not a comparison. It is still reported, with a notice.
@@ -167,11 +181,11 @@ def compare_benchmarks(
     elif any(r["direction"] == "regressed" for r in judged_rows):
         reason = "regressed"
     elif any(r["direction"] == "improved" for r in judged_rows):
-        reason = "win"
+        reason = "improved"
     else:
-        reason = "no_win"
+        reason = "no_regression"
     return {
-        "kept": reason == "win",
+        "kept": reason != "regressed",
         "reason": reason,
         "tolerance": tolerance,
         "metrics": rows,
