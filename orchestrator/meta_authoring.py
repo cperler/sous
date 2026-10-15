@@ -204,7 +204,12 @@ def latest_filing(path: str | Path, key: str) -> dict | None:
     rows = [row for row in read_filing_ledger(path) if str(row["key"]) == str(key)]
     if not rows:
         return None
-    return max(rows, key=lambda row: (_cursor_of_filing(row), int(row.get("evidence_count") or 0)))
+    return max(rows, key=filing_order)
+
+
+def filing_order(row: dict) -> tuple[tuple[str, ...], int]:
+    """Sort key that ranks a cluster's ledger rows; the maximum is its current filing."""
+    return (_cursor_of_filing(row), int(row.get("evidence_count") or 0))
 
 
 @contextmanager

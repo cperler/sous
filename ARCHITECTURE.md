@@ -455,6 +455,20 @@ never satisfy.
   suppressed a dozen accumulated lessons used to log exactly what a run with nothing to say
   logged. Best-effort filing failures remain non-fatal but are surfaced, with those outcome
   counts, in `status.meta_proposals` rather than living only in `events.jsonl`.
+- **Process-lesson triage.** The two-run floor means a targetless lesson — clustered on an
+  exact-text hash — only files if a later run repeats it word for word, so uniquely worded
+  lessons would otherwise sit in the KB unread. They are handed to the human instead:
+  `orchestrator/process_triage.py`'s pure `triage_queue` partitions the KB's `process` rows
+  into the filed meta-authoring clusters (current ref + evidence, read from
+  `meta-proposals.jsonl`) and every lesson no filing covers, and `kb process-lessons` prints
+  it. The `triage-followups` skill then has the MODEL group the uncovered lessons by meaning
+  and propose concrete edits / merges / closes — the engine's lexical clustering is
+  unchanged and it still never calls a model. Each human-approved decision is appended by
+  `kb triage-dispose` to `<runs-root>/triage-dispositions.jsonl` (append-only, last row per
+  key wins, identical re-records are no-ops, a torn final line is skipped on read and never
+  fused into the next append), keyed `lesson:<kb id>` or `issue:<ref>`; the KB rows are never
+  touched. The default listing excludes decided items and COUNTS them (`excluded`), and an
+  issue decision stores the cluster's evidence count so new evidence brings the issue back.
 - **Meta-authoring delivery gate.** Tasks sourced from issues labeled `meta-authoring`
   persist `hold_before=deliver`. They may scope, implement, test, and review normally, but
   `next_work` parks them `BLOCKED_ON_HUMAN` before DELIVER. Approval is keyed to the exact
@@ -544,7 +558,9 @@ and creation date (`orchestrator/runs_layout.py`):
 ```
   ~/Development/runs/                       $ORCHESTRATOR_RUNS_ROOT overrides the top level
     <project name>/                         the adapter's `name`, never the checkout's dir
-      learnings-kb.jsonl, queue.json        per-PROJECT shared files live here
+      learnings-kb.jsonl, queue.json        per-PROJECT shared files live here (also
+      meta-proposals.jsonl,                 the meta-authoring filing ledger and the
+      triage-dispositions.jsonl             process-lesson triage decisions)
       <YYYY-MM-DD>/<run>/                   the run's own store — the layout below
 ```
 

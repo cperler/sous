@@ -385,6 +385,10 @@ def main(argv: list[str] | None = None) -> int:
       ``<runs-root>/learnings-kb.jsonl``.  The log is append-only, so ``prune`` and
       ``backfill-outcomes`` append amendment records (retire / stamp ``task_outcome``)
       rather than rewriting rows; both preview by default and write only under ``--apply``.
+      ``kb process-lessons`` is the triage queue for REVIEW process lessons (filed
+      meta-authoring clusters + every lesson no filing covers), and ``kb triage-dispose``
+      records the human's decision in ``triage-dispositions.jsonl`` beside the KB so the
+      next listing excludes it (``--include-handled`` shows it again).
     """
     p = argparse.ArgumentParser(prog="orchestrator")
     p.add_argument("--root",
@@ -888,6 +892,31 @@ def main(argv: list[str] | None = None) -> int:
     kbb.add_argument("--apply", action="store_true",
                      help="actually append the stamps (default is a dry-run preview)")
 
+    kbl = kbsub.add_parser("process-lessons",
+                           help="the triage queue for REVIEW process lessons: filed "
+                                "meta-authoring clusters with their evidence, plus every "
+                                "lesson no filing covers (withheld / untargeted), minus what "
+                                "triage already dispositioned")
+    kbl.add_argument("--include-handled", action="store_true",
+                     help="also list lessons/issues already dispositioned (each carries its "
+                          "disposition)")
+    kbd = kbsub.add_parser("triage-dispose",
+                           help="record the human's triage decision for process lessons or a "
+                                "filed meta-authoring issue in triage-dispositions.jsonl, so "
+                                "the next `kb process-lessons` stops listing them")
+    kbd.add_argument("--lesson", action="append", dest="lessons", default=[], metavar="ID",
+                     help="KB entry id (or the `lesson:` key from process-lessons) of a lesson "
+                          "this decision covers (repeatable — a group filed as one issue)")
+    kbd.add_argument("--issue", action="append", dest="issues", default=[], metavar="REF",
+                     help="a filed meta-authoring issue ref this decision covers (repeatable)")
+    kbd.add_argument("--disposition", required=True,
+                     choices=["filed", "merged", "closed", "applied", "kept"],
+                     help="filed/merged need --ref, closed needs --reason, applied needs "
+                          "--commit; kept (issues) leaves an issue open until new evidence")
+    kbd.add_argument("--ref", default=None, help="the issue the lesson was filed/merged into")
+    kbd.add_argument("--reason", default=None, help="why (required for closed)")
+    kbd.add_argument("--commit", default=None, help="the commit that applied the change")
+
     args = p.parse_args(argv)
 
     # --shared-root lives on the global parser (so it can precede any engine command),
@@ -939,6 +968,64 @@ def main(argv: list[str] | None = None) -> int:
             default_runs_root(), project.name,  # type: ignore[union-attr]
         )
         path = resolve_kb_path(kb_root, project)
+        if args.kb_cmd == "process-lessons":
+            from .process_triage import read_queue
+            _emit({"path": str(path),
+                   **read_queue(path, read_entries(path),
+                                include_handled=args.include_handled)})
+            return 0
+        if args.kb_cmd == "triage-dispose":
+            from .process_triage import (
+                dispositions_path,
+                issue_key,
+                lesson_key,
+                read_queue,
+                record_dispositions,
+                ref_matches,
+                validate_disposition,
+            )
+            err = validate_disposition(args.disposition, ref=args.ref, reason=args.reason,
+                                       commit=args.commit)
+            if err:
+                p.error(err)
+            if not args.lessons and not args.issues:
+                p.error("triage-dispose needs at least one --lesson or --issue")
+            # Resolve every handle against the CURRENT data before writing anything: a typo'd
+            # id must fail loudly, not record a decision about a lesson that does not exist.
+            process = {lesson_key(e): e for e in read_entries(path, include_retired=True)
+                       if e.get("kind") == "process"}
+            filed = read_queue(path, read_entries(path), include_handled=True)["filed_issues"]
+            decision = {"disposition": args.disposition, "ref": args.ref,
+                        "reason": args.reason, "commit": args.commit}
+            rows: list[dict] = []
+            unknown: list[str] = []
+            for handle in args.lessons:
+                key = handle if handle.startswith("lesson:") else f"lesson:{handle}"
+                entry = process.get(key)
+                if entry is None:
+                    unknown.append(handle)
+                    continue
+                rows.append({"key": key, "subject": "lesson", **decision,
+                             "kb_id": entry.get("id"), "run_id": entry.get("run_id"),
+                             "task_id": entry.get("task_id"), "lesson_ts": entry.get("ts")})
+            for handle in args.issues:
+                item = next((i for i in filed if ref_matches(handle, i["ref"])), None)
+                if item is None:
+                    unknown.append(handle)
+                    continue
+                rows.append({"key": issue_key(item["ref"]), "subject": "issue", **decision,
+                             "cluster_key": item["cluster_key"],
+                             "evidence_count": item["evidence_count"]})
+            if unknown:
+                print(json.dumps({"ok": False, "error": "unknown lesson id(s) or filed issue "
+                                  "ref(s); nothing recorded", "unknown": unknown}),
+                      file=sys.stderr)
+                return 1
+            ledger = dispositions_path(path)
+            written = record_dispositions(ledger, rows)
+            _emit({"ok": True, "path": str(ledger), "recorded": len(written),
+                   "unchanged": len(rows) - len(written), "rows": written})
+            return 0
         if args.kb_cmd == "add":
             files = [f.strip() for f in (args.files or "").split(",") if f.strip()]
             written = append_learnings(path, [{

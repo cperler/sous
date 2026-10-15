@@ -1,6 +1,6 @@
 ---
 name: triage-followups
-description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas from the evidence-out seam, AND any issue a task filed for work it deliberately cut) ONE AT A TIME with the human — explaining each from its source finding/rationale and the code it points at — and decide keep / close / promote / edit. The human triage gate the auto-filing seams deliberately do not have. Runs after any completed run (batch or single-task); re-runnable later.
+description: After a run completes, walk the GitHub issues that run auto-filed (review non-blocking findings + improvement ideas from the evidence-out seam, AND any issue a task filed for work it deliberately cut) ONE AT A TIME with the human — explaining each from its source finding/rationale and the code it points at — and decide keep / close / promote / edit. Also triages the project's REVIEW process lessons — the open `meta-authoring` issues and every lesson no filing covers (grouped by meaning) — into concrete harness edits, merges, or closes, recording each decision so it never resurfaces. The human triage gate the auto-filing seams deliberately do not have. Runs after any completed run (batch or single-task); re-runnable later.
 ---
 
 # Triage follow-ups — human gate on a run's auto-filed issues
@@ -17,10 +17,12 @@ track and often can't parse. This skill is that missing gate: walk each auto-fil
 rationale + the code it names, not just the terse issue body), and let the human decide
 whether it is worth filing/tracking at all.
 
-This skill only **reads** the run and **acts on GitHub** (close / relabel / comment). It
-never touches the engine or re-runs any stage. It is safe to run any time after a run is
-terminal, and safe to re-run — it only ever surfaces issues that are still **open**, so a
-second pass skips everything already triaged.
+This skill only **reads** the run and **acts on GitHub** (close / relabel / comment), plus
+— for process lessons — appends the human's decisions to the disposition ledger through
+`orchestrator kb triage-dispose`. It never re-runs any stage. It is safe to run any time
+after a run is terminal, and safe to re-run — it only ever surfaces issues that are still
+**open** and process lessons with no recorded disposition, so a second pass skips
+everything already triaged.
 
 ## Constants
 - `RUN` = the run id to triage. Its logs are at
@@ -28,6 +30,8 @@ second pass skips everything already triaged.
   dir on stderr) — the `<run dir>` the paths below refer to.
 - `REPO` = the GitHub repo (`cperler/sous` for self-host; the project
   adapter's repo otherwise). `PROJECT` = the project adapter module.
+- `HARNESS_REPO` = the harness's own tracker, where process-lesson work goes
+  (`cperler/sous`; see "Process lessons" below).
 - Read-only engine call shape (for the task list): `uv run orchestrator --run "$RUN"
   --project "$PROJECT" status`.
 
@@ -121,9 +125,107 @@ Respect the human's call even when it differs from your recommendation. If they 
 stop partway, stop — the remaining issues stay open and a later re-run picks them up
 exactly where this left off (open-only enumeration makes triage naturally resumable).
 
+## Process lessons — the harness's own retrospectives
+Every REVIEW may emit a `retrospective` process lesson about the harness itself. The engine
+keeps them in the project's learnings KB and files a `meta-authoring` issue only once one
+lexical cluster spans two runs — so a lesson with no named target, worded uniquely, never
+files and is otherwise read by nobody. This part of triage is where those lessons get a
+human decision. Grouping them by meaning is your job here; the engine deliberately does not
+(it never calls a model). Run it after the issue queue above, or on its own.
+
+**Which tracker.** Process lessons are about the harness itself, so anything you file,
+edit, or close for them goes to `HARNESS_REPO` — the engine's own tracker, where the
+`meta-authoring` issues already live (`cperler/sous` unless `ORCHESTRATOR_ENGINE_PROJECT`
+selects another engine adapter) — not the product repo. The KB is per-project, so run the listing for
+the project whose runs produced the lessons.
+
+### Enumerate
+1. The deterministic queue (read-only):
+   ```
+   uv run orchestrator --project "$PROJECT" kb process-lessons
+   ```
+   (`--root <runs-root>/<project>` works too.) It returns:
+   - `filed_issues[]` — each filed meta-authoring cluster's current issue `ref`, its
+     `cluster_key`, `target`, and every KB `evidence` row behind it (run, task, ts, text).
+   - `lessons[]` — every process lesson NO filing covers (held under the two-run floor),
+     untargeted (`untargeted: true`, `cluster_key` `text:…`) first, each with `key`
+     (`lesson:<kb id>`), run, task, ts, text, target.
+   - `excluded` — how many were left out because triage already decided them
+     (`handled_*`) or because a filed issue carries them (`covered_by_filed_issue`).
+     Add `--include-handled` to see decided items again, each with its `disposition`.
+2. The open issues: `gh issue list -R "$HARNESS_REPO" --label meta-authoring --state open
+   --json number,title,body,url,comments`. Join on the issue number. A `filed_issues` entry
+   whose issue is already closed needs no triage (the engine re-files if it recurs). An
+   open `meta-authoring` issue absent from `filed_issues` came from another project's
+   ledger or was filed by hand — triage it on GitHub as normal; there is nothing to record.
+3. Report the queue size before starting: N open meta-authoring issues, M uncovered
+   lessons (K untargeted).
+
+### Meta-authoring issues — one at a time
+For each open one: read its evidence (the KB rows plus any engine comments carrying later
+evidence), then READ THE TARGET ARTIFACT at current `main` — stage templates in
+`orchestrator/stages.py` (`STAGE_SPECS`), stage schemas in `orchestrator/schemas/stages/`,
+personas in `.claude/agents/`, skills in `.claude/skills/*/SKILL.md`, scaffold assets in
+`templates/project-default/`. Decide whether the complaint still holds (it may already be
+fixed). Then recommend one of:
+- **propose an edit** — name the file and the exact change (a diff or a precise
+  before/after), not "tighten the wording". Apply CLAUDE.md's rule: *when the agent keeps
+  violating a rule, the rule is not the fix*. Recurring evidence that a prompt clause is
+  ignored argues for a structural fix (a check the engine runs, a schema field it cannot
+  skip, a deterministic gate) or for DELETING the clause — never for restating it louder.
+  Prefer subtractive edits when the evidence says a clause does nothing. On approval,
+  either edit the issue body to carry the concrete proposal (so the ordinary pipeline can
+  pick it up) or apply a trivial change directly and close it pointing at the commit.
+- **merge** — it is the same problem as another open issue: comment the cross-reference and
+  close the duplicate (`--reason "not planned"`, label `duplicate`).
+- **close** — stale, already fixed, or not worth it; close with the reason as the comment.
+- **keep** — leave it open as-is. It drops out of the queue until new evidence arrives.
+
+### Uncovered lessons — group by meaning, then one group at a time
+Read every `lessons[]` row (targeted and untargeted) and group them by what they are
+ACTUALLY about — the same underlying problem worded differently in different runs is one
+group; a lesson that fits an open `meta-authoring` issue joins that issue instead. Show the
+human the proposed grouping (group → member `lesson:` keys + one-line gist) before working
+through it, and let them regroup. Then, per group, the same brief as above (evidence, the
+artifact it implicates, read at `main`, your honest read) and a recommendation:
+- **file** — a group worth acting on becomes an ORDINARY issue on `HARNESS_REPO` with a
+  standard label (`enhancement`, `bug`, `docs`, `chore`); add `meta-authoring` only when
+  the human wants the change held before DELIVER like engine-filed ones. Title names the
+  artifact and the change; the body states the concrete proposed edit (file + change) and
+  cites every evidence row as `- kb:<id> — run <run>, task <task> (<ts>): <text>`. Those
+  `kb:<id>` markers are also the crash-safety check: before filing, `gh issue list -R
+  "$HARNESS_REPO" --state all --search "kb:<id>"` for the group's ids — if an earlier
+  interrupted pass already filed it, record that issue instead of filing a second one.
+- **merge** — fold into an existing issue: comment the evidence rows onto it.
+- **apply** — a trivial, clearly-right edit: make it now and commit (no attribution
+  trailer), then record the commit.
+- **close** — not worth acting on, already fixed, or noise. Nothing on GitHub; the
+  disposition's reason is the record.
+
+### Record every decision — after the human approves, never before
+Each decision is written to `triage-dispositions.jsonl` beside the KB (append-only; the KB
+itself is never rewritten), so it does not come back on the next pass:
+```
+uv run orchestrator --project "$PROJECT" kb triage-dispose --lesson <kb id> [--lesson …] \
+  --disposition filed|merged --ref <issue>
+uv run orchestrator --project "$PROJECT" kb triage-dispose --lesson <kb id> \
+  --disposition closed --reason "<why>"
+uv run orchestrator --project "$PROJECT" kb triage-dispose --lesson <kb id> \
+  --disposition applied --commit <sha>
+uv run orchestrator --project "$PROJECT" kb triage-dispose --issue <#N|url> \
+  --disposition kept|closed|merged|applied …
+```
+Do the GitHub action first, then record it (record the ref it produced). One call can
+cover a whole group (repeat `--lesson`). An unknown id or ref fails the call and records
+nothing; re-recording the same decision is a no-op. A `kept` (or any) issue decision
+remembers the cluster's evidence count, so the issue reappears when the engine adds new
+evidence to it.
+
 ## Close-out
 When the queue is exhausted (or the human stops), print a short ledger: each issue and its
-decision (kept / closed+reason / promoted / edited), and the count still open. That ledger
+decision (kept / closed+reason / promoted / edited), each process-lesson group or
+meta-authoring issue and its recorded disposition, and the count still open / still
+undecided. That ledger
 is the human-readable record of the gate — the mirror of the evidence-out seam that filed
 them without a gate in the first place.
 

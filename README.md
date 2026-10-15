@@ -356,6 +356,12 @@ runs, the engine files one `meta-authoring` enhancement containing both evidence
 That issue runs through the ordinary pipeline, but is automatically held before DELIVER
 until a human approves it; merging the resulting PR is the apply step.
 
+Lessons that never reach that two-run floor — typically ones with no named target, whose
+wording is unique — are not lost: the `triage-followups` skill lists them with
+`orchestrator kb process-lessons` (alongside the open `meta-authoring` issues), groups them
+by meaning, and walks each group with the human to a concrete edit, a merge, or a close.
+`orchestrator kb triage-dispose` records each approved decision so the next pass skips it.
+
 `panel-report` reads the newest run stores directly, comparing panel and plain review
 costs while breaking panel yield down by finder lens, verifier verdict, and cap hits. It is
 observational: the panel replaces the single-reviewer path, so the report explicitly does
