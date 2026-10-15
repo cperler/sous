@@ -12,8 +12,10 @@ local/offline mode instead.
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+from pathlib import Path, PurePosixPath
 
 from adapters.project.email_sink import email_sink_from_env
 from adapters.project.github_issues import GitHubIssuesSource
@@ -33,6 +35,89 @@ _NOOP = ["true"]  # this project has no e2e / shell / infra layer
 # than the head because the summary line ("Found N errors") lands last.
 _GATE_TIMEOUT_S = 300
 _GATE_OUTPUT_CAP = 2000
+
+# Impacted-test selection (#558). A change to one of these can affect any test, so it forces
+# the full suite (``orchestrator.test_selection.matches_global``: a bare name matches at any
+# depth, a pattern with ``/`` matches the whole path). Stage schemas are read by the
+# contract tests and by ``schema_for``, so a schema edit is global too.
+_TEST_GLOBAL_PATHS = [
+    "conftest.py",
+    "pyproject.toml",
+    "uv.lock",
+    ".python-version",
+    ".github/*",
+    "orchestrator/schemas/*",
+]
+_SOURCE_PACKAGES = ("orchestrator", "adapters")
+_DOC_SUFFIXES = (".md", ".markdown", ".rst", ".txt")
+
+
+def _module_patterns(dotted: str) -> list[re.Pattern[str]]:
+    """Regexes that find a test importing ``dotted`` (``a.b.c``) by absolute dotted path or
+    as ``from a.b import c``. Word boundaries keep ``orchestrator.engine`` from matching
+    ``orchestrator.engine_x``."""
+    parent, _, leaf = dotted.rpartition(".")
+    pats = [re.compile(rf"\b{re.escape(dotted)}\b")]
+    if parent:
+        pats.append(re.compile(
+            rf"from\s+{re.escape(parent)}\s+import\s+[^\n]*\b{re.escape(leaf)}\b"
+        ))
+    return pats
+
+
+def impacted_tests_for(changed: list[str], root: Path) -> list[str] | None:
+    """This repo's changed-file -> test-file mapping (#558), over the tests that exist in
+    ``root``. Conservative: returns None ("run everything") as soon as ONE non-doc changed
+    file cannot be mapped — a non-Python file, a package ``__init__.py``, a Python file
+    outside the known packages, or a module no test file names.
+
+    - ``tests/test_*.py`` maps to itself;
+    - a source module ``orchestrator/x.py`` / ``adapters/.../x.py`` (or a ``tests/`` helper)
+      maps to ``tests/test_x.py``, ``tests/test_x_*.py``, and every test file that imports
+      it by dotted path — direct importers only, so a change that reaches a test through
+      another module is the accepted gap the batch-integration gate's full run backstops;
+    - documentation is ignored."""
+    tests_dir = root / "tests"
+    if not tests_dir.is_dir():
+        return None
+    test_files = sorted(p for p in tests_dir.glob("test_*.py") if p.is_file())
+    texts: dict[Path, str] = {}
+
+    def text_of(p: Path) -> str:
+        if p not in texts:
+            try:
+                texts[p] = p.read_text(encoding="utf-8")
+            except OSError:
+                texts[p] = ""
+        return texts[p]
+
+    selected: list[str] = []
+    for raw in changed:
+        path = PurePosixPath(raw.strip())
+        if path.suffix.lower() in _DOC_SUFFIXES or "docs" in path.parts:
+            continue
+        if path.suffix != ".py" or path.name == "__init__.py":
+            return None
+        if path.parts[0] == "tests" and path.name.startswith("test_") and len(path.parts) == 2:
+            if (root / path).is_file():
+                selected.append(str(path))
+                continue
+            return None  # a deleted test file: nothing to run, can't tell what it covered
+        if path.parts[0] not in (*_SOURCE_PACKAGES, "tests"):
+            return None
+        dotted = ".".join(path.with_suffix("").parts)
+        stem = path.stem
+        pats = _module_patterns(dotted)
+        hits = [
+            p for p in test_files
+            if p.name == f"test_{stem}.py" or p.name.startswith(f"test_{stem}_")
+            or any(pat.search(text_of(p)) for pat in pats)
+        ]
+        if not hits:
+            return None
+        selected.extend(p.relative_to(root).as_posix() for p in hits)
+    return list(dict.fromkeys(selected))
+
 
 # Stage sub-role -> agent name. These resolve to the starter-kit personas seeded into
 # this repo's own ``.claude/agents/`` (bootstrapped from templates/project-default), so
@@ -89,6 +174,16 @@ class SelfHostConfig:
 
     def test_unit_cmd(self, files: list[str] | None = None) -> list[str]:
         return ["uv", "run", "pytest", *files, "-q"] if files else ["uv", "run", "pytest", "-q"]
+
+    def impacted_tests(self, changed: list[str], *, cwd: str | None = None) -> list[str] | None:
+        """The tests a change touches (#558), resolved against the task worktree ``cwd``.
+        None — the full suite — whenever the mapping can't vouch for the change; see
+        ``impacted_tests_for``."""
+        return impacted_tests_for(changed, Path(cwd) if cwd else Path.cwd())
+
+    @property
+    def test_global_paths(self) -> list[str]:
+        return list(_TEST_GLOBAL_PATHS)
 
     def test_e2e_cmd(self, files: list[str] | None = None) -> list[str]:
         return _NOOP  # no E2E layer

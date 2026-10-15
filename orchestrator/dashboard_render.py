@@ -328,6 +328,9 @@ def _stage_strip(task: dict) -> tuple[list[str], bool]:
             label = _STAGE_STATUS_LABELS.get(status, status)
             if status in ("running", "failed") and stage.get("attempt"):
                 label += f" (retry {stage['attempt']})"
+            # #558: a TEST green on the adapter-mapped subset, not the full suite.
+            if stage.get("test_scope") == "impacted":
+                label += f" (impacted {stage.get('tests_selected') or 0})"
         cells.append(f"{stage['stage'].upper()} {label}")
     return cells, used_symbol
 

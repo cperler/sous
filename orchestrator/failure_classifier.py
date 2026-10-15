@@ -37,5 +37,8 @@ class FailureClassifier(Protocol):
         ...
 
     def impacted_tests(self, changed_files: list[str]) -> list[str]:
-        """Map changed source files to the tests that should run (change->test-set)."""
+        """Map changed source files to the tests that should run (change->test-set).
+
+        Not read by the engine. TEST-stage selection uses the ProjectConfig-level
+        ``impacted_tests`` hook instead (#558, ``orchestrator/ports/project.py``)."""
         ...

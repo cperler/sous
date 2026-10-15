@@ -8,7 +8,7 @@ prompts stay repo-agnostic and the same engine drives any project.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
 from .model_table import Role
@@ -367,6 +367,18 @@ _DESIGN_REVIEW_LENS = (
     + "Treat these as review criteria — blocking only when a change materially harms usability "
     "or accessibility; otherwise record them as non-blocking polish."
 )
+
+
+def _impacted_tests_directive(files: Sequence[str]) -> str:
+    """The #558 TEST-stage block naming the adapter-mapped impacted test files."""
+    listed = "\n".join(f"- {f}" for f in files)
+    return (
+        "\n\n## Impacted tests\n"
+        "The project adapter maps this change's files to these tests. Run them as the "
+        "tests for the changed files; widen to the full suite if the change reaches "
+        "beyond them.\n"
+        f"{listed}"
+    )
 
 
 # The #41 docs-only directive, verbatim. Hoisted to a constant so the single-reviewer
@@ -765,6 +777,7 @@ def render_prompt(
     project_commands: dict[str, str] | None = None,
     tool_posture_unenforced: bool = False,
     worktree_origin_unverified: bool = False,
+    impacted_tests: Sequence[str] | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -784,6 +797,12 @@ def render_prompt(
       change has no behavioral surface, so test-coverage / ``tests_meaningful`` criteria
       don't apply. The tag is set deterministically by the ENGINE-lane git diff, so a
       model cannot trigger this exemption by asserting it in its output.
+
+    - TEST + ``impacted_tests`` (#558): names the test files the project adapter mapped
+      from the task's diff, so the model runs those instead of guessing which tests cover
+      the changed files. The caller passes what the engine resolved from its own git read
+      and the adapter hook (``orchestrator.test_selection``); empty/None leaves the prompt
+      byte-identical to the pre-#558 one.
 
     - REVIEW (all tasks, #168/#261): tells the reviewer to JUDGE ``tests_meaningful``
       whenever there are tests to read, and to OMIT it — rather than answer ``false`` —
@@ -839,6 +858,10 @@ def render_prompt(
     # the ENGINE-lane git diff, so this directive can't be triggered by a model's own claim.
     if stage in (Stage.TEST, Stage.REVIEW) and (context or {}).get("change_class") == "docs-only":
         instruction += _DOCS_ONLY_DIRECTIVE
+    # #558: the engine already knows which tests the adapter maps from this diff — say so,
+    # rather than leave "the tests for the changed files" to the model's guess.
+    if stage is Stage.TEST and impacted_tests:
+        instruction += _impacted_tests_directive(impacted_tests)
     # #168: belt-and-suspenders with the engine's fail-open-on-omit gate — tell the reviewer
     # to OMIT `tests_meaningful` (rather than answer `false`) when there is no test surface to
     # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal

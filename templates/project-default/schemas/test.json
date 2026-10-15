@@ -24,6 +24,20 @@
     "skipped": {
       "type": "string",
       "description": "#41: reason this stage was short-circuited without running the suite (e.g. 'docs-only'). Present only on a skip; never a faked green run — 'passed' means 'nothing to fail'."
+    },
+    "test_scope": {
+      "type": "string",
+      "enum": ["impacted", "full"],
+      "description": "#558: whether the unit suite ran only the tests the project adapter mapped from the diff ('impacted') or the whole suite ('full'). Set ONLY by the ENGINE-lane runner — a model claim here is ignored at the context fold. An 'impacted' green is a green on a SUBSET, not a full green."
+    },
+    "tests_selected": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "#558: number of test files the impacted run selected (0 for a full run). Set only by the ENGINE-lane runner."
+    },
+    "test_scope_reason": {
+      "type": "string",
+      "description": "#558: why this scope was chosen (e.g. the fallback that forced a full run). Set only by the ENGINE-lane runner."
     }
   },
   "additionalProperties": true

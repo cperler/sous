@@ -235,6 +235,28 @@ class ProjectConfig(Protocol):
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
     #
+    # Optional impacted-test selection hooks (#558; duck-typed via ``getattr``, NOT part of
+    # the versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
+    #   impacted_tests(changed: list[str], *, cwd: str | None = None) -> list[str] | None
+    #       Map the task's CHANGED files (repo-relative, from ``git diff <base_sha>`` plus
+    #       untracked files) to the TEST files worth running; the TEST stage then shells
+    #       ``test_unit_cmd(files)`` instead of the whole suite (e2e/shell still run whole).
+    #       ``cwd`` is the task worktree, passed only when the hook declares the keyword, so
+    #       a mapping can check which test files exist there. Return ``None`` for "can't
+    #       tell — run everything"; the engine also runs the full suite when the hook is
+    #       absent, raises, returns a non-list or an empty list, or when the diff touches a
+    #       ``test_global_paths`` entry (``orchestrator.test_selection``). The scope that ran
+    #       is recorded on the TEST result (``test_scope``: impacted|full), so a green on a
+    #       subset never reads as a full green. Distinct from
+    #       ``FailureClassifier.impacted_tests``: that older classifier method has never been
+    #       called by the engine and its scaffolded form (``"test" in f``) is not a safe
+    #       selection, so the engine deliberately does not read it.
+    #   test_global_paths: Sequence[str]
+    #       Globs whose change can affect ANY test (``conftest.py``, ``pyproject.toml``, a
+    #       lockfile, CI config), as a list attribute or a zero-arg callable. A pattern
+    #       without ``/`` matches a file name at any depth; one with ``/`` matches the whole
+    #       repo-relative path (``*`` crosses directories). Touching one forces the full suite.
+    #
     # Optional OPTIMIZE benchmark hooks (#520; duck-typed via ``getattr``, NOT part of the
     # versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   benchmark_cmd() -> list[str]
