@@ -156,6 +156,25 @@ class ReviewFixup(_StatusModel):
     source: Literal["improvement", "finding"] = "improvement"
 
 
+class CarriedReviewFiling(_StatusModel):
+    """A ``file``-disposition finding or improvement from a review the engine superseded.
+
+    A fix cycle (a blocking rejection or an approved review's fixup) resets the REVIEW
+    ``StageRecord``, and finalize files only from the review that output survives in, so a
+    request an earlier pass made would otherwise vanish unless the final reviewer happened
+    to repeat it (#546). The engine snapshots each such entry here at the reset and finalize
+    files it, deduped by ``fingerprint`` against the final review's own entries.
+    ``review_cycle`` is ``Task.review_cycles`` when the superseded review ran (0 = the
+    first review), so the filed issue and the audit can name which pass asked for it.
+    """
+
+    kind: Literal["finding", "improvement"]
+    title: str
+    detail: str = ""
+    fingerprint: str
+    review_cycle: int = 0
+
+
 def _new_stage_map() -> dict[Stage, StageRecord]:
     # Keyed by the FULL vocabulary (not the task's pipeline): off-pipeline stages sit at
     # SKIPPED, keeping the doc shape uniform across tasks (2026-07-01 design pass §1).
@@ -316,6 +335,9 @@ class Task(_StatusModel):
     # record is reset for the rework pass.  Additive: older task docs load with an empty
     # list, so no schema-version bump is needed.
     review_fixups: list[ReviewFixup] = Field(default_factory=list)
+    # ``file`` requests from reviews a fix cycle superseded (#546) — kept here for the same
+    # reason as ``review_fixups``: the REVIEW record they came from was reset. Additive.
+    carried_review_filings: list[CarriedReviewFiling] = Field(default_factory=list)
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None

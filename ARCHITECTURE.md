@@ -358,7 +358,10 @@ never satisfy.
   degrades instead — a warning-grade `review_fixup_held` plus a completion note reading
   "requested in-place fixup — not applied", because stalling an approved task over a
   trivial nit would block a headless batch. No disposition text is ever treated as evidence
-  that code changed.
+  that code changed. Because the reset replaces the REVIEW record, any `file`-disposition
+  finding or improvement from the superseded review is copied onto
+  `Task.carried_review_filings` (#546, `review_filing_carried_forward`) and filed at
+  completion unless the final review restated it (`review_filing_carried_deduped`).
 - **Failure taxonomy → recovery.** `orchestrator/retry.py` does retry-with-learnings
   (learnings appended, newest last) behind a *structured* circuit breaker (a hash over the
   normalized failure set — timestamps/paths/numbers scrubbed — so the breaker actually trips).
@@ -649,6 +652,10 @@ deletes or overwrites) and leaves the legacy KB in place with a note about its n
     stages/<task>/index.md                          same stem as its stream (#314);
                                                     evidence — teed live, never pruned)
 ```
+
+A review fix cycle restarts the re-run stages at attempt 0, so their files gain a
+`.cycle<C>` segment after the attempt (`review-attempt0.cycle1.stream.jsonl`, #546) rather
+than overwriting the earlier pass's.
 
 - **CLIs** (`orchestrator/cli.py`): `status` (progress + cost + lane-attribution audit),
   `watch` (poll one run to terminal, alerting on stalls), `tail` (live tail of a running

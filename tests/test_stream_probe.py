@@ -24,6 +24,7 @@ from orchestrator.stream_probe import (
     find_current_stream,
     follow_stream,
     probe_stream,
+    prompt_relpath,
     read_tail,
     stages_dir,
     stream_basename,
@@ -376,3 +377,61 @@ def test_stream_teeing_wrapper_passes_through_an_already_streamed_result(tmp_pat
     raw = stream_teeing_transport(inner, tmp_path)(_wi())
     assert raw.stream_files == {"stream": "stages/42/implement-attempt0.stream.jsonl"}
     assert not (tmp_path / "stages").exists()  # wrapper did not write anything
+
+
+# --- #546: a review fix cycle keeps each pass's files -------------------------------------
+
+def test_stream_basename_inserts_a_cycle_segment_only_after_a_fix_cycle() -> None:
+    """#546: a fix cycle restarts the re-run stages at attempt 0, so without a cycle segment
+    the second review pass overwrote the first's ``review-attempt0.*`` files. Cycle 0 keeps
+    the pre-#546 names; the segment sits right after the attempt, before phase and retry."""
+    assert stream_basename("review", 0, cycle=0) == "review-attempt0"
+    assert stream_basename("review", 0, cycle=1) == "review-attempt0.cycle1"
+    assert stream_basename("review", 0, 2, phase="find:code", cycle=1) == \
+        "review-attempt0.cycle1.find-code.retry2"
+    assert stream_relpath("#42", "review", 0, cycle=2) == \
+        "stages/42/review-attempt0.cycle2.stream.jsonl"
+    assert prompt_relpath("#42", "review", 0) == "stages/42/review-attempt0.prompt.txt"
+    assert prompt_relpath("#42", "review", 0, cycle=1) == \
+        "stages/42/review-attempt0.cycle1.prompt.txt"
+
+
+def test_find_current_stream_follows_the_latest_fix_cycle(tmp_path) -> None:
+    # The re-run review is attempt 0 again; a prior cycle's higher attempt must not outrank it.
+    d = stages_dir(tmp_path, "#42")
+    d.mkdir(parents=True)
+    (d / stream_filename("review", 1)).write_text("first pass, retried\n")
+    (d / stream_filename("review", 0, cycle=1)).write_text("second pass\n")
+    assert find_current_stream(tmp_path, "#42", "review").name == \
+        "review-attempt0.cycle1.stream.jsonl"
+    # A panel phase that happens to spell "cycle" is not read as the cycle segment.
+    (d / stream_filename("review", 0, phase="cycle:9")).write_text("phase\n")
+    assert find_current_stream(tmp_path, "#42", "review").name == \
+        "review-attempt0.cycle1.stream.jsonl"
+
+
+def test_tee_names_files_by_the_work_items_review_cycle(tmp_path) -> None:
+    def inner(work):
+        return RawResult({"ok": True}, raw_output="x\n", raw_stderr="e\n")
+
+    first = stream_teeing_transport(inner, tmp_path)(_wi(stage=Stage.REVIEW))
+    second = stream_teeing_transport(inner, tmp_path)(
+        _wi(stage=Stage.REVIEW).model_copy(update={"review_cycle": 1})
+    )
+    assert first.stream_files["stream"] == "stages/42/review-attempt0.stream.jsonl"
+    assert second.stream_files["stream"] == "stages/42/review-attempt0.cycle1.stream.jsonl"
+    assert second.stream_files["stderr"] == "stages/42/review-attempt0.cycle1.stderr.log"
+    assert (tmp_path / first.stream_files["stream"]).exists()
+
+
+def test_review_cycle_is_excluded_from_the_content_hash() -> None:
+    # Dispatch metadata: it names where evidence lands, so a lease issued before the field
+    # existed still verifies on record.
+    base = _wi(stage=Stage.REVIEW)
+    cycled = WorkItem.create(
+        id="wi-1", run_id="r1", task_id="#42", stage=Stage.REVIEW, prompt="p",
+        schema_ref="implement", model="m", lane_policy=_HEADLESS, created_at="now",
+        review_cycle=1,
+    )
+    assert cycled.review_cycle == 1
+    assert cycled.content_hash == base.content_hash

@@ -330,6 +330,12 @@ class WorkItem(BaseModel):
     # while the task's live tree remains unreachable. Runner metadata, never engine-authored
     # content, and therefore excluded from ``compute_content_hash`` like ``cwd``/``env``.
     workspace_isolated: bool = False
+    # ``Task.review_cycles`` at dispatch (#546): a review fix cycle restarts the re-run
+    # stages at attempt 0, so this is what keeps their stream/stderr/prompt files from
+    # overwriting the earlier pass's (see ``stream_probe.stream_basename``). Dispatch
+    # metadata like ``phase`` — it names where a call's evidence lands, never what the work
+    # IS — so it is excluded from ``compute_content_hash``.
+    review_cycle: int = 0
     created_at: str  # ISO-8601 UTC; stamped by the engine
 
     @classmethod
@@ -360,6 +366,7 @@ class WorkItem(BaseModel):
         tool_policy: ToolPolicy | None = None,
         permission_posture: PermissionPosture | None = None,
         workspace_isolated: bool = False,
+        review_cycle: int = 0,
     ) -> WorkItem:
         """Build a WorkItem with its content_hash derived consistently."""
 
@@ -397,6 +404,7 @@ class WorkItem(BaseModel):
             tool_policy=tool_policy,
             permission_posture=permission_posture,
             workspace_isolated=workspace_isolated,
+            review_cycle=review_cycle,
             created_at=created_at,
         )
 
