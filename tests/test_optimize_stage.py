@@ -119,6 +119,28 @@ def test_no_lane_preset_carries_optimize(lane) -> None:
     assert Stage.OPTIMIZE not in LANE_STAGES[lane]
 
 
+@pytest.mark.parametrize("lane", [ExecutionLane.MICRO, ExecutionLane.LITE])
+def test_cheap_lane_presets_skip_optimize_even_when_the_roster_opts_in(
+    tmp_path, optimizing, lane,
+) -> None:
+    """micro and lite exist to be cheap: an un-pinned task there never gains OPTIMIZE."""
+    eng = _engine(tmp_path, optimizing)
+    eng.create_run("r1", lane)
+    task = eng.add_task("r1", "t1")
+
+    assert Stage.OPTIMIZE not in task.pipeline
+    assert task.pipeline == LANE_STAGES[lane]
+    assert not any(e["type"] == "pipeline_stage_inserted" for e in _events(tmp_path))
+
+
+def test_a_pinned_pipeline_on_a_cheap_lane_still_gets_optimize(tmp_path, optimizing) -> None:
+    eng = _engine(tmp_path, optimizing)
+    eng.create_run("r1", ExecutionLane.MICRO)
+    task = eng.add_task("r1", "t1", pipeline=[Stage.INTAKE, Stage.IMPLEMENT, Stage.REVIEW])
+
+    assert Stage.OPTIMIZE in task.pipeline
+
+
 def test_the_roster_entry_inserts_the_stage_after_simplify(tmp_path, optimizing) -> None:
     eng = _engine(tmp_path, optimizing)
     eng.create_run("r1", ExecutionLane.FULL)

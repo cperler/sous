@@ -959,9 +959,15 @@ class Engine:
         # preset, or a decomposition child's quality-tier pipeline — so every path picks the
         # stage up from one call site instead of three that can drift. A `none` quality tier
         # is the one exception: that tier means "run no quality pass", and OPTIMIZE is one.
+        # The micro and lite presets are the other: they exist to be cheap, so an un-pinned
+        # task on either lane never gains the extra paid stage. An explicit pipeline pin
+        # still gets it, because a bespoke pipeline is the caller's own statement.
         resolved_pipeline = tuple(pipeline) if pipeline else LANE_STAGES[effective_lane]
         optimize_agent: str | None = None
-        if resolved_quality is not QualityTier.NONE:
+        cheap_preset = not pipeline_pinned and effective_lane in (
+            ExecutionLane.MICRO, ExecutionLane.LITE,
+        )
+        if resolved_quality is not QualityTier.NONE and not cheap_preset:
             optimize_agent = self._optimize_agent()
             if optimize_agent is not None:
                 resolved_pipeline = with_optimize(resolved_pipeline)
