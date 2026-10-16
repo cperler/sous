@@ -208,6 +208,7 @@ def test_a_stage_that_ran_two_models_writes_a_row_per_model(tmp_path) -> None:
     assert all("phase" not in r for r in rows)
     assert view["cost_usd"] == pytest.approx(20.0 + 5.0)
     assert view["sub_calls"] == 3
+    assert view["by_model"] == {SONNET: 0.0, HAIKU: pytest.approx(5.0), OPUS: pytest.approx(20.0)}
 
 
 def test_replay_converges_on_per_model_rows(tmp_path) -> None:
@@ -267,8 +268,14 @@ def test_cost_mismatch_tolerance() -> None:
     assert cost_mismatch({"cost_usd": 0.01, "provider_cost_usd": 0.025}) is None  # < $0.02
     assert cost_mismatch({"cost_usd": 0.38, "provider_cost_usd": None}) is None
     assert cost_mismatch({"cost_usd": 0.0, "provider_cost_usd": 1.0, "priced": False}) is None
-    gap = cost_mismatch({"cost_usd": 0.38, "provider_cost_usd": 0.50})
-    assert gap == {"engine_cost_usd": 0.38, "provider_cost_usd": 0.5, "delta_usd": -0.12}
+    gap = cost_mismatch({"model": "m", "cost_usd": 0.38, "provider_cost_usd": 0.50})
+    assert gap == {"engine_cost_usd": 0.38, "provider_cost_usd": 0.5, "delta_usd": -0.12,
+                   "by_model": {"m": 0.38}}
+    # An aggregate view over several models passes its own breakdown through.
+    split = {"a": 0.30, "b": 0.08}
+    gap = cost_mismatch({"model": "a", "cost_usd": 0.38, "provider_cost_usd": 0.50,
+                         "by_model": split})
+    assert gap is not None and gap["by_model"] == split
 
 
 def _engine_scope(tmp_path) -> tuple[Engine, WorkItem]:
@@ -303,6 +310,7 @@ def test_engine_emits_a_warning_when_its_price_disagrees(tmp_path, provider_cost
     assert gap["stage"] == "scope" and gap["work_item_id"] == scope.id
     assert gap["engine_cost_usd"] == pytest.approx(price)
     assert gap["provider_cost_usd"] == pytest.approx(price * 2)
+    assert gap["by_model"] == {scope.model: pytest.approx(price)}
 
 
 def test_raw_result_fields_reach_the_stage_result(tmp_path, monkeypatch) -> None:

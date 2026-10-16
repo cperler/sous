@@ -569,6 +569,9 @@ class CostLedger:
                 # #557: what the provider itself says this dispatch cost, for the engine's
                 # cross-check. None unless EVERY call reported one.
                 "provider_cost_usd": _provider_cost(result, rows),
+                # #557: what each model cost in this dispatch, so a ``stage_cost_mismatch``
+                # warning names where the money went without a ledger re-read.
+                "by_model": _cost_by_model(rows),
                 "priced": all(r["priced"] for r in rows),
                 "metered": all(r["metered"] for r in rows),
                 "schema_retries": sum(r["schema_retries"] for r in rows),
@@ -1023,6 +1026,16 @@ def _provider_cost(result: StageResult, rows: list[dict]) -> float | None:
     return round(sum(float(c) for c in costs if isinstance(c, int | float)), 6)
 
 
+def _cost_by_model(rows: list[dict]) -> dict[str, float]:
+    """``{model: Σ cost_usd}`` over a dispatch's rows (a model several sub-calls used
+    is summed into one entry)."""
+    by_model: dict[str, float] = {}
+    for r in rows:
+        model = str(r.get("model"))
+        by_model[model] = round(by_model.get(model, 0.0) + float(r.get("cost_usd") or 0.0), 6)
+    return by_model
+
+
 # The engine-vs-provider price gap that is worth a warning (#557): the larger of an absolute
 # floor (rounding and sub-cent drift on cheap stages) and a relative share of the stage.
 COST_MISMATCH_ABS_USD = 0.02
@@ -1033,8 +1046,8 @@ def cost_mismatch(view: dict) -> dict | None:
     """The engine-vs-provider price gap on one dispatch view, when it exceeds tolerance.
 
     Pure (the engine emits the event). Returns ``{engine_cost_usd, provider_cost_usd,
-    delta_usd, by_model}`` or None — None too when there is nothing comparable: no
-    provider figure (codex, an older CLI, a session whose earlier spend predates #557) or
+    delta_usd, by_model}`` — ``by_model`` is ``{model: cost_usd}`` over this dispatch's
+    rows — or None. None too when there is nothing comparable: no provider figure (codex, an older CLI, a session whose earlier spend predates #557) or
     an unpriced row (an unknown model already reads as a gap, and is flagged as such)."""
     provider = view.get("provider_cost_usd")
     if not isinstance(provider, int | float) or view.get("priced") is False:
@@ -1043,8 +1056,14 @@ def cost_mismatch(view: dict) -> dict | None:
     delta = engine - float(provider)
     if abs(delta) <= max(COST_MISMATCH_ABS_USD, COST_MISMATCH_REL * float(provider)):
         return None
+    # An aggregate view carries its per-model breakdown; a single persisted row IS one
+    # model's cost.
+    by_model = view.get("by_model")
+    if not isinstance(by_model, dict):
+        by_model = {str(view.get("model")): round(engine, 6)}
     return {
         "engine_cost_usd": round(engine, 6),
         "provider_cost_usd": round(float(provider), 6),
         "delta_usd": round(delta, 6),
+        "by_model": by_model,
     }

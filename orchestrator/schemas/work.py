@@ -168,8 +168,10 @@ class SubCall(BaseModel):
     # instead of a confident $0, and ``_dispatch_view``'s ``all(...)`` propagates that to the
     # dispatch aggregate.
     usage_recovered: bool = True
-    # Same per-model, SESSION-cumulative claude report as ``StageResult.model_usage`` (#557),
-    # one level down: the ledger de-cumulates it against ``session_id``.
+    # Same per-model, session-cumulative claude report as ``StageResult.model_usage`` (#557),
+    # one level down. Each panel sub-call runs in a FRESH session, so its cumulative figure
+    # is already that sub-call's own spend: the ledger prices it as-is (``session=None``),
+    # with no de-cumulation against prior rows.
     model_usage: dict[str, TokenUsage] | None = None
     provider_session_cost_usd: float | None = None
 
