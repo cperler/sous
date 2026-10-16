@@ -234,6 +234,19 @@ so its cost and failures are visible without restoring the old opaque quality lo
   review fix cycle's fresh records reconsider it against the new diff. The completion note
   says "Speed pass skipped — only non-code files changed".
 
+- **DELIVER must have pushed what it checkpointed (#500).** A DELIVER that reports success
+  is checked by the engine before the result is absorbed: it runs `git ls-remote origin
+  refs/heads/<branch>` in the task worktree, which reads the remote directly, unlike a
+  remote-tracking ref a bare-refspec `git fetch` leaves stale. It then compares that SHA
+  with the stage's checkpoint. A mismatch, or a branch the remote lacks, fails the stage
+  (warning-grade `deliver_push_mismatch`), so the ordinary retry re-dispatches DELIVER with
+  the mismatch as learnings. A match emits `deliver_push_verified`. A check that cannot run
+  (no checkpoint/branch/worktree, no `origin`, ls-remote failed or timed out) leaves the
+  stage green with a warning-grade `deliver_push_unverified`. The engine never pushes:
+  DELIVER's push is an outward action to verify, not to perform for it. #378's
+  completion-time PR check (`completion_pr_invalid`) stays as the backstop for what
+  this cannot see, such as a PR closed or retargeted after DELIVER.
+
 - **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
   made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs
   the diff made stale). This needs no prompt text: in 156 post-#381 tasks, IMPLEMENT wrote
