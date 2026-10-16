@@ -75,8 +75,8 @@ def _check_success(work: WorkItem, raw: RawResult, run: TestRun) -> tuple[RawRes
         "validation_notes": "\n\n".join(
             n for n in (model_notes, _VERIFIED_PREFIX + run_notes) if n
         ),
-        **{k: run_out[k] for k in ("test_scope", "tests_selected", "test_scope_reason")
-           if k in run_out},
+        **{k: run_out[k] for k in ("test_scope", "tests_selected", "test_scope_reason",
+                                   "flaky_failures") if k in run_out},
     }
     if run.ok:
         return replace(raw, structured_output=merged,

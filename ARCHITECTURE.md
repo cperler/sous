@@ -259,7 +259,10 @@ so its cost and failures are visible without restoring the old opaque quality lo
   worktree is settled by a green declared run (`tests_meaningful` null, left to REVIEW)
   instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
   does the TEST prompt tell the model to skip whole-suite runs. Motivated by a model that
-  ran a parallel-declared suite serially and timed out green code twice.
+  ran a parallel-declared suite serially and timed out green code twice. Up to five failing
+  unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors
+  it, else the whole unit command); failures that do not reproduce are recorded as
+  `flaky_failures` with a `test_flaky_failures_cleared` notice, not counted against the change.
 - **Impacted-only TEST (#558).** An adapter may declare `impacted_tests(changed)` (and
   `test_global_paths`); `orchestrator/test_selection.py` then narrows the unit command to
   `test_unit_cmd(files)` for the tests mapped from the task's diff. Every case it cannot

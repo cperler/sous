@@ -11,6 +11,7 @@ from __future__ import annotations
 import subprocess
 
 from adapters.execution.codex import CodexRunner
+from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.headless_claude import HeadlessClaudeRunner
 from adapters.execution.test_verdict import verify_test_verdict
 from adapters.execution.transport import RawResult
@@ -51,6 +52,7 @@ def _repo(tmp_path):
     def git(*args):
         subprocess.run(["git", *args], cwd=tmp_path, check=True, capture_output=True)
 
+    tmp_path.mkdir(parents=True, exist_ok=True)
     git("init", "-q")
     git("config", "user.email", "t@t")
     git("config", "user.name", "t")
@@ -169,6 +171,39 @@ def test_the_test_prompt_says_who_decides_only_on_a_verifying_lane() -> None:
     assert "## Who decides pass/fail" not in plain
     assert "## Who decides pass/fail" not in render_prompt(
         Stage.REVIEW, test_verdict_verified=True, **args)
+
+
+def _flaky(marker) -> _Proj:
+    """Fails on the first run (one named test), passes on every later run."""
+    return _Proj(["sh", "-c", f"if [ -f {marker} ]; then exit 0; fi; touch {marker}; "
+                              "echo 'FAILED tests/t.py::test_timing'; exit 1"])
+
+
+def test_a_failure_that_passes_on_rerun_is_flaky_not_caused(tmp_path) -> None:
+    repo = _repo(tmp_path / "repo")
+    raw, status = verify_test_verdict(_wi(repo), _model_green(), ResultStatus.SUCCESS,
+                                      _flaky(tmp_path / "ran"))
+    assert status is ResultStatus.SUCCESS
+    out = raw.structured_output
+    assert out["passed"] is True and out["failures"] == []
+    assert out["flaky_failures"] == ["tests/t.py::test_timing"]
+    assert any(n["notice"] == "test_flaky_failures_cleared" for n in raw.execution_notices)
+
+
+def test_a_failure_that_reproduces_on_rerun_stays_red(tmp_path) -> None:
+    run = DeterministicTestRunner(_RED).evaluate(_wi(_repo(tmp_path)))
+    assert run.ok is False and run.out["failures"] == ["tests/t.py::test_x"]
+    assert "re-ran the unit command once; still red" in run.out["validation_notes"]
+    assert "flaky_failures" not in run.out
+
+
+def test_many_failures_are_not_rerun(tmp_path) -> None:
+    lines = "; ".join(f"echo 'FAILED tests/t.py::test_{i}'" for i in range(6))
+    marker = tmp_path / "ran"
+    proj = _Proj(["sh", "-c", f"if [ -f {marker} ]; then exit 0; fi; touch {marker}; "
+                              f"{lines}; exit 1"])
+    run = DeterministicTestRunner(proj).evaluate(_wi(_repo(tmp_path / "repo")))
+    assert run.ok is False and len(run.out["failures"]) == 6
 
 
 def test_a_worktree_missing_on_disk_is_not_verified(tmp_path) -> None:

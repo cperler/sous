@@ -31,6 +31,13 @@ Impacted-only runs (#558): when the project adapter declares the optional
 raising, returning None, a global test input touched, an empty set — runs the full suite
 (``orchestrator.test_selection``), and the result records ``test_scope`` (impacted|full),
 ``tests_selected`` and ``test_scope_reason`` so a green subset never reads as a full green.
+
+Flaky failures: when the UNIT command fails on a few named tests, those tests are re-run
+once — narrowed via ``test_unit_cmd(failed)`` when the adapter honors it, else the whole
+unit command again. A re-run that passes means the failures did not reproduce: they are
+recorded under ``flaky_failures`` and a warning notice, not counted as caused. Prediction
+run ``batch-418-419-377-386-388`` failed a task three times on three different
+timing-sensitive tests its change never touched; one failing run is not proof.
 """
 
 from __future__ import annotations
@@ -48,6 +55,8 @@ from .transport import RawResult, _tag_head, subprocess_env, to_stage_result
 from .worktree_origin import verify_worktree_origin
 
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
+# More caused unit failures than this is treated as a real break, not flakiness — no re-run.
+_MAX_FLAKY_RERUN = 5
 
 # Documentation-file classification for the #41 docs-only change tag. Deliberately
 # conservative: a change is "docs-only" only when EVERY changed file is unambiguously
@@ -151,13 +160,24 @@ class DeterministicTestRunner:
             # never an escaped exception (which would leave the dispatch lease held with no
             # path to clear it). Mirror deterministic_setup's convert-to-FAILURE contract.
             return TestRun(None, str(exc), False, notices=origin.notices, refused=True)
-        return TestRun(out, error, ok, notices=origin.notices)
+        notices = origin.notices
+        if flaky := out.get("flaky_failures"):
+            notice: dict[str, object] = {
+                "notice": "test_flaky_failures_cleared",
+                "reason": "passed_on_rerun",
+                "failures": list(flaky)[:10],
+                "detail": "unit test failure(s) did not reproduce when re-run once; not "
+                          "counted against the change",
+            }
+            notices = notices + (notice,)
+        return TestRun(out, error, ok, notices=notices)
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
         baseline = set(_as_ids((work.context or {}).get("baseline_failures")))
         caused: list[str] = []
         caused_kinds: set[str] = set()
         inherited_count = 0
+        flaky: list[str] = []
         notes: list[str] = []
         # #5: export the task's per-task port block into the test subprocess so a suite that
         # boots a dev/test server binds THIS task's ports, never a sibling worktree's.
@@ -241,6 +261,16 @@ class DeterministicTestRunner:
             new = [f for f in failures if f.test not in baseline]
             inherited = [f for f in failures if f.test in baseline]
             inherited_count += len(inherited)
+            if new and label == "unit" and len(new) <= _MAX_FLAKY_RERUN:
+                ids = [f.test for f in new]
+                cleared, how = self._rerun_cleared(argv, ids, work.cwd, proc_env)
+                if cleared:
+                    flaky.extend(ids)
+                    notes.append(f"{label}: rc={proc.returncode}, but {len(ids)} failure(s) "
+                                 f"passed when {how} was re-run once — flaky, not counted: "
+                                 + ", ".join(ids))
+                    continue
+                notes.append(f"{label}: re-ran {how} once; still red")
             if new:
                 caused.extend(f.test for f in new)
                 caused_kinds.update(f.kind for f in new)
@@ -271,12 +301,33 @@ class DeterministicTestRunner:
             "validation_notes": "; ".join(notes),
             **extra,
             **scope,
+            **({"flaky_failures": flaky} if flaky else {}),
         }
         error = None if passed else (
             f"test stage red: {len(caused)} caused failure(s) "
             f"(kinds: {', '.join(sorted(caused_kinds)) or 'unknown'})"
         )
         return out, error, passed
+
+    def _rerun_cleared(
+        self, argv: list[str], failed: list[str], cwd: str | None, env: dict[str, str] | None,
+    ) -> tuple[bool, str]:
+        """Re-run once the unit tests that just failed; True when that run is green. Uses
+        ``test_unit_cmd(failed)`` when the adapter narrows on it, else ``argv`` again."""
+        unit = getattr(self._project, "test_unit_cmd", None)
+        narrowed = _argv_of(unit, failed)
+        if narrowed and narrowed != _argv_of(unit):
+            rerun, how = narrowed, "the failed test(s)"
+        else:
+            rerun, how = argv, "the unit command"
+        try:
+            proc = subprocess.run(  # noqa: S603
+                rerun, cwd=cwd, capture_output=True, text=True,
+                timeout=self._timeout_s, env=env,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return False, how
+        return proc.returncode == 0, how
 
     def _commands(
         self, selection: TestSelection
