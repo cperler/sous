@@ -24,6 +24,7 @@ from .enums import (
     TaskState,
 )
 from .status import (
+    CarriedReviewFiling,
     Progress,
     ResumeCursor,
     ReviewFixup,
@@ -73,6 +74,7 @@ __all__ = [
     "TaskRef",
     "StageRecord",
     "ReviewFixup",
+    "CarriedReviewFiling",
     "ResumeCursor",
     "Progress",
 ]

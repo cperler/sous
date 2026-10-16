@@ -41,7 +41,8 @@ def safe_phase(phase: str) -> str:
 
 
 def stream_basename(
-    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
     """The per-(stage, attempt[, sub-call phase][, schema-retry sub-call]) stem shared by the
     ``.stream.jsonl`` and ``.stderr.log`` files.
@@ -52,26 +53,38 @@ def stream_basename(
     dispatch owns its own stream. Within one (sub-)call, a schema-validate-and-retry sub-call
     (#70) gets a further ``.retry<K>`` suffix (K>=1) so each corrective sub-call's stream
     survives too — the first call (K=0) keeps the bare name, so the 99%-no-retry case is
-    unchanged, and a phase-less (single-call) dispatch names files exactly as it always did."""
+    unchanged, and a phase-less (single-call) dispatch names files exactly as it always did.
+
+    A review fix cycle (#546) re-opens IMPLEMENT→…→REVIEW with fresh stage records, so each
+    re-run stage starts again at attempt 0; ``cycle`` (``Task.review_cycles`` at dispatch)
+    inserts ``.cycle<C>`` after the attempt so the re-run never overwrites the earlier
+    pass's files. Cycle 0 keeps the pre-#546 name."""
     stem = f"{stage_value}-attempt{attempt}"
+    if cycle:
+        stem = f"{stem}.cycle{cycle}"
     if phase:
         stem = f"{stem}.{safe_phase(phase)}"
     return f"{stem}.retry{retry}" if retry else stem
 
 
 def stream_filename(
-    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
-    return stream_basename(stage_value, attempt, retry, phase=phase) + ".stream.jsonl"
+    return stream_basename(stage_value, attempt, retry, phase=phase, cycle=cycle) + ".stream.jsonl"
 
 
 def stderr_filename(
-    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
-    return stream_basename(stage_value, attempt, retry, phase=phase) + ".stderr.log"
+    return stream_basename(stage_value, attempt, retry, phase=phase, cycle=cycle) + ".stderr.log"
 
 
-def prompt_filename(stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None) -> str:
+def prompt_filename(
+    stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
+) -> str:
     """The dispatched prompt's file for one (stage, attempt) — ``<stem>.prompt.txt`` (#314).
 
     Shares ``stream_basename`` with the ``.stream.jsonl``/``.stderr.log`` tees deliberately:
@@ -81,7 +94,7 @@ def prompt_filename(stage_value: str, attempt: int, retry: int = 0, *, phase: st
     ``NN-`` sequence because that counter is only claimed under the record-time lock — a
     resume that supersedes a lease (#142) dispatches twice with no record in between, and
     both dispatches would predict the same ``NN``."""
-    return stream_basename(stage_value, attempt, retry, phase=phase) + ".prompt.txt"
+    return stream_basename(stage_value, attempt, retry, phase=phase, cycle=cycle) + ".prompt.txt"
 
 
 def stages_dir(run_root: str | Path, task_id: str) -> Path:
@@ -91,69 +104,79 @@ def stages_dir(run_root: str | Path, task_id: str) -> Path:
 
 
 def stream_relpath(
-    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
     """Stream path RELATIVE to the run root (portable if the run dir moves)."""
     return str(
         Path("stages") / safe_task_dirname(task_id)
-        / stream_filename(stage_value, attempt, retry, phase=phase)
+        / stream_filename(stage_value, attempt, retry, phase=phase, cycle=cycle)
     )
 
 
 def stderr_relpath(
-    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
     return str(
         Path("stages") / safe_task_dirname(task_id)
-        / stderr_filename(stage_value, attempt, retry, phase=phase)
+        / stderr_filename(stage_value, attempt, retry, phase=phase, cycle=cycle)
     )
 
 
 def prompt_relpath(
-    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None
+    task_id: str, stage_value: str, attempt: int, retry: int = 0, *, phase: str | None = None,
+    cycle: int = 0,
 ) -> str:
     """Prompt path RELATIVE to the run root (portable if the run dir moves) — the spelling
     that rides ``stage_dispatched`` so a reader never has to reconstruct the convention."""
     return str(
         Path("stages") / safe_task_dirname(task_id)
-        / prompt_filename(stage_value, attempt, retry, phase=phase)
+        / prompt_filename(stage_value, attempt, retry, phase=phase, cycle=cycle)
     )
 
 
-def _attempt_of(path: Path) -> tuple[int, int]:
-    """The ``(attempt, retry)`` encoded in ``<stage>-attemptN[.retryK].stream.jsonl`` — retry
-    defaults to 0 for a base (non-retry) file — so the newest sub-call sorts last: a higher
-    attempt wins, and within one attempt a higher schema-retry suffix wins (#70). ``(-1, -1)``
-    if the attempt is unparseable."""
+# The cycle segment sits directly after the attempt (see ``stream_basename``), so it is
+# matched there rather than anywhere in the name, where a panel phase could also spell it.
+_ATTEMPT_CYCLE_RE = re.compile(r"-attempt(\d+)(?:\.cycle(\d+))?(?:\.|$)")
+
+
+def _attempt_of(path: Path) -> tuple[int, int, int]:
+    """The ``(cycle, attempt, retry)`` encoded in
+    ``<stage>-attemptN[.cycleC][...][.retryK].stream.jsonl`` — cycle and retry default to 0
+    for a pre-#546 / non-retry file — so the newest sub-call sorts last: a later review fix
+    cycle wins (its stages restart at attempt 0, #546), then a higher attempt, then a higher
+    schema-retry suffix (#70). ``(-1, -1, -1)`` if the attempt is unparseable."""
     name = path.name
-    try:
-        attempt = int(name.split("-attempt", 1)[1].split(".", 1)[0])
-    except (IndexError, ValueError):
-        return (-1, -1)
+    m = _ATTEMPT_CYCLE_RE.search(name)
+    if m is None:
+        return (-1, -1, -1)
+    attempt = int(m.group(1))
+    cycle = int(m.group(2) or 0)
     retry = 0
     if ".retry" in name:
         try:
             retry = int(name.split(".retry", 1)[1].split(".", 1)[0])
         except (IndexError, ValueError):
             retry = 0
-    return (attempt, retry)
+    return (cycle, attempt, retry)
 
 
-def _stream_sort_key(path: Path) -> tuple[int, int, float]:
-    """``(attempt, retry, mtime)`` — the ordering ``find_current_stream`` follows.
+def _stream_sort_key(path: Path) -> tuple[int, int, int, float]:
+    """``(cycle, attempt, retry, mtime)`` — the ordering ``find_current_stream`` follows.
 
-    The mtime is the TIEBREAK within one ``(attempt, retry)``: a multi-agent REVIEW panel
-    (#73) writes one stream per sub-call (``<stage>-attempt<N>.<phase>...``), so several
-    files now share a key that used to be unique per stage-attempt. Ordering the tie by
-    mtime makes ``probe_current_stream`` / ``orchestrator tail`` follow the sub-call that is
-    actually live rather than whichever name the glob happened to yield. An unstattable file
-    (raced deletion) sorts oldest instead of raising."""
-    attempt, retry = _attempt_of(path)
+    The mtime is the TIEBREAK within one ``(cycle, attempt, retry)``: a multi-agent REVIEW
+    panel (#73) writes one stream per sub-call (``<stage>-attempt<N>.<phase>...``), so
+    several files now share a key that used to be unique per stage-attempt. Ordering the tie
+    by mtime makes ``probe_current_stream`` / ``orchestrator tail`` follow the sub-call that
+    is actually live rather than whichever name the glob happened to yield. An unstattable
+    file (raced deletion) sorts oldest instead of raising."""
+    cycle, attempt, retry = _attempt_of(path)
     try:
         mtime = path.stat().st_mtime
     except OSError:  # pragma: no cover - defensive (raced deletion)
         mtime = 0.0
-    return (attempt, retry, mtime)
+    return (cycle, attempt, retry, mtime)
 
 
 def find_current_stream(

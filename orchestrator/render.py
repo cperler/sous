@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from .benchmark_gate import format_metric_rows
 from .schemas.enums import STAGE_ORDER, ExecutionMode, StageStatus
-from .schemas.status import ReviewFixup, StageRecord, Task
+from .schemas.status import CarriedReviewFiling, ReviewFixup, StageRecord, Task
 from .stream_probe import looks_like_event_stream, readable_text_from_stream
 
 # Effort rows read high→low (then the effort-less '(default)' bucket, then any unknown
@@ -796,6 +796,7 @@ def unfiled_findings(
     review: dict | None,
     followups: list[dict] | None = None,
     fixups: list[ReviewFixup] | None = None,
+    carried: list[CarriedReviewFiling] | None = None,
 ) -> list[dict]:
     """The review's non-blocking findings the engine did NOT file, as structured data (#357).
 
@@ -815,7 +816,9 @@ def unfiled_findings(
     ``[{"title", "ref"}]`` list of findings it DID file (those are excluded). ``fixups`` is
     the task's durable ``review_fixups`` — the ONLY evidence that a ``fixup`` finding was
     actually applied; without it such a finding is reported as requested-not-applied, which
-    fails toward honesty (#414)."""
+    fails toward honesty (#414). ``carried`` is the task's ``carried_review_filings`` (#546):
+    a ``file`` finding from a review a fix cycle replaced that was neither filed nor restated
+    by the final review can only have missed the cap, and is listed as such."""
     filed_titles = {str(f.get("title") or "").strip() for f in (followups or [])}
     applied_titles = {f.title for f in (fixups or []) if f.applied}
     out: list[dict] = []
@@ -855,6 +858,24 @@ def unfiled_findings(
             "disposition": "fixup",
             "reason": _FIXUP_APPLIED_REASON if fixup.applied else _FIXUP_UNAPPLIED_REASON,
         })
+    carried_findings = [c for c in carried or [] if c.kind == "finding"]
+    if carried_findings:
+        from .review_workflow import issue_fingerprint  # local: review_workflow imports render
+
+        entries = [f for f in (review or {}).get("non_blocking") or [] if isinstance(f, dict)]
+        if isinstance((review or {}).get("improvement"), dict):
+            entries.append((review or {})["improvement"])
+        titles = (str(e.get("title") or "").strip() for e in entries)
+        restated = {issue_fingerprint(t) for t in titles if t}
+        for c in carried_findings:
+            if c.fingerprint in restated or c.title in filed_titles:
+                continue
+            restated.add(c.fingerprint)
+            out.append({
+                "title": c.title,
+                "disposition": "file",
+                "reason": f"over per-task cap (raised by review pass {c.review_cycle + 1})",
+            })
     return out
 
 
@@ -911,6 +932,8 @@ def render_completion_note(
     improvement_ref: str | None = None,
     optimize_refs: list[dict] | None = None,
     cost_total: dict | None = None,
+    *,
+    carried_improvements: list[dict] | None = None,
 ) -> str:
     """Render a run's completion evidence as Markdown — the note the engine publishes
     back to the task source (PR/issue comment) so the pipeline's reasoning outlives the
@@ -922,7 +945,9 @@ def render_completion_note(
     OPTIMIZE pass returned (#519): ``{"title", "ref"}`` for a filing, ``{"title", "deduped"}``
     for one suppressed as a duplicate of something already filed. ``cost_total`` is the
     task's ledger cost roll-up (#524) for the Total line under the stage table; see
-    ``_total_cost_line``.
+    ``_total_cost_line``. ``carried_improvements`` is ``[{"title", "ref"}]`` for each
+    improvement idea an earlier review pass marked ``file`` before a fix cycle replaced
+    that review (#546), rendered in the self-improvement section.
 
     This note is the single source for the review verdict, per-stage model/effort/tokens/
     cost, and findings: the ``task_completed`` alert embeds it verbatim rather than
@@ -991,7 +1016,9 @@ def render_completion_note(
     # disagree. A `fixup` finding reports applied/not-applied from the durable
     # `review_fixups` records rather than from its disposition (#414) — the disposition
     # says what was ASKED for, only the record says what LANDED.
-    noted = unfiled_findings(review, followups, task.review_fixups)
+    noted = unfiled_findings(
+        review, followups, task.review_fixups, task.carried_review_filings
+    )
     if noted:
         lines += ["", "### Noted, not filed"]
         lines += [f"- {n['title']} — {n['reason']}" for n in noted]
@@ -1103,9 +1130,19 @@ def render_completion_note(
             )
             if fixup.detail:
                 lines.append(fixup.detail)
+    if carried_improvements:
+        if not show_improvement and not applied_fixups:
+            lines += ["", "### Self-improvement"]
+        for c in carried_improvements:
+            ref = c.get("ref")
+            suffix = f" → {ref}" if ref else " → (filing failed)"
+            lines.append(
+                f"💡 **Improvement idea (earlier review pass):** {c.get('title', '(untitled)')}"
+                f"{suffix}"
+            )
     retro = review.get("retrospective") if isinstance(review.get("retrospective"), dict) else None
     if retro and str(retro.get("title", "")).strip():
-        if not show_improvement and not applied_fixups:
+        if not show_improvement and not applied_fixups and not carried_improvements:
             lines += ["", "### Self-improvement"]
         lines += ["", f"🔍 **Process retrospective:** {retro['title']}"]
         if str(retro.get("detail", "")).strip():

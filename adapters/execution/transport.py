@@ -546,11 +546,15 @@ def _tee_streams(root: Path, work: WorkItem, raw: RawResult) -> dict | None:
     d.mkdir(parents=True, exist_ok=True)
     files: dict = {}
     if raw.raw_output is not None:
-        p = d / stream_filename(work.stage.value, work.attempt, phase=work.phase)
+        p = d / stream_filename(
+            work.stage.value, work.attempt, phase=work.phase, cycle=work.review_cycle
+        )
         p.write_text(raw.raw_output, encoding="utf-8")
         files["stream"] = str(p.relative_to(root))
     if raw.raw_stderr:
-        p = d / stderr_filename(work.stage.value, work.attempt, phase=work.phase)
+        p = d / stderr_filename(
+            work.stage.value, work.attempt, phase=work.phase, cycle=work.review_cycle
+        )
         p.write_text(raw.raw_stderr, encoding="utf-8")
         files["stderr"] = str(p.relative_to(root))
     return files or None
@@ -837,13 +841,15 @@ def _streaming_stream_files(
     ``work.phase`` (#73) inserts the review-panel sub-call's own segment before it."""
     files: dict = {
         "stream": stream_relpath(
-            work.task_id, work.stage.value, work.attempt, retry, phase=work.phase
+            work.task_id, work.stage.value, work.attempt, retry, phase=work.phase,
+            cycle=work.review_cycle,
         )
     }
     if stderr:
         try:
             p = _stream_dir(root, work.task_id) / stderr_filename(
-                work.stage.value, work.attempt, retry, phase=work.phase
+                work.stage.value, work.attempt, retry, phase=work.phase,
+                cycle=work.review_cycle,
             )
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(stderr, encoding="utf-8")
@@ -1628,7 +1634,8 @@ def claude_cli_transport(
         try:
             if root is not None:  # == streaming; narrows root for the _stream_dir calls below
                 tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                    work.stage.value, work.attempt, retry, phase=work.phase
+                    work.stage.value, work.attempt, retry, phase=work.phase,
+                    cycle=work.review_cycle,
                 )
                 returncode, stdout, stderr = _run_teed(
                     argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env,
@@ -1977,7 +1984,8 @@ def codex_cli_transport(
             try:
                 if root is not None:
                     tee_path = _stream_dir(root, work.task_id) / stream_filename(
-                        work.stage.value, work.attempt, retry, phase=work.phase
+                        work.stage.value, work.attempt, retry, phase=work.phase,
+                        cycle=work.review_cycle,
                     )
                     returncode, stdout, stderr = _run_teed(
                         argv, timeout=work.timeout_s, cwd=work.cwd, tee_path=tee_path, env=proc_env

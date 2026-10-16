@@ -40,13 +40,14 @@ _TEXT_CT = "text/plain; charset=utf-8"
 
 #: The file names a task's ``stages/<task>/`` dir legitimately holds, and so the only names
 #: ``/api/stage-file`` serves: the per-stage record and its Markdown (``NN-<stage>.json|md``),
-#: a dispatch's prompt / raw stream / stderr tee (``<stage>-attempt<N>[.<phase>][.retry<K>]``
+#: a dispatch's prompt / raw stream / stderr tee
+#: (``<stage>-attempt<N>[.cycle<C>][.<phase>][.retry<K>]``
 #: + ``.prompt.txt|.stream.jsonl|.stderr.log``, named by ``stream_probe``), the completion note
 #: and the task index. Anything else is refused by name before the filesystem is consulted, so
 #: the endpoint cannot be walked into the run's status docs or ledger.
 _STAGE_FILE_RE = re.compile(
     r"\d{2,}-[a-z_]+\.(?:json|md)"
-    r"|[a-z_]+-attempt\d+(?:\.[A-Za-z0-9_-]+)?(?:\.retry\d+)?"
+    r"|[a-z_]+-attempt\d+(?:\.cycle\d+)?(?:\.[A-Za-z0-9_-]+)?(?:\.retry\d+)?"
     r"\.(?:prompt\.txt|stream\.jsonl|stderr\.log)"
     r"|completion-note\.md|index\.md"
 )

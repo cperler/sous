@@ -166,7 +166,7 @@ from .schemas.enums import (
     resolve_effort,
     with_optimize,
 )
-from .schemas.status import ReviewFixup, Run, RunDriver, Task, TaskRef
+from .schemas.status import CarriedReviewFiling, ReviewFixup, Run, RunDriver, Task, TaskRef
 from .schemas.work import (
     LanePolicy,
     LaneUsed,
@@ -467,6 +467,17 @@ _PLAN_UNRUN_STATUSES = frozenset({
     ResultStatus.PROVIDER_UNAVAILABLE,
     ResultStatus.INVOCATION_ERROR,
 })
+
+# #546: the review outcomes after which a LATER review replaces this one's output, mapped
+# to how many review cycles the outcome itself spent (subtracted to name the superseded
+# pass). A fix cycle re-runs implement→…→review; a hold re-dispatches REVIEW once a human
+# releases it. Finalize files only from the surviving review, so these carry `file` requests.
+_REVIEW_SUPERSEDING_OUTCOMES: dict[str, int] = {
+    "review_fixup_cycle": 1,
+    "review_rejected_fix_cycle": 1,
+    "review_fixup_held": 0,
+    "review_rejected_held": 0,
+}
 
 # The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
 # from this set, so the two types must be listed together: a park that only looked for a
@@ -1931,6 +1942,7 @@ class Engine:
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
             permission_posture=permission_posture,  # #304, hash-excluded for the same reason
+            review_cycle=task.review_cycles,  # #546: names this fix cycle's log files
         )
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
@@ -1941,7 +1953,7 @@ class Engine:
         # point of recording it — is unaffected by any truncation.
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         prompt_dropped: int | None = None
-        prompt_file = prompt_relpath(task_id, stage.value, attempt)
+        prompt_file = prompt_relpath(task_id, stage.value, attempt, cycle=work.review_cycle)
         # Commit the dispatch as a locked read-modify-write: re-check the lease and
         # that the stage hasn't advanced under us, so two concurrent next_work calls
         # can't both claim the task — the loser sees the moved lease/stage and raises.
@@ -2166,7 +2178,7 @@ class Engine:
                     return False
 
             _, prompt_dropped = self.store.write_stage_prompt(
-                task_id, prompt_filename(stage.value, attempt), prompt
+                task_id, prompt_filename(stage.value, attempt, cycle=work.review_cycle), prompt
             )
             self.store.commit_task_events(run_id, task_id, _commit, _dispatch_events)
             return True
@@ -2933,6 +2945,7 @@ class Engine:
         workspace_origin: dict[str, object] | None = None
         review_fixup_actions: list[dict[str, object]] = []
         fixups_applied: list[ReviewFixup] = []
+        review_filings_carried: list[CarriedReviewFiling] = []
         cooldown_until: str | None = None
         cooldown_wait_source: Literal["fixed_cooldown", "provider_reset"] | None = None
         cooldown_budget_charged = False
@@ -2947,6 +2960,7 @@ class Engine:
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
             nonlocal test_validation, review_fixup_actions, fixups_applied
+            nonlocal review_filings_carried
             nonlocal workspace_origin
             nonlocal cooldown_until, cooldown_wait_source, cooldown_budget_charged
             nonlocal provider_reset_at, provider_out_reason, lease_rejection
@@ -3190,6 +3204,13 @@ class Engine:
                     # it only when the run opted in AND the failure was mechanical AND the
                     # worktree still matches the session — see _settle_failed_session.
                     outcome = self._handle_failure(t, effective, run=run)
+            # #546: an outcome that re-runs REVIEW supersedes this review's output, so its
+            # `file` requests are carried onto the task doc in this same transaction.
+            if outcome in _REVIEW_SUPERSEDING_OUTCOMES and effective.stage is Stage.REVIEW:
+                review_filings_carried = self._carry_review_filings(
+                    t, effective.structured_output or {},
+                    review_cycle=t.review_cycles - _REVIEW_SUPERSEDING_OUTCOMES[outcome],
+                )
             # The per-stage log sequence is claimed under the same lock as the mutation,
             # so a replay recomputes the SAME seq (the counter only persists with the doc).
             t.stage_counter += 1
@@ -3319,6 +3340,14 @@ class Engine:
                          {"already_scheduled": action["already_scheduled"]}
                          if "already_scheduled" in action else {}
                      )}
+                )
+            for carried in review_filings_carried:
+                events.append(
+                    {"ts": _now(), "type": "review_filing_carried_forward", "run_id": run_id,
+                     "task_id": result.task_id, "stage": result.stage.value,
+                     "kind": carried.kind, "title": carried.title,
+                     "fingerprint": carried.fingerprint,
+                     "review_cycle": carried.review_cycle}
                 )
             for fixup in fixups_applied:
                 events.append(
@@ -4507,6 +4536,48 @@ class Engine:
                 source=source,
             ))
         return fixups
+
+    @staticmethod
+    def _carry_review_filings(
+        task: Task, output: dict, *, review_cycle: int
+    ) -> list[CarriedReviewFiling]:
+        """Snapshot a superseded review's ``file`` requests onto ``task`` (#546).
+
+        Called when a review's outcome re-runs REVIEW (a fix cycle, or a hold a human will
+        release into a re-review), because the next review's output replaces this one and
+        finalize files only from the survivor. Takes every ``non_blocking`` finding and the
+        ``improvement`` whose disposition is explicitly ``file``, coerced the way the
+        filing code coerces them. Skips an entry already carried (same kind + fingerprint)
+        so a review that repeats itself across cycles is carried once. Returns the entries
+        it added, for the caller to event."""
+        candidates: list[tuple[Literal["finding", "improvement"], dict]] = []
+        raw_findings = output.get("non_blocking")
+        if isinstance(raw_findings, list):
+            candidates += [("finding", f) for f in raw_findings if isinstance(f, dict)]
+        improvement = output.get("improvement")
+        if isinstance(improvement, dict):
+            candidates.append(("improvement", improvement))
+        have = {(c.kind, c.fingerprint) for c in task.carried_review_filings}
+        added: list[CarriedReviewFiling] = []
+        for kind, entry in candidates:
+            title = str(entry.get("title") or "").strip()
+            disposition = str(entry.get("disposition") or "").strip().casefold()
+            if disposition != "file" or not title:
+                continue
+            fingerprint = issue_fingerprint(title)
+            if (kind, fingerprint) in have:
+                continue
+            have.add((kind, fingerprint))
+            carried = CarriedReviewFiling(
+                kind=kind,
+                title=title,
+                detail=str(entry.get("detail") or "").strip(),
+                fingerprint=fingerprint,
+                review_cycle=review_cycle,
+            )
+            task.carried_review_filings.append(carried)
+            added.append(carried)
+        return added
 
     @staticmethod
     def _fixup_learning(fixup: ReviewFixup, *, repeated: bool = False) -> str:
@@ -7501,6 +7572,7 @@ class Engine:
         followups: list[dict] = []
         improvement_ref: str | None = None
         optimize_refs: list[dict] = []
+        carried_improvements: list[dict] = []
         note_md: str | None = None
         ts = self.project.task_source
         pr_info = self._record_completion_pr_evidence(run_id, task, ts)
@@ -7528,6 +7600,10 @@ class Engine:
                 improvement = (review.output or {}).get("improvement") if review else None
                 if isinstance(improvement, dict):
                     filed_fps.add(self._issue_fingerprint(str(improvement.get("title") or "")))
+            # #546: ideas an earlier review pass filed-marked before a fix cycle replaced it.
+            carried_improvements = self._file_carried_improvements(
+                run_id, task, ts, skip_fingerprints=filed_fps
+            )
             optimize_refs = self._file_optimize_suggestions(
                 run_id, task, ts, skip_fingerprints=filed_fps
             )
@@ -7554,7 +7630,8 @@ class Engine:
             with contextlib.suppress(Exception):
                 cost_total = self._task_cost_facts(run_id, task.task_id)
             note_md = render_completion_note(
-                task, followups, improvement_ref, optimize_refs, cost_total
+                task, followups, improvement_ref, optimize_refs, cost_total,
+                carried_improvements=carried_improvements,
             )
             self._publish_completion_note(run_id, task, ts, note_md, followups)
         except Exception as exc:  # noqa: BLE001 - evidence-out must never crash finalize
@@ -7568,6 +7645,7 @@ class Engine:
             {"ts": _now(), "type": "task_completed", "run_id": run_id,
              "task_id": task.task_id, "pr_url": task.pr_url,
              "followups_filed": len(followups), "improvement_filed": improvement_ref is not None,
+             "carried_improvements_filed": sum(1 for c in carried_improvements if c["ref"]),
              "optimize_suggestions_filed": sum(
                  1 for r in optimize_refs if not r.get("deduped")
              ),
@@ -7721,16 +7799,48 @@ class Engine:
         filed" section instead (nothing is silently dropped). A ``fixup`` finding is
         not filed because the engine APPLIES it in place (#414), not because it was
         judged unworthy of a ticket. Returns ``[{"title", "ref"}]`` for the FILED findings; a no-op
-        when the adapter lacks ``file_followup`` or the review reported none."""
+        when the adapter lacks ``file_followup`` or the review reported none.
+
+        Findings an EARLIER review marked ``file`` before a fix cycle replaced it (#546,
+        ``Task.carried_review_filings``) are filed after the final review's own, against the
+        same cap — unless the final review restated them (any disposition: the last reviewer
+        saw the finished change, so its call wins), which is evented as
+        ``review_filing_carried_deduped``. One over the cap is listed in the completion note
+        like any other overflow."""
         file_followup = getattr(task_source, "file_followup", None)
         if not callable(file_followup):
             return []
         review = task.stages.get(Stage.REVIEW)
         findings = (review.output or {}).get("non_blocking") if review else None
-        if not findings:
+        carried = [c for c in task.carried_review_filings if c.kind == "finding"]
+        if not findings and not carried:
             return []
+        if not isinstance(findings, list):
+            findings = []
         cap = self._followup_cap(run_id, task)
         filed: list[dict] = []
+
+        def _file(title: str, body: str) -> None:
+            try:
+                # No label: a review nit may be a bug, a docs gap, or an enhancement, and
+                # the engine cannot tell which. triage-followups matches on the body footer,
+                # not a label, and the human assigns a real one at triage (#367 follow-up).
+                ref = file_followup(title=title, body=body)
+            except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "followup_failed", "run_id": run_id,
+                     "task_id": task.task_id, "title": title, "error": str(exc)},
+                )
+                filed.append({"title": title, "ref": None})
+                return
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "followup_filed", "run_id": run_id,
+                 "task_id": task.task_id, "title": title, "ref": ref},
+            )
+            filed.append({"title": title, "ref": ref})
+
         for finding in findings:
             if not isinstance(finding, dict):
                 continue
@@ -7751,26 +7861,100 @@ class Engine:
                 f"_Filed automatically from the {task.task_id} review "
                 f"({task.pr_url or 'PR'}) as a non-blocking follow-up._"
             )
+            _file(title, body)
+        restated = self._final_review_fingerprints(task)
+        for c in carried:
+            if c.fingerprint in restated:
+                self._event_carried_deduped(run_id, task, c)
+                continue
+            if len(filed) >= cap:
+                continue  # listed in the completion note's "Noted, not filed" (#188)
+            body = (
+                f"{c.detail}\n\n"
+                f"_Filed automatically from the {task.task_id} review "
+                f"({task.pr_url or 'PR'}) as a non-blocking follow-up — raised by review "
+                f"pass {c.review_cycle + 1}, before a fix cycle replaced that review._"
+            )
+            _file(c.title, body)
+        return filed
+
+    @staticmethod
+    def _final_review_fingerprints(task: Task) -> set[str]:
+        """Fingerprints of every titled entry the surviving review emitted — each
+        ``non_blocking`` finding and the ``improvement``, whatever their disposition. A
+        carried request the final reviewer restated is that reviewer's to dispose of (#546)."""
+        review = task.stages.get(Stage.REVIEW)
+        output = (review.output or {}) if review else {}
+        entries = [f for f in output.get("non_blocking") or [] if isinstance(f, dict)]
+        if isinstance(output.get("improvement"), dict):
+            entries.append(output["improvement"])
+        titles = (str(e.get("title") or "").strip() for e in entries)
+        return {issue_fingerprint(t) for t in titles if t}
+
+    def _event_carried_deduped(self, run_id: str, task: Task, c: CarriedReviewFiling) -> None:
+        self.store.append_event(
+            run_id,
+            {"ts": _now(), "type": "review_filing_carried_deduped", "run_id": run_id,
+             "task_id": task.task_id, "kind": c.kind, "title": c.title,
+             "fingerprint": c.fingerprint, "review_cycle": c.review_cycle,
+             "reason": "restated by the final review"},
+        )
+
+    def _file_carried_improvements(
+        self, run_id: str, task: Task, task_source: object, skip_fingerprints: set[str],
+    ) -> list[dict]:
+        """File the improvement ideas earlier review passes marked ``file`` before a fix
+        cycle replaced them (#546). Returns ``[{"title", "ref"}]`` (ref None when filing
+        failed) for each one attempted, and adds every filed fingerprint to
+        ``skip_fingerprints`` so later filings in the same finalize dedupe against it.
+
+        Skipped, with an event, when the final review restated the idea
+        (``review_filing_carried_deduped``) or something this finalize already filed has
+        the same fingerprint (``improvement_deduped``)."""
+        file_followup = getattr(task_source, "file_followup", None)
+        if not callable(file_followup):
+            return []
+        restated = self._final_review_fingerprints(task)
+        out: list[dict] = []
+        for c in task.carried_review_filings:
+            if c.kind != "improvement":
+                continue
+            if c.fingerprint in restated:
+                self._event_carried_deduped(run_id, task, c)
+                continue
+            if c.fingerprint in skip_fingerprints:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "improvement_deduped", "run_id": run_id,
+                     "task_id": task.task_id, "title": c.title, "carried": True},
+                )
+                continue
+            body = (
+                f"{c.detail}\n\n"
+                f"_Filed automatically from the {task.task_id} review "
+                f"({task.pr_url or 'PR'}) — the run's own improvement idea (self-improvement "
+                f"loop), raised by review pass {c.review_cycle + 1} before a fix cycle "
+                f"replaced that review._"
+            )
             try:
-                # No label: a review nit may be a bug, a docs gap, or an enhancement, and
-                # the engine cannot tell which. triage-followups matches on the body footer,
-                # not a label, and the human assigns a real one at triage (#367 follow-up).
-                ref = file_followup(title=title, body=body)
+                ref = file_followup(title=c.title, body=body, labels=["enhancement"])
             except Exception as exc:  # noqa: BLE001 - finalize must survive a flaky task source
                 self.store.append_event(
                     run_id,
-                    {"ts": _now(), "type": "followup_failed", "run_id": run_id,
-                     "task_id": task.task_id, "title": title, "error": str(exc)},
+                    {"ts": _now(), "type": "improvement_failed", "run_id": run_id,
+                     "task_id": task.task_id, "title": c.title, "error": str(exc),
+                     "carried": True},
                 )
-                filed.append({"title": title, "ref": None})
+                out.append({"title": c.title, "ref": None})
                 continue
             self.store.append_event(
                 run_id,
-                {"ts": _now(), "type": "followup_filed", "run_id": run_id,
-                 "task_id": task.task_id, "title": title, "ref": ref},
+                {"ts": _now(), "type": "improvement_filed", "run_id": run_id,
+                 "task_id": task.task_id, "title": c.title, "ref": ref, "carried": True},
             )
-            filed.append({"title": title, "ref": ref})
-        return filed
+            skip_fingerprints.add(c.fingerprint)
+            out.append({"title": c.title, "ref": ref})
+        return out
 
     def _file_review_improvement(
         self, run_id: str, task: Task, task_source: object,
@@ -8677,6 +8861,7 @@ class Engine:
             (task.stages[Stage.REVIEW].output or {}) if Stage.REVIEW in task.stages else {},
             followups,
             task.review_fixups,
+            task.carried_review_filings,
         )
         note_file: str | None = None
         try:
