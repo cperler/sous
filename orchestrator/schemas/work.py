@@ -89,7 +89,25 @@ class TokenUsage(BaseModel):
     input: int = 0
     output: int = 0
     cache_read: int = 0
+    # Cache writes at the 5-minute TTL (billed ``cache_write_mult`` x input).
     cache_write: int = 0
+    # Cache writes at the 1-hour TTL (#557), DISJOINT from ``cache_write`` and billed
+    # ``cache_write_1h_mult`` x input. The headless claude CLI writes 1h entries, so pricing
+    # them at the 5m multiplier under-recorded every cache-heavy stage.
+    cache_write_1h: int = 0
+
+    def __add__(self, other: TokenUsage) -> TokenUsage:
+        return TokenUsage(
+            input=self.input + other.input,
+            output=self.output + other.output,
+            cache_read=self.cache_read + other.cache_read,
+            cache_write=self.cache_write + other.cache_write,
+            cache_write_1h=self.cache_write_1h + other.cache_write_1h,
+        )
+
+    def total(self) -> int:
+        """Every token counted, across all four buckets."""
+        return self.input + self.output + self.cache_read + self.cache_write + self.cache_write_1h
 
 
 class FinderSpec(BaseModel):
@@ -150,6 +168,10 @@ class SubCall(BaseModel):
     # instead of a confident $0, and ``_dispatch_view``'s ``all(...)`` propagates that to the
     # dispatch aggregate.
     usage_recovered: bool = True
+    # Same per-model, SESSION-cumulative claude report as ``StageResult.model_usage`` (#557),
+    # one level down: the ledger de-cumulates it against ``session_id``.
+    model_usage: dict[str, TokenUsage] | None = None
+    provider_session_cost_usd: float | None = None
 
 
 def compute_content_hash(
@@ -467,6 +489,13 @@ class StageResult(BaseModel):
     # default) on every metered success, on genuinely-$0 lanes (deterministic ENGINE), and on
     # a call that never dispatched at all (missing CLI binary — nothing was spent).
     usage_recovered: bool = True
+    # The claude CLI's per-model usage (``modelUsage``) and ``total_cost_usd`` from the
+    # call's final result event (#557). Both are CUMULATIVE over the provider session, which
+    # a task's stages chain through via ``--resume`` — so the ledger prices this stage's
+    # DELTA against what the session's prior rows already charged, one row per model.
+    # None on lanes/CLIs that do not report them (the ledger then prices ``token_usage``).
+    model_usage: dict[str, TokenUsage] | None = None
+    provider_session_cost_usd: float | None = None
     cost_usd: float | None = None
     pricing_ref: str | None = None
     error: str | None = None

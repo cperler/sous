@@ -26,7 +26,10 @@ class ModelInfo(BaseModel):
     input_per_mtok: float
     output_per_mtok: float
     cache_read_mult: float = 0.10  # cache reads bill at 10% of input
-    cache_write_mult: float = 1.25  # cache writes bill at 125% of input
+    cache_write_mult: float = 1.25  # 5-minute cache writes bill at 125% of input
+    # 1-hour cache writes bill at 200% of input (#557). The headless claude CLI writes 1h
+    # entries; pricing them at the 5m rate under-recorded every cache-heavy stage.
+    cache_write_1h_mult: float = 2.0
 
 
 # The sentinel model id for a deterministic (non-model) ENGINE-lane stage.
@@ -59,7 +62,11 @@ _MODELS: dict[str, ModelInfo] = {
     "claude-opus-5-5": ModelInfo(
         id="claude-opus-5-5", input_per_mtok=4.0, output_per_mtok=20.0, cache_read_mult=0.05
     ),
-    "claude-sonnet-5-5": ModelInfo(id="claude-sonnet-5-5", input_per_mtok=2.0, output_per_mtok=10.0),
+    # Sonnet 5.5 cache reads also bill at 0.05x input (#557: reproduces the CLI's own
+    # modelUsage costUSD to the cent, where 0.1x does not).
+    "claude-sonnet-5-5": ModelInfo(
+        id="claude-sonnet-5-5", input_per_mtok=2.0, output_per_mtok=10.0, cache_read_mult=0.05
+    ),
     "claude-haiku-4-5": ModelInfo(id="claude-haiku-4-5", input_per_mtok=1.0, output_per_mtok=5.0),
     # Superseded claude tiers — retained for PRICING historical ledger rows (runs dispatched
     # before the Opus 5 / Sonnet 5 bump), not for dispatch. Removing them would make every
@@ -164,6 +171,7 @@ class ModelTable:
             + usage.output * m.output_per_mtok
             + usage.cache_read * m.input_per_mtok * m.cache_read_mult
             + usage.cache_write * m.input_per_mtok * m.cache_write_mult
+            + usage.cache_write_1h * m.input_per_mtok * m.cache_write_1h_mult
         ) / 1_000_000
         return round(cost, 6)
 
