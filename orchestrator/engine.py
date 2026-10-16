@@ -7892,6 +7892,7 @@ class Engine:
         return {issue_fingerprint(t) for t in titles if t}
 
     def _event_carried_deduped(self, run_id: str, task: Task, c: CarriedReviewFiling) -> None:
+        """Record that a carried request was not filed because the final review restated it."""
         self.store.append_event(
             run_id,
             {"ts": _now(), "type": "review_filing_carried_deduped", "run_id": run_id,
