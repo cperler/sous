@@ -646,6 +646,7 @@ def test_plain_result_row_is_byte_identical_to_pre_change(tmp_path: Path) -> Non
         "output_tokens": 20,
         "cache_read_tokens": 30,
         "cache_write_tokens": 40,
+        "cache_write_1h_tokens": 0,  # #557
         "cost_usd": DEFAULT_MODEL_TABLE.cost_usd("claude-sonnet-5", result.token_usage),
         "priced": True,
         "metered": True,

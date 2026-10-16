@@ -93,6 +93,13 @@ class RawResult:
     # BEFORE any terminal event must be distinguishable from a measured zero. False makes the
     # ledger row unpriced/unmetered (an honest unknown) instead of a confident $0.0000.
     usage_recovered: bool = True
+    # The claude CLI's per-model ``modelUsage`` and ``total_cost_usd`` from the call's FINAL
+    # result event (#557). Both are cumulative over the provider SESSION (which ``--resume``
+    # carries across stages), so the ledger de-cumulates them; ``usage`` above stays this
+    # call's own tokens, summed over every result event in the stream. None when the CLI did
+    # not report them (older CLIs, codex).
+    model_usage: dict[str, TokenUsage] | None = None
+    provider_session_cost_usd: float | None = None
 
 
 Transport = Callable[[WorkItem], RawResult]
@@ -471,6 +478,8 @@ def _schema_retry_loop(
     schema_json: str,
     max_schema_retries: int,
     call: Callable[[WorkItem, str | None, int], RawResult],
+    *,
+    additive_usage: bool = False,
 ) -> RawResult:
     """The provider-agnostic schema-validate-and-retry loop (#32). Shared verbatim by the
     claude and codex transports so the corrective-prompt shape, retry budget, and
@@ -487,7 +496,12 @@ def _schema_retry_loop(
     (``structured_output`` None → SCHEMA_VIOLATION), with the validation errors appended to
     ``raw_output`` so the failure-learning tail is specific. ``schema_retries`` rides the
     RawResult onto the ledger row, and each superseded sub-call's stream files ride on
-    ``stream_files["retries"]`` so a post-mortem keeps the whole chain's evidence (#70)."""
+    ``stream_files["retries"]`` so a post-mortem keeps the whole chain's evidence (#70).
+
+    ``additive_usage`` (#557) is for a provider whose ``usage`` is per-CALL (claude): each
+    corrective call's tokens are added to the running total instead of replacing it, so a
+    re-prompted dispatch is not billed for its last call alone. Codex reports session-
+    cumulative usage, which the ledger de-cumulates, so it keeps the replacing default."""
     retries = 0
     chain: list[dict] = []  # superseded sub-calls' stream-file pairs, oldest first (#70)
     while True:
@@ -511,7 +525,10 @@ def _schema_retry_loop(
             errors, schema_json, raw.structured_output, continued=bool(resume_ref)
         )
         earlier_notices = raw.execution_notices
+        earlier_usage = raw.usage
         raw = call(work.model_copy(update={"prompt": corrective}), resume_ref, retries)
+        if additive_usage:
+            raw = replace(raw, usage=earlier_usage + raw.usage)
         # A superseded sub-call's execution notices (e.g. #556's terminated-after-result)
         # describe something that really happened in this dispatch — keep them.
         raw = replace(raw, schema_retries=retries,
@@ -930,6 +947,8 @@ def to_stage_result(
         execution_notices=raw.execution_notices,
         token_usage=raw.usage,
         usage_recovered=raw.usage_recovered,
+        model_usage=raw.model_usage,
+        provider_session_cost_usd=raw.provider_session_cost_usd,
         completed_at=completed_at.isoformat(),
     )
 
@@ -956,12 +975,70 @@ def _usage_from(d: dict) -> TokenUsage:
         # max(): a provider that ever reports cached > input must not yield negative fresh
         # input, which would price as a credit.
         cache_read, fresh_input = codex_cache_read, max(0, reported_input - codex_cache_read)
+    cache_write = u.get("cache_creation_input_tokens", 0) or 0
+    # claude splits its cache writes by TTL under ``cache_creation`` (#557); the 1h share
+    # bills at a higher multiplier. No split reported (older CLIs, codex) keeps the legacy
+    # all-5m reading.
+    split = u.get("cache_creation")
+    write_1h = (split.get("ephemeral_1h_input_tokens") or 0) if isinstance(split, dict) else 0
+    write_1h = min(write_1h, cache_write)
     return TokenUsage(
         input=fresh_input,
         output=u.get("output_tokens", 0) or 0,
         cache_read=cache_read,
-        cache_write=u.get("cache_creation_input_tokens", 0) or 0,
+        cache_write=cache_write - write_1h,
+        cache_write_1h=write_1h,
     )
+
+
+def _claude_usage_report(
+    events: list[dict],
+) -> tuple[TokenUsage, dict[str, TokenUsage] | None, float | None]:
+    """``(usage, model_usage, session_cost)`` from a claude call's result events, in order.
+
+    #557: two corrections over reading the final event's ``usage`` alone.
+
+    - One stream can hold SEVERAL ``type=="result"`` events (the CLI's own structured-output
+      re-prompt, background-task follow-ups, a resumed session's zero-turn echo), and each
+      ``usage`` covers only the turns since the previous one. ``usage`` here is their SUM —
+      the call's own tokens, across whichever models it ran.
+    - The final event's ``modelUsage`` (per model) and ``total_cost_usd`` are the
+      authoritative figures, but CUMULATIVE over the provider session: a ``--resume``d stage
+      re-reports every earlier stage's spend. They are returned as-is for the ledger to
+      de-cumulate against the session's prior rows. ``modelUsage`` gives no TTL split for
+      its cache writes, so each model's writes are split in the 1h:5m ratio this stream's
+      ``usage.cache_creation`` showed (all-1h when it showed none — what the headless CLI
+      writes).
+    """
+    usage = TokenUsage()
+    write_1h = write_5m = 0
+    for ev in events:
+        usage = usage + _usage_from(ev)
+        split = (ev.get("usage") or {}).get("cache_creation")
+        if isinstance(split, dict):
+            write_1h += split.get("ephemeral_1h_input_tokens") or 0
+            write_5m += split.get("ephemeral_5m_input_tokens") or 0
+    final = events[-1] if events else {}
+    raw_models = final.get("modelUsage")
+    model_usage: dict[str, TokenUsage] | None = None
+    if isinstance(raw_models, dict) and raw_models:
+        share_1h = write_1h / (write_1h + write_5m) if (write_1h + write_5m) else 1.0
+        model_usage = {}
+        for model, m in raw_models.items():
+            if not isinstance(m, dict):
+                continue
+            writes = int(m.get("cacheCreationInputTokens") or 0)
+            writes_1h = round(writes * share_1h)
+            model_usage[str(model)] = TokenUsage(
+                input=int(m.get("inputTokens") or 0),
+                output=int(m.get("outputTokens") or 0),
+                cache_read=int(m.get("cacheReadInputTokens") or 0),
+                cache_write=writes - writes_1h,
+                cache_write_1h=writes_1h,
+            )
+    cost = final.get("total_cost_usd")
+    session_cost = float(cost) if isinstance(cost, int | float) and cost >= 0 else None
+    return usage, model_usage, session_cost
 
 
 def _has_tokens(usage: TokenUsage) -> bool:
@@ -969,7 +1046,7 @@ def _has_tokens(usage: TokenUsage) -> bool:
     its spend is the numbers themselves — a lane like codex whose partial event stream has no
     single terminal envelope to point at. All-zero counts a report as MISSING, which errs
     toward 'unknown' over a confident $0."""
-    return (usage.input + usage.output + usage.cache_read + usage.cache_write) > 0
+    return usage.total() > 0
 
 
 def _codex_usage(events_stdout: str) -> TokenUsage:
@@ -1422,7 +1499,7 @@ def checkpointing_transport(inner: Transport) -> Transport:
 
 def _envelope_to_raw(
     data: dict, *, stdout: str, stderr: str, invocation: str, stream_files: dict | None,
-    raw_output: str | None = None,
+    raw_output: str | None = None, events: list[dict] | None = None,
 ) -> RawResult:
     """Build a RawResult from a claude result envelope (the whole ``--output-format json``
     object, or the ``type=="result"`` event of the ``stream-json`` stream — same field
@@ -1432,7 +1509,10 @@ def _envelope_to_raw(
     ``--output-format json`` path leaves it None so it defaults to ``stdout`` (which there IS the
     readable JSON envelope), while the streaming path passes the model's extracted FINAL TEXT so
     the raw event stream never lands in the .md Commentary / failure-learning tail (the full
-    stream is already teed to ``.stream.jsonl``)."""
+    stream is already teed to ``.stream.jsonl``).
+
+    ``events`` (#557) is every result event of a streamed call, oldest first, so usage is
+    summed across them; it defaults to ``[data]`` (the single-shot envelope)."""
     # Presence check, not truthiness: a valid-but-empty structured_output ({}) must not
     # fall through to the prose `result`.
     structured = data["structured_output"] if "structured_output" in data else data.get("result")
@@ -1441,11 +1521,13 @@ def _envelope_to_raw(
         # recover the JSON object it printed (validated later by the schema-retry loop).
         structured = _json_object_from_text(structured)
     session_id = data.get("session_id")
-    return RawResult(structured, _usage_from(data),
+    usage, model_usage, session_cost = _claude_usage_report(events or [data])
+    return RawResult(structured, usage,
                      raw_output=raw_output if raw_output is not None else stdout,
                      raw_stderr=stderr, exit_code=0, invocation=invocation,
                      stream_files=stream_files,
-                     session_ref=session_id if isinstance(session_id, str) else None)
+                     session_ref=session_id if isinstance(session_id, str) else None,
+                     model_usage=model_usage, provider_session_cost_usd=session_cost)
 
 
 _TERMINATED_AFTER_RESULT = "provider_terminated_after_result"
@@ -1472,11 +1554,11 @@ def _settles_claude_stage(line: str) -> bool:
     return isinstance(turns, int) and turns > 0
 
 
-def _last_result_event(stdout: str) -> dict | None:
-    """The final ``{"type":"result", ...}`` event from a claude ``stream-json`` stdout — the
-    envelope carrying the model's answer/usage/session. ``None`` if the stream ended without
-    one (a crashed/killed call), which the caller treats as a transport error."""
-    result: dict | None = None
+def _result_events(stdout: str) -> list[dict]:
+    """Every ``{"type":"result", ...}`` event in a claude ``stream-json`` stdout, oldest
+    first. A stream can carry several (#557); each one's ``usage`` covers only its own
+    turns, so pricing the call means reading all of them."""
+    results: list[dict] = []
     for line in stdout.splitlines():
         line = line.strip()
         if not line.startswith("{"):
@@ -1486,8 +1568,16 @@ def _last_result_event(stdout: str) -> dict | None:
         except json.JSONDecodeError:
             continue
         if isinstance(ev, dict) and ev.get("type") == "result":
-            result = ev
-    return result
+            results.append(ev)
+    return results
+
+
+def _last_result_event(stdout: str) -> dict | None:
+    """The final ``{"type":"result", ...}`` event from a claude ``stream-json`` stdout — the
+    envelope carrying the model's answer/session. ``None`` if the stream ended without
+    one (a crashed/killed call), which the caller treats as a transport error."""
+    results = _result_events(stdout)
+    return results[-1] if results else None
 
 
 def _json_envelope(stdout: str) -> dict | None:
@@ -1514,15 +1604,28 @@ def _recover_usage(stdout: str, *, streaming: bool) -> tuple[TokenUsage, str | N
     before it printed one). The caller propagates that to the ledger, which then writes the
     row unpriced/unmetered — an honest unknown — instead of a confident $0.0000.
     """
-    data = _last_result_event(stdout) if streaming else _json_envelope(stdout)
-    if data is None:
-        return TokenUsage(), None, False
-    session_id = data.get("session_id")
-    return (
-        _usage_from(data),
-        session_id if isinstance(session_id, str) else None,
-        True,
-    )
+    fields = _recovered_usage_fields(stdout, streaming=streaming)
+    return fields["usage"], fields["session_ref"], fields["usage_recovered"]
+
+
+def _recovered_usage_fields(stdout: str, *, streaming: bool) -> dict:
+    """``_recover_usage`` as ``RawResult`` keyword arguments, including the per-model
+    session report (#557), so a failed or timed-out attempt is priced exactly like a
+    successful one."""
+    events = _result_events(stdout) if streaming else []
+    if not streaming and (envelope := _json_envelope(stdout)) is not None:
+        events = [envelope]
+    if not events:
+        return {"usage": TokenUsage(), "session_ref": None, "usage_recovered": False}
+    session_id = events[-1].get("session_id")
+    usage, model_usage, session_cost = _claude_usage_report(events)
+    return {
+        "usage": usage,
+        "session_ref": session_id if isinstance(session_id, str) else None,
+        "usage_recovered": True,
+        "model_usage": model_usage,
+        "provider_session_cost_usd": session_cost,
+    }
 
 
 def _timeout_stdout(exc: subprocess.TimeoutExpired) -> str:
@@ -1656,12 +1759,9 @@ def claude_cli_transport(
             # timeout is one of the costliest failures a run has, so recover whatever usage the
             # partial stream had already reported; with no terminal event the spend is
             # genuinely unknown and the row must say so rather than claim $0.
-            usage, session_id, recovered = _recover_usage(
-                _timeout_stdout(exc), streaming=streaming
-            )
-            return RawResult(None, usage=usage, exit_code=124,
+            return RawResult(None, exit_code=124,
                              error=f"timed out after {work.timeout_s}s", invocation=invocation,
-                             session_ref=session_id, usage_recovered=recovered)
+                             **_recovered_usage_fields(_timeout_stdout(exc), streaming=streaming))
         # #93: on the streaming path, raw_output is the model's readable final text (result
         # event / last assistant text), falling back to a bounded stream-tail note — NOT the
         # raw JSONL event stream (already teed to `.stream.jsonl`). The single-shot path keeps
@@ -1675,14 +1775,15 @@ def claude_cli_transport(
             # usage and session id even under `is_error: true`, so parse it regardless of the
             # exit code — dropping it billed a real $4.25 attempt as free and threw away the
             # session warm retry (#8) needs for exactly this mechanical-failure case.
-            usage, session_id, recovered = _recover_usage(stdout, streaming=streaming)
-            return RawResult(None, usage=usage, exit_code=returncode,
+            return RawResult(None, exit_code=returncode,
                              error=stderr.strip()[:500],
                              raw_output=raw_out, raw_stderr=stderr,
                              invocation=invocation, stream_files=stream_files,
-                             session_ref=session_id, usage_recovered=recovered)
+                             **_recovered_usage_fields(stdout, streaming=streaming))
+        events: list[dict] | None = None
         if streaming:
-            data = _last_result_event(stdout)
+            events = _result_events(stdout)
+            data = events[-1] if events else None
             if data is None:
                 # Exit 0 but no result event (partial/killed stream): fail the dispatch. The
                 # stream ended before any usage report, so the spend is unknown (#319) — flag
@@ -1709,7 +1810,7 @@ def claude_cli_transport(
         # invalid object here would throw away exactly what the retry needs to quote back.
         return _envelope_to_raw(data, stdout=stdout, stderr=stderr,
                                 invocation=invocation, stream_files=stream_files,
-                                raw_output=raw_output_value)
+                                raw_output=raw_output_value, events=events)
 
     def run(work: WorkItem) -> RawResult:
         raw = _call(work, work.session_ref)
@@ -1724,7 +1825,8 @@ def claude_cli_transport(
         schema_json = schema_json_for(work.schema_ref) if schema_json_for else None
         if not schema_json:
             return raw
-        return _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call)
+        return _schema_retry_loop(raw, work, schema_json, max_schema_retries, _call,
+                                  additive_usage=True)
 
     return run
 

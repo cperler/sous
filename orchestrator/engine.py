@@ -40,7 +40,7 @@ from .benchmark_gate import (
 )
 from .capacity import DEFAULT_CAPACITY, CapacityPolicy, DispatchBand
 from .commit_attribution import scan_commits
-from .cost_ledger import CostLedger
+from .cost_ledger import CostLedger, cost_mismatch
 from .cost_policy import BUDGET_SOFT_FRACTION, DEFAULT_COST_ROUTER, CostRouter
 from .dag import Dag
 from .decomposition import (
@@ -2804,6 +2804,16 @@ class Engine:
         # with the task doc written last as the one durable commit point — so a crash
         # can never persist a task transition whose events are not already on disk.
         events: list[dict] = []
+        # #557: cross-check the engine's price against what the provider itself reported
+        # for this dispatch. The ledger only returns both numbers; the event is emitted
+        # here, so a drifted price table or a usage report the ledger misreads is loud in
+        # events.jsonl instead of silently skewing every budget and cost report.
+        if (price_gap := cost_mismatch(cost_row)) is not None:
+            events.append({"ts": _now(), "type": "stage_cost_mismatch", "level": "warning",
+                           "run_id": run_id, "task_id": result.task_id,
+                           "stage": result.stage.value, "attempt": result.attempt,
+                           "work_item_id": result.work_item_id, "model": result.model,
+                           **price_gap})
         # Multi-agent REVIEW synthesis (#73 design §3): a plan-bearing dispatch returns the
         # raw panel output in ``sub_results`` and leaves ``structured_output`` to the engine.
         # Fold it into canonical review.json HERE — deterministically, with no model call —

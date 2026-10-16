@@ -159,7 +159,7 @@ def test_cache_read_multipliers_differ_per_model() -> None:
     reads = TokenUsage(cache_read=1_000_000)
     assert t.cost_usd("claude-fable-5-1", reads) == pytest.approx(10.0 * 0.025)  # $0.25
     assert t.cost_usd("claude-opus-5-5", reads) == pytest.approx(4.0 * 0.05)  # $0.20
-    assert t.cost_usd("claude-sonnet-5-5", reads) == pytest.approx(2.0 * 0.10)  # default 0.1x
+    assert t.cost_usd("claude-sonnet-5-5", reads) == pytest.approx(2.0 * 0.05)  # 0.05x (#557)
     assert t.cost_usd("claude-haiku-4-5", reads) == pytest.approx(1.0 * 0.10)
 
 

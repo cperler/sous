@@ -9,16 +9,18 @@ whose result carries ``sub_calls`` (each finder / verifier of a review panel) wr
 row PER SUB-CALL — sharing the dispatch's ``work_item_id``/stage/attempt and discriminated
 by ``phase`` — and NO aggregate row on top. Sums are the report's job; a double-counted
 aggregate is worse than one more row to add up. Without ``sub_calls`` the dispatch is
-itself the single call and the row is exactly what it always was.
+itself the single call and the row is exactly what it always was — unless that call
+billed several models (#557: the claude CLI's ``modelUsage`` names every model a stage's
+subagents and internal calls ran on), in which case each model gets its own row.
 
 Pricing is authoritative: the cost written is computed from the engine's single
 ``model_table`` (the same table used everywhere), NOT from the runner-supplied
 ``StageResult.cost_usd`` (nor a ``SubCall``'s self-reported usage pricing). A runner
 cannot under- or over-report spend; the engine's table is the single source of truth.
 
-Recording is IDEMPOTENT on the durable key ``(work_item_id, phase)`` (#277): a
+Recording is IDEMPOTENT on the durable key ``(work_item_id, phase, model)`` (#277): a
 dispatch's work_item_id is unique per model call (sub-calls share it, discriminated
-by ``phase``), so replaying the same StageResult after a crash mid-``Engine.record``
+by ``phase``; a call that billed several models writes one row per ``model``, #557), so replaying the same StageResult after a crash mid-``Engine.record``
 converges on the rows already on disk instead of charging the call twice. The
 scan-then-append runs under an exclusive file lock so two concurrent duplicate
 records cannot both append. The ledger append is itself a crash boundary: an
@@ -74,12 +76,17 @@ _ATTRIBUTION_FIELDS: frozenset[str] = frozenset({"model", "effort", "cost_usd"})
 #       true spend. Claude-lane rows of this vintage are unaffected in practice, but the
 #       regime is per-FILE-FORMAT, not per-provider — a v1 row is one written by code that
 #       had the bug, whether or not that particular row tripped it.
-#   2 — current: ``_stage_usage`` de-cumulates session-reporting providers and cached tokens
-#       are netted out of fresh input.
+#   2 — ``_stage_usage`` de-cumulates session-reporting providers and cached tokens are
+#       netted out of fresh input.
+#   3 — current (#557): a claude row is priced from the CLI's per-model ``modelUsage``,
+#       de-cumulated against the session's prior rows, one row per model; 1h cache writes
+#       bill at their own multiplier. v2 claude rows read only the final result event's
+#       ``usage`` (often just the last few turns, and only the routed model) and priced 1h
+#       writes at the 5m rate, so they under-record by roughly 3-5x.
 #
 # Nothing rewrites history — the ledgers on disk keep their original numbers, and readers
 # disclose the mix instead (see ``accounting``).
-ACCOUNTING_VERSION = 2
+ACCOUNTING_VERSION = 3
 
 # When the v2 regime began: the commit that fixed #350 (9c4c513, 2026-08-01T08:19:24-05:00).
 # An UNSTAMPED row is classified by its own timestamp against this instant, not defaulted to
@@ -95,7 +102,8 @@ def row_accounting_version(row: dict) -> int:
     """The accounting regime of one ledger row (see ``ACCOUNTING_VERSION``).
 
     An explicit stamp is authoritative. An unstamped row is dated against
-    ``ACCOUNTING_V2_SINCE``; an unparseable or missing timestamp reads as v1."""
+    ``ACCOUNTING_V2_SINCE``; an unparseable or missing timestamp reads as v1. Every row
+    since v2 is stamped, so an unstamped row is never v3."""
     raw = row.get("accounting_version")
     if isinstance(raw, int) and raw > 0:
         return raw
@@ -105,7 +113,7 @@ def row_accounting_version(row: dict) -> int:
         return 1
     if ts.tzinfo is None:  # naive timestamps are recorded in UTC
         ts = ts.replace(tzinfo=UTC)
-    return ACCOUNTING_VERSION if ts >= ACCOUNTING_V2_SINCE else 1
+    return 2 if ts >= ACCOUNTING_V2_SINCE else 1
 
 
 class CostLedger:
@@ -127,7 +135,8 @@ class CostLedger:
 
         One row per model call (see the module docstring): the plain path writes exactly
         one row and returns it, unchanged; a ``sub_calls``-bearing result writes one row
-        per sub-call and returns a non-persisted aggregate over them (``cost_usd`` = Σ
+        per sub-call (and a call that billed several models one row per model, #557) and
+        returns a non-persisted aggregate over them (``cost_usd`` = Σ
         sub-calls) for the caller that attributes one number to the stage.
 
         Cost is recomputed from ``model_table`` (authoritative) — the runner's
@@ -139,8 +148,9 @@ class CostLedger:
         rows = self.record_rows(result, duration_s=duration_s)
         # Keyed on the RESULT's shape, not on ``len(rows)``: a one-sub-call panel must
         # still answer with the aggregate view, so a caller never has to guess whether the
-        # dict it got back is a persisted row or a sum.
-        if result.sub_calls:
+        # dict it got back is a persisted row or a sum. A single call that billed several
+        # models (#557) writes one row per model, and is summed the same way.
+        if result.sub_calls or len(rows) > 1:
             return self._dispatch_view(result, rows, duration_s=duration_s)
         return rows[0]
 
@@ -154,7 +164,7 @@ class CostLedger:
         each priced on its OWN model and usage, and deliberately no aggregate row — the
         report sums; the ledger must never double-count.
 
-        Idempotent on ``(work_item_id, phase)`` (#277): rows already on disk for this
+        Idempotent on ``(work_item_id, phase, model)`` (#277): rows already on disk for this
         dispatch are returned as-is and NOT re-appended, so a replay after a crash
         mid-``Engine.record`` (ledger row committed, task doc not) converges. A partial
         prior write (some of a panel's sub-call rows) appends only the missing phases.
@@ -186,29 +196,36 @@ class CostLedger:
         whole lines and the converge pass re-appends the rows that never landed."""
         if result.sub_calls:
             built = [
-                self._row(
+                row
+                for sub in result.sub_calls
+                for row in self._call_rows(
                     result,
                     model=sub.model,
-                    usage=self._stage_usage(result, sub.usage),
+                    usage=sub.usage,
+                    model_usage=sub.model_usage,
+                    session_cost=sub.provider_session_cost_usd,
+                    # A panel sub-call runs in its own fresh session (never resumed by a
+                    # later stage), so its cumulative report IS its own spend.
+                    session=None,
                     duration_s=sub.duration_s,
                     schema_retries=sub.schema_retries,
                     phase=sub.phase,
                     usage_recovered=sub.usage_recovered,
                 )
-                for sub in result.sub_calls
             ]
         else:
-            built = [
-                self._row(
-                    result,
-                    model=result.model,
-                    usage=self._stage_usage(result, result.token_usage),
-                    duration_s=duration_s,
-                    schema_retries=result.schema_retries,
-                    phase=None,
-                    usage_recovered=result.usage_recovered,
-                )
-            ]
+            built = self._call_rows(
+                result,
+                model=result.model,
+                usage=result.token_usage,
+                model_usage=result.model_usage,
+                session_cost=result.provider_session_cost_usd,
+                session=result.session_ref,
+                duration_s=duration_s,
+                schema_retries=result.schema_retries,
+                phase=None,
+                usage_recovered=result.usage_recovered,
+            )
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with file_lock(self.path):
             on_disk, torn_at = self._scan()
@@ -240,6 +257,118 @@ class CostLedger:
     # Providers whose usage report is SESSION-cumulative rather than per-call (#350).
     _CUMULATIVE_USAGE_PROVIDERS = frozenset({"codex"})
 
+    def _call_rows(
+        self,
+        result: StageResult,
+        *,
+        model: str,
+        usage: TokenUsage,
+        model_usage: dict[str, TokenUsage] | None,
+        session_cost: float | None,
+        session: str | None,
+        duration_s: float | None,
+        schema_retries: int,
+        phase: str | None,
+        usage_recovered: bool,
+    ) -> list[dict]:
+        """The ledger rows for ONE model call: a single row, or one per model (#557).
+
+        Without a per-model report the call is one row priced from ``usage`` (de-cumulated
+        for codex, as before). With one — the claude CLI's ``modelUsage`` — every model the
+        call billed gets its own row priced on its own rate, because a stage routed to one
+        model also pays for whatever subagents and CLI-internal calls ran on others. The
+        report is SESSION-cumulative, so each model is charged only its delta over the
+        session's prior rows (``_session_deltas``).
+
+        The routed model's row is always written (even at zero tokens) and carries the
+        call's ``phase``, ``duration_s`` and ``schema_retries``, so a single-model stage is
+        still exactly one row. Any other model with a non-zero delta adds a row of the same
+        phase, flagged ``secondary_model``, with no duration (the wall time is the call's,
+        and summing it per model would over-count). The routed row also carries
+        ``provider_session_cost_usd`` (the CLI's cumulative ``total_cost_usd``) and
+        ``provider_cost_usd`` (its delta for this call, or None when the session's earlier
+        spend was recorded without one), which the engine cross-checks against the price."""
+        if not model_usage:
+            return [self._row(
+                result, model=model, usage=self._stage_usage(result, usage),
+                duration_s=duration_s, schema_retries=schema_retries, phase=phase,
+                usage_recovered=usage_recovered,
+            )]
+        deltas, provider_cost = self._session_deltas(
+            result.work_item_id, session, model_usage, session_cost
+        )
+        routed = self._row(
+            result, model=model, usage=deltas.pop(model, TokenUsage()),
+            duration_s=duration_s, schema_retries=schema_retries, phase=phase,
+            usage_recovered=usage_recovered,
+        )
+        routed["provider_session_cost_usd"] = session_cost
+        routed["provider_cost_usd"] = provider_cost
+        rows = [routed]
+        for other in sorted(deltas):
+            if deltas[other].total() == 0:
+                continue
+            row = self._row(
+                result, model=other, usage=deltas[other], duration_s=None,
+                schema_retries=0, phase=phase, usage_recovered=usage_recovered,
+            )
+            row["secondary_model"] = True
+            rows.append(row)
+        return rows
+
+    def _session_deltas(
+        self,
+        work_item_id: str,
+        session: str | None,
+        model_usage: dict[str, TokenUsage],
+        session_cost: float | None,
+    ) -> tuple[dict[str, TokenUsage], float | None]:
+        """This call's per-model usage and provider cost, net of the session's prior rows.
+
+        The same self-healing de-cumulation as ``_stage_usage`` (#350), per model: the
+        session's prior rows are themselves deltas, so they sum to what the session has
+        already been charged, and a stage the ledger never priced (killed before its
+        report) is absorbed into the next one instead of lost. Rows of THIS dispatch are
+        excluded, so a crash-replay rebuilds the same rows ``_converge`` matches on disk.
+
+        A cumulative ``total_cost_usd`` LOWER than the last one recorded for the session
+        means the CLI did not carry the session's counters across the resume; the report
+        is then this call's own and is taken whole. The provider cost is None when prior
+        rows exist but none recorded a cumulative figure (they predate #557), because
+        there is no baseline to subtract."""
+        prior: dict[str, TokenUsage] = {}
+        last_session_cost: float | None = None
+        saw_prior = False
+        if session:
+            for row in self.rows():
+                if row.get("session_ref") != session or row.get("work_item_id") == work_item_id:
+                    continue
+                saw_prior = True
+                name = str(row.get("model", "unknown"))
+                prior[name] = prior.get(name, TokenUsage()) + _row_usage(row)
+                if isinstance(row.get("provider_session_cost_usd"), int | float):
+                    last_session_cost = float(row["provider_session_cost_usd"])
+        reset = (
+            session_cost is not None
+            and last_session_cost is not None
+            and session_cost < last_session_cost - 1e-9
+        )
+        if reset:
+            prior = {}
+        deltas = {
+            name: _usage_delta(cum, prior.get(name, TokenUsage()))
+            for name, cum in model_usage.items()
+        }
+        if session_cost is None:
+            provider_cost = None
+        elif not saw_prior or reset:
+            provider_cost = round(session_cost, 6)
+        elif last_session_cost is not None:
+            provider_cost = round(max(0.0, session_cost - last_session_cost), 6)
+        else:
+            provider_cost = None
+        return deltas, provider_cost
+
     def _stage_usage(self, result: StageResult, usage: TokenUsage) -> TokenUsage:
         """This CALL's usage, de-cumulated when the provider reports session totals (#350).
 
@@ -264,23 +393,12 @@ class CostLedger:
             return usage
         prior = TokenUsage()
         for row in self.rows():
-            if row.get("session_ref") != session:
+            # Rows of this same dispatch are a crash-replay's own prior write (#277), not
+            # earlier session spend — excluded so the replay rebuilds the row on disk.
+            if row.get("session_ref") != session or row.get("work_item_id") == result.work_item_id:
                 continue
-            prior = TokenUsage(
-                input=prior.input + (row.get("input_tokens") or 0),
-                output=prior.output + (row.get("output_tokens") or 0),
-                cache_read=prior.cache_read + (row.get("cache_read_tokens") or 0),
-                cache_write=prior.cache_write + (row.get("cache_write_tokens") or 0),
-            )
-        # max(): a cumulative counter should only ever grow, but a provider that resets or
-        # re-reports low must not produce a negative row (which would price as a credit and
-        # silently refund the session's real spend).
-        return TokenUsage(
-            input=max(0, usage.input - prior.input),
-            output=max(0, usage.output - prior.output),
-            cache_read=max(0, usage.cache_read - prior.cache_read),
-            cache_write=max(0, usage.cache_write - prior.cache_write),
-        )
+            prior = prior + _row_usage(row)
+        return _usage_delta(usage, prior)
 
     def _tail_missing_newline(self) -> bool:
         """True when the ledger exists, is non-empty, and its last byte is not ``\\n``.
@@ -314,18 +432,18 @@ class CostLedger:
         """Fold freshly-built rows onto the dispatch's rows already on disk.
 
         Returns ``(rows, to_append)``: ``rows`` is the built list with each row replaced
-        by its on-disk counterpart when one exists (same ``phase`` key; duplicates of a
-        phase pair up positionally), preserving the ORIGINAL priced/timestamped row;
+        by its on-disk counterpart when one exists (same ``phase`` and ``model`` — a call
+        priced per model writes one row per model, #557; duplicates pair up positionally), preserving the ORIGINAL priced/timestamped row;
         ``to_append`` is the subset of built rows with no counterpart — the missing
         phases of a partial prior write. A full prior write appends nothing."""
-        by_phase: dict[str | None, list[dict]] = {}
+        by_phase: dict[tuple[str | None, str | None], list[dict]] = {}
         for row in existing:
-            by_phase.setdefault(row.get("phase"), []).append(row)
-        used: dict[str | None, int] = {}
+            by_phase.setdefault((row.get("phase"), row.get("model")), []).append(row)
+        used: dict[tuple[str | None, str | None], int] = {}
         rows: list[dict] = []
         to_append: list[dict] = []
         for row in built:
-            key = row.get("phase")
+            key = (row.get("phase"), row.get("model"))
             i = used.get(key, 0)
             prior = by_phase.get(key, [])
             if i < len(prior):
@@ -363,7 +481,7 @@ class CostLedger:
         # its zero-token rows are UNMETERED (cost unknown), not free. Metered lanes and
         # the deterministic engine lane (genuinely $0) stay metered=True. Renderers use
         # this to say "n/a / unmetered" instead of a confident $0.0000.
-        tokens_seen = usage.input + usage.output + usage.cache_read + usage.cache_write
+        tokens_seen = usage.total()
         metered = not (
             result.lane_used.execution_mode.value == "interactive" and tokens_seen == 0
         )
@@ -396,6 +514,8 @@ class CostLedger:
             "output_tokens": usage.output,
             "cache_read_tokens": usage.cache_read,
             "cache_write_tokens": usage.cache_write,
+            # #557: 1h-TTL cache writes, disjoint from the 5m ``cache_write_tokens``.
+            "cache_write_1h_tokens": usage.cache_write_1h,
             "cost_usd": cost,
             "priced": priced,
             "metered": metered,
@@ -444,7 +564,14 @@ class CostLedger:
                 "output_tokens": sum(r["output_tokens"] for r in rows),
                 "cache_read_tokens": sum(r["cache_read_tokens"] for r in rows),
                 "cache_write_tokens": sum(r["cache_write_tokens"] for r in rows),
+                "cache_write_1h_tokens": sum(r.get("cache_write_1h_tokens", 0) for r in rows),
                 "cost_usd": round(sum(r["cost_usd"] for r in rows), 6),
+                # #557: what the provider itself says this dispatch cost, for the engine's
+                # cross-check. None unless EVERY call reported one.
+                "provider_cost_usd": _provider_cost(result, rows),
+                # #557: what each model cost in this dispatch, so a ``stage_cost_mismatch``
+                # warning names where the money went without a ledger re-read.
+                "by_model": _cost_by_model(rows),
                 "priced": all(r["priced"] for r in rows),
                 "metered": all(r["metered"] for r in rows),
                 "schema_retries": sum(r["schema_retries"] for r in rows),
@@ -607,7 +734,7 @@ class CostLedger:
             if v < ACCOUNTING_VERSION:
                 cost = row.get("cost_usd") or 0.0
                 legacy_cost += cost
-                if row.get("provider") in self._CUMULATIVE_USAGE_PROVIDERS:
+                if v < 2 and row.get("provider") in self._CUMULATIVE_USAGE_PROVIDERS:
                     affected_rows += 1
                     affected_cost += cost
         versions = sorted(counts)
@@ -804,7 +931,11 @@ class CostLedger:
             ci = row.get("input_tokens", 0) or 0
             co = row.get("output_tokens", 0) or 0
             cr = row.get("cache_read_tokens", 0) or 0
-            cw = row.get("cache_write_tokens", 0) or 0
+            # #557: 1h cache writes are their own column (billed at a higher multiplier);
+            # the token buckets count every write, the premium prices each TTL separately.
+            cw_5m = row.get("cache_write_tokens", 0) or 0
+            cw_1h = row.get("cache_write_1h_tokens", 0) or 0
+            cw = cw_5m + cw_1h
             total_cost += cost
             fresh_input += ci
             output += co
@@ -819,7 +950,10 @@ class CostLedger:
                 continue
             in_price = info.input_per_mtok
             cache_read_savings += cr * in_price * (1.0 - info.cache_read_mult) / 1_000_000
-            cache_write_premium += cw * in_price * (info.cache_write_mult - 1.0) / 1_000_000
+            cache_write_premium += (
+                cw_5m * in_price * (info.cache_write_mult - 1.0)
+                + cw_1h * in_price * (info.cache_write_1h_mult - 1.0)
+            ) / 1_000_000
 
         # uncached counterfactual: every input-side token billed once at full input
         # price (no read discount, no write premium) => actual + net_win.
@@ -848,3 +982,88 @@ class CostLedger:
                 "unpriced_models": sorted(unpriced),
             },
         }
+
+
+def _row_usage(row: dict) -> TokenUsage:
+    """The token usage a ledger row charged (tolerant of rows that predate a column)."""
+    return TokenUsage(
+        input=row.get("input_tokens") or 0,
+        output=row.get("output_tokens") or 0,
+        cache_read=row.get("cache_read_tokens") or 0,
+        cache_write=row.get("cache_write_tokens") or 0,
+        cache_write_1h=row.get("cache_write_1h_tokens") or 0,
+    )
+
+
+def _usage_delta(cumulative: TokenUsage, prior: TokenUsage) -> TokenUsage:
+    """``cumulative - prior``, floored at zero per bucket.
+
+    max(): a cumulative counter should only ever grow, but a provider that resets or
+    re-reports low must not produce a negative row (which would price as a credit and
+    silently refund the session's real spend). Cache writes are netted as ONE total and
+    re-split in the cumulative report's 1h:5m ratio: the claude report carries no per-TTL
+    history, so netting the two TTLs separately could push one negative and the other high
+    when the ratio drifts between stages."""
+    writes_cum = cumulative.cache_write + cumulative.cache_write_1h
+    writes = max(0, writes_cum - (prior.cache_write + prior.cache_write_1h))
+    writes_1h = round(writes * cumulative.cache_write_1h / writes_cum) if writes_cum else 0
+    return TokenUsage(
+        input=max(0, cumulative.input - prior.input),
+        output=max(0, cumulative.output - prior.output),
+        cache_read=max(0, cumulative.cache_read - prior.cache_read),
+        cache_write=writes - writes_1h,
+        cache_write_1h=writes_1h,
+    )
+
+
+def _provider_cost(result: StageResult, rows: list[dict]) -> float | None:
+    """The sum of each call's provider-reported cost, or None unless every model call of
+    the dispatch reported one (one routed row per call carries it)."""
+    calls = len(result.sub_calls) if result.sub_calls else 1
+    costs = [r.get("provider_cost_usd") for r in rows if "provider_session_cost_usd" in r]
+    if len(costs) != calls or any(not isinstance(c, int | float) for c in costs):
+        return None
+    return round(sum(float(c) for c in costs if isinstance(c, int | float)), 6)
+
+
+def _cost_by_model(rows: list[dict]) -> dict[str, float]:
+    """``{model: Σ cost_usd}`` over a dispatch's rows (a model several sub-calls used
+    is summed into one entry)."""
+    by_model: dict[str, float] = {}
+    for r in rows:
+        model = str(r.get("model"))
+        by_model[model] = round(by_model.get(model, 0.0) + float(r.get("cost_usd") or 0.0), 6)
+    return by_model
+
+
+# The engine-vs-provider price gap that is worth a warning (#557): the larger of an absolute
+# floor (rounding and sub-cent drift on cheap stages) and a relative share of the stage.
+COST_MISMATCH_ABS_USD = 0.02
+COST_MISMATCH_REL = 0.05
+
+
+def cost_mismatch(view: dict) -> dict | None:
+    """The engine-vs-provider price gap on one dispatch view, when it exceeds tolerance.
+
+    Pure (the engine emits the event). Returns ``{engine_cost_usd, provider_cost_usd,
+    delta_usd, by_model}`` — ``by_model`` is ``{model: cost_usd}`` over this dispatch's
+    rows — or None. None too when there is nothing comparable: no provider figure (codex, an older CLI, a session whose earlier spend predates #557) or
+    an unpriced row (an unknown model already reads as a gap, and is flagged as such)."""
+    provider = view.get("provider_cost_usd")
+    if not isinstance(provider, int | float) or view.get("priced") is False:
+        return None
+    engine = float(view.get("cost_usd") or 0.0)
+    delta = engine - float(provider)
+    if abs(delta) <= max(COST_MISMATCH_ABS_USD, COST_MISMATCH_REL * float(provider)):
+        return None
+    # An aggregate view carries its per-model breakdown; a single persisted row IS one
+    # model's cost.
+    by_model = view.get("by_model")
+    if not isinstance(by_model, dict):
+        by_model = {str(view.get("model")): round(engine, 6)}
+    return {
+        "engine_cost_usd": round(engine, 6),
+        "provider_cost_usd": round(float(provider), 6),
+        "delta_usd": round(delta, 6),
+        "by_model": by_model,
+    }

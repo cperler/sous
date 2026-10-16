@@ -219,6 +219,9 @@ def _dispatch_sub(
         schema_retries=raw.schema_retries,
         # #319: a sub-call that died before reporting usage must not bill as a metered $0.
         usage_recovered=raw.usage_recovered,
+        # #557: the per-model session report, priced per model by the ledger.
+        model_usage=raw.model_usage,
+        provider_session_cost_usd=raw.provider_session_cost_usd,
     )
 
 
@@ -437,12 +440,7 @@ def _panel_stream_files(sub_calls: list[SubCall]) -> dict | None:
 
 
 def _sum_usage(sub_calls: list[SubCall]) -> TokenUsage:
-    return TokenUsage(
-        input=sum(c.usage.input for c in sub_calls),
-        output=sum(c.usage.output for c in sub_calls),
-        cache_read=sum(c.usage.cache_read for c in sub_calls),
-        cache_write=sum(c.usage.cache_write for c in sub_calls),
-    )
+    return sum((c.usage for c in sub_calls), TokenUsage())
 
 
 def _notice(kind: str, detail: str, **extras: int) -> dict[str, object]:
