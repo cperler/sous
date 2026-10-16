@@ -295,6 +295,19 @@ def last_record(root: Path, *, run_id: str | None = None) -> dict | None:
     return records[-1] if records else None
 
 
+def _current_generation(records: list[dict]) -> list[dict]:
+    """The records written by the current driver process: everything from the LAST start.
+
+    Each ``run-headless`` invocation writes exactly one start record before anything
+    else, so the last one marks where the current generation begins. A log with no start
+    record at all is returned whole — there is no generation boundary to cut at.
+    """
+    for idx in range(len(records) - 1, -1, -1):
+        if records[idx].get("type") == REC_START:
+            return records[idx:]
+    return records
+
+
 def liveness_from_log(
     root: Path, claim: dict, *, run_id: str | None = None, now: datetime | None = None
 ) -> dict:
@@ -312,8 +325,13 @@ def liveness_from_log(
     promise. ``None`` means unknowable (a claim from another host, where a local pid probe
     means nothing). The claim's own ``state``/``reclaimable`` are passed through unchanged
     — lease reclaim safety (#313) is decided by the pid, never by a heartbeat.
+
+    Every log-derived field describes the CURRENT driver generation only (#510):
+    ``driver.jsonl`` is append-only across ``run-headless`` restarts, so a resumed run's
+    log also holds its predecessors' start/heartbeat/exit records. Those stay in the file
+    as history but are never reported as the present — see ``_current_generation``.
     """
-    records = read_records(root, run_id=run_id)
+    records = _current_generation(read_records(root, run_id=run_id))
     start = next((r for r in records if r.get("type") == REC_START), None)
     beats = [r for r in records if r.get("type") == REC_HEARTBEAT]
     exit_rec = next((r for r in reversed(records) if r.get("type") == REC_EXIT), None)

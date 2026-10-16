@@ -397,6 +397,64 @@ def test_an_exited_driver_is_not_alive_even_though_the_pid_is_ours(tmp_path, pro
     assert driver["alive"] is False  # ...but the loop is over, and says so
 
 
+def _two_generations(tmp_path) -> tuple[DriverLog, dict]:
+    """Driver A beats twice and exits; driver B (a #313 resume) starts and beats once."""
+    a = DriverLog(tmp_path, "r1")
+    a.start(settings={})
+    a.heartbeat(state=STATE_DISPATCHING, tick=1, next_heartbeat_within_s=None)
+    a.heartbeat(state=STATE_WAITING_CAPACITY, tick=2, next_heartbeat_within_s=60)
+    a.exit("nothing_dispatchable")
+
+    b = DriverLog(tmp_path, "r1")
+    b_start = b.start(settings={})
+    b.heartbeat(state=STATE_DISPATCHING, tick=1, next_heartbeat_within_s=None)
+    return b, b_start
+
+
+def test_a_resumed_driver_is_not_reported_dead_by_its_predecessors_exit(tmp_path) -> None:
+    # #510: driver.jsonl is append-only across restarts, so the log of a resumed run also
+    # holds the previous driver's exit. That exit must not describe the live driver.
+    _, b_start = _two_generations(tmp_path)
+    claim = {"state": "live", "host": socket.gethostname(), "pid": 82138,
+             "claimed_at": b_start["ts"], "reclaimable": False}
+
+    live = liveness_from_log(tmp_path, claim, run_id="r1")
+
+    assert live["alive"] is True
+    assert live["exited"] is False
+    assert live["exit_reason"] is None and live["exit_ts"] is None
+    assert live["started_at"] == b_start["ts"]  # B's start, not A's
+    assert live["heartbeats"] == 1 and live["tick"] == 1  # B's beats only
+    assert live["last_state"] == STATE_DISPATCHING
+    assert len(read_records(tmp_path, run_id="r1")) == 6  # A's records stay as history
+
+
+def test_a_resumed_driver_that_exits_reports_its_own_exit(tmp_path) -> None:
+    b, b_start = _two_generations(tmp_path)
+    b.exit("signal:SIGTERM")
+    claim = {"state": "mine", "host": socket.gethostname(), "pid": os.getpid(),
+             "claimed_at": b_start["ts"], "reclaimable": True}
+
+    live = liveness_from_log(tmp_path, claim, run_id="r1")
+
+    assert live["alive"] is False and live["exited"] is True
+    assert live["exit_reason"] == "signal:SIGTERM"
+    assert live["heartbeats"] == 1 and live["started_at"] == b_start["ts"]
+
+
+def test_a_resumed_driver_killed_without_an_exit_is_dead_but_not_exited(tmp_path) -> None:
+    # B was SIGKILLed: the claim's dead pid says so, and A's exit must not make it look
+    # like B shut down cleanly.
+    _two_generations(tmp_path)
+    claim = {"state": "dead", "host": socket.gethostname(), "pid": 82138,
+             "claimed_at": "2026-09-04T19:03:11+00:00", "reclaimable": True}
+
+    live = liveness_from_log(tmp_path, claim, run_id="r1")
+
+    assert live["alive"] is False
+    assert live["exited"] is False and live["exit_reason"] is None
+
+
 # --- the operator's terminal -------------------------------------------------------
 
 
