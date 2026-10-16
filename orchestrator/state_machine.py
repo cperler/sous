@@ -488,6 +488,44 @@ def pr_not_opened(structured_output: dict | None) -> str | None:
     return None
 
 
+def remote_branch_sha(ls_remote_stdout: str, branch: str) -> str | None:
+    """The SHA ``git ls-remote origin refs/heads/<branch>`` printed for ``branch`` — else
+    ``None`` (branch absent on the remote, or output that names no such ref). Pure (#500)."""
+    want = f"refs/heads/{branch}"
+    for line in (ls_remote_stdout or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == want and re.fullmatch(r"[0-9a-f]{7,64}", parts[0]):
+            return parts[0]
+    return None
+
+
+def deliver_push_mismatch(checkpoint_sha: str, remote_sha: str | None, branch: str) -> str | None:
+    """Veto reason when DELIVER's checkpoint is not what the remote branch holds — else
+    ``None`` (#500).
+
+    On ``ff-v1-b32`` task 254 a DELIVER agent probed with ``git fetch origin task/254``,
+    which updates ``FETCH_HEAD`` but NOT the stale ``origin/task/254`` tracking ref, read two
+    "unpushed commit" reports as "already up to date", and recorded success without
+    pushing; the PR sat one commit behind the delivered work. ``remote_sha`` comes from an
+    engine-run ``git ls-remote`` (no local tracking state to go stale), so this post-condition
+    is one the model does not author. Pure: the engine call site turns it into the veto and
+    the event.
+    """
+    if remote_sha and remote_sha == checkpoint_sha:
+        return None
+    seen = (
+        f"origin/{branch} is at {remote_sha}" if remote_sha
+        else f"origin has no branch {branch}"
+    )
+    return (
+        f"deliver gate: the delivered commit {checkpoint_sha} is not on the remote — {seen}, "
+        "so the PR does not show the delivered work. Run `git push origin "
+        f"{branch}` and confirm with `git ls-remote origin refs/heads/{branch}`; a "
+        "remote-tracking ref (`origin/<branch>`, `git log origin/...`) can be stale after a "
+        "bare-refspec `git fetch` and is not proof of a push."
+    )
+
+
 def no_model_test_surface(task: Task) -> bool:
     """#41/#168: does this task have NO model-written/graded test surface for the #13
     independent test-validate criterion to bite on?

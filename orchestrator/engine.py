@@ -182,10 +182,12 @@ from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
     apply_result,
     begin_stage,
+    deliver_push_mismatch,
     is_done,
     next_stage,
     no_model_test_surface,
     pr_not_opened,
+    remote_branch_sha,
     reset_for_fix_cycle,
     resume_point,
     unjudged_tests_notice,
@@ -365,6 +367,11 @@ class _SkipRaced(Exception):  # noqa: N818 - private control-flow signal, not an
 # after a green anchor run, it reads as the pass having broken the benchmark (reverted) —
 # either way record() is never wedged.
 _BENCHMARK_TIMEOUT_S = 1800
+
+# #500: the DELIVER push check's one network round trip. Bounded well under GIT_TIMEOUT_S so a
+# hung or credential-prompting remote reads as "unverified" quickly instead of stalling
+# record(); GIT_TERMINAL_PROMPT=0 makes a prompting remote fail fast rather than hang.
+_DELIVER_LS_REMOTE_TIMEOUT_S = 30
 
 # The veto an OPTIMIZE result gets when the gate decided NOT to keep its commit but could not
 # confirm the commit is off the worktree's HEAD (#520 review). Dropping the checkpoint alone
@@ -2894,6 +2901,14 @@ class Engine:
             effective = self._optimize_benchmark_gate(
                 run_id, task, effective, prior_checkpoint_sha=prior_checkpoint_sha
             )
+        # #500: a DELIVER that reports success must have PUSHED what it checkpointed. The
+        # engine reads the remote branch itself and fails the stage on a mismatch, so the
+        # retry re-opens DELIVER instead of the PR silently trailing the delivered commit
+        # until the completion-time backstop notices. Skipped when ``_stage_gate`` already
+        # vetoed (no PR opened): that failure is the one to retry on.
+        if effective.stage is Stage.DELIVER and effective.status is ResultStatus.SUCCESS:
+            effective, push_event = self._deliver_push_gate(run_id, task, effective)
+            events.append(push_event)
         # #227/#414: capture the fixup requests from the canonical review output (including
         # a synthesized panel output) before entering the locked transition — the
         # improvement idea AND any non-blocking finding that asked to be fixed in place.
@@ -3828,6 +3843,67 @@ class Engine:
                 "the tests would fail if this change regressed."
             )
         return None
+
+    def _deliver_push_gate(
+        self, run_id: str, task: Task, result: StageResult
+    ) -> tuple[StageResult, dict]:
+        """Verify a SUCCESS DELIVER actually pushed its checkpoint; returns the (possibly
+        vetoed) result and the one audit event to commit with it (#500).
+
+        The engine runs ``git ls-remote origin refs/heads/<branch>`` itself — it reads the
+        remote directly, so a stale remote-tracking ref (the ``ff-v1-b32`` #254 misread) cannot
+        fool it — and compares the answer with ``result.checkpoint['sha']``. A mismatch, or a
+        branch the remote does not have, downgrades the result to FAILURE with the
+        ``deliver_push_mismatch`` reason as ``error``, so the ordinary retry re-dispatches
+        DELIVER with it as learnings. The engine never pushes: the push is DELIVER's outward
+        action to verify, not one to perform on its behalf (the #322 posture on amends).
+
+        Fail-OPEN when the check cannot run (no checkpoint, branch or worktree; ls-remote
+        failed, timed out, or there is no ``origin``): the result stands, and a warning-grade
+        ``deliver_push_unverified`` says nobody checked. A match emits the info-grade
+        ``deliver_push_verified`` receipt, so "checked and clean" and "never checked" never
+        read alike. ``_record_completion_pr_evidence`` stays as the completion-time backstop
+        for what this cannot see (a PR closed or retargeted after DELIVER).
+        """
+        branch = str(task.context.get("branch") or "").strip()
+        worktree = str(task.context.get("worktree") or "").strip()
+        checkpoint_sha = str((result.checkpoint or {}).get("sha") or "").strip()
+        base = {"ts": _now(), "run_id": run_id, "task_id": task.task_id,
+                "stage": result.stage.value, "attempt": result.attempt,
+                "branch": branch or None, "expected_sha": checkpoint_sha or None}
+
+        def unverified(reason: str, detail: str) -> tuple[StageResult, dict]:
+            return result, {**base, "type": "deliver_push_unverified", "level": "warning",
+                            "reason": reason, "detail": detail}
+
+        if not checkpoint_sha:
+            return unverified("no_checkpoint", "the stage reported no checkpoint SHA to check")
+        if not branch:
+            return unverified("no_branch", "the task context names no branch")
+        if not worktree or not Path(worktree).is_dir():
+            return unverified(
+                "worktree_missing", f"task worktree {worktree or '(unset)'} is not a directory")
+        try:
+            proc = subprocess.run(  # noqa: S603
+                ["git", "ls-remote", "origin", f"refs/heads/{branch}"],  # noqa: S607
+                cwd=worktree, capture_output=True, text=True,
+                timeout=_DELIVER_LS_REMOTE_TIMEOUT_S,
+                env={**os.environ, "GIT_TERMINAL_PROMPT": "0"},
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            return unverified("ls_remote_failed", f"{type(exc).__name__}: {exc}"[:300])
+        if proc.returncode != 0:
+            return unverified(
+                "ls_remote_failed",
+                f"git ls-remote exited {proc.returncode}: {(proc.stderr or '').strip()[:300]}",
+            )
+        remote_sha = remote_branch_sha(proc.stdout, branch)
+        veto = deliver_push_mismatch(checkpoint_sha, remote_sha, branch)
+        if veto is None:
+            return result, {**base, "type": "deliver_push_verified", "remote_sha": remote_sha}
+        failed = result.model_copy(update={"status": ResultStatus.FAILURE, "error": veto})
+        return failed, {**base, "type": "deliver_push_mismatch", "level": "warning",
+                        "remote_sha": remote_sha, "error": veto}
 
     def _scope_not_feasible(self, result: StageResult) -> str | None:
         """Feasibility gate over a completed SCOPE stage (issue #45); returns the
@@ -7624,7 +7700,10 @@ class Engine:
         exact head). MERGED is valid only when GitHub's preserved PR head SHA equals the
         delivered checkpoint; a stale merged URL cannot prove later fix commits shipped.
         Failures never undo the already-durable task transition, but they make the
-        completion audit non-clean instead of letting ``undelivered: 0`` lie.
+        completion audit non-clean instead of letting ``undelivered: 0`` lie. An unpushed
+        DELIVER checkpoint is caught earlier, as a stage failure, by ``_deliver_push_gate``
+        (#500); this is the backstop for what that cannot see (a PR closed or retargeted
+        after DELIVER, or a push check that could not run).
         """
         if not task.pr_url:
             return None
