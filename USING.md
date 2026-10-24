@@ -290,7 +290,7 @@ already wrote `Depends-on: #N` into the bodies — so the engine builds the corr
 further analysis.
 
 The snapshot also includes issue comments under a bounded `## Discussion` section: the newest
-20 non-empty comments are eligible, with 4,000 characters per comment and 16,000 across their
+20 non-empty comments are eligible, with 12,000 characters per comment and 48,000 across their
 text. Marker-tagged orchestrator progress comments are excluded, and any count or character
 truncation is stated in the snapshot. Comments added or edited after `add-task` do not alter an
 in-progress run automatically; use `refresh-spec --task '#7'` (or first inspect with `--check`)
