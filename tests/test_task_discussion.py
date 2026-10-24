@@ -6,7 +6,11 @@ import json
 
 from adapters.project.github_issues import GitHubIssuesSource
 from adapters.project.selfhost.task_source import LocalFileTaskSource
-from adapters.project.task_discussion import append_discussion
+from adapters.project.task_discussion import (
+    _DISCUSSION_COMMENT_CHARS,
+    _DISCUSSION_TOTAL_CHARS,
+    append_discussion,
+)
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.status_store import StatusStore
@@ -75,14 +79,17 @@ def test_discussion_keeps_newest_comments_and_discloses_count_truncation() -> No
 
 
 def test_discussion_caps_individual_and_aggregate_comment_text() -> None:
-    comments: list[object] = [str(n) * 4_001 for n in range(5)]
+    per_comment = _DISCUSSION_COMMENT_CHARS
+    assert 4 * per_comment == _DISCUSSION_TOTAL_CHARS  # the shape below relies on it
+    comments: list[object] = [str(n) * (per_comment + 1) for n in range(5)]
 
     body = append_discussion("Task", comments)
 
     assert "0" * 100 not in body  # aggregate cap drops the oldest comment first
-    assert all(str(n) * 4_000 in body for n in range(1, 5))
+    assert all(str(n) * per_comment in body for n in range(1, 5))
     assert body.count("… [truncated]") == 4
-    assert "kept 4 newest of 5 eligible comments; 4005 comment chars dropped" in body
+    dropped = per_comment + 1 + 4
+    assert f"kept 4 newest of 5 eligible comments; {dropped} comment chars dropped" in body
 
 
 def test_local_file_resolve_supports_string_and_structured_comments(tmp_path) -> None:
