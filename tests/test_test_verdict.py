@@ -210,3 +210,54 @@ def test_a_worktree_missing_on_disk_is_not_verified(tmp_path) -> None:
     green = _model_green()
     assert verify_test_verdict(_wi(tmp_path / "gone"), green, ResultStatus.SUCCESS, _RED) == (
         green, ResultStatus.SUCCESS)
+
+
+def _at_test(eng, run: str, task: str):
+    """Walk ``task`` to its TEST dispatch, recording every earlier stage green."""
+    from tests.conftest import make_result
+
+    work = eng.next_work(run, task)
+    while work is not None and work.stage is not Stage.TEST:
+        eng.record(run, make_result(work))
+        work = eng.next_work(run, task)
+    return work
+
+
+def test_a_verifying_model_test_carries_the_intake_baseline(tmp_path, project) -> None:
+    """Prediction run pred-1154-1155-1156-653: a model TEST went red twice on a test
+    intake had recorded as failing at base, because the verdict re-run got no context —
+    no baseline_failures to exclude, no base_sha to narrow the suite by."""
+    from orchestrator.cost_ledger import CostLedger
+    from orchestrator.engine import Engine
+    from orchestrator.schemas.enums import ExecutionLane
+    from orchestrator.status_store import StatusStore
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.store.update_task("r1", "t1", lambda t: t.context.update(
+        base_sha="abc123", baseline_failures=["tests/t.py::test_x"]))
+    eng._lane_verifies_test_verdict = lambda lane: True  # type: ignore[method-assign]
+
+    work = _at_test(eng, "r1", "t1")
+
+    assert work is not None and work.lane_policy.execution_mode is not ExecutionMode.ENGINE
+    assert work.context is not None
+    assert work.context["baseline_failures"] == ["tests/t.py::test_x"]
+    assert work.context["base_sha"] == "abc123"
+
+
+def test_a_non_verifying_model_test_still_gets_no_context(tmp_path, project) -> None:
+    from orchestrator.cost_ledger import CostLedger
+    from orchestrator.engine import Engine
+    from orchestrator.schemas.enums import ExecutionLane
+    from orchestrator.status_store import StatusStore
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng._lane_verifies_test_verdict = lambda lane: False  # type: ignore[method-assign]
+
+    work = _at_test(eng, "r1", "t1")
+
+    assert work is not None and work.context is None

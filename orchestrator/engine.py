@@ -1856,6 +1856,10 @@ class Engine:
         # here from (lane, stage), not a constant in the transport. None on the deterministic
         # lane, which runs no model and therefore has no permission gate to set.
         permission_posture = None if deterministic else self._permission_posture(lane, tool_policy)
+        # A model-lane TEST on a cell that re-runs the declared test commands after the model.
+        verifies_test_verdict = (
+            stage is Stage.TEST and not deterministic and self._lane_verifies_test_verdict(lane)
+        )
         prompt = render_prompt(
             stage,
             task_id=task_id,
@@ -1879,10 +1883,7 @@ class Engine:
             ),
             # A model-lane TEST on a cell that re-runs the declared test commands is told
             # that run decides pass/fail (the cell's ``verifies_test_verdict`` capability).
-            test_verdict_verified=(
-                stage is Stage.TEST and not deterministic
-                and self._lane_verifies_test_verdict(lane)
-            ),
+            test_verdict_verified=verifies_test_verdict,
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -1937,9 +1938,12 @@ class Engine:
             # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
+            # A model TEST whose verdict the lane re-runs gets it too: that re-run is the
+            # deterministic runner, and without baseline_failures/base_sha it counted
+            # inherited red as caused and could never narrow to impacted tests.
             context=(
                 self._deterministic_context(task, stage=stage, run=run)
-                if deterministic
+                if deterministic or verifies_test_verdict
                 else None
             ),
             # #5: the task's per-task port block, exported into the stage subprocess (BOTH
