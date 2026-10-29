@@ -8,7 +8,8 @@ are scripts, not model calls. This runner serves the whole
   - INTAKE  → this module: create/reuse an isolated worktree+branch, report any uncommitted
     work a REUSED worktree inherited from a previous, dead run (#385 — report-only),
     best-effort install, tag the baseline, actually run the unit tests to capture the
-    baseline (``intake``).
+    baseline — shared across the run's tasks that start from the same tree (#553,
+    ``baseline_cache``) (``intake``).
     Ports ``run_setup_stage`` from the reference bash system.
   - TEST    → ``deterministic_test.DeterministicTestRunner`` (#33): run the project's test
     commands, classify failures, split inherited baseline red from caused (``test``).
@@ -48,7 +49,7 @@ from orchestrator.ports.project import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from . import install_cache
+from . import baseline_cache, install_cache
 from .transport import RawResult, _git, _tag_head, to_stage_result
 from .worktree_origin import (
     environment_reset_notice,
@@ -148,6 +149,14 @@ def _inherited_changes(worktree: Path) -> tuple[dict[str, object],
     return fields, (notice,)
 
 
+def _baseline_provenance(baseline: dict) -> dict[str, object]:
+    """#553: the structured reuse fields for the intake output — empty for a fresh run, so
+    only a SHARED baseline carries ``baseline_reused_from``/``baseline_tree``."""
+    if "reused_from" not in baseline:
+        return {}
+    return {"baseline_reused_from": baseline["reused_from"], "baseline_tree": baseline["tree"]}
+
+
 class _SetupError(Exception):
     """A deterministic-setup failure (e.g. git error) — surfaced as ResultStatus.FAILURE."""
 
@@ -159,9 +168,18 @@ class _SetupError(Exception):
 class DeterministicSetupRunner:
     """In-process runner for the deterministic ENGINE lane (currently: intake setup)."""
 
-    def __init__(self, project: ProjectConfig, *, base_ref: str = "HEAD") -> None:
+    def __init__(
+        self,
+        project: ProjectConfig,
+        *,
+        base_ref: str = "HEAD",
+        baseline_cache_dir: str | Path | None = None,
+    ) -> None:
         self._project = project  # ProjectConfig (install_cmd; optional setup_task override)
         self._base_ref = base_ref
+        # #553: the run dir whose ``baseline-cache/`` lets same-tree tasks share one baseline
+        # run. None => every intake captures its own (the pre-#553 behavior).
+        self._baseline_cache_dir = baseline_cache_dir
 
     def capabilities(self) -> list[CapabilityDescriptor]:
         return [
@@ -216,7 +234,7 @@ class DeterministicSetupRunner:
                     raise
                 notices = inherited_notices + notices
                 port_env = port_env_for(self._project, *ports) if ports else None
-                baseline = self._capture_baseline(worktree, port_env)
+                baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
                 out.update({
                     "baseline_captured": baseline["captured"],
                     "baseline_failures": baseline["failures"],
@@ -224,6 +242,7 @@ class DeterministicSetupRunner:
                         f"custom worktree; install: {install_note}; "
                         f"tests: {baseline['note']}"
                     ),
+                    **_baseline_provenance(baseline),
                     **install_meta,
                     # #385: engine-verified, so it overrides any claim the override made.
                     **inherited,
@@ -327,7 +346,7 @@ class DeterministicSetupRunner:
         # #5: capture the baseline with the task's port block exported, so a suite that boots
         # a server binds this task's ports even at the intake baseline run.
         port_env = port_env_for(self._project, *ports) if ports else None
-        baseline = self._capture_baseline(worktree, port_env)
+        baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
         dep_note = (
             f"; composed deps: {', '.join(composed_deps)}" if composed_deps else ""
         )
@@ -348,6 +367,7 @@ class DeterministicSetupRunner:
                 f"isolated worktree off {base_sha}{dep_note}; install: {install_note}; "
                 f"tests: {baseline['note']}"
             ),
+            **_baseline_provenance(baseline),  # #553: set only when the result was reused
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
             # #385: what the worktree already held before this run touched it.
             **inherited,
@@ -451,12 +471,23 @@ class DeterministicSetupRunner:
             return None
         return Path(gd.stdout.strip()) / install_cache.MARKER_NAME
 
-    def _capture_baseline(self, worktree: Path, port_env: dict[str, str] | None = None) -> dict:
+    def _capture_baseline(
+        self,
+        worktree: Path,
+        port_env: dict[str, str] | None = None,
+        *,
+        task_id: str = "",
+    ) -> dict:
         """Run ``test_unit_cmd`` at base and classify the failures (via the project's
         classifier when present). Never fatal: a missing/no-op command, a timeout, or an
         unrunnable suite yields ``captured: False`` with the reason in the note — an
         HONEST miss, never a fabricated baseline. ``port_env`` (#5) is merged over the
-        process env so the baseline run uses the task's port block."""
+        process env so the baseline run uses the task's port block.
+
+        #553: with a run cache dir and a clean git worktree, the result is shared per
+        (tree, argv, lockfile) key across the run's tasks — see ``baseline_cache``. A reused
+        result says so in its note and carries ``reused_from``/``tree``, so it never reads
+        like a fresh run."""
         getter = getattr(self._project, "test_unit_cmd", None)
         try:
             argv = getter() if callable(getter) else None
@@ -464,6 +495,33 @@ class DeterministicSetupRunner:
             argv = None
         if not argv or argv == ["true"]:  # the no-op sentinel
             return {"captured": False, "failures": [], "note": "n/a (no unit-test command)"}
+        keyed = (
+            baseline_cache.compute_key(worktree, argv, self._project)
+            if self._baseline_cache_dir is not None
+            else None
+        )
+        if keyed is None or self._baseline_cache_dir is None:
+            return self._run_baseline(worktree, argv, port_env)
+        key, tree = keyed
+        result, provenance = baseline_cache.cached_or_run(
+            self._baseline_cache_dir, key, tree=tree, task_id=task_id,
+            run_fn=lambda: self._run_baseline(worktree, argv, port_env),
+        )
+        if provenance is None:
+            return result
+        source, src_tree = provenance["source_task"], provenance["tree"]
+        return {
+            **result,
+            "failures": list(result["failures"]),
+            "note": f"reused from {source} at tree {src_tree[:12]} ({result['note']})",
+            "reused_from": source,
+            "tree": src_tree,
+        }
+
+    def _run_baseline(
+        self, worktree: Path, argv: list[str], port_env: dict[str, str] | None
+    ) -> dict:
+        """Actually run the suite once and classify the outcome (the uncached capture)."""
         env = {**os.environ, **port_env} if port_env else None
         try:
             proc = subprocess.run(  # noqa: S603

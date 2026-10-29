@@ -261,7 +261,12 @@ so its cost and failures are visible without restoring the old opaque quality lo
 - **Deterministic stage executors** run on the `engine×none` lane — no model, $0. Intake
   (`deterministic_setup.py`) creates the worktree/branch, reports any uncommitted work a
   REUSED worktree inherited from a previous, dead run (#385 — report-only: never reset,
-  never adopted), and captures the test baseline; `deterministic_test.py` runs the suite and
+  never adopted), and captures the test baseline — once per run for every task that starts
+  from the same clean tree, keyed on (HEAD tree after #216 dep composition, `test_unit_cmd`
+  argv, lockfile hash) and persisted under `<run dir>/baseline-cache/` (#553,
+  `baseline_cache.py`; a reused baseline's note says `reused from #N at tree …`, a flaky
+  test is shared by every sharer, `ORCHESTRATOR_NO_BASELINE_CACHE` opts out);
+  `deterministic_test.py` runs the suite and
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
