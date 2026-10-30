@@ -196,6 +196,16 @@ def test_the_origin_check_is_stated_once_and_composed_by_both_directives() -> No
     assert _RUNNER_ORIGIN_CHECK in _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE
 
 
+def test_a_result_flipping_mutation_counts_as_origin_proof() -> None:
+    """pred-1159-1175-1178-1182 #1175: the runner-side `__file__` print came out empty under
+    pytest's output capture, while reverting the fix in the workspace failed 10 tests. Only a
+    runner importing this checkout sees such a flip, so it is accepted as the same proof — and
+    a mutation that changes nothing is explicitly not, since it cannot tell the trees apart."""
+    assert "`-s`" in _RUNNER_ORIGIN_CHECK
+    assert "FLIPS a runner result" in _RUNNER_ORIGIN_CHECK
+    assert "changes nothing proves nothing" in _RUNNER_ORIGIN_CHECK
+
+
 def test_unverified_workspace_orders_the_check_before_any_relied_on_command() -> None:
     """ff-batch-20260903-1724 #232: the reviewer DID have the probe available and caught a real
     sibling-worktree mismatch with it — but only by chance, because #390 framed it as a

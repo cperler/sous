@@ -440,13 +440,21 @@ _DOCS_ONLY_DIRECTIVE = (
 # and repeatedly gave reviewers a false confirmation — ff-batch-20260903-2004 #227 followed
 # the old wording exactly, got the right answer from `python -c`, and then ran every mutation
 # check against a sibling worktree's source anyway.
+#
+# A result-flipping mutation is accepted as the same proof (prediction pred-1159-1175-1178-1182
+# #1175, kb lk-37a566121365): the `__file__` print came out empty under pytest's capture, while
+# reverting the fix in the workspace failed 10 tests — evidence only this checkout's import gives.
 _RUNNER_ORIGIN_CHECK = (
     "resolve an exercised module's `__file__` FROM INSIDE THE TEST RUNNER — a collected test "
     "that prints it, run by the project's own test command — and confirm that path lies under "
     "this workspace. A bare `python -c \"import pkg; print(pkg.__file__)\"` is NOT that check "
     "and can agree with this workspace while the runner does not: `python -c` puts your cwd "
     "first on `sys.path`, so it reports the local copy while the runner (different rootdir, "
-    "different install) imports another worktree's."
+    "different install) imports another worktree's. (The runner captures output: pass `-s` "
+    "to pytest or the print comes out empty.) A mutation of this workspace's source that "
+    "FLIPS a runner result (a passing test now fails) is equal proof, since only a runner "
+    "importing this checkout can see it; name the mutation. A mutation that changes nothing "
+    "proves nothing about origin."
 )
 
 
