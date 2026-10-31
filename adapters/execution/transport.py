@@ -130,6 +130,7 @@ _RATE_LIMIT_MARKERS = (
 # narrowness of ``_RATE_LIMIT_MARKERS`` was already guarding against. Case-insensitive.
 _PROVIDER_LIMIT_NOTICE_MARKERS = (
     "hit your session limit", "hit your usage limit",
+    "hit your 5-hour limit", "hit your weekly limit",
     "session limit reached", "usage limit reached",
 )
 
