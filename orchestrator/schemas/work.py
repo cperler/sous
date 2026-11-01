@@ -330,9 +330,10 @@ class WorkItem(BaseModel):
     # while the task's live tree remains unreachable. Runner metadata, never engine-authored
     # content, and therefore excluded from ``compute_content_hash`` like ``cwd``/``env``.
     workspace_isolated: bool = False
-    # ``Task.review_cycles`` at dispatch (#546): a review fix cycle restarts the re-run
-    # stages at attempt 0, so this is what keeps their stream/stderr/prompt files from
-    # overwriting the earlier pass's (see ``stream_probe.stream_basename``). Dispatch
+    # ``Task.review_cycles + Task.test_fix_cycles`` at dispatch (#546, #541): either kind of
+    # fix cycle restarts the re-run stages at attempt 0, so this is what keeps their
+    # stream/stderr/prompt files from overwriting the earlier pass's (see
+    # ``stream_probe.stream_basename``). Dispatch
     # metadata like ``phase`` — it names where a call's evidence lands, never what the work
     # IS — so it is excluded from ``compute_content_hash``.
     review_cycle: int = 0

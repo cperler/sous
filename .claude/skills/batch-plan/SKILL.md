@@ -39,7 +39,9 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      localized code change → `lite`; `full` only for risky, cross-cutting, or ambiguous work
      (touches shared engine/adapter logic, needs design, or the body is unclear). When you
      pick `full`, the `rationale` must say which of those applies. Read-only analysis that
-     produces a write-up is `lite`, not `full`.
+     produces a write-up is `lite`, not `full`. Omit `deterministic_stages` to take the lane's
+     default (TEST runs no model on any lane); `[]` explicitly runs every stage on a model, so
+     use it only when a task really needs a model TEST.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

@@ -257,6 +257,13 @@ def make_result(
     )
 
 
+# The fields an approving REVIEW must carry on a change with a test surface (#541).
+REVIEW_PROOF: dict = {
+    "tests_meaningful": True,
+    "mutation_checks": [{"mutation": "a.py:1 drop the guard", "failed_tests": ["t::x"]}],
+}
+
+
 def _default_output(stage: Stage) -> dict:
     return {
         Stage.INTAKE: {"branch": "issue-42", "worktree": "/wt/42", "baseline_captured": True},
@@ -265,8 +272,7 @@ def _default_output(stage: Stage) -> dict:
         Stage.SIMPLIFY: {"files_changed": [], "summary": "already simple", "committed": False},
         Stage.OPTIMIZE: {"files_changed": ["a.py"], "summary": "batched the hot loop",
                          "committed": True, "measurements": [], "suggestions": []},
-        Stage.TEST: {"passed": True, "failures": [], "tests_meaningful": True,
-                     "validation_notes": "asserts the changed behavior"},
+        Stage.TEST: {"passed": True, "failures": [], "validation_notes": "unit: green"},
         Stage.DELIVER: {"pr_number": 1234, "pr_url": "https://github.com/x/y/pull/1234"},
-        Stage.REVIEW: {"approved": True, "issues": []},
+        Stage.REVIEW: {"approved": True, "issues": [], **REVIEW_PROOF},
     }[stage]

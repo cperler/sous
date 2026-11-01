@@ -34,7 +34,10 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      sequence — an unnecessary edge serializes work that could parallelize.
    - **Lane fit** (`pipeline`): docs-only / pure-config → `micro` (and put `test`,`deliver` in
      `deterministic_stages` — a docs change needs no model test/PR-writing); small mechanical /
-     localized → `lite`; risky, cross-cutting, or ambiguous → `full`.
+     localized → `lite`; risky, cross-cutting, or ambiguous → `full`. Omit
+     `deterministic_stages` to take the lane's default (TEST runs no model on any lane); `[]`
+     explicitly runs every stage on a model, so use it only when a task really needs a model
+     TEST.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

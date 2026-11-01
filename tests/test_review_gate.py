@@ -15,7 +15,7 @@ from orchestrator.errors import ContractError
 from orchestrator.render import format_review_issue
 from orchestrator.schemas.enums import ResultStatus, Stage, StageStatus, TaskState
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -80,7 +80,7 @@ def test_fix_cycle_then_approval_completes(tmp_path, project) -> None:
         eng.record("r1", make_result(eng.next_work("r1", "t1")))
     w2 = eng.next_work("r1", "t1")
     assert w2.stage is Stage.REVIEW
-    out = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
+    out = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": [], **REVIEW_PROOF}))
     assert out["outcome"] == "task_completed"
     assert eng.store.load_task("r1", "t1").state is TaskState.COMPLETED
 
@@ -112,7 +112,7 @@ def test_approved_fixup_reimplements_redelivers_and_records_application(tmp_path
     review = _advance_to_review(eng)
     result = make_result(
         review,
-        structured_output={"approved": True, "issues": [], "improvement": FIXUP},
+        structured_output={"approved": True, "issues": [], **REVIEW_PROOF, "improvement": FIXUP},
     )
 
     out = eng.record("r1", result)
@@ -137,7 +137,7 @@ def test_approved_fixup_reimplements_redelivers_and_records_application(tmp_path
 
     final_review = _drive_fixup_tail(eng)
     out = eng.record(
-        "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
+        "r1", make_result(final_review, structured_output={"approved": True, "issues": [], **REVIEW_PROOF})
     )
     assert out["outcome"] == "task_completed"
     task = eng.store.load_task("r1", "t1")
@@ -197,7 +197,7 @@ def test_rejected_review_holds_fixup_when_combined_cycle_cannot_redeliver(
     final_review = eng.next_work("r1", "t1")
     assert final_review.stage is Stage.REVIEW
     out = eng.record(
-        "r1", make_result(final_review, structured_output={"approved": True, "issues": []})
+        "r1", make_result(final_review, structured_output={"approved": True, "issues": [], **REVIEW_PROOF})
     )
     assert out["outcome"] == "task_completed"
     assert "applied in place, not filed" not in project.task_source.notes[0]["body"]
@@ -207,7 +207,7 @@ def test_repeated_fixup_parks_instead_of_looping(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
-    output = {"approved": True, "issues": [], "improvement": FIXUP}
+    output = {"approved": True, "issues": [], **REVIEW_PROOF, "improvement": FIXUP}
     eng.record("r1", make_result(_advance_to_review(eng), structured_output=output))
 
     out = eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output=output))
@@ -244,7 +244,7 @@ def test_fixup_parks_when_pipeline_cannot_reimplement(
         "r1",
         make_result(
             review,
-            structured_output={"approved": True, "issues": [], "improvement": FIXUP},
+            structured_output={"approved": True, "issues": [], **REVIEW_PROOF, "improvement": FIXUP},
         ),
     )
 
@@ -306,7 +306,7 @@ def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, pro
     eng.add_task("r1", "t1")
     w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={
-        "approved": True, "issues": [], "tests_meaningful": False,
+        "approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": False,
     }))
     assert out["outcome"] == "review_rejected_fix_cycle"
     task = eng.store.load_task("r1", "t1")
@@ -315,24 +315,26 @@ def test_reviewer_vacuous_tests_verdict_rejects_even_when_approved(tmp_path, pro
     for _ in range(3):
         eng.record("r1", make_result(eng.next_work("r1", "t1")))
     w2 = eng.next_work("r1", "t1")
-    out2 = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": []}))
+    out2 = eng.record("r1", make_result(w2, structured_output={"approved": True, "issues": [], **REVIEW_PROOF}))
     assert out2["outcome"] == "task_completed"
 
 
-def test_deterministic_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
-    """#168: a task whose TEST stage runs on the deterministic $0 ENGINE lane has no
-    model-written/graded tests for the #13 gate to bite on, so a reviewer's
-    tests_meaningful=false must NOT reject an otherwise-approved review (the #144 misfire)."""
+def test_deterministic_test_stage_does_not_exempt_a_vacuous_tests_rejection(
+    tmp_path, project,
+) -> None:
+    """#541 reversed #168 here: TEST on the ENGINE lane is now the default everywhere, a model
+    still wrote the tests, and REVIEW is the only stage left judging them. So a reviewer's
+    tests_meaningful=false rejects, or the veto would never fire on any task."""
     from orchestrator.schemas.enums import Stage as _Stage
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    task = eng.add_task("r1", "t1", deterministic_stages=[_Stage.TEST, _Stage.DELIVER])
+    task = eng.add_task("r1", "t1")
     assert _Stage.TEST in task.deterministic_stages
-    w = _advance_to_review(eng)  # FULL pipeline (6 stages), TEST just runs on ENGINE lane
+    w = _advance_to_review(eng)
     out = eng.record("r1", make_result(w, structured_output={
-        "approved": True, "issues": [], "tests_meaningful": False,
+        "approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": False,
     }))
-    assert out["outcome"] == "task_completed"  # deterministic TEST → no model test surface
+    assert out["outcome"] == "review_rejected_fix_cycle"
 
 
 def test_micro_no_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) -> None:
@@ -349,7 +351,7 @@ def test_micro_no_test_stage_exempts_vacuous_tests_rejection(tmp_path, project) 
     w = eng.next_work("r1", "t1")
     assert w.stage is Stage.REVIEW
     out = eng.record("r1", make_result(w, structured_output={
-        "approved": True, "issues": [], "tests_meaningful": False,
+        "approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": False,
     }))
     assert out["outcome"] == "task_completed"
 
@@ -384,7 +386,7 @@ def test_docs_only_tag_exempts_vacuous_tests_rejection(tmp_path, project) -> Non
         "passed": True, "failures": [], "tests_meaningful": None, "change_class": "docs-only",
     })
     out = eng.record("r1", make_result(w, structured_output={
-        "approved": True, "issues": [], "tests_meaningful": False,
+        "approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": False,
     }))
     assert out["outcome"] == "task_completed"  # docs-only exempts the missing-tests rejection
     assert eng.store.load_task("r1", "t1").context["change_class"] == "docs-only"
@@ -420,7 +422,7 @@ def test_model_claimed_docs_only_is_ignored_still_rejects(tmp_path, project) -> 
     )
     assert "change_class" not in eng.store.load_task("r1", "t1").context  # dropped at the fold
     out = eng.record("r1", make_result(w, structured_output={
-        "approved": True, "issues": [], "tests_meaningful": False,
+        "approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": False,
     }))
     assert out["outcome"] == "review_rejected_fix_cycle"  # no exemption from a model's claim
 
@@ -582,7 +584,7 @@ def test_finding_fixup_reimplements_and_reports_application_from_evidence(
     out = eng.record("r1", make_result(
         _advance_to_review(eng),
         structured_output={
-            "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+            "approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [FINDING_FIXUP],
         },
     ))
 
@@ -604,7 +606,7 @@ def test_finding_fixup_reimplements_and_reports_application_from_evidence(
 
     final = _drive_fixup_tail(eng)
     out = eng.record("r1", make_result(
-        final, structured_output={"approved": True, "issues": []}
+        final, structured_output={"approved": True, "issues": [], **REVIEW_PROOF}
     ))
 
     assert out["outcome"] == "task_completed"
@@ -628,10 +630,10 @@ def test_finding_fixup_note_reports_application_not_the_ask(tmp_path, project) -
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+        "approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [FINDING_FIXUP],
     }))
     eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{**FINDING_FIXUP, "disposition": "drop"}],
     }))
 
@@ -646,7 +648,7 @@ def test_two_finding_fixups_share_one_cycle(tmp_path, project) -> None:
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [FINDING_FIXUP, FINDING_FIXUP_2],
     }))
 
@@ -661,7 +663,7 @@ def test_two_finding_fixups_share_one_cycle(tmp_path, project) -> None:
     assert len(scheduled) == 2  # both are individually auditable
 
     out = eng.record("r1", make_result(
-        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
+        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": [], **REVIEW_PROOF}
     ))
     assert out["outcome"] == "task_completed"
     assert all(f.applied for f in eng.store.load_task("r1", "t1").review_fixups)
@@ -672,7 +674,7 @@ def test_improvement_and_finding_fixups_share_one_cycle(tmp_path, project) -> No
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": FIXUP, "non_blocking": [FINDING_FIXUP],
     }))
 
@@ -682,7 +684,7 @@ def test_improvement_and_finding_fixups_share_one_cycle(tmp_path, project) -> No
     assert [f.source for f in task.review_fixups] == ["improvement", "finding"]
 
     eng.record("r1", make_result(
-        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": []}
+        _drive_fixup_tail(eng), structured_output={"approved": True, "issues": [], **REVIEW_PROOF}
     ))
     note = project.task_source.notes[0]["body"]
     # the improvement is reported in its own section, the finding in the findings section
@@ -698,7 +700,7 @@ def test_unschedulable_finding_fixup_completes_instead_of_parking(tmp_path, proj
     eng.add_task("r1", "t1")
 
     out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [], "non_blocking": [FINDING_FIXUP],
+        "approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [FINDING_FIXUP],
     }))
 
     assert out["outcome"] == "task_completed"
@@ -721,7 +723,7 @@ def test_held_finding_fixup_is_not_swept_applied_by_its_own_review(tmp_path, pro
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
-    output = {"approved": True, "issues": [], "non_blocking": [FINDING_FIXUP]}
+    output = {"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [FINDING_FIXUP]}
     eng.record("r1", make_result(_advance_to_review(eng), structured_output=output))
 
     out = eng.record("r1", make_result(_drive_fixup_tail(eng), structured_output=output))
@@ -747,7 +749,7 @@ def test_improvement_fixup_still_parks_when_a_finding_rides_along(tmp_path, proj
     eng.add_task("r1", "t1")
 
     out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": FIXUP, "non_blocking": [FINDING_FIXUP],
     }))
 
@@ -766,7 +768,7 @@ def test_fix_now_finding_is_noted_but_never_claimed_fixed(tmp_path, project) -> 
     eng.add_task("r1", "t1")
 
     out = eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{**FINDING_FIXUP, "disposition": "fix_now"}],
     }))
 
@@ -784,7 +786,7 @@ def test_one_nit_stated_twice_earns_one_fixup(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
 
     eng.record("r1", make_result(_advance_to_review(eng), structured_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": FINDING_FIXUP, "non_blocking": [FINDING_FIXUP],
     }))
 

@@ -235,6 +235,11 @@ class ProjectConfig(Protocol):
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
     #
+    # Optional model TEST opt-in (#541; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``model_test_stage = True`` drops TEST from a task's preset- or cost-derived
+    # deterministic stages, so this project's tasks run TEST on a model lane instead of the
+    # ENGINE lane. A task's own explicit stages still win. The declared test commands still
+    # decide that stage's verdict, and tests-meaningful stays REVIEW's either way.
     # Optional impacted-test selection hooks (#558; duck-typed via ``getattr``, NOT part of
     # the versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   impacted_tests(changed: list[str], *, cwd: str | None = None) -> list[str] | None

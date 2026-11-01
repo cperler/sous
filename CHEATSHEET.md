@@ -151,6 +151,8 @@ Then `/triage-followups`.
 | `lite` | Small, mechanical, localized | |
 | `full` | Risky, cross-cutting, ambiguous | Default |
 
+TEST runs no model on any lane by default. For a model TEST: `--deterministic-stages none`.
+
 Optional per-task: `--model fable` (architecture-heavy design work), `--effort high`.
 Via `/batch-plan` these are **plan fields** — hand-writing `add-task --model` costs you
 `apply`'s topological ordering.

@@ -107,9 +107,9 @@ written.
   bare `python -c` import puts the workspace's cwd first on `sys.path` and so passes while the
   runner imports a sibling worktree — the false green observed live. When
   it declares neither, the skip is now stated to the reviewer in-band (#390) alongside a standing
-  posture that a revert/mutation check the reviewer runs itself CORROBORATES the TEST stage's
-  reported result rather than adjudicating it — an unattributable sandbox result is inconclusive,
-  not a `tests_meaningful: false`. #411 made that in-band block an ORDERING rather than a
+  posture that a mutation check the reviewer runs there is only evidence once the runner is shown
+  to import this checkout — an unattributable sandbox result is inconclusive (recorded in
+  `tests_not_checked_reason`), not a `tests_meaningful: false`. #411 made that in-band block an ORDERING rather than a
   caveat: the runner probe runs FIRST, before any command whose result the review relies on,
   because twenty-odd further retrospectives showed a check framed as a fallback gets skipped
   on a run where nothing looks anomalous. The reviewer reports the outcome as `workspace_origin`
@@ -270,12 +270,29 @@ so its cost and failures are visible without restoring the old opaque quality lo
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
+- **TEST is mechanical; REVIEW judges the tests (#541).** TEST runs on the ENGINE lane by default
+  on every lane, FULL included: `LANE_DETERMINISTIC_STAGES` is resolved onto `Task` at `add_task`,
+  decomposition children inherit the parent's set, and a task (`--deterministic-stages none`) or a
+  project (`model_test_stage = True`) can opt back into a model TEST. The runner cannot fix what it
+  finds and retrying it re-runs identical code, so a red run that reached a verdict re-opens
+  IMPLEMENT with the failing ids and output tail as a learning (`test_failed_fix_cycle`, at most
+  `max_attempts - 1` per task, then the task fails). A run that only timed out or could not start
+  (`failure_kinds == ["infra"]`, or no output) keeps the same-stage retry, since the code was
+  never shown to be wrong. Whether the tests mean anything is REVIEW's required output:
+  `tests_meaningful` plus `mutation_checks` (which mutation, which tests failed on it). For a
+  panel, only `find:tests` may report them, and that lens stays on the trivial-diff rung.
+  `state_machine.review_proof_gate` sends an approval on a change with a test surface back for
+  another review unless it has a boolean verdict with a mutation that failed a test or a stated
+  `tests_not_checked_reason`; a stated reason is evented as `test_validation_skipped`
+  (`not_judged`/`unproven`), and `status` shows the verdict and how many mutations back it. A
+  docs-only change or a pipeline with no TEST stage is exempt, as is a `none`-tier child, which has
+  no REVIEW and so no verdict. Interactive REVIEW has no disposable copy, so it is told not to
+  mutate and to state that as the reason.
 - **The declared commands decide a model TEST's verdict.** On the in-process model lanes
   (headless×claude, any×codex), `test_verdict.py` re-runs the ENGINE lane's evaluation
   (`DeterministicTestRunner.evaluate`) after the model: a claimed green that the declared
   commands fail becomes a FAILURE with the real failures, and a timeout over a clean
-  worktree is settled by a green declared run (`tests_meaningful` null, left to REVIEW)
-  instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
+  worktree is settled by a green declared run instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
   does the TEST prompt tell the model to skip whole-suite runs. Motivated by a model that
   ran a parallel-declared suite serially and timed out green code twice. Up to five failing
   unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors

@@ -27,7 +27,28 @@
     },
     "tests_meaningful": {
       "type": ["boolean", "null"],
-      "description": "the find:tests lens's independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false is vacuous; omitted/absent/null fails OPEN but folds to a null 'not judged' in review.json rather than a true (#261). Answer it whenever there are tests to read; abstain only when the change has genuinely no test surface. Only the find:tests finder emits this."
+      "description": "the find:tests lens's independent test-validate verdict (#13/#541): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false is vacuous. true needs a mutation_checks entry that failed a test, or a tests_not_checked_reason. Answer it whenever there are tests to read; answer null only when the change has genuinely no test surface. Only the find:tests finder emits this."
+    },
+    "mutation_checks": {
+      "type": "array",
+      "description": "#541: the mutations the find:tests finder applied to prove tests_meaningful. Only the find:tests finder emits this.",
+      "items": {
+        "type": "object",
+        "required": ["mutation", "failed_tests"],
+        "properties": {
+          "mutation": {"type": "string", "description": "file:line and what was changed"},
+          "failed_tests": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "ids of the tests that failed on this mutation; empty means it survived"
+          }
+        },
+        "additionalProperties": true
+      }
+    },
+    "tests_not_checked_reason": {
+      "type": "string",
+      "description": "#541: why no mutation settled tests_meaningful. Accepted in place of proof and evented as unproven. Only the find:tests finder emits this."
     },
     "improvement": {
       "type": "object",

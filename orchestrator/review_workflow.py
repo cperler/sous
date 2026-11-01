@@ -205,7 +205,8 @@ def synthesize(sub_results: object) -> SynthesisResult:
     5. ``non_blocking`` = suggestion findings, plus every refuted finding prefixed
        ``refuted:`` and carrying the verifier's reasoning. Both are explicitly
        dispositioned ``file`` so evidence-out keeps the panel's human-review loop open.
-    6. ``tests_meaningful`` = ``find:tests``'s report VERBATIM, or ``null`` when no lens
+    6. ``tests_meaningful`` (with its ``mutation_checks`` and any
+       ``tests_not_checked_reason``) = ``find:tests``'s report VERBATIM, or ``null`` when no lens
        supplied a boolean one; only an explicit ``false`` is vacuous (fail-OPEN preserved),
        so a docs-only plan that omits the lens folds to ``null`` — "not judged", never a
        synthesized ``true`` (#261).
@@ -242,6 +243,8 @@ def synthesize(sub_results: object) -> SynthesisResult:
     # second pass over the raw input would be the drift this module forbids).
     by_lens_fingerprints: dict[str, set[str]] = {}
     tests_meaningful: bool | None = None
+    mutation_checks: list[dict] = []
+    not_checked_reason: str | None = None
     improvement: object = None
     retrospective: object = None
 
@@ -270,6 +273,9 @@ def synthesize(sub_results: object) -> SynthesisResult:
                 ))
             elif tests_meaningful is None:
                 tests_meaningful = reported
+        mutation_checks, not_checked_reason = _absorb_test_proof(
+            lens, payload, mutation_checks, not_checked_reason, notices,
+        )
 
         if payload.get("improvement") is not None:
             if improvement is None:
@@ -332,13 +338,51 @@ def synthesize(sub_results: object) -> SynthesisResult:
         # approve/reject math is unchanged: it reads `vacuous`, which is still
         # `is False`-only, so a null keeps failing OPEN.
         "tests_meaningful": tests_meaningful,
+        # #541: the lens's proof for that verdict, carried for ``review_proof_gate`` to read.
+        "mutation_checks": mutation_checks,
     }
+    if not_checked_reason is not None:
+        review["tests_not_checked_reason"] = not_checked_reason
     if improvement is not None:
         review["improvement"] = improvement
     if retrospective is not None:
         review["retrospective"] = retrospective
     summary = _panel_summary(by_lens, by_lens_fingerprints, verdicts, runner_notices)
     return SynthesisResult(review, tuple(notices), summary)
+
+
+def _absorb_test_proof(
+    lens: str,
+    payload: dict,
+    mutation_checks: list[dict],
+    not_checked_reason: str | None,
+    notices: list[dict],
+) -> tuple[list[dict], str | None]:
+    """Take ``find:tests``'s ``mutation_checks`` / ``tests_not_checked_reason`` (#541). The
+    same one-lens rule ``tests_meaningful`` has: another lens's report is ignored with a
+    notice, and so is a malformed one, which then simply fails to prove anything."""
+    checks = payload.get("mutation_checks")
+    reason = payload.get("tests_not_checked_reason")
+    if lens != TESTS_LENS:
+        for field, value in (("mutation_checks", checks), ("tests_not_checked_reason", reason)):
+            if value:
+                notices.append(_notice(
+                    "tests_meaningful_ignored",
+                    f"lens {lens!r} reported {field}; only {TESTS_LENS} judges test "
+                    "meaningfulness — ignored",
+                ))
+        return mutation_checks, not_checked_reason
+    if checks is not None:
+        kept = [c for c in checks if isinstance(c, dict)] if isinstance(checks, list) else []
+        if not isinstance(checks, list) or len(kept) != len(checks):
+            notices.append(_notice(
+                "tests_meaningful_ignored",
+                f"{TESTS_LENS} reported malformed mutation_checks — malformed entries ignored",
+            ))
+        mutation_checks = mutation_checks or kept
+    if isinstance(reason, str) and reason.strip() and not_checked_reason is None:
+        not_checked_reason = reason.strip()
+    return mutation_checks, not_checked_reason
 
 
 def _panel_summary(

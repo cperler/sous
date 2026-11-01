@@ -55,10 +55,11 @@ def stream_basename(
     survives too — the first call (K=0) keeps the bare name, so the 99%-no-retry case is
     unchanged, and a phase-less (single-call) dispatch names files exactly as it always did.
 
-    A review fix cycle (#546) re-opens IMPLEMENT→…→REVIEW with fresh stage records, so each
-    re-run stage starts again at attempt 0; ``cycle`` (``Task.review_cycles`` at dispatch)
-    inserts ``.cycle<C>`` after the attempt so the re-run never overwrites the earlier
-    pass's files. Cycle 0 keeps the pre-#546 name."""
+    A fix cycle (#546 review, #541 red TEST) re-opens IMPLEMENT→…→REVIEW with fresh stage
+    records, so each re-run stage starts again at attempt 0; ``cycle``
+    (``Task.review_cycles + Task.test_fix_cycles`` at dispatch) inserts ``.cycle<C>`` after
+    the attempt so the re-run never overwrites the earlier pass's files. Cycle 0 keeps the
+    pre-#546 name."""
     stem = f"{stage_value}-attempt{attempt}"
     if cycle:
         stem = f"{stem}.cycle{cycle}"

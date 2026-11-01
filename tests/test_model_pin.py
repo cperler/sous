@@ -72,7 +72,7 @@ def test_pinned_model_wins_over_role_default_across_stages(tmp_path, project) ->
     pinned tier, not their role defaults. The pin is a mid-chain model so it differs from all three."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1", model="sonnet")
+    eng.add_task("r1", "t1", model="sonnet", deterministic_stages=())
     seen: dict[Stage, str] = {}
     while (w := eng.next_work("r1", "t1")) is not None:
         seen[w.stage] = w.model

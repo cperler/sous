@@ -266,8 +266,9 @@ class Task(_StatusModel):
     # (#33) without flipping the global default for every project — the SAME routing
     # decision (→ ENGINE lane) as intake, just sourced from the task (mirrors how the
     # pipeline itself became per-task in schema v2). Empty by default on the model; add_task
-    # fills it from the lane preset (#68 — micro/lite default to deterministic TEST/DELIVER,
-    # FULL keeps model TEST/DELIVER), so a hand-built/loaded doc keeps exactly its stored set.
+    # fills it from the lane preset (#68/#541 — every preset defaults to deterministic TEST,
+    # micro/lite to deterministic DELIVER too), so a hand-built/loaded doc keeps exactly its
+    # stored set. An empty set is an explicit choice of model stages, and it persists.
     deterministic_stages: tuple[Stage, ...] = ()
     # Optional pre-stage human checkpoint (#71). The task is parked before this stage
     # until that exact gate identity is approved. Additive for backward compatibility.
@@ -326,6 +327,10 @@ class Task(_StatusModel):
     # improvement fixup that re-opens implement→…→review increments this; at the engine's
     # max_review_cycles the task parks BLOCKED_ON_HUMAN instead of looping forever.
     review_cycles: int = 0
+    # Count of times a red ENGINE-lane TEST re-opened implement→…→review (#541). Retrying that
+    # TEST would re-run identical code, so a regression goes back to the implementer instead;
+    # this bounds those trips at ``max_attempts - 1``, after which the task fails.
+    test_fix_cycles: int = 0
     # Fingerprints (file:description, normalized) of the LAST rejection's blocking
     # issues — the convergence key (#15): a re-review whose issues are a subset of
     # these (no net-new findings, none critical) has converged and auto-approves.

@@ -124,7 +124,7 @@ def test_workitem_create_threads_effort_into_field_and_hash() -> None:
 def test_spec_default_effort_rides_each_model_stage(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     seen: dict[Stage, str | None] = {}
     while (w := eng.next_work("r1", "t1")) is not None:
         seen[w.stage] = w.effort
@@ -138,7 +138,7 @@ def test_spec_default_effort_rides_each_model_stage(tmp_path, project) -> None:
 def test_effort_pin_wins_over_spec_default_across_stages(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    task = eng.add_task("r1", "t1", effort="low")
+    task = eng.add_task("r1", "t1", effort="low", deterministic_stages=())
     assert task.effort_pin == "low"
     assert eng.store.load_task("r1", "t1").effort_pin == "low"  # round-trips
     seen: dict[Stage, str | None] = {}

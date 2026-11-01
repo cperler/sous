@@ -48,7 +48,7 @@ from orchestrator.stages import (
     render_review_plan,
 )
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 _UNVERIFIED_MARKER = "toolchain origin was NOT verified"
 
@@ -59,13 +59,13 @@ def _review_prompt(**kw) -> str:
 
 # --- (a) the mutation-check trust posture ------------------------------------------------
 
-def test_single_reviewer_is_told_its_mutation_check_only_corroborates() -> None:
-    """The pre-#390 wording covered ONE direction (a mutation that fails to fail) and framed
-    the check as decisive. Both halves are load-bearing: b24 #145 saw the same command pass
-    and fail alternately."""
+def test_single_reviewer_is_told_a_mutation_check_can_lie_in_either_direction() -> None:
+    """The pre-#390 wording covered ONE direction (a mutation that fails to fail). Both
+    halves matter: b24 #145 saw the same command pass and fail alternately. An inconclusive
+    check now goes in tests_not_checked_reason (#541)."""
     prompt = _review_prompt()
     assert _MUTATION_CHECK_TRUST in prompt
-    assert "CORROBORATES" in prompt
+    assert "`tests_not_checked_reason`" in _MUTATION_CHECK_TRUST
     assert "spurious failure" in prompt  # the false-FAILURE direction, not just false-pass
     assert "INCONCLUSIVE" in prompt
 
@@ -260,7 +260,7 @@ def _review_events(tmp_path, project, structured_output):
 
 
 def _approved(**extra):
-    return {"approved": True, "issues": [], "tests_meaningful": True, **extra}
+    return {"approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": True, **extra}
 
 
 def test_omitted_workspace_origin_events_on_an_unverified_review(tmp_path, project) -> None:

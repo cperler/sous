@@ -320,6 +320,12 @@ The `pipeline` per task is the main cost dial:
 - `full` — risky, cross-cutting, or ambiguous (the example's t4, where being wrong is
   expensive).
 
+Every lane runs TEST with no model by default: the engine runs your declared test commands, and
+a real failure goes back to IMPLEMENT. REVIEW judges whether the tests mean anything, by applying
+a mutation and recording which tests failed on it. To use a model TEST anyway, pass
+`--deterministic-stages none` on a task (`"deterministic_stages": []` in a batch plan), or set
+`model_test_stage = True` on your project adapter for every task.
+
 Optional per-task pins: `model` (e.g. `fable` for architecture-heavy design work) and
 `effort`.
 
