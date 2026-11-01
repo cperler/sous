@@ -201,8 +201,7 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     # stage does not act on — #520 makes them engine-run, which is when they become
     # evidence worth carrying into a downstream prompt.
     Stage.OPTIMIZE: (),
-    Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class",
-                 "test_scope"),
+    Stage.TEST: ("failures", "validation_notes", "change_class", "test_scope"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
 }
@@ -315,7 +314,7 @@ def _enforce_context_ceiling(task: Task) -> list[dict[str, object]]:
     """Keep task.context under the whole-context ceiling by a per-KEY size-weighted
     sweep, heaviest-first: each pass evicts the single folded key that weighs the most
     bytes, so a fat key is shed while its small stage-siblings survive (dropping a
-    near-ceiling ``test.failures`` no longer takes ``tests_meaningful`` /
+    near-ceiling ``test.failures`` no longer takes ``change_class`` /
     ``validation_notes`` down with it — whole-stage eviction was needlessly coarse).
     Ties break reverse-pipeline (review's keys first, intake's last) then the fixed key
     order within that stage's ``CONTEXT_KEYS`` tuple — downstream stages need the earliest
@@ -526,86 +525,144 @@ def deliver_push_mismatch(checkpoint_sha: str, remote_sha: str | None, branch: s
     )
 
 
-def no_model_test_surface(task: Task) -> bool:
-    """#41/#168: does this task have NO model-written/graded test surface for the #13
-    independent test-validate criterion to bite on?
+def no_test_surface(task: Task) -> bool:
+    """#41/#168: does this task have NO test surface for REVIEW's tests-meaningful judgment
+    (#13/#541) to bite on?
 
-    True on any of three signals, ALL fixed at ``add_task`` time or set only by the
+    True on either of two signals, both fixed at ``add_task`` time or set only by the
     deterministic ENGINE lane — so a model can never self-exempt:
 
     (a) #41 the change was deterministically classified ``docs-only`` (the git-diff tag; a
         model claim is dropped at the fold, see ``DETERMINISTIC_ONLY_KEYS``);
-    (b) #168 the pipeline has no TEST stage at all (micro);
-    (c) #168 TEST ran on the deterministic $0 ENGINE runner (#33/#68), so no model wrote or
-        graded the tests the reviewer would be judging.
+    (b) #168 the pipeline has no TEST stage at all (micro).
 
-    Pure (a function of the task doc only). Lives here, next to the fold, because BOTH the
-    engine's ``_review_verdict`` exemption and ``unjudged_tests_notice`` below must read
-    the SAME predicate — two spellings would drift.
+    TEST running on the ENGINE lane is deliberately NOT a signal (#541): that is now every
+    lane's default, and a model (IMPLEMENT) still wrote the tests REVIEW judges.
+
+    Pure (a function of the task doc only). Lives here, next to the fold, because the
+    engine's ``_review_verdict`` exemption, ``review_proof_gate`` and
+    ``unjudged_tests_notice`` below must read the SAME predicate — spellings would drift.
     """
     return (
         task.context.get("change_class") == "docs-only"
         or Stage.TEST not in task.pipeline
-        or Stage.TEST in task.deterministic_stages
+    )
+
+
+def proving_mutation_count(output: dict) -> int:
+    """How many of a REVIEW output's ``mutation_checks`` actually failed a test: a named
+    mutation with at least one failing test id. A survived mutation is a real record, but it
+    proves nothing in favor of the tests. Tolerant of any shape, since a model wrote it."""
+    checks = output.get("mutation_checks")
+    if not isinstance(checks, list):
+        return 0
+    return sum(
+        1 for check in checks
+        if isinstance(check, dict)
+        and str(check.get("mutation") or "").strip()
+        and isinstance(check.get("failed_tests"), list)
+        and any(str(test).strip() for test in check["failed_tests"])
+    )
+
+
+def _not_checked_reason(output: dict) -> str | None:
+    """The reviewer's stated reason for not proving the verdict, or None when blank."""
+    reason = output.get("tests_not_checked_reason")
+    return reason.strip() if isinstance(reason, str) and reason.strip() else None
+
+
+def review_proof_gate(task: Task, result: StageResult) -> str | None:
+    """Why an APPROVING REVIEW must re-run because it did not prove the tests mean anything
+    (#541), or None. Pure; the engine downgrades the result to a failure with this as its
+    error, so the retry reads it as a learning and the breaker bounds the loop.
+
+    Applies to a successful approval on a change with a test surface. It requires either a
+    boolean verdict backed by a mutation that failed a test, or a stated
+    ``tests_not_checked_reason``, which is accepted and evented by ``unjudged_tests_notice``
+    so an unproven pass stays visible. An explicit ``false`` needs no proof (the verdict
+    rejects it anyway), and a rejecting review is not vetoed because it re-runs after the fix.
+    """
+    if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+        return None
+    out = result.structured_output or {}
+    if out.get("approved") is not True or out.get("tests_meaningful") is False:
+        return None
+    if no_test_surface(task) or _not_checked_reason(out) is not None:
+        return None
+    verdict = out.get("tests_meaningful")
+    if isinstance(verdict, bool) and proving_mutation_count(out):
+        return None
+    return (
+        "review proof gate: the review approved a change with tests but recorded no proof "
+        "they mean anything. Apply a mutation to the change's source, run the covering tests, "
+        "and report tests_meaningful plus mutation_checks naming the mutation and the tests "
+        "that failed on it; if no check can settle it, say why in tests_not_checked_reason."
     )
 
 
 def unjudged_tests_notice(task: Task, result: StageResult) -> dict[str, object] | None:
-    """Did anything actually judge whether this change's tests are meaningful (#261)?
+    """Did REVIEW actually judge whether this change's tests are meaningful (#261/#541)?
 
-    Returns a notice dict describing what went unjudged (or was judged and then
-    discarded), else None. PURE — no wall-clock/random/I/O, per the project's
-    "pure functions return what they dropped; the engine emits the event" convention:
-    ``Engine.record`` turns a notice into a warning-grade ``test_validation_skipped``
-    event. This NEVER blocks completion — fail-OPEN is deliberate and load-bearing; the
-    fix is to stop *claiming* a verification that did not happen, not to start blocking.
+    Returns a notice dict describing what went unjudged, unproven, or judged and then
+    discarded, else None. PURE — no wall-clock/random/I/O, per the project's "pure functions
+    return what they dropped; the engine emits the event" convention: ``Engine.record`` turns
+    a notice into a warning-grade ``test_validation_skipped`` event. It never blocks;
+    ``review_proof_gate`` is what blocks, and an approval that reaches here without proof got
+    past it by stating a reason, which this event carries as ``stated_reason``.
 
-    Two shapes, both observed on the lite lane (#255):
+    ``kind="not_judged"`` — REVIEW returned no boolean. Scoped to a plausible test surface: a
+    pipeline that HAS a TEST stage and a change not deterministically classified
+    ``docs-only``. A pipeline with no TEST stage (micro) is out of scope — that lane declares
+    no test verification at all at ``add_task`` time, which is a recorded lane choice rather
+    than a silent skip.
 
-    ``kind="not_judged"`` — neither side produced a boolean: the TEST stage abstained
-    (the deterministic ENGINE runner reports ``tests_meaningful: null`` because a script
-    cannot judge it) AND the REVIEW output omitted/nulled the field. Each side deferred to
-    the other and neither did it. Scoped to a plausible test surface: a pipeline that HAS a
-    TEST stage and a change not deterministically classified ``docs-only``. A pipeline with
-    no TEST stage (micro) is out of scope — that lane declares no test verification at all
-    at ``add_task`` time, which is a recorded lane choice rather than a silent skip.
+    ``kind="unproven"`` — REVIEW answered ``true`` without a mutation that failed a test.
 
     ``kind="verdict_suppressed"`` — the reviewer DID judge (an explicit ``false``) and the
-    #41/#168 no-model-test-surface exemption discarded it. That is the other half of the
-    same mutual deference: on the lite lane a model (IMPLEMENT) wrote those tests even
-    though TEST ran on the ENGINE lane, so the reviewer's verdict was about something real.
-    Behavior is unchanged (the exemption still suppresses); it is no longer silent.
+    #41/#168 no-test-surface exemption discarded it. Behavior is unchanged (the exemption
+    still suppresses); it is no longer silent.
     """
     if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
         return None
-    reviewed = (result.structured_output or {}).get("tests_meaningful")
-    tested = task.context.get("tests_meaningful")
-    exempt = no_model_test_surface(task)
+    out = result.structured_output or {}
+    reviewed = out.get("tests_meaningful")
+    exempt = no_test_surface(task)
     if reviewed is False and exempt:
         return {
             "kind": "verdict_suppressed",
             "test_stage": _test_stage_fact(task),
             "review_reported": False,
             "reason": (
-                "the reviewer judged the tests NOT meaningful, but the no-model-test-surface "
+                "the reviewer judged the tests NOT meaningful, but the no-test-surface "
                 "exemption (#41/#168) discarded that verdict, so it did not reject the task"
             ),
         }
-    if isinstance(reviewed, bool) or isinstance(tested, bool):
-        return None  # somebody judged it — nothing to report
-    if task.context.get("change_class") == "docs-only" or Stage.TEST not in task.pipeline:
-        return None  # no plausible test surface to judge (docs-only / no TEST stage)
+    if exempt or reviewed is False:
+        return None
+    stated = _not_checked_reason(out)
+    if not isinstance(reviewed, bool):
+        return {
+            "kind": "not_judged",
+            "test_stage": _test_stage_fact(task),
+            # Null/absent in the normal case; a non-boolean (a model can return anything
+            # there) is bounded, never carried into the event verbatim.
+            "review_reported": _bound_report(reviewed),
+            "stated_reason": stated[:_MAX_DROPPED_VALUE] if stated else None,
+            "reason": (
+                "nothing judged whether the tests meaningfully exercise this change: REVIEW "
+                "returned no tests_meaningful verdict (fail-OPEN, not blocking)"
+            ),
+        }
+    if proving_mutation_count(out):
+        return None
     return {
-        "kind": "not_judged",
+        "kind": "unproven",
         "test_stage": _test_stage_fact(task),
-        # Null/absent on both sides in the normal case; a non-boolean (a model can return
-        # anything there) is bounded, never carried into the event verbatim.
-        "test_reported": _bound_report(tested),
-        "review_reported": _bound_report(reviewed),
+        "review_reported": True,
+        "stated_reason": stated[:_MAX_DROPPED_VALUE] if stated else None,
         "reason": (
-            "nothing judged whether the tests meaningfully exercise this change: the TEST "
-            "stage reported no verdict and REVIEW omitted tests_meaningful — the #13 "
-            "independent test-validate guarantee did not happen (fail-OPEN, not blocking)"
+            "REVIEW answered tests_meaningful=true without recording a mutation that failed "
+            "a test, so the verdict is the reviewer's reading, not a measurement"
         ),
     }
 
@@ -627,10 +684,11 @@ def _test_stage_fact(task: Task) -> str:
     return "engine" if Stage.TEST in task.deterministic_stages else "model"
 
 
-def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
-    """Re-open the tail of the pipeline for a review-driven fix cycle: every
-    pipeline stage at/after ``from_stage`` gets a fresh PENDING record, so
-    ``next_stage`` returns ``from_stage`` and the fix re-runs implement→…→review.
+def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review") -> list[Stage]:
+    """Re-open the tail of the pipeline for a fix cycle: every pipeline stage at/after
+    ``from_stage`` gets a fresh PENDING record, so ``next_stage`` returns ``from_stage`` and
+    the fix re-runs implement→…→review. ``cause`` (what sent it back: ``review`` or ``test``)
+    only names the cycle in the resume hint.
 
     History is not lost — every prior execution is already durable in the per-stage
     logs (``write_stage_log``); the stage RECORD is working state, not the audit trail.
@@ -643,7 +701,7 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
     for stage in reset:
         task.stages[stage] = StageRecord()
     task.resume_cursor = ResumeCursor(
-        stage=from_stage, hint=f"review fix cycle: re-running from {from_stage.value}"
+        stage=from_stage, hint=f"{cause} fix cycle: re-running from {from_stage.value}"
     )
     return reset
 

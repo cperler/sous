@@ -216,22 +216,15 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         agent_role="test",
         timeout_s=1200,  # test/fix iterate-until-green loop
         checkpoint=True,
-        effort=Effort.MEDIUM,  # judgment (meaningfulness) but mostly mechanical loops (#96)
+        effort=Effort.MEDIUM,  # diagnosing a regression, otherwise mechanical loops (#96)
         template=(
             "Run the project's tests for the changed files, fix regressions you "
             "introduced, and re-run until green or no progress. Tests listed under "
             "baseline_failures in the context above were ALREADY failing at base — "
             "inherited, not yours: do not fix them and do not count them against this "
-            "change. Then VERIFY the tests are meaningful: they must exercise THIS "
-            "change and would fail if it regressed — not vacuous, tautological, or "
-            "always-green. Derive what to probe from the diff (`git diff <base_sha>..HEAD`) "
-            "and the task spec, NOT from the implementer's `summary` above: the hazards it "
-            "names are ones the implementer already checked, so replaying them re-confirms "
-            "its own claims. Aim any revert/mutation check at behavior the diff changes "
-            "that the summary does NOT mention.\n"
-            "Return: passed, failures (list of failing test ids), tests_meaningful "
-            "(bool — only true if the tests genuinely cover the change), "
-            "validation_notes (what the tests assert / any gaps)."
+            "change.\n"
+            "Return: passed, failures (list of failing test ids), validation_notes (what "
+            "ran and what failed)."
         ),
     ),
     Stage.DELIVER: StageSpec(
@@ -280,10 +273,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "Review the PR (see pr_url in the context above) against the task goal and "
             "code quality. Assess the goal criterion-by-criterion and check for "
             "regressions; approve only if it achieves the goal without regressions. "
-            "INDEPENDENTLY verify the change's tests: read them and judge whether they "
-            "meaningfully exercise this change (would they fail if it regressed, or are "
-            "they vacuous/tautological/always-green?) — report tests_meaningful (bool); "
-            "you are a different agent from the one that wrote them, which is the point. "
+            "INDEPENDENTLY verify the change's tests: would they fail if it regressed, or are "
+            "they vacuous/tautological/always-green? You are a different agent from the one "
+            "that wrote them, which is the point; see Reporting tests_meaningful below. "
             "Separately, record any NON-BLOCKING findings (nits, edge cases, polish, "
             "follow-on ideas) that must not hold up this PR, and CLASSIFY each with a "
             "`disposition` against the filing bar — would a maintainer put this on the "
@@ -331,7 +323,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "{severity: critical|important|suggestion, file, line, description, "
             "suggested_fix}; a rejection re-runs implement→…→review with your issues as "
             "learnings, so make them concrete and actionable; suggestion-only rejections "
-            "auto-approve), non_blocking (list of {title, detail, disposition: "
+            "auto-approve), tests_meaningful (bool or null), mutation_checks (list of "
+            "{mutation, failed_tests}), tests_not_checked_reason (string, when no mutation "
+            "settled it), non_blocking (list of {title, detail, disposition: "
             "file|fixup|fix_now|drop}; empty if none), improvement ({title, detail, "
             "disposition: file|fixup|fix_now|drop} or omitted), retrospective ({title, "
             "detail, target?} or omitted)."
@@ -410,8 +404,8 @@ _TEST_VERDICT_VERIFIED_DIRECTIVE = (
     "When this stage returns, the engine runs the project's declared test commands (listed "
     "under Project commands) over this worktree, and that run decides whether TEST passes. "
     "Do not run the whole suite yourself: run the specific tests you need to find and fix "
-    "regressions and to check the tests are meaningful, then commit and return. If you do "
-    "need a wide run, use the declared command exactly as written."
+    "regressions, then commit and return. If you do need a wide run, use the declared command "
+    "exactly as written."
 )
 
 
@@ -423,8 +417,8 @@ _DOCS_ONLY_DIRECTIVE = (
     "\n\n## Change classification: DOCS-ONLY\n"
     "This change was deterministically classified as documentation-only (every "
     "changed file is docs). It has no behavioral surface, so DO NOT apply "
-    "test-coverage criteria: treat tests_meaningful as satisfied and do not reject "
-    "or hold this change for lacking new/updated tests. Judge it on documentation "
+    "test-coverage criteria: answer tests_meaningful null with no mutation_checks, and do "
+    "not reject or hold this change for lacking new/updated tests. Judge it on documentation "
     "correctness and clarity instead."
 )
 
@@ -467,44 +461,76 @@ _RUNNER_ORIGIN_CHECK = (
 # that last one to pytest's rootdir deciding which install answers the import. The
 # structural half is already fixed for adapters declaring the #381/#391 hooks (a disposable
 # REVIEW checkout discards declared artifacts, installs fresh, and origin probes fail
-# closed); what the prompt still owed is the epistemics: the reviewer's own mutation check
-# CORROBORATES the TEST stage's result, it does not adjudicate it. Replaces the narrower
-# one-direction sentence it grew out of, and is shared with the panel's `find:tests` lens so
-# the single-reviewer and finder wordings cannot drift.
+# closed); what the prompt still owed is the epistemics. Shared with the panel's `find:tests`
+# lens so the single-reviewer and finder wordings cannot drift.
 _MUTATION_CHECK_TRUST = (
-    "A revert/mutation check YOU run in this workspace CORROBORATES the TEST stage's "
-    "reported result; it does not replace it. TEST ran in the one worktree whose install is "
-    "guaranteed to match its source, while a review workspace can resolve the package to a "
-    "SIBLING worktree, which fabricates a survived mutation and a spurious failure alike. "
-    "So before concluding anything from such a check, " + _RUNNER_ORIGIN_CHECK + " If you "
-    "cannot confirm it that way, or identical invocations disagree, the check is "
-    "INCONCLUSIVE: say so, fall back to reading the tests, and do not answer "
-    "`tests_meaningful: false` or raise a blocking issue on its strength alone."
+    "The engine's own run of the declared test commands decided pass/fail at TEST, in the one "
+    "worktree whose install is guaranteed to match its source. A review workspace can resolve "
+    "the package to a SIBLING worktree, which fabricates a survived mutation and a spurious "
+    "failure alike. So before concluding anything from a check you run here, "
+    + _RUNNER_ORIGIN_CHECK + " If you cannot confirm it that way, or identical invocations "
+    "disagree, the check is INCONCLUSIVE: say so in `tests_not_checked_reason`, fall back to "
+    "reading the tests, and do not answer `tests_meaningful: false` or raise a blocking issue "
+    "on its strength alone."
 )
 
 
-# The #13/#168/#261 tests_meaningful directive for the single-reviewer REVIEW prompt.
+# #541: the check itself, moved here from the TEST stage, which kept restating the
+# implementer's coverage claims instead of running one. Stated once for the single reviewer
+# and the panel's `find:tests` lens. The aim-it-past-the-summary and single-window clauses are
+# the lessons of #392 and #1028; what makes it stick is not this prose but the required
+# `mutation_checks` field and `state_machine.review_proof_gate`.
+_MUTATION_PROOF_RECIPE = (
+    "Prove the verdict: change one line of this change's source in this workspace with a "
+    "shell command, since file-editing tools are off in this stage (the workspace is "
+    "discarded after you finish; undo each mutation before the next), run the tests that "
+    "cover it with the project's own test runner, and record it in `mutation_checks` as "
+    "{mutation: file:line and what you changed, failed_tests: ids of the tests that failed, "
+    "empty if it survived}. Run only those targeted tests, in the foreground: the engine "
+    "already ran the declared suite, and this stage has a time limit, so never run the whole "
+    "suite or poll a background run.\n"
+    "Derive what to mutate from the diff and the task spec, NOT from the implementer's "
+    "`summary`: the hazards it names are ones the implementer already checked. Aim at "
+    "behavior the diff changes that the summary does not mention. Where the plan states an "
+    "exclusion rule, check that what the task targets does not fall into it. For a tool that "
+    "works on one window (a night, a session), probe with input cut to that single window, "
+    "not only a multi-day fixture.\n"
+    "`tests_meaningful: true` needs a recorded mutation that failed a test. If no mutation "
+    "can settle it, say why in `tests_not_checked_reason`: that passes, but is recorded as "
+    "unproven. An approval with neither is sent back by the engine and this review re-runs.\n"
+)
+
+
+# #541: interactive REVIEW runs outside the in-process disposable copy (the same lanes that
+# cannot enforce its write-denying posture), so a mutation there would edit the tree being
+# judged. Conditional, so every other lane's prompt omits it.
+_NO_DISPOSABLE_WORKSPACE_DIRECTIVE = (
+    "\n\n## No disposable workspace on this lane\n"
+    "This lane runs REVIEW in the task's live worktree, so do NOT apply a mutation here: a "
+    "leftover edit would land in the tree you are judging. Judge `tests_meaningful` by reading "
+    "the tests, leave `mutation_checks` empty, and set `tests_not_checked_reason` to say the "
+    "lane has no disposable workspace."
+)
+
+
+# The #13/#168/#261/#541 tests_meaningful directive for the single-reviewer REVIEW prompt.
 # Hoisted next to _DOCS_ONLY_DIRECTIVE for the same reason: one wording, one place.
 #
-# #261: the omission carve-out is scoped EXPLICITLY to a genuinely absent test surface. The
-# old wording ("Only set it when there ARE tests to judge … OMIT the field entirely") read as
-# broad permission to omit, and on a lite-lane task with 7 new tests the reviewer took it —
-# while the deterministic TEST runner was deferring to REVIEW. Each side deferred to the
-# other and nobody judged. So: state that an omission is recorded as "not judged" and
-# evented, never as a pass. The `false`-is-a-rejection warning stays (it is what #144/#168
-# exist for) — it just no longer doubles as an excuse to skip the judgment.
+# #261: the no-verdict carve-out is scoped EXPLICITLY to a genuinely absent test surface. An
+# older, broader wording let a reviewer on a lite-lane task with 7 new tests skip the judgment
+# while the deterministic TEST runner deferred to REVIEW. The `false`-is-a-rejection warning
+# stays (it is what #144/#168 exist for) — it just does not double as an excuse to skip it.
 _TESTS_MEANINGFUL_DIRECTIVE = (
     "\n\n## Reporting tests_meaningful\n"
     "JUDGE `tests_meaningful` whenever this change has tests you can read — including tests "
-    "it adds, changes, or should have added. That judgment is your job here: you are a "
-    "different agent from the one that wrote them, which is the whole point of the check. "
-    "OMIT the field ONLY when there is genuinely NO test surface: a docs/config-only change, "
-    "or nothing behavioral that any test could exercise.\n"
-    "An omission is recorded as **not judged** and is evented as a skipped verification — it "
-    "is NOT a pass, and it does not save you the work. But do not answer `false` merely "
-    "because a change has no tests to judge: a literal `false` reads as a rejection for "
-    "having vacuous tests and drives a fix cycle. `false` means \"there ARE tests and they "
-    "would NOT fail if this change regressed\".\n"
+    "it adds, changes, or should have added. No other stage judges this: TEST only runs them. "
+    "Answer null ONLY when there is genuinely NO test surface: a docs/config-only change, or "
+    "nothing behavioral that any test could exercise, and say so in "
+    "`tests_not_checked_reason`.\n"
+    + _MUTATION_PROOF_RECIPE
+    + "Do not answer `false` merely because a change has no tests to judge: a literal `false` "
+    "reads as a rejection for having vacuous tests and drives a fix cycle. `false` means "
+    "\"there ARE tests and they would NOT fail if this change regressed\".\n"
     + _MUTATION_CHECK_TRUST
 )
 
@@ -735,9 +761,8 @@ def _render_value(v: object) -> str:
     if isinstance(v, list):
         return "; ".join(str(x) for x in v) if v else "(none)"
     if v is None:
-        # A folded null is an explicit ABSTENTION, not the string "None" (#261: the
-        # deterministic TEST runner reports `tests_meaningful: null` because it cannot judge
-        # meaningfulness). Render it as such so a downstream prompt reads it correctly.
+        # A folded null is an explicit ABSTENTION, not the string "None" (#261). Render it as
+        # such so a downstream prompt reads it correctly.
         return "(not reported)"
     return str(v)
 
@@ -836,7 +861,7 @@ def render_prompt(
 
     Stage-specific directives appended to the instruction section:
 
-    - TEST/REVIEW + ``change_class == "docs-only"`` (#41): tells the runner that the
+    - REVIEW + ``change_class == "docs-only"`` (#41): tells the reviewer that the
       change has no behavioral surface, so test-coverage / ``tests_meaningful`` criteria
       don't apply. The tag is set deterministically by the ENGINE-lane git diff, so a
       model cannot trigger this exemption by asserting it in its output.
@@ -853,11 +878,12 @@ def render_prompt(
       itself. The caller passes the RESOLVED lane's ``verifies_test_verdict`` capability;
       default False keeps every other prompt byte-identical.
 
-    - REVIEW (all tasks, #168/#261): tells the reviewer to JUDGE ``tests_meaningful``
-      whenever there are tests to read, and to OMIT it — rather than answer ``false`` —
-      ONLY when the change has genuinely no test surface (a literal ``false`` there
-      spuriously triggers the #13 independent-test-validate reject, the #144 misfire).
-      An omission is stated to be recorded as "not judged" and evented, not a pass.
+    - REVIEW (all tasks, #168/#261/#541): tells the reviewer to JUDGE ``tests_meaningful``
+      whenever there are tests to read, to prove it with a recorded mutation, and to answer
+      null — rather than ``false`` — ONLY when the change has genuinely no test surface (a
+      literal ``false`` there spuriously triggers the #13 independent-test-validate reject,
+      the #144 misfire). On a lane with no disposable workspace (``tool_posture_unenforced``)
+      it also says not to mutate, and to state that as the reason.
 
     - REVIEW + stacked branch (#310): when the task was composed on unmerged batch
       dependencies (``composed_deps`` non-empty), names them and scopes the review to
@@ -901,11 +927,11 @@ def render_prompt(
     )
 
     instruction = f"## {stage.value.upper()}\n{spec.template}"
-    # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell the
-    # TEST/REVIEW stages to skip test-coverage / tests_meaningful criteria for it, so the
+    # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell REVIEW
+    # to skip test-coverage / tests_meaningful criteria for it, so the
     # reviewer doesn't demand (or reject over) unreachable coverage. The tag is set only by
     # the ENGINE-lane git diff, so this directive can't be triggered by a model's own claim.
-    if stage in (Stage.TEST, Stage.REVIEW) and (context or {}).get("change_class") == "docs-only":
+    if stage is Stage.REVIEW and (context or {}).get("change_class") == "docs-only":
         instruction += _DOCS_ONLY_DIRECTIVE
     # #558: the engine already knows which tests the adapter maps from this diff — say so,
     # rather than leave "the tests for the changed files" to the model's guess.
@@ -913,12 +939,14 @@ def render_prompt(
         instruction += _impacted_tests_directive(impacted_tests)
     if stage is Stage.TEST and test_verdict_verified:
         instruction += _TEST_VERDICT_VERIFIED_DIRECTIVE
-    # #168: belt-and-suspenders with the engine's fail-open-on-omit gate — tell the reviewer
-    # to OMIT `tests_meaningful` (rather than answer `false`) when there is no test surface to
-    # judge (a docs/config change, or a task whose pipeline runs no meaningful tests). A literal
-    # `false` on a no-test-surface change is what spuriously kicked #144 into a fix cycle.
+    # #168/#541: tell the reviewer to judge `tests_meaningful`, prove it, and answer null
+    # (rather than `false`) when there is no test surface. A literal `false` on a
+    # no-test-surface change is what spuriously kicked #144 into a fix cycle.
     if stage is Stage.REVIEW:
         instruction += _TESTS_MEANINGFUL_DIRECTIVE
+        # #541: where the posture is unenforced REVIEW has no disposable copy to mutate in.
+        if tool_posture_unenforced:
+            instruction += _NO_DISPOSABLE_WORKSPACE_DIRECTIVE
         # #310: a task stacked on unmerged batch dependencies (#216) is told which commits
         # are its own, so the reviewer doesn't judge the PR's trunk-relative diff — which
         # carries the dependencies' commits too — as if it were this task's change. Empty
@@ -1063,11 +1091,12 @@ _LENS_TESTS = _Lens(
         "visual/design craft.\n"
         "Also return tests_meaningful (bool) — your verdict on whether the tests genuinely "
         "cover this change. JUDGE it whenever there are tests to read (including ones this "
-        "change adds or should have added); OMIT it ONLY when the change has genuinely no "
-        "test surface (docs/config-only, nothing behavioral). An omission is recorded as "
-        "'not judged' and evented as a skipped verification — it is not a pass. Do not "
-        "answer false merely because tests are absent: false means 'there ARE tests and they "
-        "would NOT fail if this change regressed', and it reads as a rejection.\n"
+        "change adds or should have added); answer null ONLY when the change has genuinely no "
+        "test surface (docs/config-only, nothing behavioral), and say so in "
+        "tests_not_checked_reason. Do not answer false merely because tests are absent: false "
+        "means 'there ARE tests and they would NOT fail if this change regressed', and it "
+        "reads as a rejection.\n"
+        + _MUTATION_PROOF_RECIPE
         # #390: the same mutation-check trust posture the single-reviewer prompt states, from
         # ONE constant — a finder that runs a revert check in its own disposable copy faces
         # the identical sibling-worktree aliasing.
@@ -1197,6 +1226,7 @@ def render_review_plan(
     agent_for: Callable[[Stage, str | None], str | None] | None = None,
     change_class: str | None = None,
     diff_stat: DiffStat | None = None,
+    no_disposable_workspace: bool = False,
 ) -> ReviewPlan:
     """Resolve the multi-agent REVIEW plan deterministically at ``next_work`` (design §1).
 
@@ -1222,8 +1252,9 @@ def render_review_plan(
 
     The ladder, in order:
 
-    1. Deterministically-trivial diff ⇒ ``find:code`` alone (a typo fix should not pay for a
-       dedicated spec AND test reviewer, each carrying a full context render).
+    1. Deterministically-trivial diff ⇒ ``find:code`` and ``find:tests`` (a typo fix should
+       not pay for a dedicated spec reviewer, but ``find:tests`` is the only lens that may
+       report ``tests_meaningful``, and REVIEW is the only stage that judges it, #541).
     2. Otherwise the unrelaxed base panel: ``find:code``, ``find:spec``, ``find:tests``.
     3. ``change_class == "docs-only"`` ⇒ drop ``find:tests`` (the same relaxation, on the
        same trusted tag, the single-reviewer path already makes).
@@ -1249,16 +1280,16 @@ def render_review_plan(
     )
 
     docs_only = change_class == "docs-only"
-    if _is_trivial_diff(diff_stat):
-        lenses: list[_Lens] = [_LENS_CODE]
-    else:
-        lenses = [lens for lens in _BASE_LENSES if not (docs_only and lens is _LENS_TESTS)]
+    base = (_LENS_CODE, _LENS_TESTS) if _is_trivial_diff(diff_stat) else _BASE_LENSES
+    lenses: list[_Lens] = [lens for lens in base if not (docs_only and lens is _LENS_TESTS)]
     if _has_frontend_change((context or {}).get("files_changed")):
         lenses.append(_LENS_DESIGN)
 
     finders: list[FinderSpec] = []
     for lens in lenses:
         instruction = lens.body
+        if lens is _LENS_TESTS and no_disposable_workspace:
+            instruction += _NO_DISPOSABLE_WORKSPACE_DIRECTIVE
         # The docs-only directive is ENGINE-trusted (parameter, not context) and rides every
         # surviving lens so a finder doesn't demand unreachable test coverage.
         if docs_only:

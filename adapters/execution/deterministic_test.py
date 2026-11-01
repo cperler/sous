@@ -6,18 +6,12 @@ a red suite as green. This runner shells the project's declared test commands in
 worktree, bounds their output, classifies failures via the project's ``FailureClassifier``,
 and returns the ``test`` stage contract deterministically at $0.
 
-MEANINGFULNESS IS DELIBERATELY NOT JUDGED HERE. The ``test`` schema's ``tests_meaningful``
-asks whether the tests genuinely exercise the change — a judgment a script cannot make.
-So this runner emits ``tests_meaningful: null`` on every exit path (#261): null is the
-honest "no claim" encoding — it is fail-OPEN everywhere (every gate tests ``is False``),
-it keeps the key present so the schema's ``required`` list still catches a codex model that
-simply omits it, and — unlike the ``true`` this used to write — it does not put an
-affirmative verification into the audit record that nobody performed. It never emits
-``false`` either (that is the engine's veto in ``Engine._stage_gate``, which would reject
-the stage over a judgment this runner did not make). The real meaningfulness call belongs to
-the model REVIEW / test-validate path, so a pipeline that runs deterministic TEST MUST keep
-a model REVIEW stage (micro/lite do) — and when NEITHER side judges it, the engine emits a
-warning-grade ``test_validation_skipped`` event rather than passing quietly (#261).
+Whether the tests genuinely exercise the change is not judged here or anywhere in TEST: that
+is REVIEW's required ``tests_meaningful`` / ``mutation_checks`` output (#541), so a pipeline
+that runs this runner keeps a model REVIEW stage. A red run here cannot fix anything itself,
+so the engine sends a regression back to IMPLEMENT (``Engine._handle_failure``); the output
+carries ``failure_kinds`` and a bounded output tail for that, and a run that only timed out
+or could not start reports ``infra`` so it is retried rather than blamed on the code.
 
 Baseline handling mirrors the TEST stage template (orchestrator/stages.py): a failing test
 already present in intake's ``baseline_failures`` was RED at base — inherited, not caused —
@@ -195,7 +189,6 @@ class DeterministicTestRunner:
             out = {
                 "passed": True,
                 "failures": [],
-                "tests_meaningful": None,  # not judged here — see module docstring / REVIEW
                 "change_class": "docs-only",
                 "skipped": "docs-only",
                 "validation_notes": "docs-only change (every changed file is documentation): "
@@ -218,10 +211,8 @@ class DeterministicTestRunner:
             out = {
                 "passed": True,
                 "failures": [],
-                "tests_meaningful": None,  # not judged here — see module docstring / REVIEW
                 "validation_notes": "deterministic test run: no test commands defined "
-                                    "(nothing to run); meaningfulness NOT judged here "
-                                    "(reported as null) — the model REVIEW path judges it.",
+                                    "(nothing to run).",
                 **extra,
             }
             return out, None, True
@@ -276,6 +267,7 @@ class DeterministicTestRunner:
                 caused_kinds.update(f.kind for f in new)
                 notes.append(f"{label}: FAILED rc={proc.returncode} — {len(new)} caused"
                              + (f", {len(inherited)} inherited (excluded)" if inherited else ""))
+                notes.append(f"{label} output tail: {combined.strip()[-_MAX_TAIL:]}")
             elif inherited:
                 # Every failure was already red at base — inherited, not caused by this change.
                 notes.append(f"{label}: rc={proc.returncode} but all {len(inherited)} failures "
@@ -291,17 +283,15 @@ class DeterministicTestRunner:
         if inherited_count:
             notes.append(f"{inherited_count} inherited baseline failure(s) excluded "
                          "(RED at base — not this change's regression).")
-        notes.append("tests_meaningful not judged by this runner (reported as null) — the "
-                     "model REVIEW path verifies the tests genuinely exercise the change.")
         passed = not caused
         out = {
             "passed": passed,
             "failures": caused[:40],
-            "tests_meaningful": None,  # see module docstring: no claim, never a fake true
             "validation_notes": "; ".join(notes),
             **extra,
             **scope,
             **({"flaky_failures": flaky} if flaky else {}),
+            **({"failure_kinds": sorted(caused_kinds)} if caused else {}),
         }
         error = None if passed else (
             f"test stage red: {len(caused)} caused failure(s) "

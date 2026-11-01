@@ -126,7 +126,7 @@ def test_the_reading_stages_declare_a_posture_and_it_denies_writes() -> None:
 def test_reading_dispatches_carry_the_posture_and_writing_stages_do_not(tmp_path, project) -> None:
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     seen: dict[Stage, ToolPolicy | None] = {}
     postures: dict[Stage, PermissionPosture | None] = {}
     while (w := eng.next_work("r1", "t1")) is not None:

@@ -151,6 +151,16 @@ tracker or fix-forward.
   shelled — never hardcoded pytest/ruff/mypy — keeping the engine project-agnostic. Neither
   gate performs PR-merge orchestration or starts an automatic remediation run (file-only).
 
+- **TEST runs no model by default; REVIEW owns whether the tests mean anything** (#541). TEST is
+  on the ENGINE lane on every lane, FULL included (`LANE_DETERMINISTIC_STAGES`). A task opts into
+  a model TEST with `--deterministic-stages none` (a batch plan's `"deterministic_stages": []`), a
+  project with `model_test_stage = True` on its adapter. A red ENGINE-lane TEST re-opens
+  IMPLEMENT (`test_failed_fix_cycle`, bounded by `Task.test_fix_cycles`), because retrying it
+  would re-run identical code. REVIEW must return `tests_meaningful` and `mutation_checks`;
+  `state_machine.review_proof_gate` sends back an approval that has neither a mutation which
+  failed a test nor a `tests_not_checked_reason`, and a stated reason is evented as
+  `test_validation_skipped` so an unproven pass never reads like a proven one.
+
 ## Running a batch: headless is the default lane
 Use the **`orchestrate-batch-headless`** skill for ordinary batches. One `run-headless` driver
 owns the run — backgrounded from the session, detached via fork+`os.setsid()`, or run in a
@@ -162,7 +172,8 @@ per stage, so no stage prompt or output passes through the session. Measured on
 real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
 
 An all-codex batch requires the global `--provider codex` flag: `provider_tag` routes only
-`routing.DEFAULT_CODEX_ELIGIBLE` (IMPLEMENT/TEST/SIMPLIFY), not the remaining stages. Even then,
+`routing.DEFAULT_CODEX_ELIGIBLE` (IMPLEMENT/TEST/SIMPLIFY), not the remaining stages. TEST itself
+runs on the ENGINE lane by default on every lane unless opted out (#541). Even then,
 `routing.engine_lane_required` vetoes DELIVER onto deterministic `ENGINE:none`, at `$0` and
 without the model DELIVER's docstring refresh; the warning-grade
 `stage_rerouted_to_engine_lane` records the move. The codex sandbox turns DELIVER's `git push`

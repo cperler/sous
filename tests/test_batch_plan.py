@@ -398,3 +398,19 @@ def test_cli_candidates_smoke(tmp_path, capsys, monkeypatch) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["count"] == 2
     assert out["candidates"][1]["depends_on"] == ["#1"]
+
+
+def test_an_empty_deterministic_stages_is_an_explicit_model_choice(tmp_path, project) -> None:
+    """#541: [] means every stage on a model; only an absent key takes the preset's default."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1")
+    plan = _plan()
+    plan["tasks"][0]["pipeline"] = "full"
+    plan["tasks"][0]["deterministic_stages"] = []
+    plan["tasks"][1]["pipeline"] = "full"
+    plan["tasks"][1].pop("deterministic_stages", None)
+    apply_plan(eng, "r1", plan)
+    assert eng.store.load_task("r1", plan["tasks"][0]["task_id"]).deterministic_stages == ()
+    assert eng.store.load_task("r1", plan["tasks"][1]["task_id"]).deterministic_stages == (
+        Stage.TEST,
+    )

@@ -23,7 +23,7 @@ from orchestrator.schemas.enums import ExecutionLane, Stage, StageStatus
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 from orchestrator.schemas.status import Task
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -44,6 +44,7 @@ def _drive(eng: Engine, *, review_output: dict, run="r1", task="t1") -> list:
 _REVIEW_WITH_FINDINGS = {
     "approved": True,
     "issues": [],
+    **REVIEW_PROOF,
     "non_blocking": [
         {"title": "Handle a nonexistent --repo path", "detail": "raises FileNotFoundError",
          "disposition": "file"},
@@ -99,6 +100,7 @@ def test_finalize_files_followups_and_publishes_note(tmp_path, project) -> None:
 _REVIEW_WITH_SELF_IMPROVEMENT = {
     "approved": True,
     "issues": [],
+    **REVIEW_PROOF,
     "improvement": {"title": "Add a schema-validate-retry loop to the transport",
                     "detail": "Retire the postamble band-aid with a real retry.",
                     "disposition": "file"},
@@ -139,7 +141,7 @@ def test_finalize_survives_a_non_string_improvement_field(tmp_path, project) -> 
     eng.add_task("r1", "t1")
 
     outcomes = _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": {"title": "coerce me", "detail": ["a", "list", "not", "a", "string"]},
     })
 
@@ -155,7 +157,7 @@ def test_finalize_no_findings_files_nothing_but_still_notes(tmp_path, project) -
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
 
-    _drive(eng, review_output={"approved": True, "issues": []})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF})
 
     ts = project.task_source
     assert ts.followups == []
@@ -173,7 +175,7 @@ def test_disposition_gate_files_only_explicit_file(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
 
     _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [
             {"title": "Automate the events-balance audit", "detail": "d", "disposition": "file"},
             {"title": "Finding without a disposition", "detail": "d"},
@@ -217,7 +219,7 @@ def test_per_task_cap_bounds_filed_followups(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(MAX_FILED_FOLLOWUPS_PER_TASK + 2)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     assert len(ts.followups) == MAX_FILED_FOLLOWUPS_PER_TASK
@@ -241,7 +243,7 @@ def test_per_task_cap_override_raises_the_limit(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(raised + 1)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     # the per-task cap (not the default) bounds the filing; the single overflow is noted
@@ -259,7 +261,7 @@ def test_per_task_cap_override_of_zero_files_nothing(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(3)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     assert ts.followups == []
@@ -277,7 +279,7 @@ def test_engine_default_cap_is_configurable(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(3)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     assert len(ts.followups) == 1
@@ -306,7 +308,7 @@ def test_run_default_cap_bounds_filed_followups(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(3)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     assert len(ts.followups) == 1
@@ -323,7 +325,7 @@ def test_per_task_cap_overrides_run_default(tmp_path, project) -> None:
         {"title": f"File-worthy finding {i}", "detail": "d", "disposition": "file"}
         for i in range(3)
     ]
-    _drive(eng, review_output={"approved": True, "issues": [], "non_blocking": findings})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": findings})
 
     ts = project.task_source
     assert len(ts.followups) == 2
@@ -348,7 +350,7 @@ def test_improvement_deduped_against_filed_followup(tmp_path, project) -> None:
 
     shared = "Type abandon() disposition as a Literal"
     _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
         "improvement": {"title": shared, "detail": "same idea, restated",
                         "disposition": "file"},
@@ -374,7 +376,7 @@ def test_distinct_improvement_still_files(tmp_path, project) -> None:
     eng.add_task("r1", "t1")
 
     _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{"title": "Guard the --repo path", "detail": "d", "disposition": "file"}],
         "improvement": {"title": "Add a run-finalize dedup pass", "detail": "different idea",
                         "disposition": "file"},
@@ -396,7 +398,7 @@ def test_improvement_disposition_gate_suppresses_filing(tmp_path, project, dispo
     eng.add_task("r1", "t1")
 
     _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": {"title": "Expose a retry-count knob",
                         "detail": "speculative tunability", "disposition": disposition},
     })
@@ -432,7 +434,7 @@ def test_improvement_with_explicit_file_disposition_still_files(tmp_path, projec
 
     improvement = {"title": "Add a schema-validate-retry loop", "detail": "real need",
                    "disposition": "file"}
-    _drive(eng, review_output={"approved": True, "issues": [], "improvement": improvement})
+    _drive(eng, review_output={"approved": True, "issues": [], **REVIEW_PROOF, "improvement": improvement})
 
     ts = project.task_source
     enh = [f for f in ts.followups if f["labels"] == ["enhancement"]]
@@ -483,7 +485,7 @@ def test_failed_followup_does_not_dedup_a_matching_improvement(tmp_path, project
 
     shared = "Type abandon() disposition as a Literal"
     _drive(eng, review_output={
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{"title": shared, "detail": "d", "disposition": "file"}],
         "improvement": {"title": shared, "detail": "same idea, restated",
                         "disposition": "file"},
@@ -613,7 +615,7 @@ def test_render_completion_note_denied_verdict() -> None:
 def test_render_note_self_improvement_sections() -> None:
     task = Task(task_id="#9", run_id="r1", created_at="t0", updated_at="t0")
     task.stages[Stage.REVIEW].output = {
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": {"title": "Cost-aware routing", "detail": "route by budget"},
         "retrospective": {"title": "Batch lane untested", "detail": "run a batch"},
     }
@@ -624,7 +626,7 @@ def test_render_note_self_improvement_sections() -> None:
 
     # retrospective still renders when there's no improvement
     task.stages[Stage.REVIEW].output = {
-        "approved": True, "issues": [], "retrospective": {"title": "Lesson only", "detail": "d"}}
+        "approved": True, "issues": [], **REVIEW_PROOF, "retrospective": {"title": "Lesson only", "detail": "d"}}
     note2 = render_completion_note(task, [])
     assert "### Self-improvement" in note2 and "Lesson only" in note2
     assert "Improvement idea" not in note2
@@ -636,6 +638,7 @@ def test_render_note_never_claims_raw_fixup_disposition_was_applied() -> None:
     task.stages[Stage.REVIEW].output = {
         "approved": True,
         "issues": [],
+        **REVIEW_PROOF,
         "improvement": {"title": "Tighten the guard", "disposition": "fixup"},
     }
 
@@ -871,18 +874,18 @@ def test_review_schema_accepts_non_blocking() -> None:
     validator = jsonschema.Draft202012Validator(schema)
 
     validator.validate({
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [{"title": "x", "detail": "y"}, {"title": "z"}],
     })
     # a finding missing the required title is a schema violation
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
-            "approved": True, "issues": [], "non_blocking": [{"detail": "no title"}],
+            "approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [{"detail": "no title"}],
         })
 
     # #188/#414: the optional per-finding disposition enum is accepted...
     validator.validate({
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "non_blocking": [
             {"title": "a", "disposition": "file"},
             {"title": "b", "disposition": "fix_now"},
@@ -891,18 +894,18 @@ def test_review_schema_accepts_non_blocking() -> None:
         ],
     })
     # ...a missing disposition still validates (and degrades safely to note-only)...
-    validator.validate({"approved": True, "issues": [], "non_blocking": [{"title": "e"}]})
+    validator.validate({"approved": True, "issues": [], **REVIEW_PROOF, "non_blocking": [{"title": "e"}]})
     # ...and an out-of-enum disposition is rejected
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "non_blocking": [{"title": "f", "disposition": "maybe"}],
         })
 
     # self-improvement loop fields are optional objects with a required title
     assert "improvement" in schema["properties"] and "retrospective" in schema["properties"]
     validator.validate({
-        "approved": True, "issues": [],
+        "approved": True, "issues": [], **REVIEW_PROOF,
         "improvement": {"title": "idea", "detail": "why"},
         "retrospective": {
             "title": "lesson", "detail": "what",
@@ -910,10 +913,10 @@ def test_review_schema_accepts_non_blocking() -> None:
         },
     })
     with pytest.raises(jsonschema.ValidationError):
-        validator.validate({"approved": True, "issues": [], "improvement": {"detail": "no title"}})
+        validator.validate({"approved": True, "issues": [], **REVIEW_PROOF, "improvement": {"detail": "no title"}})
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "retrospective": {
                 "title": "lesson", "target": {"kind": "engine-logic", "ref": "record"}
             },
@@ -922,13 +925,13 @@ def test_review_schema_accepts_non_blocking() -> None:
     # #223: the improvement's optional disposition enum (file|fixup|fix_now|drop) validates...
     for disp in ("file", "fixup", "fix_now", "drop"):
         validator.validate({
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "improvement": {"title": "idea", "disposition": disp},
         })
     # ...and an out-of-enum improvement disposition is rejected
     with pytest.raises(jsonschema.ValidationError):
         validator.validate({
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "improvement": {"title": "idea", "disposition": "maybe"},
         })
 
@@ -944,6 +947,7 @@ def test_review_schema_accepts_non_blocking() -> None:
 _REVIEW_WITH_UNFILED = {
     "approved": True,
     "issues": [],
+    **REVIEW_PROOF,
     "non_blocking": [
         {"title": "Two dict entries over-indented", "detail": "cosmetic",
          "disposition": "fix_now"},

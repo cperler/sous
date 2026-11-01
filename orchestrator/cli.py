@@ -479,7 +479,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="per-task provider routing tag (the old '82:codex' tag)")
     at.add_argument("--deterministic-stages", default=None,
                     help="comma-separated stages to run on the $0 ENGINE lane instead of a "
-                         "model (e.g. 'test,deliver'); intake is always deterministic (#33)")
+                         "model (e.g. 'test,deliver'), or 'none' to run the preset's "
+                         "deterministic stages on a model, such as a model TEST (#541); "
+                         "intake is always deterministic (#33)")
     at.add_argument("--estimate", default=None,
                     help="rough size hint (small/medium/large or a USD number) — feeds "
                          "cost-aware lane routing on a route-by-cost run (#34)")
@@ -1683,9 +1685,11 @@ def main(argv: list[str] | None = None) -> int:
             [d.strip() for d in args.depends_on.split(",") if d.strip()]
             if args.depends_on else None
         )
+        det_arg = getattr(args, "deterministic_stages", None)
         det = (
-            [Stage(s.strip()) for s in args.deterministic_stages.split(",") if s.strip()]
-            if getattr(args, "deterministic_stages", None) else None
+            None if det_arg is None
+            else [Stage(s.strip()) for s in det_arg.split(",")
+                  if s.strip() and s.strip().lower() != "none"]
         )
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,

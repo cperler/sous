@@ -128,10 +128,15 @@ def test_docs_only_frontend_change_still_gets_the_design_finder() -> None:
 
 # --- (b) the size-aware ladder ----------------------------------------------------------
 
-def test_trivial_diff_resolves_to_the_code_finder_alone() -> None:
-    """A one-line typo fix must not pay for a dedicated spec AND test reviewer, each
-    carrying a full context render."""
-    assert _lenses(_plan(diff_stat=_TRIVIAL)) == ["find:code"]
+def test_trivial_diff_drops_the_spec_finder_but_keeps_the_tests_finder() -> None:
+    """A one-line typo fix must not pay for a dedicated spec reviewer, but find:tests is the
+    only lens that may report tests_meaningful and REVIEW the only stage that judges it (#541):
+    without it every small diff's verdict would be null."""
+    assert _lenses(_plan(diff_stat=_TRIVIAL)) == ["find:code", "find:tests"]
+
+
+def test_trivial_docs_only_diff_drops_the_tests_finder_too() -> None:
+    assert _lenses(_plan(diff_stat=_TRIVIAL, change_class="docs-only")) == ["find:code"]
 
 
 def test_diff_just_over_the_trivial_threshold_keeps_the_full_base_set() -> None:
@@ -152,7 +157,7 @@ def test_unmeasurable_diff_gets_no_relaxation() -> None:
 def test_trivial_frontend_diff_still_adds_design() -> None:
     """The size ladder relaxes the BASE set; the additive design lens is independent."""
     plan = _plan(diff_stat=_TRIVIAL, context={"files_changed": ["ui/Button.css"]})
-    assert _lenses(plan) == ["find:code", "find:design"]
+    assert _lenses(plan) == ["find:code", "find:tests", "find:design"]
 
 
 # --- the trust boundary (guard) ---------------------------------------------------------

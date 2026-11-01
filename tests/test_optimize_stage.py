@@ -32,7 +32,7 @@ from orchestrator.schemas.enums import (
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 from orchestrator.stages import STAGE_SPECS
 from orchestrator.status_store import StatusStore
-from tests.conftest import FakeProject, make_result
+from tests.conftest import REVIEW_PROOF, FakeProject, make_result
 
 CHECKPOINT = {"tag": "task/r1/t1/optimize/0", "sha": "a" * 40}
 
@@ -360,7 +360,7 @@ def test_a_suggestion_matching_a_filed_finding_is_deduped(tmp_path, optimizing) 
     eng.add_task("r1", "t1")
     _drive(eng, outputs={
         Stage.REVIEW: {
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "non_blocking": [{"title": "Move scoring to a process pool",
                               "detail": "the GIL bounds it", "disposition": "file"}],
         },
@@ -378,7 +378,7 @@ def test_a_suggestion_matching_the_filed_improvement_is_deduped(tmp_path, optimi
     eng.add_task("r1", "t1")
     _drive(eng, outputs={
         Stage.REVIEW: {
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "improvement": {"title": "Move scoring to a process pool",
                             "detail": "the GIL bounds it", "disposition": "file"},
         },
@@ -401,7 +401,7 @@ def test_a_deduped_suggestion_is_not_reported_as_cap_overflow(tmp_path, optimizi
     eng.add_task("r1", "t1")
     _drive(eng, outputs={
         Stage.REVIEW: {
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "non_blocking": [{"title": "Move scoring to a process pool",
                               "detail": "the GIL bounds it", "disposition": "file"}],
         },
@@ -435,7 +435,7 @@ def test_a_duplicate_is_deduped_even_when_an_earlier_suggestion_filled_the_cap(
     eng.add_task("r1", "t1", max_filed_followups=1)
     _drive(eng, outputs={
         Stage.REVIEW: {
-            "approved": True, "issues": [],
+            "approved": True, "issues": [], **REVIEW_PROOF,
             "non_blocking": [{"title": "Move scoring to a process pool",
                               "detail": "the GIL bounds it", "disposition": "file"}],
         },

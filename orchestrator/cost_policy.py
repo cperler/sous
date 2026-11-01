@@ -23,7 +23,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .schemas.enums import LANE_STAGES, ExecutionLane, Stage
+from .schemas.enums import LANE_DETERMINISTIC_STAGES, ExecutionLane, Stage
 
 # Soft-warning threshold: warn ONCE when metered spend reaches this fraction of the
 # budget. The hard stop is at 1.0 (spend >= budget). Engine-overridable.
@@ -87,10 +87,6 @@ _LANE_RANK: tuple[ExecutionLane, ...] = (
     ExecutionLane.FULL, ExecutionLane.LITE, ExecutionLane.MICRO,
 )
 
-# Stages that are $0 on the deterministic ENGINE lane (#33) — preferred as deterministic
-# whenever routing downgrades a task to conserve budget.
-_CHEAP_DETERMINISTIC: tuple[Stage, ...] = (Stage.TEST, Stage.DELIVER)
-
 
 @dataclass(frozen=True)
 class RouteDecision:
@@ -132,11 +128,9 @@ class CostRouter:
             if idx + 1 < len(_LANE_RANK):
                 lane = _LANE_RANK[idx + 1]
                 nudged = True
-        # Below FULL, prefer $0 deterministic TEST/DELIVER for whatever the preset runs.
-        det: tuple[Stage, ...] = ()
-        if lane is not ExecutionLane.FULL:
-            preset_stages = set(LANE_STAGES[lane])
-            det = tuple(s for s in _CHEAP_DETERMINISTIC if s in preset_stages)
+        # The chosen preset's own $0 deterministic stages (#68/#541): one table, so a routed
+        # task and an unrouted one on the same preset can't disagree about TEST.
+        det: tuple[Stage, ...] = LANE_DETERMINISTIC_STAGES[lane]
         return RouteDecision(
             lane=lane,
             deterministic_stages=det,

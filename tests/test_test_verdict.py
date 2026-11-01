@@ -92,16 +92,14 @@ def test_a_claimed_green_that_the_declared_commands_fail_becomes_a_failure(tmp_p
     assert any(n["notice"] == "test_verdict_overridden" for n in raw.execution_notices)
 
 
-def test_a_claimed_green_the_declared_commands_confirm_keeps_the_models_judgment(tmp_path) -> None:
+def test_a_claimed_green_the_declared_commands_confirm_keeps_the_models_notes(tmp_path) -> None:
     raw, status = verify_test_verdict(_wi(_repo(tmp_path)), _model_green(),
                                       ResultStatus.SUCCESS, _GREEN)
     assert status is ResultStatus.SUCCESS
     out = raw.structured_output
     assert out["passed"] is True and out["failures"] == []
-    assert out["tests_meaningful"] is True  # meaningfulness stays the model's call
     assert "mutation check failed the new test" in out["validation_notes"]
     assert "Engine re-ran the project's declared test commands" in out["validation_notes"]
-    assert "tests_meaningful not judged" not in out["validation_notes"]
     assert out["test_scope"] == "full"
 
 
@@ -112,7 +110,7 @@ def test_a_timeout_over_a_clean_worktree_is_settled_green_by_the_declared_comman
     assert status is ResultStatus.SUCCESS
     assert raw.exit_code == 0 and raw.error is None
     assert raw.structured_output["passed"] is True
-    assert raw.structured_output["tests_meaningful"] is None  # not judged; REVIEW judges
+    assert "tests_meaningful" not in raw.structured_output  # REVIEW's output, not TEST's
     assert "timed out" in raw.structured_output["validation_notes"]
     assert raw.checkpoint and raw.checkpoint["tag"] == "ckpt-test"
     assert any(n["notice"] == "test_timeout_settled_by_declared_commands"
@@ -234,7 +232,7 @@ def test_a_verifying_model_test_carries_the_intake_baseline(tmp_path, project) -
 
     eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
     eng.create_run("r1", ExecutionLane.FULL)
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     eng.store.update_task("r1", "t1", lambda t: t.context.update(
         base_sha="abc123", baseline_failures=["tests/t.py::test_x"]))
     eng._lane_verifies_test_verdict = lambda lane: True  # type: ignore[method-assign]
@@ -255,7 +253,7 @@ def test_a_non_verifying_model_test_still_gets_no_context(tmp_path, project) -> 
 
     eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
     eng.create_run("r1", ExecutionLane.FULL)
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     eng._lane_verifies_test_verdict = lambda lane: False  # type: ignore[method-assign]
 
     work = _at_test(eng, "r1", "t1")

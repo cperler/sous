@@ -220,7 +220,9 @@ def apply_plan(
         external = [d for d in all_deps if d not in plan_ids]
         if external:
             dropped[tid] = external
-        det = [Stage(s) for s in (t.get("deterministic_stages") or [])] or None
+        # None takes the preset's default; [] is an explicit choice of model stages (#541).
+        raw_det = t.get("deterministic_stages")
+        det = None if raw_det is None else [Stage(s) for s in raw_det]
         entry = {
             "task_id": tid,
             "depends_on": internal_deps,

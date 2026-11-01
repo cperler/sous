@@ -80,40 +80,43 @@ def test_test_green_run_succeeds_schema_valid(tmp_path) -> None:
     assert (res.lane_used.execution_mode, res.lane_used.provider) == (ExecutionMode.ENGINE, Provider.NONE)
     out = res.structured_output
     assert out["passed"] is True and out["failures"] == []
-    # #261: a script cannot judge meaningfulness, so it makes NO claim (null) — never the
-    # affirmative `true` it used to write next to a "not judged by this runner" note.
-    assert out["tests_meaningful"] is None
+    assert "tests_meaningful" not in out  # #541: REVIEW's output, not TEST's
     _assert_schema_valid("test", out)
 
 
-def test_engine_lane_never_claims_tests_meaningful_on_any_exit_path(tmp_path) -> None:
-    """#261 regression: the ENGINE-lane TEST runner must not emit an affirmative
-    `tests_meaningful: true` on ANY of its three exit paths — it cannot judge meaningfulness
-    (a `true` there is a false audit record; the lite lane's REVIEW then omitted the field
-    and nobody judged it at all). The key stays PRESENT as null: an honest abstention that
-    still satisfies the schema's `required` list. It must never be `false` either — that is
-    the engine's veto over a judgment this runner did not make.
-    """
-    # (a) real suite run (green) and (b) real suite run (red)
+def test_engine_lane_never_reports_tests_meaningful_on_any_exit_path(tmp_path) -> None:
+    """#261/#541: a script cannot judge meaningfulness and REVIEW owns the verdict, so no exit
+    path of the ENGINE-lane TEST runner carries the key at all."""
     for cmd, red in ((["sh", "-c", "exit 0"], False),
-                     (["sh", "-c", "echo 'FAILED a::t1'; exit 1"], True)):
+                     (["sh", "-c", "echo 'FAILED a::t1'; exit 1"], True),
+                     (["true"], False)):  # the no-op sentinel: nothing to run
         res = DeterministicTestRunner(_TestProj(unit=cmd)).dispatch(
             _wi(Stage.TEST, schema_ref="test", cwd=str(tmp_path), context={})
         )
         out = res.structured_output
         assert (res.status is ResultStatus.FAILURE) is red
-        assert out["tests_meaningful"] is None, cmd
-        assert "not judged by this runner" in out["validation_notes"]
+        assert "tests_meaningful" not in out, cmd
+        assert "meaningful" not in out["validation_notes"]
         _assert_schema_valid("test", out)
 
-    # (c) no test commands defined (the ['true'] no-op sentinel → nothing to run)
-    res = DeterministicTestRunner(_TestProj(unit=["true"])).dispatch(
+
+def test_a_red_run_reports_its_failure_kinds_and_output_tail(tmp_path) -> None:
+    """#541: what the engine needs to send a regression back to IMPLEMENT: whether a test
+    reached a verdict at all, and what it said."""
+    res = DeterministicTestRunner(_TestProj(
+        unit=["sh", "-c", "echo 'E assert 1 == 2'; echo 'FAILED a::t1'; exit 1"]
+    )).dispatch(_wi(Stage.TEST, schema_ref="test", cwd=str(tmp_path), context={}))
+    out = res.structured_output
+    assert out["failure_kinds"] and out["failure_kinds"] != ["infra"]
+    assert "assert 1 == 2" in out["validation_notes"]
+
+
+def test_a_timed_out_run_reports_infra_alone(tmp_path) -> None:
+    res = DeterministicTestRunner(_TestProj(unit=["sh", "-c", "sleep 5"]), timeout_s=1).dispatch(
         _wi(Stage.TEST, schema_ref="test", cwd=str(tmp_path), context={})
     )
-    assert res.status is ResultStatus.SUCCESS
-    assert res.structured_output["tests_meaningful"] is None
-    assert "no test commands defined" in res.structured_output["validation_notes"]
-    _assert_schema_valid("test", res.structured_output)
+    assert res.status is ResultStatus.FAILURE
+    assert res.structured_output["failure_kinds"] == ["infra"]
 
 
 def test_test_caused_failure_fails_with_classified_kind(tmp_path) -> None:
@@ -735,11 +738,40 @@ def test_micro_preset_defaults_to_deterministic_deliver_only(tmp_path) -> None:
     assert Stage.TEST not in task.pipeline
 
 
-def test_full_preset_keeps_model_test_and_deliver(tmp_path) -> None:
+def test_full_preset_runs_engine_test_and_model_deliver(tmp_path) -> None:
+    """#541: TEST is mechanical on every lane; FULL keeps model DELIVER for its docstrings."""
     eng = _eng(tmp_path)
     eng.create_run("r", ExecutionLane.FULL)
     task = eng.add_task("r", "t1")
-    assert task.deterministic_stages == ()  # FULL pays for model TEST/DELIVER
+    assert task.deterministic_stages == (Stage.TEST,)
+
+
+def test_an_explicit_empty_set_opts_a_task_into_model_test(tmp_path) -> None:
+    eng = _eng(tmp_path)
+    eng.create_run("r", ExecutionLane.FULL)
+    task = eng.add_task("r", "t1", deterministic_stages=())
+    assert task.deterministic_stages == ()
+    assert eng.store.load_task("r", "t1").deterministic_stages == ()  # persisted
+
+
+def test_a_project_can_opt_every_lane_into_model_test(tmp_path) -> None:
+    """The project opt-in edits a default, on every lane, and never an explicit task choice."""
+    eng = _eng(tmp_path)
+    eng.project.model_test_stage = True
+    eng.create_run("r", ExecutionLane.FULL)
+    assert eng.add_task("r", "full").deterministic_stages == ()
+    lite = eng.add_task("r", "lite", ExecutionLane.LITE)
+    assert lite.deterministic_stages == (Stage.DELIVER,)
+    explicit = eng.add_task("r", "explicit", deterministic_stages=[Stage.TEST])
+    assert explicit.deterministic_stages == (Stage.TEST,)
+
+
+def test_a_non_true_project_attribute_does_not_opt_in(tmp_path) -> None:
+    """An adapter or test double that merely answers every attribute does not opt in."""
+    eng = _eng(tmp_path)
+    eng.project.model_test_stage = "yes"
+    eng.create_run("r", ExecutionLane.FULL)
+    assert eng.add_task("r", "t1").deterministic_stages == (Stage.TEST,)
 
 
 def test_explicit_deterministic_stages_override_the_preset_default(tmp_path) -> None:

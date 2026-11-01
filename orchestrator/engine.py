@@ -185,11 +185,13 @@ from .state_machine import (
     deliver_push_mismatch,
     is_done,
     next_stage,
-    no_model_test_surface,
+    no_test_surface,
     pr_not_opened,
+    proving_mutation_count,
     remote_branch_sha,
     reset_for_fix_cycle,
     resume_point,
+    review_proof_gate,
     unjudged_tests_notice,
 )
 from .status_store import StatusStore
@@ -831,9 +833,12 @@ class Engine:
         pipeline, not the sequencing mechanism). ``deterministic_stages`` marks which of
         those stages run on the $0 ENGINE lane in ADDITION to the globally-deterministic
         intake (#33 — a pipeline opting TEST/DELIVER into the shell runners). Omitted, a
-        task resolved from a lane preset inherits that preset's default (#68): micro/lite
-        run TEST/DELIVER deterministically, FULL keeps model TEST/DELIVER. An explicit
-        pipeline pin opts out of the preset default. ``depends_on``/``provider_tag``
+        task resolved from a lane preset inherits that preset's default (#68/#541): every
+        preset runs TEST deterministically, micro/lite run DELIVER that way too. An empty
+        value is an explicit choice of model stages. A project whose adapter sets
+        ``model_test_stage`` drops TEST from a preset- or cost-derived default; an explicit
+        value always wins over it. An explicit pipeline pin opts out of the preset default.
+        ``depends_on``/``provider_tag``
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
         ``82:codex`` tag / ralph dependency analysis, human-supplied). ``model`` pins a
@@ -938,6 +943,7 @@ class Engine:
         route_reason: dict | None = None
         effective_lane = lane or run.lane
         pipeline_pinned = pipeline is not None
+        deterministic_explicit = deterministic_stages is not None
         if pipeline is None and run.route_by_cost:
             est = estimate if estimate is not None else self._estimate_from_labels(spec.labels)
             decision = self.cost_router.route(self._remaining_budget_fraction(run), est)
@@ -946,14 +952,23 @@ class Engine:
             if deterministic_stages is None:
                 deterministic_stages = decision.deterministic_stages
             route_reason = decision.reason
-        # #68: a task resolved from a lane PRESET (no explicit pipeline pin) adopts that
-        # preset's default deterministic stages — micro/lite run TEST/DELIVER on the $0
-        # ENGINE lane, FULL keeps model TEST/DELIVER. An explicit ``deterministic_stages``
+        # #68/#541: a task resolved from a lane PRESET (no explicit pipeline pin) adopts that
+        # preset's default deterministic stages — TEST on the $0 ENGINE lane everywhere, and
+        # DELIVER too on micro/lite. An explicit ``deterministic_stages``
         # (--deterministic-stages) or a cost-routing decision above already set it and wins;
         # an explicit pipeline pin is a bespoke pipeline that states its own deterministic
         # stages, so the preset default does not reach it.
         if deterministic_stages is None and not pipeline_pinned:
             deterministic_stages = LANE_DETERMINISTIC_STAGES.get(effective_lane, ())
+        # #541: the project-level opt-in to a model TEST. It only edits a default, so a task
+        # that named its stages explicitly keeps them. Baked into the persisted task below, so
+        # no later subcommand has to re-read the adapter.
+        if (
+            not deterministic_explicit
+            and deterministic_stages
+            and getattr(self.project, "model_test_stage", False) is True
+        ):
+            deterministic_stages = tuple(s for s in deterministic_stages if s is not Stage.TEST)
         # #519: the optional OPTIMIZE pass, for a project where speed is part of the product.
         # Applied to whatever pipeline is about to be PERSISTED — lane preset, cost-routed
         # preset, or a decomposition child's quality-tier pipeline — so every path picks the
@@ -1959,7 +1974,9 @@ class Engine:
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
             permission_posture=permission_posture,  # #304, hash-excluded for the same reason
-            review_cycle=task.review_cycles,  # #546: names this fix cycle's log files
+            # #546: names this fix cycle's log files. A TEST-driven cycle (#541) restarts the
+            # same stages at attempt 0, so it counts too; the sum only ever grows.
+            review_cycle=task.review_cycles + task.test_fix_cycles,
         )
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
@@ -2527,6 +2544,7 @@ class Engine:
                 "docs-only" if task.context.get("change_class") == "docs-only" else None
             ),
             diff_stat=self._deterministic_diff_stat(task),
+            no_disposable_workspace=not self._lane_enforces_tool_policy(lane),
         )
 
     @staticmethod
@@ -2811,11 +2829,9 @@ class Engine:
             result.lane_used.provider,
         ) in self.registry.sanctioned()
 
-        # Deterministic stage gate (the "verify" half of the collapsed test stage,
-        # target.md §6.1): a runner-reported SUCCESS can still be vetoed by the engine.
-        # Today: the test stage must affirm its tests are meaningful — a green run that
-        # doesn't is downgraded to a failure so it retries-with-learnings instead of
-        # shipping vacuous tests. Cost is still recorded above (the model did run).
+        # Deterministic stage gate: a runner-reported SUCCESS can still be vetoed by the
+        # engine, which downgrades it to a failure so it retries with learnings. Cost is
+        # still recorded above (the model did run).
         gate_error = self._stage_gate(result) if result.status is ResultStatus.SUCCESS else None
         effective = (
             result if gate_error is None
@@ -2920,6 +2936,12 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
+            # #541: an approval must carry its proof that the tests mean anything. Here, not
+            # in ``_stage_gate``, because only now does a panel review have its folded output.
+            if (proof_error := review_proof_gate(task, effective)) is not None:
+                effective = effective.model_copy(
+                    update={"status": ResultStatus.FAILURE, "error": proof_error}
+                )
         # #520: the OPTIMIZE pass, checked by the harness for REGRESSIONS. The engine runs
         # the project adapter's declared benchmark before and after the stage's commit and
         # strips the checkpoint (plus hard-resets the worktree) when the numbers got slower or
@@ -3391,10 +3413,9 @@ class Engine:
                      "title": fixup.title, "fingerprint": fixup.fingerprint,
                      "source": fixup.source}
                 )
-            # #261: nobody judged whether the tests are meaningful (or the reviewer's verdict
-            # was suppressed by the no-model-test-surface exemption). Warning-grade, so a run
-            # that skipped the #13 guarantee SAYS so instead of carrying a `tests_meaningful:
-            # true` nobody earned. Never blocking — the gates stay fail-OPEN.
+            # #261/#541: REVIEW passed without judging or proving the tests (or its verdict
+            # was suppressed by the no-test-surface exemption). Warning-grade, so a run that
+            # skipped the #13 guarantee SAYS so instead of reading like a proven one.
             if test_validation is not None:
                 events.append(
                     {"ts": _now(), "type": "test_validation_skipped", "level": "warning",
@@ -3696,10 +3717,16 @@ class Engine:
                 ref = mapping[local_id]
                 if ref in registered:
                     continue
+                child_pipeline = _CHILD_PIPELINES[child.quality_tier]
                 self.add_task(
                     run_id,
                     ref,
-                    pipeline=_CHILD_PIPELINES[child.quality_tier],
+                    pipeline=child_pipeline,
+                    # A child's pipeline is pinned, so the preset default cannot reach it:
+                    # inherit the parent's choice, including an explicit model TEST (#541).
+                    deterministic_stages=[
+                        s for s in parent.deterministic_stages if s in child_pipeline
+                    ],
                     depends_on=[mapping[dep] for dep in child.depends_on],
                     provider_tag=parent.provider_tag,
                     agent_role=child.agent,
@@ -3854,26 +3881,9 @@ class Engine:
     def _stage_gate(self, result: StageResult) -> str | None:
         """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.
 
-        The collapsed test stage folds in the as-built 'test-validate' step (§6.1): a
-        green run is necessary but not sufficient — the tests must actually exercise the
-        change. The runner is asked to self-report ``tests_meaningful``; if it explicitly
-        reports ``false`` we veto (retry-with-learnings) rather than ship vacuous tests.
-
-        Fail-OPEN on a MISSING or NULL field: nothing enforces this soft field on the
-        interactive/headless lanes (no JSON schema), so a model that simply omits it — or a
-        runner that honestly reports ``null`` because it cannot judge meaningfulness (the
-        deterministic ENGINE lane, #261) — must not dead-end otherwise-green work. Only an
-        explicit ``false`` is a veto. An abstention here is not free, though: if REVIEW
-        abstains too, ``record`` emits a warning-grade ``test_validation_skipped`` event so
-        the run never *claims* a verification nobody performed. (A stronger, schema- or
-        independent-reviewer-enforced version is tracked as issue #13.)
-
-        The veto downgrades the result to a FAILURE, so ``apply_result`` never absorbs its
-        outputs — which is why ``_failure_learning`` carries the vetoed attempt's
-        ``validation_notes`` forward into the retry's prompt explicitly (#298), the way a
-        REVIEW rejection carries its blocking ``issues``. The veto string below is
-        load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
-        failure streak → ``task.last_error``): enrich the learning, not this reason."""
+        SCOPE's child plan must parse and DELIVER must have opened a PR. Whether the tests
+        mean anything is not TEST's to say (#541): see ``state_machine.review_proof_gate``,
+        which ``record`` applies once a panel review has its folded output."""
         if result.stage is Stage.SCOPE:
             try:
                 parse_subtasks(result.structured_output)
@@ -3882,15 +3892,6 @@ class Engine:
             return None
         if result.stage is Stage.DELIVER:
             return pr_not_opened(result.structured_output)
-        if result.stage is not Stage.TEST:
-            return None
-        out = result.structured_output or {}
-        if out.get("tests_meaningful") is False:  # explicit self-report only
-            return (
-                "test-validate gate: the runner reported the tests do not meaningfully "
-                "exercise the change (tests_meaningful=false). Add/adjust assertions so "
-                "the tests would fail if this change regressed."
-            )
         return None
 
     def _deliver_push_gate(
@@ -4514,40 +4515,35 @@ class Engine:
         must not hold up an otherwise-approved PR.
 
         Also the independent test-validate half (#13): the reviewer — a different agent
-        from the one that wrote/ran the tests — reports ``tests_meaningful``; an explicit
-        ``false`` REJECTS even an approved review (vacuous-green tests are exactly what
-        the self-graded TEST gate can't catch about itself). Fail-open when omitted.
+        from the one that wrote the tests — reports ``tests_meaningful``; an explicit
+        ``false`` REJECTS even an approved review. A missing or null answer does not reject
+        here: ``state_machine.review_proof_gate`` has already sent an approval without proof
+        back for another review, and one that stated a reason is evented as
+        ``test_validation_skipped``.
 
-        The #13 gate is suppressed for tasks with NO model test surface (#41/#168): i.e.
-        when ``change_class == "docs-only"`` (ENGINE-detected, not model-asserted), when
-        ``Stage.TEST`` is absent from the task's pipeline (micro tasks), or when TEST ran
-        on the deterministic ENGINE lane (opted in via ``deterministic_stages``). A model
-        cannot self-exempt: all three signals are fixed at ``add_task`` time. An explicit
-        ``approved=false`` still rejects normally — the exemption covers only the vacuous-
-        tests criterion, never a substantive reviewer rejection. When the exemption discards
-        an EXPLICIT reviewer ``false``, that suppression is no longer silent: ``record``
-        emits a warning-grade ``test_validation_skipped`` event for it (#261). An OMITTED /
-        null ``tests_meaningful`` still fails open here — and is likewise evented when the
-        TEST stage did not judge it either."""
+        The #13 gate is suppressed for tasks with NO test surface (#41/#168): i.e. when
+        ``change_class == "docs-only"`` (ENGINE-detected, not model-asserted) or when
+        ``Stage.TEST`` is absent from the task's pipeline (micro tasks). A model cannot
+        self-exempt: both signals are engine-set. An explicit ``approved=false`` still
+        rejects normally — the exemption covers only the vacuous-tests criterion, never a
+        substantive reviewer rejection. When the exemption discards an EXPLICIT reviewer
+        ``false``, that suppression is no longer silent: ``record`` emits a warning-grade
+        ``test_validation_skipped`` event for it (#261)."""
         if result.stage is not Stage.REVIEW:
             return None
         out = result.structured_output or {}
         approved_false = out.get("approved") is False  # explicit self-report only
-        # #41/#168: a task with NO model test surface has nothing for the #13 independent
+        # #41/#168: a task with NO test surface has nothing for the #13 independent
         # test-validate gate to bite on, so a `tests_meaningful=false` verdict must NOT reject
         # it for lacking meaningful new tests. Two engine-side, non-fabricatable signals qualify
-        # (both derived from add_task-time state, never from a model's output — so a model can't
-        # self-exempt): (a) #41 a deterministically-detected docs-only change (ENGINE-lane-only
-        # `change_class` tag); (b) #168 the TEST stage did not run on a model lane — absent from
-        # the pipeline (micro) or opted into the deterministic $0 ENGINE runner (#33/#68), so no
-        # model wrote/graded the tests the reviewer would be judging. An explicit `approved=false`
-        # still rejects normally: this relaxes only the tests criterion, never a substantive reject.
-        # The predicate itself is the pure ``state_machine.no_model_test_surface`` so the
+        # (never from a model's output — so a model can't self-exempt): (a) #41 a
+        # deterministically-detected docs-only change (ENGINE-lane-only `change_class` tag);
+        # (b) #168 no TEST stage in the pipeline (micro). An explicit `approved=false` still
+        # rejects normally: this relaxes only the tests criterion, never a substantive reject.
+        # The predicate itself is the pure ``state_machine.no_test_surface`` so the
         # #261 test_validation_skipped notice reads the SAME exemption (it reports when this
         # suppresses an explicit reviewer `false` — no second spelling to drift).
-        tests_vacuous = (
-            out.get("tests_meaningful") is False and not no_model_test_surface(task)
-        )
+        tests_vacuous = out.get("tests_meaningful") is False and not no_test_surface(task)
         if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")
@@ -5151,9 +5147,54 @@ class Engine:
             # Terminal: no retry follows, so the session is always cleared (retrying=False).
             self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=False)
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
+        # #541: a red ENGINE-lane TEST has nothing to retry with. Nobody edits anything between
+        # attempts, so the identical code would go red identically, and no model is there to
+        # fix its own regression the way a model TEST could. The implementer does it instead.
+        if self._red_test_implicates_code(task, result, infra_only=infra_only):
+            if task.test_fix_cycles >= task.max_attempts - 1:
+                task.state = TaskState.FAILED
+                task.error_signatures = []
+                self._settle_failed_session(task, result, run=run, infra_only=infra_only,
+                                            retrying=False)
+                return "task_failed_max_attempts"
+            reset_for_fix_cycle(task, Stage.IMPLEMENT, cause="test")
+            task.test_fix_cycles += 1
+            task.state = TaskState.RETRYING
+            # Same boundary as a review fix cycle: the implementer acts from the learning
+            # above, not from inside a prior stage's session.
+            task.session_ref = None
+            task.session_provider = None
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "test_failed_fix_cycle", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "failures": list((result.structured_output or {}).get("failures") or [])[:10],
+                 "cycles_used": task.test_fix_cycles,
+                 "cycles_budget": task.max_attempts - 1},
+            )
+            return "test_failed_fix_cycle"
         task.state = TaskState.RETRYING
         self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
         return "stage_failed_will_retry"
+
+    @staticmethod
+    def _red_test_implicates_code(task: Task, result: StageResult, *, infra_only: bool) -> bool:
+        """Is this a red ENGINE-lane TEST the implementer should fix (#541)?
+
+        True only when the runner reached a verdict about the code: a run that never ran a
+        command reports no failures, and one that only timed out or could not start reports
+        ``infra`` alone. Those keep the ordinary same-stage retry, because the code was never
+        shown to be wrong. A task with no IMPLEMENT stage has nobody to send it to."""
+        if (
+            result.stage is not Stage.TEST
+            or result.status is not ResultStatus.FAILURE
+            or Stage.TEST not in task.deterministic_stages
+            or Stage.IMPLEMENT not in task.pipeline
+            or infra_only
+        ):
+            return False
+        out = result.structured_output or {}
+        return bool(out.get("failures")) and out.get("failure_kinds") != ["infra"]
 
     def _run_infra_reset(self, task: Task) -> str:
         """Shell the project's ``infra_reset`` command in the task's worktree
@@ -5209,19 +5250,9 @@ class Engine:
         """One failed attempt's learning entry. Richer than a bare error string (the old
         system carried the stage trail + a log tail): the failing-test ids (kind-tagged
         when classified) and a bounded tail of the runner's output, so the retry starts
-        from the failure's substance instead of re-discovering it.
-
-        #298 — the vacuity-rejection asymmetry, closed here: a REVIEW rejection already
-        carries its blocking ``issues`` forward as learnings (``_apply_review_rejection``),
-        which is what makes the fix cycle converge. A TEST vacuity veto
-        (``_stage_gate``, ``tests_meaningful=false``) used to carry NOTHING: the gate
-        downgrades a SUCCESS to a FAILURE, so ``apply_result`` never absorbs the result's
-        outputs and ``validation_notes`` — the only channel naming *why* the attempt
-        rejected — was dropped. The retry then re-derived the diagnosis from scratch, or
-        (worse) passed on a second look and converted a caught vacuity into a shipped one.
-        So a TEST failure whose result explicitly self-reports ``tests_meaningful=false``
-        appends the prior ``validation_notes`` verbatim (bounded) plus the convergence
-        directive: close the named gap, treat already-confirmed coverage as settled."""
+        from the failure's substance instead of re-discovering it. A failed result's outputs
+        are never absorbed into the context, so a red TEST's ``validation_notes``, which carry
+        the runner's output tail, ride along here for the implementer (#541)."""
         lines = [f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"]
         kind_by_test = {f.test: f.kind.value for f in classified}
         if isinstance(failures, list) and failures:
@@ -5255,45 +5286,17 @@ class Engine:
                 "not a code failure — consider resetting the test environment before "
                 "re-diagnosing the change itself."
             )
-        # #298: a TEST vacuity veto carries its reasoning forward, the way a REVIEW
-        # rejection carries its blocking issues. Bounded to the explicit self-report
-        # (never a missing/null tests_meaningful — #261 made the field tri-state) and to
-        # a non-empty string note, so no empty header is ever emitted.
-        notes = Engine._vacuity_notes(result)
-        if notes is not None:
-            clipped = notes[:1000]
-            suffix = "…" if len(notes) > 1000 else ""
-            lines.append(
-                f"  why the previous attempt rejected — prior validation_notes: "
-                f"{clipped}{suffix}"
-            )
-            lines.append(
-                "  CLOSE the specific gap those notes name — do not merely re-derive it. "
-                "Coverage the notes already confirm ADEQUATE is settled: do not redundantly "
-                "re-verify or re-mutation-test it."
-            )
+        notes = (result.structured_output or {}).get("validation_notes")
+        if result.stage is Stage.TEST and isinstance(notes, str) and notes.strip():
+            notes = notes.strip()
+            prefix = "…" if len(notes) > 1500 else ""
+            lines.append(f"  test run notes: {prefix}{notes[-1500:]}")
         tail = (result.raw_output or "").strip()
         if tail:
             clipped = tail[-500:]
             prefix = "…" if len(tail) > 500 else ""
             lines.append(f"  output tail: {prefix}{clipped}")
         return "\n".join(lines)
-
-    @staticmethod
-    def _vacuity_notes(result: StageResult) -> str | None:
-        """The prior attempt's ``validation_notes`` when — and only when — this failed
-        result is a TEST stage that explicitly self-reported ``tests_meaningful=false``
-        (#298). None for every other stage, for an absent/null tri-state field (#261), and
-        for absent/blank/non-string notes, so the caller emits no empty header."""
-        if result.stage is not Stage.TEST:
-            return None
-        out = result.structured_output or {}
-        if out.get("tests_meaningful") is not False:  # explicit self-report only
-            return None
-        notes = out.get("validation_notes")
-        if not isinstance(notes, str) or not notes.strip():
-            return None
-        return notes.strip()
 
     # --- human approval gate (design pass §4) ----------------------------------
     def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
@@ -6998,6 +7001,13 @@ class Engine:
             if test_out.get("test_scope"):
                 task_status["test_scope"] = test_out["test_scope"]
                 task_status["tests_selected"] = test_out.get("tests_selected")
+            # #541: REVIEW's verdict on the tests, with how many mutations back it, so a pass
+            # nobody proved is visible without opening the stage log.
+            review_rec = task.stages.get(Stage.REVIEW)
+            review_out = (review_rec.output if review_rec is not None else None) or {}
+            if "tests_meaningful" in review_out:
+                task_status["tests_meaningful"] = review_out["tests_meaningful"]
+                task_status["proving_mutations"] = proving_mutation_count(review_out)
             if task.quality_tier is not None:
                 task_status.update({
                     "agent_role": task.agent_role,

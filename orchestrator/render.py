@@ -1225,6 +1225,8 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
     notes = []
     if task.review_cycles:
         notes.append(f"{task.review_cycles} review cycle(s)")
+    if task.test_fix_cycles:
+        notes.append(f"{task.test_fix_cycles} test fix cycle(s)")
     if task.salvage_count:
         notes.append(f"{task.salvage_count} salvage-keep(s)")
     if task.infra_resets:
