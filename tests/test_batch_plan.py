@@ -9,6 +9,7 @@ work); here we exercise only the code around it.
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -398,6 +399,16 @@ def test_cli_candidates_smoke(tmp_path, capsys, monkeypatch) -> None:
     out = json.loads(capsys.readouterr().out)
     assert out["count"] == 2
     assert out["candidates"][1]["depends_on"] == ["#1"]
+
+
+@pytest.mark.parametrize("skills_dir", [".claude", ".agents"])
+def test_batch_plan_skill_says_what_an_empty_deterministic_stages_means(skills_dir) -> None:
+    """#541: both skill copies must warn that [] selects a model TEST, or a planner writing []
+    for "nothing special" silently opts its task out of the ENGINE-lane default."""
+    root = Path(__file__).resolve().parents[1]
+    skill = " ".join((root / skills_dir / "skills/batch-plan/SKILL.md").read_text().split())
+    assert "Omit `deterministic_stages` to take the lane's default" in skill
+    assert "`[]` explicitly runs every stage on a model" in skill
 
 
 def test_an_empty_deterministic_stages_is_an_explicit_model_choice(tmp_path, project) -> None:

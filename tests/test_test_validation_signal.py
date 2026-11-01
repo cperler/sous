@@ -287,6 +287,7 @@ def test_test_prompt_and_persona_no_longer_ask_for_a_meaningfulness_judgment() -
                            test_verdict_verified=True)
     assert "meaningful" not in prompt and "mutation" not in prompt
     for persona in (".claude/agents/test-validator.md",
+                    ".codex/agents/test-validator.toml",
                     "templates/project-default/agents/test-validator.md"):
         text = Path(persona).read_text()
         assert "`tests_meaningful`" not in text and "vacuous" not in text
