@@ -228,7 +228,7 @@ def apply_plan(
             "depends_on": internal_deps,
             "pipeline": t.get("pipeline"),
             "provider_tag": t.get("provider_tag"),
-            "deterministic_stages": [s.value for s in (det or ())],
+            "deterministic_stages": None if det is None else [s.value for s in det],
             "model": t.get("model"),
             "effort": t.get("effort"),
             "rationale": t.get("rationale", ""),

@@ -409,7 +409,16 @@ def test_an_empty_deterministic_stages_is_an_explicit_model_choice(tmp_path, pro
     plan["tasks"][0]["deterministic_stages"] = []
     plan["tasks"][1]["pipeline"] = "full"
     plan["tasks"][1].pop("deterministic_stages", None)
+    # The preview the human confirms and the batch_planned event must not show a default task
+    # as an explicit model choice, because here [] means the opposite of what would run.
+    preview = apply_plan(eng, "r1", plan, known_ids=["#1", "#2", "#3"], dry_run=True)
+    by_id = {e["task_id"]: e["deterministic_stages"] for e in preview["added"]}
+    assert by_id[plan["tasks"][0]["task_id"]] == []
+    assert by_id[plan["tasks"][1]["task_id"]] is None
+    assert by_id[plan["tasks"][2]["task_id"]] == ["test", "deliver"]
     apply_plan(eng, "r1", plan)
+    planned = [e for e in eng.store.read_events("r1") if e["type"] == "batch_planned"]
+    assert {t["task_id"]: t["deterministic_stages"] for t in planned[0]["tasks"]} == by_id
     assert eng.store.load_task("r1", plan["tasks"][0]["task_id"]).deterministic_stages == ()
     assert eng.store.load_task("r1", plan["tasks"][1]["task_id"]).deterministic_stages == (
         Stage.TEST,

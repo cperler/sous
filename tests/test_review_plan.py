@@ -392,6 +392,33 @@ def _skip_reasons(eng, run="r1") -> list[str]:
     ]
 
 
+def test_interactive_panel_tells_find_tests_not_to_mutate_the_live_worktree(
+    tmp_path, project,
+) -> None:
+    """#541: the engine, not just ``render_review_plan``, must say so. Interactive×claude runs
+    panels but has no disposable copy, so a mutation there would edit the tree being judged.
+    Headless×claude reviews in a disposable copy and gets no such directive."""
+    heading = "## No disposable workspace on this lane"
+
+    live = _engine(tmp_path / "interactive", project, registry=build_registry())
+    live.create_run("r1", review_workflow=True)
+    live.add_task("r1", "t1")
+    w = _drive_to_review(live)
+    assert w.lane_policy.execution_mode is ExecutionMode.INTERACTIVE
+    assert w.plan is not None
+    assert [f.lens for f in w.plan.finders if heading in f.prompt] == ["find:tests"]
+
+    disposable = _engine(
+        tmp_path / "headless", project, registry=build_registry(),
+        router=Router(execution_mode=ExecutionMode.HEADLESS),
+    )
+    disposable.create_run("r1", review_workflow=True)
+    disposable.add_task("r1", "t1")
+    w = _drive_to_review(disposable)
+    assert w.plan is not None
+    assert not any(heading in f.prompt for f in w.plan.finders)
+
+
 def test_codex_lane_never_carries_a_plan(tmp_path, project) -> None:
     """The plan is in content_hash, so it may only ride a lane that can execute it."""
     reg = Registry()
