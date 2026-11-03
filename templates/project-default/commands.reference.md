@@ -40,6 +40,10 @@ Notes:
   `(*DEFAULT_NON_CODE_GLOBS, "experiments/**")`. Keep config and data files out of it.
 - A stage's command method should **fail closed** (exit non-zero) until set, so an
   unconfigured run doesn't vacuously pass — see the generated adapter's `test_unit_cmd`.
+- **`test_unit_cmd(files)` narrows on pytest (#618).** A `test_unit` containing a `pytest` token
+  generates a method that appends `files`, so TEST's flaky re-run runs only the failed tests.
+  Any other runner ignores `files`, and the re-run repeats the full command. Keep a pytest
+  `test_unit` free of a pinned test path, or a narrowed run still includes that path.
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).
 - These are defaults; the interview confirms/overrides them against what's actually in the
   repo (lockfiles, `package.json` scripts, `pyproject.toml`, Makefile targets).

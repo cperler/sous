@@ -662,7 +662,12 @@ def _command_method(method: str, key: str, takes_files: bool, profile: Profile, 
     sig_arg = "self, files: list[str] | None = None" if takes_files else "self"
     argv = _resolve_command(method, key, profile.commands)
     note = _METHOD_NOTES.get(method, "")
-    if argv:
+    if argv and method == "test_unit_cmd" and "pytest" in argv:
+        # pytest takes test ids positionally, so TEST's flaky re-run and impacted-test
+        # selection can narrow to them (#618). Other runners have no common way to take
+        # ids: they ignore ``files``, and the engine falls back to the full command.
+        body = f"        return [*{_argv_literal(argv)}, *(files or [])]"
+    elif argv:
         body = f"        return {_argv_literal(argv)}"
     elif key == "test_unit":
         # FAIL-CLOSED until set, so an unconfigured run can't vacuously pass.
