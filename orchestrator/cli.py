@@ -497,6 +497,11 @@ def main(argv: list[str] | None = None) -> int:
                          "on model-lane stages; translated per lane (claude --effort, codex "
                          "model_reasoning_effort). Honored by the capacity downshift like "
                          "--model pins")
+    at.add_argument("--keep-issue-open", action=argparse.BooleanOptionalAction, default=None,
+                    help="merging this task's PR does not finish its issue: DELIVER writes "
+                         "'Part of #N' and refuses a PR that would close it (#613). "
+                         "--no-keep-issue-open overrides a keep-open label; omitted follows "
+                         "the project's keep-open labels")
     at.add_argument("--max-filed-followups", type=int, default=None,
                     help="per-task cap on how many non-blocking review findings are FILED as "
                          "follow-up issues (#191); overrides the engine-wide default for a task "
@@ -1695,13 +1700,15 @@ def main(argv: list[str] | None = None) -> int:
                             depends_on=deps, provider_tag=args.provider_tag,
                             deterministic_stages=det, estimate=args.estimate,
                             model=args.model, effort=args.effort,
-                            max_filed_followups=args.max_filed_followups)
+                            max_filed_followups=args.max_filed_followups,
+                            keep_issue_open=args.keep_issue_open)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
                "execution_lane": task.execution_lane.value,
                "depends_on": task.depends_on, "provider_tag": task.provider_tag,
-               "model_pin": task.model_pin, "effort_pin": task.effort_pin})
+               "model_pin": task.model_pin, "effort_pin": task.effort_pin,
+               "keep_issue_open": task.keep_issue_open})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
         # the ENGINE lane — #33) run in-process — drain them here so the interactive

@@ -191,6 +191,11 @@ runs detached or in a foreground terminal.
 **A multi-issue `Closes #7, #8` only closes the first.** Verify issue closures by hand after
 merging.
 
+**A PR that does not finish its issue needs `keep_issue_open`.** Set `"keep_issue_open": true` in
+the plan (`add-task --keep-issue-open`), or declare `keep_open_labels` on the adapter. DELIVER
+then writes `Part of #N`, and a PR that would still close the issue fails the stage. Saying so in
+the issue's text does not work.
+
 **Never `rm -rf runs/<run>/`.** Worktrees, branches, and checkpoint tags are cleanup targets;
 the run log dir is the durable audit trail and is pruned only by a human, deliberately.
 

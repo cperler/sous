@@ -247,6 +247,21 @@ so its cost and failures are visible without restoring the old opaque quality lo
   completion-time PR check (`completion_pr_invalid`) stays as the backstop for what
   this cannot see, such as a PR closed or retargeted after DELIVER.
 
+- **A keep-open task's PR must not close its issue (#613).** `Task.keep_issue_open` is set from a
+  plan field, an `add-task` flag, or the adapter's optional `keep_open_labels` (an explicit value
+  wins and is pinned against a later label refresh; a refresh can only turn a label's match on).
+  Both DELIVER lanes then write `Part of #N`. A prose instruction did not hold, so the check is
+  structural: the engine-lane runner reads `closingIssuesReferences` back and repairs the PR body,
+  and for every lane the engine reads the same answer through the task source's optional
+  `closing_issue_numbers` hook before absorbing a SUCCESS DELIVER. A hit fails the stage
+  (warning-grade `deliver_keep_open_violated`), so the ordinary retry re-dispatches DELIVER with
+  the reason as learnings. A clean read emits `deliver_keep_open_verified`; a read that cannot run
+  leaves the stage green with a warning-grade `deliver_keep_open_unverified`. Completion checks
+  again and reports a hit through `completion_pr_invalid`, for a body rewritten after DELIVER.
+  Decomposition children do not inherit the setting: each child's PR closes its own new issue, and
+  no PR names the parent's. Closing keywords in commit messages are not covered: GitHub honors them
+  at merge, and only the PR description gets repaired.
+
 - **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
   made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs
   the diff made stale). This needs no prompt text: in 156 post-#381 tasks, IMPLEMENT wrote

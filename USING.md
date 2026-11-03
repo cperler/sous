@@ -329,6 +329,23 @@ a mutation and recording which tests failed on it. To use a model TEST anyway, p
 Optional per-task pins: `model` (e.g. `fable` for architecture-heavy design work) and
 `effort`.
 
+### Keeping an issue open past the merge
+
+Set `"keep_issue_open": true` on a plan task (`add-task --keep-issue-open`) when merging its PR
+does not finish the issue: a reading after a release, a server change still to make, data still
+to arrive. To apply it to a whole class of issue, declare `keep_open_labels = ("experiment",)`
+on your project adapter; `false` (`--no-keep-issue-open`) overrides a label for one task.
+
+DELIVER then writes `Part of #N` instead of `Closes #N`, on the model and engine lanes alike.
+After DELIVER the engine reads the PR's closing references back from GitHub, and a PR that would
+still close the issue fails the stage and retries (`deliver_keep_open_violated`). The check runs
+again at completion, where a hit marks the delivery invalid. If it cannot read the answer you
+get a warning-grade `deliver_keep_open_unverified`, not a pass.
+
+A commit message containing a closing keyword (`Fixes #N`) is not covered: GitHub honors it at
+merge, and the runner only repairs the PR description. If a keep-open issue closes anyway, look
+there first.
+
 ### Two rules learned the hard way
 
 **Don't add an edge just because two things *could* run in sequence.** An unnecessary edge
@@ -460,7 +477,8 @@ conflicts the engine avoided.
 
 When a PR closes multiple issues, the deliver stage writes a comma-list (`Closes #7, #8`).
 **GitHub honors only the first ref.** The rest stay open silently and look like unfinished
-work forever. List the issues and confirm — don't trust the PR body.
+work forever. List the issues and confirm — don't trust the PR body. A task planned with
+`keep_issue_open` says `Part of #N` and should still be open afterwards.
 
 ### Clean up — but never the run logs
 

@@ -20,7 +20,7 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Literal, cast
@@ -184,6 +184,7 @@ from .state_machine import (
     begin_stage,
     deliver_push_mismatch,
     is_done,
+    keep_open_violation,
     next_stage,
     no_test_surface,
     pr_not_opened,
@@ -299,6 +300,13 @@ def _claim_modes(task: Task, paths: Sequence[str]) -> dict[str, str]:
     is exactly what the audit needs to do.
     """
     return {path: task.scope_file_modes.get(path, MODE_REWRITE) for path in paths}
+
+
+def _keep_issue_open_event(run_id: str, task_id: str, label: str | None, *, ts: str) -> dict:
+    """The receipt that a task keeps its issue open (#613), naming what set it: the label that
+    matched, or nothing because someone chose it explicitly."""
+    return {"ts": ts, "type": "keep_issue_open_set", "run_id": run_id, "task_id": task_id,
+            "source": "explicit" if label is None else "label", "label": label}
 
 
 def _claims_inferred_events(
@@ -827,6 +835,7 @@ class Engine:
         implementation_budget: str | ImplementationBudget | None = None,
         max_filed_followups: int | None = None,
         hold_before: Stage | None = None,
+        keep_issue_open: bool | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
@@ -889,6 +898,12 @@ class Engine:
         something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
         audited way to move the snapshot mid-run.
 
+        ``keep_issue_open`` says merging this task's PR does not finish its issue (#613):
+        DELIVER writes ``Part of #N``, and a PR that would close the issue fails the stage.
+        ``None`` follows the project's ``keep_open_labels``; an explicit value wins over them
+        and is pinned, so a later label refresh cannot overrule it. A ``True`` result is
+        evented as ``keep_issue_open_set``, naming where it came from.
+
         A task whose resolved pipeline has no SCOPE stage (micro, lite, a decomposition
         child) cannot declare files for the contention gate (#377), so it registers with
         the paths its issue title and body name (#428): ``scope_files`` is filled by
@@ -901,6 +916,8 @@ class Engine:
             str(label).strip().casefold() == "meta-authoring" for label in spec.labels
         ):
             hold_before = Stage.DELIVER
+        keep_open_label = None if keep_issue_open is not None else self._keep_open_label(spec.labels)
+        keep_open = keep_issue_open if keep_issue_open is not None else keep_open_label is not None
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
         # Per-task model pin (#84): resolve the alias/id, then validate it against the task's
@@ -1082,6 +1099,8 @@ class Engine:
                 pipeline=resolved_pipeline,
                 deterministic_stages=tuple(deterministic_stages or ()),
                 hold_before=hold_before,
+                keep_issue_open=keep_open,
+                keep_issue_open_pinned=keep_issue_open is not None,
                 max_attempts=self.max_attempts,
                 max_filed_followups=max_filed_followups,
                 scope_files=list(inferred_claims.claims) if inferred_claims else [],
@@ -1096,6 +1115,11 @@ class Engine:
                 run_id,
                 {"ts": _now(), "type": "task_registration_repaired", "run_id": run_id,
                  "task_id": task_id, "reason": repair_reason},
+            )
+        if keep_open:
+            self.store.append_event(
+                run_id,
+                _keep_issue_open_event(run_id, task_id, keep_open_label, ts=_now()),
             )
         if route_reason is not None:
             # Routing is never silent (#34): record WHY this un-pinned task got its preset
@@ -1121,6 +1145,24 @@ class Engine:
             for event in _claims_inferred_events(run_id, task_id, inferred_claims, ts=_now()):
                 self.store.append_event(run_id, event)
         return task
+
+    def _keep_open_label(self, labels: Iterable[object]) -> str | None:
+        """The first of ``labels`` the project declares keep-open (#613), else ``None``.
+
+        Read through ``getattr`` because the attribute is optional, and a project with no
+        opinion about it must resolve to "no match" rather than break task registration. A
+        bare string counts as one label, not as a sequence of letters.
+        """
+        declared = getattr(self.project, "keep_open_labels", ())
+        if isinstance(declared, str):
+            declared = (declared,)
+        if not isinstance(declared, list | tuple | set | frozenset):
+            return None
+        wanted = {str(label).strip().casefold() for label in declared}
+        for label in labels:
+            if str(label).strip().casefold() in wanted:
+                return str(label)
+        return None
 
     def _optimize_agent(self) -> str | None:
         """The project's OPTIMIZE agent, or ``None`` when the project has not opted in (#519).
@@ -1899,6 +1941,10 @@ class Engine:
             # A model-lane TEST on a cell that re-runs the declared test commands is told
             # that run decides pass/fail (the cell's ``verifies_test_verdict`` capability).
             test_verdict_verified=verifies_test_verdict,
+            # #613: DELIVER's keyword comes from the persisted setting, not a rule to remember.
+            keep_open_issue=(
+                task.issue_number if stage is Stage.DELIVER and task.keep_issue_open else None
+            ),
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -2963,6 +3009,20 @@ class Engine:
         if effective.stage is Stage.DELIVER and effective.status is ResultStatus.SUCCESS:
             effective, push_event = self._deliver_push_gate(run_id, task, effective)
             events.append(push_event)
+        # #613: a task that keeps its issue open must not hand a human a PR whose merge closes
+        # it. Prose did not hold (three PRs said `Closes` with the keep-open instruction in
+        # their own context), so the engine reads GitHub's answer back. Same veto shape as the
+        # push gate above, and only when that left the result standing.
+        if (
+            effective.stage is Stage.DELIVER
+            and effective.status is ResultStatus.SUCCESS
+            and task.keep_issue_open
+            and task.issue_number is not None
+        ):
+            effective, keep_open_event = self._deliver_keep_open_gate(
+                run_id, task, effective, task.issue_number
+            )
+            events.append(keep_open_event)
         # #227/#414: capture the fixup requests from the canonical review output (including
         # a synthesized panel output) before entering the locked transition — the
         # improvement idea AND any non-blocking finding that asked to be fixed in place.
@@ -3954,6 +4014,55 @@ class Engine:
         failed = result.model_copy(update={"status": ResultStatus.FAILURE, "error": veto})
         return failed, {**base, "type": "deliver_push_mismatch", "level": "warning",
                         "remote_sha": remote_sha, "error": veto}
+
+    def _deliver_keep_open_gate(
+        self, run_id: str, task: Task, result: StageResult, issue: int
+    ) -> tuple[StageResult, dict]:
+        """Fail a SUCCESS DELIVER whose PR would close the issue this task keeps open;
+        returns the (possibly vetoed) result and the one audit event to commit with it (#613).
+
+        The PR comes from the stage's own output, because the fold has not absorbed it yet. A
+        violation downgrades the result to FAILURE with the reason as ``error``, so the
+        ordinary retry re-dispatches DELIVER with it as learnings (warning-grade
+        ``deliver_keep_open_violated``). A clean read emits ``deliver_keep_open_verified``.
+        Fail-OPEN when the check cannot run: the result stands and a warning-grade
+        ``deliver_keep_open_unverified`` says nobody checked, so "checked and clean" and
+        "never checked" never read alike. ``_record_completion_pr_evidence`` checks again for
+        a body rewritten after this stage.
+        """
+        pr_url = str((result.structured_output or {}).get("pr_url") or "").strip()
+        base = {"ts": _now(), "run_id": run_id, "task_id": task.task_id,
+                "stage": result.stage.value, "attempt": result.attempt,
+                "issue_number": issue, "pr_url": pr_url or None}
+        closing, problem = (
+            self._read_closing_issues(self.project.task_source, pr_url)
+            if pr_url else (None, "the stage reported no pr_url to check")
+        )
+        if closing is None:
+            return result, {**base, "type": "deliver_keep_open_unverified", "level": "warning",
+                            "error": problem}
+        veto = keep_open_violation(issue, closing)
+        if veto is None:
+            return result, {**base, "type": "deliver_keep_open_verified",
+                            "closing_issues": closing}
+        failed = result.model_copy(update={"status": ResultStatus.FAILURE, "error": veto})
+        return failed, {**base, "type": "deliver_keep_open_violated", "level": "warning",
+                        "closing_issues": closing, "error": veto}
+
+    @staticmethod
+    def _read_closing_issues(
+        task_source: object, pr_url: str
+    ) -> tuple[list[int] | None, str | None]:
+        """(issues the PR closes on merge, None), or (None, why that could not be read).
+        Never raises: a missing or failing hook must read as unverified, not break the
+        stage or the completion it was asked about (#613)."""
+        hook = getattr(task_source, "closing_issue_numbers", None)
+        if not callable(hook):
+            return None, "task source has no closing_issue_numbers hook"
+        try:
+            return [int(number) for number in hook(pr_url)], None
+        except Exception as exc:  # noqa: BLE001 - a failed read is reported, never fatal
+            return None, f"{type(exc).__name__}: {exc}"[:300]
 
     def _scope_not_feasible(self, result: StageResult) -> str | None:
         """Feasibility gate over a completed SCOPE stage (issue #45); returns the
@@ -6655,9 +6764,10 @@ class Engine:
         # overwritten, and ``applied_diff`` (not the pre-lock one) is what the event reports.
         applied_diff = diff
         reinferred: ClaimDeclaration | None = None
+        keep_open_label: str | None = None
 
         def _refresh(t: Task) -> None:
-            nonlocal applied_diff, reinferred
+            nonlocal applied_diff, reinferred, keep_open_label
             # Re-validate under the lock (#311's shape): raising here aborts the transaction
             # before any event append or doc write, so a refused refresh leaves no trace but
             # the caller's error — same outcome as the pre-check, just race-free.
@@ -6676,6 +6786,13 @@ class Engine:
             t.title = new_title
             t.body = new_body
             t.labels = [str(label) for label in (getattr(spec, "labels", None) or [])]
+            # #613: a keep-open label added since registration counts from here on. Only ever
+            # on: removing the label does not reopen the question, and a person's explicit
+            # choice is not the label's to overrule.
+            if not t.keep_issue_open and not t.keep_issue_open_pinned:
+                keep_open_label = self._keep_open_label(t.labels)
+                if keep_open_label is not None:
+                    t.keep_issue_open = True
             t.spec_fingerprint = new_fingerprint
             t.spec_source_updated_at = source_updated_at
             # ``spec_captured_at`` moves too: it dates the copy the prompts render from,
@@ -6708,6 +6825,9 @@ class Engine:
             }] + (
                 _claims_inferred_events(run_id, task_id, reinferred, ts=refreshed_at)
                 if reinferred is not None else []
+            ) + (
+                [_keep_issue_open_event(run_id, task_id, keep_open_label, ts=refreshed_at)]
+                if keep_open_label is not None else []
             ),
         )
         report["applied"] = True
@@ -7533,6 +7653,10 @@ class Engine:
         # PR with which review cycle re-pushed it (best-effort comment; never load-bearing).
         if task.review_cycles:
             ctx.setdefault("review_cycles", task.review_cycles)
+        # #613: the deterministic DELIVER runner writes `Part of #N` and repairs the PR. Only
+        # when set, so every other task's context stays byte-identical.
+        if task.keep_issue_open:
+            ctx["keep_issue_open"] = True
         # #216: at INTAKE, compose the tree of every COMPLETED DAG dependency into the
         # dependent's worktree. The edge only ORDERS execution; without this the dependent
         # is branched off the run base and its per-PR gate never sees a sibling's shared
@@ -7854,6 +7978,21 @@ class Engine:
             )
         if state == "MERGED" and not expected_sha:
             reasons.append("MERGED PR cannot be tied to this run without a DELIVER checkpoint")
+        # #613: the DELIVER gate saw the PR body as it stood then; anything that rewrote it
+        # later (a review-stage edit) could bring the keyword back. Report-only, as all of
+        # this check is: the task has already completed.
+        if task.keep_issue_open and task.issue_number is not None:
+            closing, problem = self._read_closing_issues(task_source, task.pr_url)
+            if closing is None:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "deliver_keep_open_unverified", "level": "warning",
+                     "run_id": run_id, "task_id": task.task_id, "checked_at": "completion",
+                     "issue_number": task.issue_number, "pr_url": task.pr_url,
+                     "error": problem},
+                )
+            elif veto := keep_open_violation(task.issue_number, closing):
+                reasons.append(veto)
         payload = {
             "ts": _now(),
             "type": "completion_pr_invalid" if reasons else "completion_pr_validated",

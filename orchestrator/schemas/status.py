@@ -273,6 +273,12 @@ class Task(_StatusModel):
     # Optional pre-stage human checkpoint (#71). The task is parked before this stage
     # until that exact gate identity is approved. Additive for backward compatibility.
     hold_before: Stage | None = None
+    # #613: this task's PR is part of its issue, not the end of it, so DELIVER writes
+    # ``Part of #N`` and the engine refuses a PR that would close the issue on merge.
+    # Persisted because every CLI subcommand rebuilds the Engine from defaults. ``_pinned``
+    # records that a person chose the value, so a later label refresh cannot overrule it.
+    keep_issue_open: bool = False
+    keep_issue_open_pinned: bool = False
     # Identity of the currently pending checkpoint; approval consumes and clears it.
     pending_approval_what: str | None = None
     # Checkpoint identities released for this task. Dispatch additionally requires the
