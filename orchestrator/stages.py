@@ -15,6 +15,24 @@ from .model_table import Role
 from .schemas.enums import STAGE_ORDER, Effort, Stage
 from .schemas.work import FinderSpec, ReviewPlan, ToolPolicy
 
+# DELIVER's default instruction for an issue-sourced task. Named because a task that keeps
+# its issue open (#613) gets ``_deliver_keep_open_sentence`` in its place.
+_DELIVER_CLOSES_SENTENCE = (
+    "If the task is a GitHub issue (#N), include 'Closes #N' "
+    "in the PR description so the merge closes the issue. "
+)
+
+
+def _deliver_keep_open_sentence(issue: int) -> str:
+    """DELIVER's instruction when merging this PR must not close issue ``issue`` (#613)."""
+    return (
+        f"Merging this PR does not finish issue #{issue}, which stays open: write "
+        f"'Part of #{issue}' in the PR description, and never put a GitHub closing keyword "
+        f"(a form of close, fix or resolve) in front of #{issue} anywhere in it, including "
+        "in text quoted from the issue. The engine reads the PR's closing references back "
+        "and fails this stage if they name the issue. "
+    )
+
 
 @dataclass(frozen=True)
 class StageSpec:
@@ -239,8 +257,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
         effort=Effort.LOW,  # mechanical prose + `gh pr create` — the cheap stage (#96)
         template=(
             "Add/refresh docstrings for changed source, then open a pull request for "
-            "the task branch. If the task is a GitHub issue (#N), include 'Closes #N' "
-            "in the PR description so the merge closes the issue. If the context above "
+            f"the task branch. {_DELIVER_CLOSES_SENTENCE}If the context above "
             "already shows a pr_url for this task (a review fix cycle), treat it only "
             "as a selector: run `gh pr view <url> --json state,headRefName,baseRefName` "
             "and reuse it only when it is OPEN and its head is the task branch. If it "
@@ -846,6 +863,7 @@ def render_prompt(
     worktree_origin_unverified: bool = False,
     impacted_tests: Sequence[str] | None = None,
     test_verdict_verified: bool = False,
+    keep_open_issue: int | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -913,6 +931,11 @@ def render_prompt(
       function guessing — ``stages.py`` knows nothing about lanes. Default False, so every
       enforcing-lane prompt is byte-identical to the pre-#302 one.
 
+    - DELIVER + ``keep_open_issue`` (#613): the issue number of a task that keeps its issue
+      open. Swaps the template's ``Closes #N`` sentence for one naming this issue and
+      ``Part of``, so the stage gets the right keyword rather than a rule to remember.
+      Default None, so every other task's prompt is byte-identical.
+
     The frontend and inherited-changes blocks read model-influenced context rather than
     ENGINE-lane parameters (unlike ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
     ``render_review_plan`` for the same boundary stated over the finder set.
@@ -926,7 +949,12 @@ def render_prompt(
         project_commands=project_commands,
     )
 
-    instruction = f"## {stage.value.upper()}\n{spec.template}"
+    template = spec.template
+    if stage is Stage.DELIVER and keep_open_issue is not None:
+        template = template.replace(
+            _DELIVER_CLOSES_SENTENCE, _deliver_keep_open_sentence(keep_open_issue)
+        )
+    instruction = f"## {stage.value.upper()}\n{template}"
     # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell REVIEW
     # to skip test-coverage / tests_meaningful criteria for it, so the
     # reviewer doesn't demand (or reject over) unreachable coverage. The tag is set only by

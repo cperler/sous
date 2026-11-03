@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Collection
 from typing import NamedTuple
 
 from pydantic import ValidationError
@@ -496,6 +497,26 @@ def remote_branch_sha(ls_remote_stdout: str, branch: str) -> str | None:
         if len(parts) == 2 and parts[1] == want and re.fullmatch(r"[0-9a-f]{7,64}", parts[0]):
             return parts[0]
     return None
+
+
+def keep_open_violation(issue: int, closing_issues: Collection[int]) -> str | None:
+    """Reason a keep-open task's PR is wrong when GitHub would close its issue — else
+    ``None`` (#613).
+
+    ``closing_issues`` is GitHub's own answer (the PR's closing references), read by the
+    engine, so this post-condition is one the model does not author: on ``pred-1141-1291``
+    PRs said ``Closes`` with "do not close it on merge" in their own context. Pure: the
+    engine call sites turn it into the veto or the completion finding, and the event.
+    """
+    if issue not in closing_issues:
+        return None
+    return (
+        f"keep-open check: issue #{issue} stays open after this PR, but GitHub lists it as "
+        "an issue the PR closes on merge. Edit the PR description (`gh pr edit`) to say "
+        f"'Part of #{issue}' with no closing keyword (a form of close, fix or resolve) in "
+        f"front of #{issue}, and remove any manual link to it from the PR's Development "
+        "section."
+    )
 
 
 def deliver_push_mismatch(checkpoint_sha: str, remote_sha: str | None, branch: str) -> str | None:

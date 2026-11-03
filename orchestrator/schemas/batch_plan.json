@@ -20,6 +20,7 @@
           "deterministic_stages": {"type": ["array", "null"], "items": {"type": "string", "enum": ["intake", "scope", "implement", "test", "deliver", "review"]}, "description": "stages to run on the $0 ENGINE lane instead of a model (e.g. test/deliver for a docs-only task); null takes the preset's default, where TEST runs no model; [] is the explicit choice of a model for every stage"},
           "model": {"type": ["string", "null"], "description": "per-task model pin (#84): a friendly alias (fable/opus/sonnet/haiku) or an exact model id, e.g. 'fable' for an architecture-heavy task. Must belong to the task's provider (a codex-tagged task pins a codex id); null keeps the role default"},
           "effort": {"type": ["string", "null"], "enum": ["low", "medium", "high", null], "description": "per-task reasoning-effort pin (#96), overriding the stage-spec defaults; null keeps the stage defaults"},
+          "keep_issue_open": {"type": ["boolean", "null"], "description": "true when merging this task's PR does not finish its issue: DELIVER writes 'Part of #N' and refuses a PR that would close it (#613). false overrides a keep-open label; null or absent follows the project's keep-open labels."},
           "rationale": {"type": "string", "description": "why these edges/lane were chosen — the model's analysis, human-visible"}
         },
         "additionalProperties": false

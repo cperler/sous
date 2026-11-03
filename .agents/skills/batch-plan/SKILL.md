@@ -38,6 +38,10 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      `deterministic_stages` to take the lane's default (TEST runs no model on any lane); `[]`
      explicitly runs every stage on a model, so use it only when a task really needs a model
      TEST.
+   - **Issue stays open** (`keep_issue_open`): set `true` when merging the PR cannot meet the
+     issue's done-when: a reading after a release, a server change still to make, data still
+     to arrive. DELIVER then writes `Part of #N`, and a PR that would close the issue fails
+     the stage. Omit it to follow the project's keep-open labels; `false` overrides them.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

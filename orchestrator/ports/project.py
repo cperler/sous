@@ -74,6 +74,12 @@ class TaskSource(Protocol):
     #       ``head_sha`` lets a MERGED PR prove that it contains this run's delivered head,
     #       rather than merely sharing a stale recorded URL. The GitHub source implements
     #       it; sources without PR lifecycle semantics may omit it.
+    #   closing_issue_numbers(pr_url) -> list[int]
+    #       The issue numbers, in this source's own tracker, that the PR closes on merge as
+    #       the tracker itself reports them (#613). The engine reads it for a task that keeps
+    #       its issue open, after DELIVER and again at completion. A missing or raising hook
+    #       reads as unverified (warning event), never as clean. The GitHub source implements
+    #       it; sources without PR lifecycle semantics may omit it.
 
     # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
     # them only via ``getattr`` at task finalize, so an older external adapter that omits
@@ -240,6 +246,10 @@ class ProjectConfig(Protocol):
     # deterministic stages, so this project's tasks run TEST on a model lane instead of the
     # ENGINE lane. A task's own explicit stages still win. The declared test commands still
     # decide that stage's verdict, and tests-meaningful stays REVIEW's either way.
+    # Optional keep-open labels (#613; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``keep_open_labels = ("experiment",)`` makes a task sourced from an issue with
+    # one of these labels (compared ignoring case) keep that issue open, as if it had been
+    # planned with ``keep_issue_open``. A task's own explicit choice still wins.
     # Optional impacted-test selection hooks (#558; duck-typed via ``getattr``, NOT part of
     # the versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   impacted_tests(changed: list[str], *, cwd: str | None = None) -> list[str] | None
