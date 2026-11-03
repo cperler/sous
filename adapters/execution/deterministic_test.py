@@ -28,9 +28,14 @@ raising, returning None, a global test input touched, an empty set — runs the 
 
 Flaky failures: when the UNIT command fails on a few named tests, those tests are re-run
 once — narrowed via ``test_unit_cmd(failed)`` when the adapter honors it, else the whole
-unit command again. A re-run that passes means the failures did not reproduce: they are
-recorded under ``flaky_failures`` and a warning notice, not counted as caused. Prediction
-run ``batch-418-419-377-386-388`` failed a task three times on three different
+unit command again. The re-run clears them when it exits 0, or when it exits non-zero and every
+failure it reports is already in the baseline (#618): an unnarrowed re-run still runs the known
+red tests, so its exit code says nothing about the flaky ones. A non-zero exit with no parsed
+failures (a crash) does not clear, and neither does any parsed failure outside the baseline. An
+unnarrowed suite that stops early (``-x``, ``--maxfail``) can stop at a baseline failure before
+reaching the flaky test and clear it unproven; a narrowed re-run has no such gap. Cleared
+failures are recorded under ``flaky_failures`` and a warning notice, not counted as caused.
+Prediction run ``batch-418-419-377-386-388`` failed a task three times on three different
 timing-sensitive tests its change never touched; one failing run is not proof.
 """
 
@@ -254,7 +259,9 @@ class DeterministicTestRunner:
             inherited_count += len(inherited)
             if new and label == "unit" and len(new) <= _MAX_FLAKY_RERUN:
                 ids = [f.test for f in new]
-                cleared, how = self._rerun_cleared(argv, ids, work.cwd, proc_env)
+                cleared, how, also_failed = self._rerun_cleared(
+                    argv, ids, baseline, work.cwd, proc_env
+                )
                 if cleared:
                     flaky.extend(ids)
                     notes.append(f"{label}: rc={proc.returncode}, but {len(ids)} failure(s) "
@@ -262,6 +269,9 @@ class DeterministicTestRunner:
                                  + ", ".join(ids))
                     continue
                 notes.append(f"{label}: re-ran {how} once; still red")
+                if also_failed:
+                    notes.append(f"{label}: the re-run also failed, outside the baseline: "
+                                 + ", ".join(also_failed[:10]))
             if new:
                 caused.extend(f.test for f in new)
                 caused_kinds.update(f.kind for f in new)
@@ -300,10 +310,22 @@ class DeterministicTestRunner:
         return out, error, passed
 
     def _rerun_cleared(
-        self, argv: list[str], failed: list[str], cwd: str | None, env: dict[str, str] | None,
-    ) -> tuple[bool, str]:
-        """Re-run once the unit tests that just failed; True when that run is green. Uses
-        ``test_unit_cmd(failed)`` when the adapter narrows on it, else ``argv`` again."""
+        self,
+        argv: list[str],
+        failed: list[str],
+        baseline: set[str],
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[bool, str, list[str]]:
+        """Re-run once the unit tests that just failed. Uses ``test_unit_cmd(failed)`` when
+        the adapter narrows on it, else ``argv`` again. Returns whether the failures cleared,
+        what was re-run, and any failure the re-run showed that is neither in ``failed`` nor
+        in ``baseline``.
+
+        Cleared means exit 0, or a non-zero exit where at least one failure parsed and all of
+        them are in ``baseline`` (#618). This is stricter than "no id from ``failed`` came
+        back": a collection error parses as a new id (``ERROR tests/x.py``) and has not shown
+        the failed tests passing, so nothing outside the baseline may clear them."""
         unit = getattr(self._project, "test_unit_cmd", None)
         narrowed = _argv_of(unit, failed)
         if narrowed and narrowed != _argv_of(unit):
@@ -316,8 +338,14 @@ class DeterministicTestRunner:
                 timeout=self._timeout_s, env=env,
             )
         except (OSError, subprocess.SubprocessError):
-            return False, how
-        return proc.returncode == 0, how
+            return False, how, []
+        if proc.returncode == 0:
+            return True, how, []
+        parsed = [f.test for f in self._classify(f"{proc.stdout}\n{proc.stderr}")]
+        outside_baseline = [test for test in parsed if test not in baseline]
+        if parsed and not outside_baseline:
+            return True, how, []
+        return False, how, [test for test in outside_baseline if test not in failed]
 
     def _commands(
         self, selection: TestSelection

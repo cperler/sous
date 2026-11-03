@@ -15,6 +15,7 @@ from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.headless_claude import HeadlessClaudeRunner
 from adapters.execution.test_verdict import verify_test_verdict
 from adapters.execution.transport import RawResult
+from adapters.project.selfhost.classifier import SelfHostClassifier
 from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LanePolicy, WorkItem
@@ -62,11 +63,11 @@ def _repo(tmp_path):
     return tmp_path
 
 
-def _wi(cwd, stage=Stage.TEST, checkpoint_tag=None) -> WorkItem:
+def _wi(cwd, stage=Stage.TEST, checkpoint_tag=None, baseline_failures=()) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="#42", stage=stage, prompt="p", schema_ref="test",
         model="sonnet", lane_policy=_HEADLESS, created_at="now", cwd=str(cwd),
-        context={"baseline_failures": []}, checkpoint_tag=checkpoint_tag,
+        context={"baseline_failures": list(baseline_failures)}, checkpoint_tag=checkpoint_tag,
     )
 
 
@@ -202,6 +203,87 @@ def test_many_failures_are_not_rerun(tmp_path) -> None:
                               f"{lines}; exit 1"])
     run = DeterministicTestRunner(proj).evaluate(_wi(_repo(tmp_path / "repo")))
     assert run.ok is False and len(run.out["failures"]) == 6
+
+
+_BASE_RED = "tests/t.py::test_base"
+_FLAKY = "tests/t.py::test_timing"
+
+
+def _first_run_then(marker, rerun: str) -> _Proj:
+    """A full suite with one baseline and one other failure, then ``rerun`` on later runs."""
+    return _Proj(["sh", "-c", f"if [ -f {marker} ]; then {rerun}; fi; touch {marker}; "
+                              f"echo 'FAILED {_BASE_RED}'; echo 'FAILED {_FLAKY}'; exit 1"])
+
+
+def _evaluate_beside_baseline(tmp_path, proj):
+    return DeterministicTestRunner(proj).evaluate(
+        _wi(_repo(tmp_path / "repo"), baseline_failures=[_BASE_RED]))
+
+
+def test_a_flaky_failure_beside_a_baseline_failure_clears_on_a_full_rerun(tmp_path) -> None:
+    """#618: the full re-run exits 1 on the baseline failure whatever the flaky test did."""
+    proj = _first_run_then(tmp_path / "ran", f"echo 'FAILED {_BASE_RED}'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is True and run.out["failures"] == []
+    assert run.out["flaky_failures"] == [_FLAKY]
+    assert any(n["notice"] == "test_flaky_failures_cleared" for n in run.notices)
+    assert "1 inherited baseline failure(s) excluded" in run.out["validation_notes"]
+
+
+def test_a_repeated_failure_beside_a_baseline_failure_stays_caused(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran",
+                           f"echo 'FAILED {_BASE_RED}'; echo 'FAILED {_FLAKY}'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+    assert "re-ran the unit command once; still red" in run.out["validation_notes"]
+
+
+def test_a_rerun_crash_with_no_parsed_failures_stays_caused(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran", "echo 'Segmentation fault'; exit 139")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+
+
+def test_a_new_failure_in_the_rerun_stays_caused_and_is_named(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran",
+                           f"echo 'FAILED {_BASE_RED}'; echo 'FAILED tests/t.py::test_new'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+    assert ("the re-run also failed, outside the baseline: tests/t.py::test_new"
+            in run.out["validation_notes"])
+
+
+def test_a_parsed_collection_error_in_the_rerun_stays_caused(tmp_path) -> None:
+    """The failed test is absent from the re-run, but it never ran, so it has not passed."""
+    proj = _first_run_then(tmp_path / "ran", "echo 'ERROR tests/t.py - ImportError'; exit 2")
+    proj.classifier = SelfHostClassifier()
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+
+
+class _NarrowingProj(_Proj):
+    """A suite that fails while whole, and records the ids it is narrowed to."""
+
+    def __init__(self, recorded) -> None:
+        super().__init__(["sh", "-c", f"echo 'FAILED {_FLAKY}'; exit 1"])
+        self._recorded = recorded
+
+    def test_unit_cmd(self, files=None):
+        if not files:
+            return self._unit
+        return ["sh", "-c", f'printf "%s\\n" "$@" > {self._recorded}', "sh", *files]
+
+
+def test_an_adapter_that_narrows_reruns_only_the_failed_tests(tmp_path) -> None:
+    recorded = tmp_path / "rerun-ids"
+    run = DeterministicTestRunner(_NarrowingProj(recorded)).evaluate(_wi(_repo(tmp_path / "repo")))
+    assert run.ok is True and run.out["flaky_failures"] == [_FLAKY]
+    assert recorded.read_text().splitlines() == [_FLAKY]
+    assert "passed when the failed test(s) was re-run once" in run.out["validation_notes"]
 
 
 def test_a_worktree_missing_on_disk_is_not_verified(tmp_path) -> None:

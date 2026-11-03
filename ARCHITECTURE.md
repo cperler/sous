@@ -313,6 +313,10 @@ so its cost and failures are visible without restoring the old opaque quality lo
   unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors
   it, else the whole unit command); failures that do not reproduce are recorded as
   `flaky_failures` with a `test_flaky_failures_cleared` notice, not counted against the change.
+  The re-run clears them on exit 0, or on a non-zero exit whose parsed failures are all in the
+  baseline (#618). A non-zero exit that parses nothing, or any parsed failure outside the
+  baseline, stays caused. An unnarrowed suite that stops early (`-x`) can stop at a baseline
+  failure before reaching the flaky test; a narrowed re-run has no such gap.
 - **Impacted-only TEST (#558).** An adapter may declare `impacted_tests(changed)` (and
   `test_global_paths`); `orchestrator/test_selection.py` then narrows the unit command to
   `test_unit_cmd(files)` for the tests mapped from the task's diff. Every case it cannot

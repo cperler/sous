@@ -143,6 +143,24 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     assert rp.commands["lint"] == ["uv", "run", "python", "-m", "ruff", "check", "."]
 
 
+def test_generated_pytest_unit_command_narrows_on_files(tmp_path) -> None:
+    """#618: TEST's flaky re-run reaches the failed tests only if the adapter takes them."""
+    prof = profile_from_languages("py-narrow", ["python"], MANIFEST)
+    scaffold_adapter("py-narrow", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "py-narrow").get_config()
+    full = ["uv", "run", "python", "-m", "pytest", "-q"]
+    assert cfg.test_unit_cmd() == full
+    assert cfg.test_unit_cmd([]) == full
+    assert cfg.test_unit_cmd(["tests/t.py::test_x"]) == [*full, "tests/t.py::test_x"]
+
+
+def test_generated_non_pytest_unit_command_ignores_files(tmp_path) -> None:
+    prof = profile_from_languages("go-narrow", ["go"], MANIFEST)
+    scaffold_adapter("go-narrow", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "go-narrow").get_config()
+    assert cfg.test_unit_cmd(["pkg/x"]) == cfg.test_unit_cmd() == ["go", "test", "./..."]
+
+
 def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
     tmp_path, monkeypatch
 ) -> None:
