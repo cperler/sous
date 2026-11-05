@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 from adapters.project.email_sink import email_sink_from_env
 from adapters.project.github_issues import GitHubIssuesSource
 from adapters.project.origin_probes import PROBE_FILE, runner_source_probe
+from orchestrator.policy_gate import gate_output_fields
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
@@ -219,7 +220,9 @@ class SelfHostConfig:
 
         This closes that: a blocking finding forces ``approved=false``, which the engine
         turns into a bounded fix cycle with the failure text as learnings, so the run
-        repairs itself instead of handing a human a red PR.
+        repairs itself instead of handing a human a red PR. Only findings not already there
+        at ``base_sha`` block (#591): the engine splits this output against the task's
+        ``baseline_lint`` and reports the inherited ones as advisory.
 
         Best-effort in the shape the seam expects. No worktree (or a path that isn't a
         directory) yields no findings. A command that could not be RUN at all — missing
@@ -261,6 +264,9 @@ class SelfHostConfig:
             "severity": "critical",
             "suggested_fix": f"Run `{' '.join(argv)}` in the worktree and fix what it reports.",
             "blocking": True,
+            # #591: the engine compares this against what INTAKE recorded at base, so an error
+            # already on trunk does not block. Without it the finding blocks as written.
+            **gate_output_fields(label, proc),
         }
 
     @staticmethod

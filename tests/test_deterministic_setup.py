@@ -628,3 +628,139 @@ def test_inherited_changes_survive_a_failed_intake(tmp_path, monkeypatch) -> Non
     inherited = next(n for n in res.execution_notices
                      if n["notice"] == "worktree_inherited_changes")
     assert inherited["count"] == 4  # the three dirty entries plus the stale .venv
+
+
+# --- #591: what lint and typecheck already report at base ------------------------------
+
+_RED_LINT = ["sh", "-c", "echo 'a.py:3:1: E722 bare'; echo 'Found 1 error.'; exit 1"]
+
+
+class _LintProj(_Proj):
+    """Lint is red at base, typecheck is green, and each run is counted in a file."""
+
+    def __init__(self, counter: Path, lint: list[str] | None = None) -> None:
+        self.counter = counter
+        self.lint = lint or _RED_LINT
+
+    def typecheck_cmd(self) -> list[str]:
+        return ["sh", "-c", f"echo lint >> {self.counter}; " + self.lint[2]]
+
+    def types_cmd(self) -> list[str]:
+        return ["sh", "-c", "exit 0"]
+
+
+def test_intake_records_lint_findings_at_base(tmp_path, monkeypatch) -> None:
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = DeterministicSetupRunner(_LintProj(tmp_path / ".git" / "n")).dispatch(_wi())
+    assert out.status is ResultStatus.SUCCESS
+    assert out.structured_output["baseline_lint"] == ["a.py: E722 bare"]
+    note = out.structured_output["baseline_lint_note"]
+    assert "lint: 1 finding(s)" in note and "typecheck: green" in note
+
+
+def test_intake_without_lint_commands_records_an_empty_baseline(tmp_path, monkeypatch) -> None:
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = DeterministicSetupRunner(_Proj()).dispatch(_wi())
+    assert out.structured_output["baseline_lint"] == []
+    assert out.structured_output["baseline_lint_note"].startswith("n/a")
+
+
+def test_noop_lint_command_is_not_run(tmp_path, monkeypatch) -> None:
+    class _Noop(_Proj):
+        def typecheck_cmd(self) -> list[str]:
+            return ["true"]
+
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = DeterministicSetupRunner(_Noop()).dispatch(_wi())
+    assert out.structured_output["baseline_lint_note"].startswith("n/a")
+
+
+def test_lint_baseline_is_shared_across_same_tree_tasks(tmp_path, monkeypatch) -> None:
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    counter = tmp_path / ".git" / "lint-runs"
+    runner = DeterministicSetupRunner(_LintProj(counter), baseline_cache_dir=tmp_path / ".git" / "c")
+    first = runner.dispatch(_wi("#7"))
+    second = runner.dispatch(_wi("#8"))
+    assert first.structured_output["baseline_lint"] == ["a.py: E722 bare"]
+    assert second.structured_output["baseline_lint"] == ["a.py: E722 bare"]
+    assert "reused from #7" in second.structured_output["baseline_lint_note"]
+    assert counter.read_text().splitlines() == ["lint"]  # one machine, one run
+
+
+def test_dirty_worktree_records_no_lint_baseline(tmp_path, monkeypatch) -> None:
+    """A dead run's lint error must not be recorded as pre-existing."""
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    counter = tmp_path / ".git" / "lint-runs"
+    project = _LintProj(counter)
+    assert DeterministicSetupRunner(project).dispatch(_wi()).status is ResultStatus.SUCCESS
+    counter.unlink()
+    (tmp_path / ".worktrees" / "7" / "leftover.py").write_text("x = 1\n")
+    out = DeterministicSetupRunner(project).dispatch(_wi())
+    assert out.structured_output["baseline_lint"] == []
+    assert "not verifiably clean" in out.structured_output["baseline_lint_note"]
+    assert not counter.exists()
+
+
+def test_unreadable_lint_output_never_fabricates_a_baseline(tmp_path, monkeypatch) -> None:
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    project = _LintProj(tmp_path / ".git" / "n", ["sh", "-c", "echo crashed; exit 2"])
+    out = DeterministicSetupRunner(project).dispatch(_wi())
+    assert out.status is ResultStatus.SUCCESS  # never fatal
+    assert out.structured_output["baseline_lint"] == []
+    assert any(n.get("notice") == "lint_baseline_not_captured" and n["leg"] == "lint"
+               for n in out.execution_notices)
+
+
+def test_unrunnable_lint_command_never_fails_intake(tmp_path, monkeypatch) -> None:
+    class _Missing(_Proj):
+        def typecheck_cmd(self) -> list[str]:
+            return ["/no/such/linter"]
+
+    _git_repo(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    out = DeterministicSetupRunner(_Missing()).dispatch(_wi())
+    assert out.status is ResultStatus.SUCCESS
+    assert out.structured_output["baseline_lint"] == []
+    assert "FileNotFoundError" in out.structured_output["baseline_lint_note"]
+    assert "lint_baseline_not_captured" in [n["notice"] for n in out.execution_notices]
+
+
+def test_lint_leg_timeout_is_recorded_not_raised(tmp_path, monkeypatch) -> None:
+    def timed_out(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired("ruff", 300)
+
+    monkeypatch.setattr(subprocess, "run", timed_out)
+    result = DeterministicSetupRunner._run_lint_leg(tmp_path, ["ruff"])
+    assert result["captured"] is False and "TimeoutExpired" in result["note"]
+
+
+def test_setup_task_override_records_the_lint_baseline(tmp_path) -> None:
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+    _git_repo(worktree)
+
+    class _Override(_LintProj):
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": f"task/{task_id}", "worktree": str(worktree)}
+
+    out = DeterministicSetupRunner(_Override(tmp_path / "n")).dispatch(_wi())
+    assert out.status is ResultStatus.SUCCESS
+    assert out.structured_output["baseline_lint"] == ["a.py: E722 bare"]
+
+
+def test_setup_task_override_on_a_non_git_directory_skips_the_lint_baseline(tmp_path) -> None:
+    worktree = tmp_path / "wt"
+    worktree.mkdir()
+
+    class _Override(_LintProj):
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": f"task/{task_id}", "worktree": str(worktree)}
+
+    out = DeterministicSetupRunner(_Override(tmp_path / "n")).dispatch(_wi())
+    assert out.structured_output["baseline_lint"] == []

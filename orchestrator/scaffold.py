@@ -86,7 +86,8 @@ _METHOD_NOTES: dict[str, str] = {
         "    # The project's speed benchmark (#529): profile.toml's `bench` command. The engine's\n"
         "    # OPTIMIZE gate (#520) runs it before and after the stage and reads a one-line JSON\n"
         "    # metrics object from the LAST stdout line (rc 0 on both runs); the REVIEW gate\n"
-        "    # below runs it too (rc 1 blocks, anything else that is not rc 0 is advisory).\n"
+        "    # below runs it too (rc 1 twice on a machine with spare capacity blocks; a single\n"
+        "    # rc 1 or an overloaded machine is an inconclusive advisory; other rcs are UNVERIFIED).\n"
     ),
 }
 
@@ -830,6 +831,7 @@ import sys
 from pathlib import Path
 
 from adapters.project.email_sink import email_sink_from_env
+from orchestrator.policy_gate import gate_output_fields, run_bench_gate
 from orchestrator.schemas.enums import Stage
 from orchestrator.schemas.stage_schemas import resolve_stage_schema
 
@@ -911,8 +913,11 @@ class {cls}:
     def review_findings(self, *, worktree: str | None = None) -> list[dict]:
         """Run profile-declared lint/typecheck/benchmark policy gates in the task worktree.
 
-        A red command blocks REVIEW. A command that cannot run is advisory instead: the
-        gate is visibly UNVERIFIED without deadlocking a task on a missing tool or timeout.
+        A red command blocks REVIEW, except for what this change did not cause (#591): lint
+        and typecheck findings already there at base are advisory, and a benchmark blocks only
+        when it is red twice on a machine that was not overloaded. A command that cannot run
+        is advisory: the gate is visibly UNVERIFIED without deadlocking a task on a missing
+        tool or timeout.
 
         The methods are the ENGINE's leg names, not the tools' (#412): ``typecheck_cmd`` is
         the lint leg, ``types_cmd`` the static-typing leg. Calling exactly the pair both
@@ -926,8 +931,7 @@ class {cls}:
                             ("typecheck", self.types_cmd())):
             if (finding := self._gate(worktree, label, argv)) is not None:
                 findings.append(finding)
-        if (finding := self._bench_gate(worktree, self.benchmark_cmd())) is not None:
-            findings.append(finding)
+        findings.extend(self._bench_gate(worktree, self.benchmark_cmd()))
         return findings
 
     def _gate(self, worktree: str, label: str, argv: list[str]) -> dict | None:
@@ -953,46 +957,16 @@ class {cls}:
             "severity": "critical",
             "suggested_fix": f"Run `{{command}}` in the worktree and fix what it reports.",
             "blocking": True,
+            # #591: the engine compares this against what INTAKE recorded at base.
+            **gate_output_fields(label, proc),
         }}
 
-    def _bench_gate(self, worktree: str, argv: list[str]) -> dict | None:
-        """Run the benchmark leg: rc 0 passes, rc 1 blocks, anything else is advisory.
-
-        rc 1 is the benchmark reporting a regression, so its finding carries the output
-        tail (the timings). Any other rc, a timeout, or a failure to start means the
-        benchmark did not judge the change: advisory UNVERIFIED, never green.
-        """
+    def _bench_gate(self, worktree: str, argv: list[str]) -> list[dict]:
+        """Run the benchmark leg: the engine's ``run_bench_gate`` owns the re-run and the load
+        check, so a fix to either reaches this adapter without regenerating it (#591)."""
         if not argv or argv == _NOOP:
-            return None
-        command = " ".join(argv)
-        try:
-            proc = self._run_bench(argv, worktree)
-        except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
-            return {{
-                "description": f"benchmark gate could not run in the task worktree "
-                               f"({{type(exc).__name__}}: {{exc}}). The gate is UNVERIFIED "
-                               "for this change.",
-                "severity": "important",
-                "blocking": False,
-            }}
-        if proc.returncode == 0:
-            return None
-        if proc.returncode == 1:
-            return {{
-                "description": f"benchmark gate is RED on this change — profile.toml declares "
-                               f"`{{command}}` as the project benchmark and it reported a "
-                               f"regression. Output:\\n{{_output_tail(proc)}}",
-                "severity": "critical",
-                "suggested_fix": f"Run `{{command}}` in the worktree and recover the timings.",
-                "blocking": True,
-            }}
-        return {{
-            "description": f"benchmark gate exited {{proc.returncode}} (not a pass/fail verdict) "
-                           f"running `{{command}}`. The gate is UNVERIFIED for this change. "
-                           f"Output:\\n{{_output_tail(proc)}}",
-            "severity": "important",
-            "blocking": False,
-        }}
+            return []
+        return run_bench_gate(argv, worktree, self._run_bench)
 
     @staticmethod
     def _run_gate(argv: list[str], cwd: str) -> subprocess.CompletedProcess[str]:
