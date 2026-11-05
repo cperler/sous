@@ -407,3 +407,257 @@ class _WorkItemStub:
         self.lane_policy = LanePolicy(
             execution_mode=ExecutionMode.INTERACTIVE, provider=Provider.CLAUDE
         )
+
+
+# --- #614: the stopping rule for surviving mutants -----------------------------------------
+BLOCKING_SURVIVOR = {
+    "mutation": "orchestrator/a.py:12 drop the refusal guard",
+    "failed_tests": [],
+    "blocking": True,
+    "blocking_reason": "the spec requires the refusal on an unknown maker",
+}
+
+
+def _survivor_events(eng, kind, run="r1") -> list[dict]:
+    return [e for e in eng.store.read_events(run) if e["type"] == kind]
+
+
+def test_a_blocking_survivor_with_a_reason_opens_a_fix_cycle_and_names_itself(
+    tmp_path, project
+) -> None:
+    """The engine, not the reviewer, opens the cycle: the reviewer APPROVED with the survivor
+    only in mutation_checks, and the rule turns it into the blocking issue."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [PROOF["mutation_checks"][0], BLOCKING_SURVIVOR],
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    t = eng.store.load_task("r1", "t1")
+    assert t.open_mutants == ["orchestrator/a.py:12 drop the refusal guard"]
+    assert t.review_cycles == 1
+    # The fix cycle reset the REVIEW record, so the promoted issue is read where the
+    # implementer reads it: the rejection learning, rendered by format_review_issue.
+    [learning] = [x for x in t.learnings if x.startswith("review rejected (cycle 1)")]
+    assert "important — orchestrator/a.py:12 — surviving mutant: orchestrator/a.py:12 drop " \
+           "the refusal guard — the spec requires the refusal on an unknown maker" in learning
+    [receipt] = _survivor_events(eng, "surviving_mutants_disposed")
+    assert receipt["blocking"] == 1 and receipt["noted"] == 0 and receipt["demoted"] == 0
+    assert receipt["blocking_mutations"] == t.open_mutants
+    assert _survivor_events(eng, "surviving_mutant_demoted") == []
+    # The fix cycle reset the REVIEW record, so status carries no verdict until the re-review.
+    assert "surviving_mutations" not in eng.status("r1")["tasks"]["t1"]
+    # The fix cycle re-opens IMPLEMENT with the survivor as a learning.
+    assert eng.next_work("r1", "t1").stage is Stage.IMPLEMENT
+
+
+def test_a_blocking_flag_without_a_reason_is_demoted_and_opens_no_cycle(
+    tmp_path, project
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    unexplained = {**BLOCKING_SURVIVOR, "blocking_reason": "  "}
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [PROOF["mutation_checks"][0], unexplained],
+    }))
+    assert out["outcome"] == "task_completed"
+    t = eng.store.load_task("r1", "t1")
+    assert t.open_mutants == [] and t.review_cycles == 0
+    [demoted] = _survivor_events(eng, "surviving_mutant_demoted")
+    assert demoted["level"] == "warning"
+    assert demoted["mutation"] == "orchestrator/a.py:12 drop the refusal guard"
+    [receipt] = _survivor_events(eng, "surviving_mutants_disposed")
+    assert (receipt["blocking"], receipt["noted"], receipt["demoted"]) == (0, 1, 1)
+    [gap] = t.stages[Stage.REVIEW].output["non_blocking"]
+    assert gap["disposition"] == "drop" and gap["title"].startswith("surviving mutant:")
+    status = eng.status("r1")["tasks"]["t1"]
+    assert status["surviving_mutations"] == 1 and status["blocking_mutations"] == 0
+
+
+def test_a_plain_survivor_is_a_noted_gap_and_the_task_completes(tmp_path, project) -> None:
+    """The pred-1141-1291 shape: correct code, a wording-only survivor. Noted once, no cycle,
+    and a reviewer that had already listed the same gap does not get it doubled."""
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [
+            PROOF["mutation_checks"][0],
+            {"mutation": "b.py:4 change the account tag text", "failed_tests": []},
+            {"mutation": "c.py:9 reword the log line", "failed_tests": [],
+             "blocking": False, "blocking_reason": "label only"},
+        ],
+        "non_blocking": [{"title": "surviving mutant: b.py:4 change the account tag text",
+                          "detail": "already noted by the reviewer", "disposition": "drop"}],
+    }))
+    assert out["outcome"] == "task_completed"
+    t = eng.store.load_task("r1", "t1")
+    nb = t.stages[Stage.REVIEW].output["non_blocking"]
+    assert [e["title"] for e in nb] == [
+        "surviving mutant: b.py:4 change the account tag text",
+        "surviving mutant: c.py:9 reword the log line",
+    ]
+    assert nb[0]["detail"] == "already noted by the reviewer"  # the reviewer's entry won
+    assert "Reviewer note: label only" in nb[1]["detail"]
+    assert t.stages[Stage.REVIEW].output["approved"] is True
+    [receipt] = _survivor_events(eng, "surviving_mutants_disposed")
+    assert (receipt["blocking"], receipt["noted"], receipt["demoted"]) == (0, 2, 0)
+    assert eng.status("r1")["tasks"]["t1"]["surviving_mutations"] == 2
+
+
+def test_no_survivors_leaves_the_review_byte_identical_and_silent(tmp_path, project) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True, **PROOF,
+    }))
+    assert _survivor_events(eng, "surviving_mutants_disposed") == []
+    out = eng.store.load_task("r1", "t1").stages[Stage.REVIEW].output
+    assert "non_blocking" not in out
+
+
+def _cycle_back_to_review(eng, run="r1", task="t1"):
+    """After a review rejection on the LITE lane: implement, TEST-on-ENGINE, deliver."""
+    eng.record(run, make_result(eng.next_work(run, task)))  # implement
+    wt = eng.next_work(run, task)
+    assert wt.stage is Stage.TEST
+    eng.record(run, make_result(wt, structured_output=ENGINE_TEST_OUTPUT))
+    eng.record(run, make_result(eng.next_work(run, task)))  # deliver
+    w = eng.next_work(run, task)
+    assert w.stage is Stage.REVIEW
+    return w
+
+
+def test_the_re_review_is_told_the_named_survivors_and_clears_them_when_closed(
+    tmp_path, project
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    assert "## Named survivors to re-check" not in w.prompt  # first review: byte-identical
+    eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [PROOF["mutation_checks"][0], BLOCKING_SURVIVOR],
+    }))
+    w2 = _cycle_back_to_review(eng)
+    assert "## Named survivors to re-check" in w2.prompt
+    assert "- orchestrator/a.py:12 drop the refusal guard" in w2.prompt
+    # The re-review re-applies it (verbatim up to whitespace/case) and it now fails a test.
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [{"mutation": "orchestrator/a.py:12  Drop the refusal guard",
+                             "failed_tests": ["tests/test_a.py::test_refuses_unknown_maker"]}],
+    }))
+    assert out["outcome"] == "task_completed"
+    assert eng.store.load_task("r1", "t1").open_mutants == []
+    assert _survivor_events(eng, "named_survivor_unchecked") == []
+
+
+def test_a_re_review_that_ignores_the_named_survivors_is_evented_not_vetoed(
+    tmp_path, project
+) -> None:
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [PROOF["mutation_checks"][0], BLOCKING_SURVIVOR],
+    }))
+    w2 = _cycle_back_to_review(eng)
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True, **PROOF,  # a fresh sample
+    }))
+    assert out["outcome"] == "task_completed"
+    [missed] = _survivor_events(eng, "named_survivor_unchecked")
+    assert missed["level"] == "warning"
+    assert missed["mutations"] == ["orchestrator/a.py:12 drop the refusal guard"]
+    assert eng.store.load_task("r1", "t1").open_mutants == []  # the approval still clears
+
+
+def test_a_second_rejection_replaces_the_named_survivors(tmp_path, project) -> None:
+    """The list is the LAST rejection's, so a re-review that found a different blocking
+    survivor hands the next cycle only that one."""
+    eng = _engine(tmp_path, project, max_review_cycles=3)
+    eng.create_run("r1", ExecutionLane.LITE)
+    eng.add_task("r1", "t1")
+    w = _lite_to_review(eng)
+    eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [PROOF["mutation_checks"][0], BLOCKING_SURVIVOR],
+    }))
+    w2 = _cycle_back_to_review(eng)
+    other = {**BLOCKING_SURVIVOR, "mutation": "orchestrator/b.py:3 skip the halt",
+             "blocking_reason": "the halt path is a money-path guard"}
+    out = eng.record("r1", make_result(w2, structured_output={
+        "approved": True, "issues": [], "tests_meaningful": True,
+        "mutation_checks": [{**BLOCKING_SURVIVOR, "failed_tests": ["t::closed"]}, other],
+    }))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert eng.store.load_task("r1", "t1").open_mutants == ["orchestrator/b.py:3 skip the halt"]
+
+
+def test_review_prompts_state_the_stopping_rule_and_the_re_check_block_only_when_named(
+) -> None:
+    from orchestrator.stages import (
+        _LENS_TESTS,
+        _MUTATION_PROOF_RECIPE,
+        _SURVIVOR_STOPPING_RULE,
+        render_prompt,
+        render_review_plan,
+    )
+
+    assert _SURVIVOR_STOPPING_RULE in _MUTATION_PROOF_RECIPE
+    assert _SURVIVOR_STOPPING_RULE in _LENS_TESTS.body
+    assert "do NOT restate it in `issues`" in _SURVIVOR_STOPPING_RULE
+    assert "money-path / safety" in _SURVIVOR_STOPPING_RULE
+    common = {"task_id": "t1", "title": "x", "body": ""}
+    prompt = render_prompt(Stage.REVIEW, **common)
+    assert _SURVIVOR_STOPPING_RULE in prompt
+    assert "blocking?, blocking_reason?" in prompt
+    heading = "## Named survivors to re-check"
+    assert heading not in prompt
+    assert heading not in render_prompt(Stage.REVIEW, open_mutants=["  "], **common)
+    named = render_prompt(Stage.REVIEW, open_mutants=["a.py:1 drop guard"], **common)
+    assert heading in named and "- a.py:1 drop guard" in named and "VERBATIM" in named
+    plan = render_review_plan(open_mutants=["a.py:1 drop guard"], **common)
+    assert [f.lens for f in plan.finders if heading in f.prompt] == ["find:tests"]
+    assert not any(heading in f.prompt for f in render_review_plan(**common).finders)
+
+
+def test_surviving_mutant_disposition_tolerates_any_shape() -> None:
+    from orchestrator.state_machine import (
+        surviving_mutant_disposition,
+        unchecked_named_survivors,
+    )
+
+    assert surviving_mutant_disposition({}) == ([], [], [])
+    assert surviving_mutant_disposition({"mutation_checks": "ran some"}) == ([], [], [])
+    blocking, noted, demoted = surviving_mutant_disposition({"mutation_checks": [
+        "oops", {"failed_tests": []}, {"mutation": "   ", "failed_tests": []},
+        {"mutation": "a.py:1 x", "failed_tests": ["t"]},  # proving: untouched
+        {"mutation": "b.py:2 y", "failed_tests": "none"},  # malformed proof: a survivor
+        {"mutation": "drop the guard", "failed_tests": [], "blocking": "true",
+         "blocking_reason": "spec"},  # no file:line prefix → no file, still blocking
+        {"mutation": "c.py:3 z", "failed_tests": [], "blocking": True},
+    ]})
+    assert [n["title"] for n in noted] == ["surviving mutant: b.py:2 y",
+                                           "surviving mutant: c.py:3 z"]
+    assert [b["mutation"] for b in blocking] == ["drop the guard"]
+    assert "file" not in blocking[0] and "line" not in blocking[0]
+    assert [d["mutation"] for d in demoted] == ["c.py:3 z"]
+    assert unchecked_named_survivors([], {"mutation_checks": []}) == []
+    assert unchecked_named_survivors(["A.py:1  x", "b.py:2 y"], {
+        "mutation_checks": [{"mutation": "a.py:1 x", "failed_tests": []}, "oops"],
+    }) == ["b.py:2 y"]

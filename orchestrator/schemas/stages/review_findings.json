@@ -41,7 +41,9 @@
             "type": "array",
             "items": {"type": "string"},
             "description": "ids of the tests that failed on this mutation; empty means it survived"
-          }
+          },
+          "blocking": {"type": "boolean", "description": "#614: whether this SURVIVED mutation (empty failed_tests) opens a fix cycle. The engine, not the reviewer, acts on it: true only when the mutation sits on behaviour the task spec requires or on a guard the project marks money-path/safety, and it needs a non-blank blocking_reason naming which, or the engine demotes it (evented). Every other survivor is reported once as a noted gap in non_blocking, never as a blocking issue. Defaults to false. Ignored on a mutation that failed a test"},
+          "blocking_reason": {"type": "string", "description": "#614: required when blocking is true: the spec requirement or money-path/safety guard this survivor falls on. A blocking survivor with no reason is demoted to a noted gap"}
         },
         "additionalProperties": true
       }

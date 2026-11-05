@@ -165,6 +165,15 @@ tracker or fix-forward.
   `state_machine.review_proof_gate` sends back an approval that has neither a mutation which
   failed a test nor a `tests_not_checked_reason`, and a stated reason is evented as
   `test_validation_skipped` so an unproven pass never reads like a proven one.
+  **A surviving mutant has a stopping rule (#614).** A mutation the tests miss is never a
+  blocking issue by itself: it opens a fix cycle only when the reviewer marks the
+  `mutation_checks` entry `blocking: true` with a `blocking_reason` naming the spec-required
+  behaviour or money-path/safety guard it falls on, and the engine
+  (`state_machine.surviving_mutant_disposition`) promotes it to the issue, demotes a flag with
+  no reason (`surviving_mutant_demoted`), and reports every other survivor once as a `drop`
+  non-blocking gap. The rejection stores the blocking survivors on `Task.open_mutants`, so the
+  re-review is told to re-apply exactly those instead of sampling fresh mutations; a re-review
+  that re-applies none of them is evented `named_survivor_unchecked`, never vetoed.
 
 ## Running a batch: headless is the default lane
 Use the **`orchestrate-batch-headless`** skill for ordinary batches. One `run-headless` driver

@@ -994,3 +994,18 @@ def test_status_surfaces_panel_notices_per_task(tmp_path, project) -> None:
     assert audit["notices"] == 3
     assert audit["by_notice"] == {"verifier_cap": 1, "verifier_inconclusive": 2}
     assert audit["by_task"] == {"t1": {"verifier_cap": 1, "verifier_inconclusive": 2}}
+
+
+def test_survivor_blocking_fields_pass_through_from_find_tests_verbatim() -> None:
+    """#614: the fold carries `blocking`/`blocking_reason` on a find:tests check untouched, so
+    the engine's stopping rule reads a panel review exactly as it reads a single one."""
+    survivor = {"mutation": "a.py:9 drop the guard", "failed_tests": [],
+                "blocking": True, "blocking_reason": "spec requires the refusal"}
+    review, notices, _ = synthesize(_panel({
+        "find:tests": {"findings": [], "tests_meaningful": True,
+                       "mutation_checks": [{"mutation": "a.py:1", "failed_tests": ["t::x"]},
+                                           survivor]},
+    }))
+    assert review["mutation_checks"][1] == survivor
+    assert review["approved"] is True  # the fold does not apply the rule; the engine does
+    assert notices == ()

@@ -621,6 +621,151 @@ def proving_mutation_count(output: dict) -> int:
     )
 
 
+class SurvivorDisposition(NamedTuple):
+    """What ``surviving_mutant_disposition`` made of a REVIEW's survived mutations (#614).
+
+    ``blocking``: structured review issues (``review.json`` issue-object shape, tagged
+    ``source="mutation_check"`` and carrying the verbatim ``mutation``) for every survivor the
+    reviewer flagged ``blocking: true`` WITH a reason. ``noted``: ``non_blocking`` entries
+    (``disposition="drop"``) for every other survivor. ``demoted``: survivors flagged blocking
+    without a reason, which the engine refuses to cycle on and events instead.
+    """
+
+    blocking: list[dict]
+    noted: list[dict]
+    demoted: list[dict]
+
+
+_MUTATION_LOCATION = re.compile(r"^\s*(?P<file>[^\s:]+?)(?::(?P<line>\d+))?(?=[\s:]|$)")
+# The verbatim mutation string is the re-review's lookup key, so it is kept whole up to a
+# bound that still fits the convergence fingerprint's 160-code-point window with the prefix.
+_MAX_MUTATION_TEXT = 120
+# A ``non_blocking`` title (the fingerprint key at finalize) is cut where the filing code cuts.
+_MAX_NOTED_TITLE = 80
+
+
+def _is_blocking_flag(value: object) -> bool:
+    """``blocking: true`` as a model may actually spell it (a bool, or the string)."""
+    return value is True or (isinstance(value, str) and value.strip().casefold() == "true")
+
+
+def _mutation_text(check: dict) -> str:
+    """One check's ``mutation`` string, whitespace-collapsed and bounded; ``""`` when
+    absent or blank (a model may omit it), so callers can skip the check in one test."""
+    return re.sub(r"\s+", " ", str(check.get("mutation") or "")).strip()[:_MAX_MUTATION_TEXT]
+
+
+def surviving_mutant_disposition(output: dict) -> SurvivorDisposition:
+    """The stopping rule for surviving mutants (#614), as a pure walk over a REVIEW output's
+    ``mutation_checks``.
+
+    A reviewer proves ``tests_meaningful`` by mutating the change and watching tests fail.
+    Mutations the tests MISS are real records, but each review samples different ones, so
+    treating any survivor as a blocking finding opened a full implement-through-review cycle
+    per round on code that was correct every time (pred-1141-1291 #1254/#1310, pred-1396-1382
+    #1378). The rule, decided here rather than by the prompt: a survivor opens a cycle only
+    when the reviewer flags it ``blocking: true`` AND names a ``blocking_reason`` (the spec
+    requirement or money-path/safety guard it falls on). A flag without a reason is DEMOTED,
+    never promoted — an unexplained block is the hydra this exists to stop. Everything else is
+    a noted gap, reported once in ``non_blocking`` and never filed.
+
+    Tolerant of any shape, since a model wrote it: a survivor is a named mutation with no
+    recorded failing test (the exact complement of ``proving_mutation_count``), so a check
+    whose ``failed_tests`` is missing or malformed proves nothing and is handled as one.
+    """
+    checks = output.get("mutation_checks")
+    if not isinstance(checks, list):
+        return SurvivorDisposition([], [], [])
+    blocking: list[dict] = []
+    noted: list[dict] = []
+    demoted: list[dict] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        mutation = _mutation_text(check)
+        if not mutation:
+            continue
+        failed = check.get("failed_tests")
+        if isinstance(failed, list) and any(str(t).strip() for t in failed):
+            continue  # a proving mutation; not this rule's business
+        reason = check.get("blocking_reason")
+        reason = re.sub(r"\s+", " ", reason).strip()[:300] if isinstance(reason, str) else ""
+        if _is_blocking_flag(check.get("blocking")):
+            if not reason:
+                demoted.append({
+                    "mutation": mutation,
+                    "reason": "flagged blocking with no blocking_reason — noted, not cycled",
+                })
+                noted.append(_noted_gap(mutation, ""))
+                continue
+            issue: dict = {
+                "severity": "important",
+                "description": f"surviving mutant: {mutation} — {reason}",
+                "suggested_fix": (
+                    "add or sharpen a test that fails on exactly this mutation, then re-apply "
+                    "it to confirm"
+                ),
+                "source": "mutation_check",
+                "mutation": mutation,
+            }
+            located = _MUTATION_LOCATION.match(mutation)
+            if located and ("/" in located["file"] or "." in located["file"]):
+                issue["file"] = located["file"]
+                if located["line"] is not None:
+                    issue["line"] = int(located["line"])
+            blocking.append(issue)
+        else:
+            noted.append(_noted_gap(mutation, reason))
+    return SurvivorDisposition(blocking, noted, demoted)
+
+
+def _noted_gap(mutation: str, reason: str) -> dict:
+    """The ``non_blocking`` entry for a survivor that opens no cycle: a ``drop``
+    disposition (noted in the completion note, never filed), titled by the mutation so the
+    engine can dedupe it against an entry the reviewer already wrote, with the reviewer's
+    own note appended when one was given."""
+    detail = (
+        f"The mutation `{mutation}` survived the covering tests (no test failed on it). "
+        "The reviewer did not place it on spec-required behaviour or a money-path/safety "
+        "guard, so under the #614 stopping rule it is noted once and opens no fix cycle."
+    )
+    if reason:
+        detail += f" Reviewer note: {reason}"
+    return {
+        "title": f"surviving mutant: {mutation}"[:_MAX_NOTED_TITLE],
+        "detail": detail,
+        "disposition": "drop",
+    }
+
+
+def unchecked_named_survivors(open_mutants: Collection[str], output: dict) -> list[str]:
+    """Which of a fix cycle's named survivors this re-review did NOT re-apply (#614).
+
+    The re-review is told to copy each named ``mutation`` string verbatim into its own
+    ``mutation_checks``; the match is on the same normalization the convergence fingerprint
+    uses (whitespace-collapsed, case-folded), so cosmetic rewording still counts. Pure; the
+    engine events the misses (``named_survivor_unchecked``) and never vetoes on them — a
+    reviewer that reads the fix instead of re-running it has still reviewed.
+    """
+    if not open_mutants:
+        return []
+    checks = output.get("mutation_checks")
+    seen: set[str] = set()
+    if isinstance(checks, list):
+        for check in checks:
+            if isinstance(check, dict):
+                text = _mutation_text(check)
+                if text:
+                    seen.add(_normalize_mutation(text))
+    return [m for m in open_mutants if _normalize_mutation(m) not in seen]
+
+
+def _normalize_mutation(text: str) -> str:
+    """The match key for a named survivor: the same whitespace/case fold the convergence
+    fingerprint applies, so a re-review's cosmetic rewording of the mutation still counts."""
+    return re.sub(r"\s+", " ", str(text)).strip().casefold()[:_MAX_MUTATION_TEXT]
+
+
 def _not_checked_reason(output: dict) -> str | None:
     """The reviewer's stated reason for not proving the verdict, or None when blank."""
     reason = output.get("tests_not_checked_reason")

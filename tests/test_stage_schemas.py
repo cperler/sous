@@ -190,3 +190,21 @@ def test_default_outputs_satisfy_their_schemas() -> None:
         schema = load_stage_schema(STAGE_SPECS[stage].schema_ref)
         errors = list(Draft202012Validator(schema).iter_errors(_default_output(stage)))
         assert not errors, f"{stage.value} default output violates its schema: {errors}"
+
+
+def test_review_schemas_accept_the_survivor_blocking_fields_and_the_old_shape() -> None:
+    """#614: `blocking`/`blocking_reason` are optional on a mutation_checks item, in the
+    single-reviewer contract and the find:tests finder contract alike."""
+    base = {"approved": True, "issues": [], "tests_meaningful": True}
+    old = {"mutation": "a.py:1 drop the guard", "failed_tests": []}
+    new = {**old, "blocking": True, "blocking_reason": "the spec requires it"}
+    for ref, wrap in (("review", lambda c: {**base, "mutation_checks": [c]}),
+                      ("review_findings", lambda c: {"findings": [], "mutation_checks": [c]})):
+        validator = Draft202012Validator(load_stage_schema(ref))
+        assert not list(validator.iter_errors(wrap(old)))
+        assert not list(validator.iter_errors(wrap(new)))
+        assert list(validator.iter_errors(wrap({**old, "blocking": "yes"})))
+        assert list(validator.iter_errors(wrap({**old, "blocking_reason": 3})))
+        item = load_stage_schema(ref)["properties"]["mutation_checks"]["items"]
+        assert {"blocking", "blocking_reason"} <= set(item["properties"])
+        assert "blocking" not in item["required"]
