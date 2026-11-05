@@ -615,6 +615,8 @@ def _is_blocking_flag(value: object) -> bool:
 
 
 def _mutation_text(check: dict) -> str:
+    """One check's ``mutation`` string, whitespace-collapsed and bounded; ``""`` when
+    absent or blank (a model may omit it), so callers can skip the check in one test."""
     return re.sub(r"\s+", " ", str(check.get("mutation") or "")).strip()[:_MAX_MUTATION_TEXT]
 
 
@@ -683,6 +685,10 @@ def surviving_mutant_disposition(output: dict) -> SurvivorDisposition:
 
 
 def _noted_gap(mutation: str, reason: str) -> dict:
+    """The ``non_blocking`` entry for a survivor that opens no cycle: a ``drop``
+    disposition (noted in the completion note, never filed), titled by the mutation so the
+    engine can dedupe it against an entry the reviewer already wrote, with the reviewer's
+    own note appended when one was given."""
     detail = (
         f"The mutation `{mutation}` survived the covering tests (no test failed on it). "
         "The reviewer did not place it on spec-required behaviour or a money-path/safety "
@@ -720,6 +726,8 @@ def unchecked_named_survivors(open_mutants: Collection[str], output: dict) -> li
 
 
 def _normalize_mutation(text: str) -> str:
+    """The match key for a named survivor: the same whitespace/case fold the convergence
+    fingerprint applies, so a re-review's cosmetic rewording of the mutation still counts."""
     return re.sub(r"\s+", " ", str(text)).strip().casefold()[:_MAX_MUTATION_TEXT]
 
 
