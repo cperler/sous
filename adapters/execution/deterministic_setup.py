@@ -39,6 +39,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from orchestrator.policy_gate import fingerprints
 from orchestrator.port_registry import (
     port_env_for,
     project_needs_ports,
@@ -57,6 +58,10 @@ from .worktree_origin import (
     remove_fresh_install_paths,
     verify_worktree_origin,
 )
+
+# #591: bound for one lint/typecheck leg at intake, the same as the REVIEW gate's bound.
+_LINT_BASELINE_TIMEOUT_S = 300
+_LINT_BASELINE_LEGS = (("lint", "typecheck_cmd"), ("typecheck", "types_cmd"))
 
 
 def _ref_safe(s: str) -> str:
@@ -235,7 +240,12 @@ class DeterministicSetupRunner:
                 notices = inherited_notices + notices
                 port_env = port_env_for(self._project, *ports) if ports else None
                 baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
+                lint_fields, lint_notices = self._capture_lint_baseline(
+                    worktree, inherited, task_id=work.task_id
+                )
+                notices += lint_notices
                 out.update({
+                    **lint_fields,
                     "baseline_captured": baseline["captured"],
                     "baseline_failures": baseline["failures"],
                     "baseline": (
@@ -347,6 +357,10 @@ class DeterministicSetupRunner:
         # a server binds this task's ports even at the intake baseline run.
         port_env = port_env_for(self._project, *ports) if ports else None
         baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
+        lint_fields, lint_notices = self._capture_lint_baseline(
+            worktree, inherited, task_id=work.task_id
+        )
+        notices += lint_notices
         dep_note = (
             f"; composed deps: {', '.join(composed_deps)}" if composed_deps else ""
         )
@@ -368,6 +382,7 @@ class DeterministicSetupRunner:
                 f"tests: {baseline['note']}"
             ),
             **_baseline_provenance(baseline),  # #553: set only when the result was reused
+            **lint_fields,  # #591: what lint/typecheck already report at base
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
             # #385: what the worktree already held before this run touched it.
             **inherited,
@@ -542,6 +557,85 @@ class DeterministicSetupRunner:
                  f"regression diff unavailable"
         )
         return {"captured": True, "failures": failures[:40], "note": note}
+
+    def _capture_lint_baseline(
+        self, worktree: Path, inherited: dict[str, object], *, task_id: str
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+        """Record what the declared lint/typecheck legs already report at base (#591), so
+        REVIEW can block only on what the task added. Returns ``(output fields, notices)``.
+
+        Never fatal and never fabricated. A leg that times out, errors, or is red with output
+        that cannot be read contributes nothing and raises a notice, so its findings at REVIEW
+        read as new and block as they always did. A worktree not verifiably clean at intake is
+        skipped outright: a dead run's lint error must not be recorded as pre-existing."""
+        if inherited.get("inherited_changes_count") != 0:
+            return {"baseline_lint": [],
+                    "baseline_lint_note": "skipped: worktree not verifiably clean at intake"}, ()
+        entries: list[str] = []
+        notes: list[str] = []
+        notices: list[dict[str, object]] = []
+        for leg, method in _LINT_BASELINE_LEGS:
+            getter = getattr(self._project, method, None)
+            try:
+                argv = getter() if callable(getter) else None
+            except Exception:  # noqa: BLE001 - a project command surface must never fail setup
+                argv = None
+            if not argv or argv == ["true"]:  # undeclared, or the no-op sentinel
+                continue
+            result = self._lint_leg_baseline(worktree, argv, task_id)
+            notes.append(f"{leg}: {result['note']}")
+            if result["captured"]:
+                entries.extend(result["failures"])
+            else:
+                notices.append({
+                    "notice": "lint_baseline_not_captured",
+                    "leg": leg,
+                    "detail": f"{leg} baseline not captured ({result['note']}); its findings "
+                              "will block at REVIEW even if they were already at base",
+                })
+        fields: dict[str, object] = {
+            "baseline_lint": entries,
+            "baseline_lint_note": "; ".join(notes) or "n/a (no lint or typecheck command)",
+        }
+        return fields, tuple(notices)
+
+    def _lint_leg_baseline(self, worktree: Path, argv: list[str], task_id: str) -> dict:
+        """One leg's result, shared across same-tree tasks the way the test baseline is (#553):
+        a batch on one machine should not run mypy N times over identical code."""
+        keyed = (
+            baseline_cache.compute_key(worktree, argv, self._project)
+            if self._baseline_cache_dir is not None
+            else None
+        )
+        if keyed is None or self._baseline_cache_dir is None:
+            return self._run_lint_leg(worktree, argv)
+        key, tree = keyed
+        result, provenance = baseline_cache.cached_or_run(
+            self._baseline_cache_dir, key, tree=tree, task_id=task_id,
+            run_fn=lambda: self._run_lint_leg(worktree, argv),
+        )
+        if provenance is None:
+            return result
+        return {**result, "note": f"reused from {provenance['source_task']} ({result['note']})"}
+
+    @staticmethod
+    def _run_lint_leg(worktree: Path, argv: list[str]) -> dict:
+        """Actually run one leg and read its findings (the uncached capture)."""
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=worktree, capture_output=True, text=True,
+                timeout=_LINT_BASELINE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - a lint baseline must never fail setup
+            return {"captured": False, "failures": [], "note": f"error ({type(exc).__name__})"}
+        if proc.returncode == 0:
+            return {"captured": True, "failures": [], "note": "green at base"}
+        found = fingerprints(f"{proc.stdout}\n{proc.stderr}", str(worktree))
+        if found is None:
+            return {"captured": False, "failures": [],
+                    "note": f"rc={proc.returncode} with output that could not be read"}
+        return {"captured": True, "failures": found,
+                "note": f"{len(found)} finding(s) already at base"}
 
     def _classify_baseline(self, test_output: str) -> list[str]:
         """Failing-test ids from raw output via the project classifier (best-effort)."""

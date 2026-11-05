@@ -119,6 +119,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
+from .policy_gate import apply_lint_baseline
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -400,6 +401,9 @@ def _validated_budget(value: float | None, *, field: str, run_id: str) -> float 
 # thousands of lines, but the event/issue only needs the last few for the operator to see
 # what broke. Truncation is never silent — the caller marks a trimmed tail as such.
 _TRUNK_GATE_TAIL_LINES = 40
+# The unit suite's key in ``Engine._project_commands``. IMPLEMENT's denial reads the same joined
+# string the prompt shows the model, so the two cannot name different commands (#626).
+_UNIT_SUITE_LABEL = "test (unit)"
 
 # Bound the post-commit attribution scan (#322). A stage produces a handful of commits; a
 # three-figure range means the anchor was wrong (a stale checkpoint, a rebased branch), and
@@ -1983,12 +1987,27 @@ class Engine:
         # derived — nothing run-level to persist (#206), so re-reading the spec at every
         # dispatch boundary is the whole mechanism.
         tool_policy = None if deterministic else spec.tool_policy
+        project_commands = self._project_commands()
+        # #626: TEST runs the whole suite next, and IMPLEMENT kept timing out waiting on its
+        # own run of it, so IMPLEMENT may not run the project's declared unit command as is.
+        denied_unit_suite = (
+            project_commands.get(_UNIT_SUITE_LABEL)
+            if stage is Stage.IMPLEMENT and not deterministic
+            else None
+        )
+        if denied_unit_suite:
+            tool_policy = (tool_policy or ToolPolicy()).model_copy(
+                update={"denied_commands": (denied_unit_suite,)}
+            )
         # Honesty gate (#272): a lane that cannot translate the posture into a real provider
         # restriction (the interactive shim — its `agent()` call takes no tool argument) still
         # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
         # Resolved BEFORE the prompt render because #302 made it prompt-affecting: on such a
         # lane the posture is stated in-band, which is the only enforcement available there.
-        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
+        unenforced_policy = tool_policy is not None and (
+            not self._lane_enforces_tool_policy(lane)
+            or (bool(tool_policy.denied_commands) and not self._lane_enforces_command_denials(lane))
+        )
         # Permission posture (#304): the lane's declared default, tightened to RESTRICTED by a
         # write-denying stage posture — so `--dangerously-skip-permissions` is a decision made
         # here from (lane, stage), not a constant in the transport. None on the deterministic
@@ -2005,8 +2024,9 @@ class Engine:
             body=task.body,
             learnings=learnings,
             context=task.context,
-            project_commands=self._project_commands(),
+            project_commands=project_commands,
             tool_posture_unenforced=unenforced_policy,
+            denied_unit_suite=denied_unit_suite,
             # #390: the reviewer runs commands in this workspace, so tell it in-band when
             # nothing can prove the workspace's toolchain is its own. Stated on EVERY lane
             # with no declared hooks, not only the lane that also fails the #391 capability
@@ -2360,6 +2380,14 @@ class Engine:
         makes the gap visible rather than assuming protection the lane may not have."""
         try:
             return self.registry.describe(lane).enforces_tool_policy
+        except NoRunnerError:
+            return False
+
+    def _lane_enforces_command_denials(self, lane: LanePolicy) -> bool:
+        """Does the resolved lane turn ``ToolPolicy.denied_commands`` into a refusal (#626)?
+        An unregistered lane counts as NOT enforcing, as in ``_lane_enforces_tool_policy``."""
+        try:
+            return self.registry.describe(lane).enforces_command_denials
         except NoRunnerError:
             return False
 
@@ -4191,13 +4219,19 @@ class Engine:
         blocking?=True}``. Blocking findings join ``issues`` and force
         ``approved=false`` (severity defaults to critical so a repeated policy finding
         can never convergence-auto-approve past the gate); non-blocking ones join
-        ``non_blocking`` and get filed as follow-up issues at finalize."""
+        ``non_blocking`` and get filed as follow-up issues at finalize, unless they carry
+        their own ``disposition`` (``drop`` is noted, not filed).
+
+        #591: a red lint or type finding that carries ``gate_output`` is compared against
+        ``task.baseline_lint`` here, so only what this change added blocks. A
+        ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
+        event, which is how a green benchmark's load and timing reach the run log."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
+        worktree = task.context.get("worktree")
         try:
-            findings = [f for f in (hook(worktree=task.context.get("worktree")) or [])
-                        if isinstance(f, dict) and str(f.get("description") or "").strip()]
+            raw = [f for f in (hook(worktree=worktree) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -4205,6 +4239,18 @@ class Engine:
                  "task_id": task.task_id, "error": str(exc)},
             )
             return result
+        for entry in raw:
+            if isinstance(entry.get("gate_record"), dict):
+                self.store.append_event(
+                    run_id,
+                    {**entry["gate_record"], "ts": _now(), "type": "policy_gate_result",
+                     "run_id": run_id, "task_id": task.task_id},
+                )
+        findings = apply_lint_baseline(
+            [f for f in raw if str(f.get("description") or "").strip()],
+            task.baseline_lint,
+            worktree if isinstance(worktree, str) else None,
+        )
         if not findings:
             return result
         out = dict(result.structured_output or {})
@@ -4213,7 +4259,7 @@ class Engine:
         if blocking:
             issues = list(out.get("issues") or [])
             for f in blocking:
-                issue = {k: v for k, v in f.items() if k != "blocking"}
+                issue = {k: v for k, v in f.items() if k not in ("blocking", "disposition")}
                 issue.setdefault("severity", "critical")  # a policy gate is a hard gate
                 issues.append(issue)
             out["issues"] = issues
@@ -4221,9 +4267,9 @@ class Engine:
         if advisory:
             nb = list(out.get("non_blocking") or [])
             nb.extend(
-                {"title": str(f.get("description"))[:80],
+                {"title": str(f.get("description")).strip().splitlines()[0][:80],
                  "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"}),
-                 "disposition": "file"}
+                 "disposition": str(f.get("disposition") or "file")}
                 for f in advisory
             )
             out["non_blocking"] = nb
@@ -7861,7 +7907,7 @@ class Engine:
         out: dict[str, str] = {}
         for label, getter in (
             ("install", self.project.install_cmd),
-            ("test (unit)", self.project.test_unit_cmd),
+            (_UNIT_SUITE_LABEL, self.project.test_unit_cmd),
             # e2e/shell were declared on the adapter but invisible to prompts — the
             # model could never learn the project HAS an e2e suite. Optional (getattr):
             # a minimal adapter without them still works.

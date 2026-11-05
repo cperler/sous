@@ -23,7 +23,10 @@ tracker or fix-forward.
   policy-gate seam — runs ruff and mypy over the task worktree at REVIEW and returns a
   BLOCKING finding on red, which overrides an approving reviewer and re-opens the fix
   cycle with the tool output as learnings. A leg that cannot run at all degrades to
-  advisory, so unverified never reads as green.
+  advisory, so unverified never reads as green. Only what the task caused blocks (#591):
+  INTAKE records what ruff and mypy already report at `base_sha` as `Task.baseline_lint`,
+  and a generated adapter's benchmark must be red twice on a machine that was not
+  overloaded (`orchestrator/policy_gate.py`).
 - **Nothing is silently dropped** (`gh issue list -R cperler/sous`).
   Anything cut, thinned, or found-missing while building gets an ordinary issue with a
   `**Source:** #N` line naming the task that cut it — that line, not a label, is what

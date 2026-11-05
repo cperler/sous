@@ -239,6 +239,10 @@ _MAX_ITEM_STR = 500  # a string element inside a list value (the default per-ite
 _MAX_LIST = 40  # elements kept from a list value
 _MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
 _MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice (#201)
+# #591: Task.baseline_lint entries kept. Generous because a repo can carry hundreds of old lint
+# errors, and bounded because the task doc is rewritten on every update. An entry past the cap
+# is reported, and its finding reads as new at REVIEW, which blocks as it did before #591.
+_MAX_BASELINE_LINT = 2000
 
 # #289: the per-item cap is chosen by what a FIELD MEANS, not by the value's python type.
 # A SCOPE ``plan`` is an ordered list of prose subtask INSTRUCTIONS — routinely well over
@@ -457,6 +461,22 @@ def _absorb_outputs(
         relaxation = relax_claims(declaration.claims, declaration.modes, parallel_safe_paths)
         relaxed_claims = relaxation.relaxed
         task.scope_file_modes = relaxation.modes
+    # #591: what the lint/type tools already report at base. A durable task field, not a context
+    # key: the context plane caps a list at 40 items (the rest would read as new errors) and
+    # feeds every later prompt. ENGINE lane only, so a model cannot excuse its own errors.
+    if result.stage is Stage.INTAKE and engine_lane and "baseline_lint" in out:
+        raw_lint = out["baseline_lint"]
+        entries = (
+            [e for e in raw_lint if isinstance(e, str)] if isinstance(raw_lint, list) else []
+        )
+        task.baseline_lint = entries[:_MAX_BASELINE_LINT]
+        if len(entries) > _MAX_BASELINE_LINT:
+            truncations.append({
+                "field": "baseline_lint",
+                "part": "list_tail",
+                "kept_items": _MAX_BASELINE_LINT,
+                "dropped_items": len(entries) - _MAX_BASELINE_LINT,
+            })
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,

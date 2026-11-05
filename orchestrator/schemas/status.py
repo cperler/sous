@@ -313,6 +313,11 @@ class Task(_StatusModel):
     # one it would neither wait for nor block anybody. The flag tells a status reader a
     # guess from a declaration, and lets ``refresh_spec`` re-guess before the claim is held.
     # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
+    # ``baseline_lint`` (#591) is what the declared lint/type tools already reported at
+    # ``base_sha``, as location-free fingerprints (``orchestrator.policy_gate``). REVIEW blocks
+    # only on findings not listed here. Empty means none, or never captured; either way every
+    # finding reads as new, so a missing baseline blocks exactly as it did before #591.
+    baseline_lint: list[str] = Field(default_factory=list)
     scope_files: list[str] = Field(default_factory=list)
     scope_file_modes: dict[str, str] = Field(default_factory=dict)
     scope_files_inferred: bool = False

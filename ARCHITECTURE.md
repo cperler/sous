@@ -88,6 +88,11 @@ written.
   adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
   it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
   prompted), independent of the permission gate below.
+  **IMPLEMENT** carries `ToolPolicy.denied_commands` naming the project's declared unit-suite
+  command (#626), because TEST runs it next and waiting on it here caused IMPLEMENT timeouts.
+  Claude translates it to `Bash(<command>)`, which refuses the bare, piped and wrapped forms and
+  leaves targeted runs alone. Codex has no per-command flag, so there the rule is prompt-only and
+  `tool_policy_unenforced` says so (`CapabilityDescriptor.enforces_command_denials`).
 - **REVIEW execution isolation** (#301). Every in-process headless REVIEW transport call runs
   in an independent throwaway local clone seeded with the live worktree payload (including
   ignored dependencies and dirty state, excluding its linked `.git`). The clone has its own
@@ -390,7 +395,12 @@ never satisfy.
   `max_review_cycles`). Convergence auto-approval (`_review_verdict`): a re-review whose
   blocking issues are a subset of the prior rejection's — no net-new findings — ends the
   loop. Deterministic project policy findings merge in via the `review_findings` hook (#65)
-  and force `approved=false`. An improvement — or a non-blocking finding (#414) —
+  and force `approved=false`, but only for problems the task caused (#591,
+  `orchestrator/policy_gate.py`). INTAKE records what lint and typecheck already report at
+  base as `Task.baseline_lint`, and `_merge_policy_findings` blocks only on findings not in
+  it; the inherited ones are noted, not filed. A red benchmark re-runs once, records load and
+  CPU count on every outcome (`policy_gate_result` event), and blocks only when red twice on
+  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. An improvement — or a non-blocking finding (#414) —
   dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
   requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
   whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains

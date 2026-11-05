@@ -126,8 +126,15 @@ class TaskSource(Protocol):
     #       a REVIEW stage completes; each finding is {description, severity?, file?,
     #       line?, suggested_fix?, blocking?=True}. Blocking findings merge into the
     #       review's `issues` and force approved=false (the model cannot skip a policy
-    #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups.
-    #       Must be best-effort and fast — it runs inline in record().
+    #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups,
+    #       unless they carry `disposition` (`drop` is noted, not filed). Must be
+    #       best-effort and fast — it runs inline in record(). The exception is a red
+    #       benchmark, re-run once, so it can take two bench timeouts inline (#591).
+    #       Two optional additions (#591, helpers in orchestrator/policy_gate.py):
+    #       `gate_leg` + `gate_output` on a red lint/type finding make the engine compare
+    #       the output against Task.baseline_lint, so only what the change added blocks;
+    #       and a `{gate_record: {...}}` entry is not a finding but a `policy_gate_result`
+    #       event, which is how a green benchmark's load and timing reach the run log.
     #
     #   notify(kind: str, payload: dict) -> None
     #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify
