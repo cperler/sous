@@ -354,6 +354,9 @@ def _validated_budget(value: float | None, *, field: str, run_id: str) -> float 
 # thousands of lines, but the event/issue only needs the last few for the operator to see
 # what broke. Truncation is never silent — the caller marks a trimmed tail as such.
 _TRUNK_GATE_TAIL_LINES = 40
+# The unit suite's key in ``Engine._project_commands``. IMPLEMENT's denial reads the same joined
+# string the prompt shows the model, so the two cannot name different commands (#626).
+_UNIT_SUITE_LABEL = "test (unit)"
 
 # Bound the post-commit attribution scan (#322). A stage produces a handful of commits; a
 # three-figure range means the anchor was wrong (a stale checkpoint, a rebased branch), and
@@ -1903,12 +1906,27 @@ class Engine:
         # derived — nothing run-level to persist (#206), so re-reading the spec at every
         # dispatch boundary is the whole mechanism.
         tool_policy = None if deterministic else spec.tool_policy
+        project_commands = self._project_commands()
+        # #626: TEST runs the whole suite next, and IMPLEMENT kept timing out waiting on its
+        # own run of it, so IMPLEMENT may not run the project's declared unit command as is.
+        denied_unit_suite = (
+            project_commands.get(_UNIT_SUITE_LABEL)
+            if stage is Stage.IMPLEMENT and not deterministic
+            else None
+        )
+        if denied_unit_suite:
+            tool_policy = (tool_policy or ToolPolicy()).model_copy(
+                update={"denied_commands": (denied_unit_suite,)}
+            )
         # Honesty gate (#272): a lane that cannot translate the posture into a real provider
         # restriction (the interactive shim — its `agent()` call takes no tool argument) still
         # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
         # Resolved BEFORE the prompt render because #302 made it prompt-affecting: on such a
         # lane the posture is stated in-band, which is the only enforcement available there.
-        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
+        unenforced_policy = tool_policy is not None and (
+            not self._lane_enforces_tool_policy(lane)
+            or (bool(tool_policy.denied_commands) and not self._lane_enforces_command_denials(lane))
+        )
         # Permission posture (#304): the lane's declared default, tightened to RESTRICTED by a
         # write-denying stage posture — so `--dangerously-skip-permissions` is a decision made
         # here from (lane, stage), not a constant in the transport. None on the deterministic
@@ -1925,8 +1943,9 @@ class Engine:
             body=task.body,
             learnings=learnings,
             context=task.context,
-            project_commands=self._project_commands(),
+            project_commands=project_commands,
             tool_posture_unenforced=unenforced_policy,
+            denied_unit_suite=denied_unit_suite,
             # #390: the reviewer runs commands in this workspace, so tell it in-band when
             # nothing can prove the workspace's toolchain is its own. Stated on EVERY lane
             # with no declared hooks, not only the lane that also fails the #391 capability
@@ -2280,6 +2299,14 @@ class Engine:
         makes the gap visible rather than assuming protection the lane may not have."""
         try:
             return self.registry.describe(lane).enforces_tool_policy
+        except NoRunnerError:
+            return False
+
+    def _lane_enforces_command_denials(self, lane: LanePolicy) -> bool:
+        """Does the resolved lane turn ``ToolPolicy.denied_commands`` into a refusal (#626)?
+        An unregistered lane counts as NOT enforcing, as in ``_lane_enforces_tool_policy``."""
+        try:
+            return self.registry.describe(lane).enforces_command_denials
         except NoRunnerError:
             return False
 
@@ -7781,7 +7808,7 @@ class Engine:
         out: dict[str, str] = {}
         for label, getter in (
             ("install", self.project.install_cmd),
-            ("test (unit)", self.project.test_unit_cmd),
+            (_UNIT_SUITE_LABEL, self.project.test_unit_cmd),
             # e2e/shell were declared on the adapter but invisible to prompts — the
             # model could never learn the project HAS an e2e suite. Optional (getattr):
             # a minimal adapter without them still works.

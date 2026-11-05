@@ -64,7 +64,8 @@ class StageSpec:
     # like ``effort``). None = the historical everything-allowed posture, which every
     # non-REVIEW stage keeps: ``implement`` legitimately edits files, ``test`` fixes
     # regressions. Only REVIEW declares one, because only REVIEW's contract is
-    # read-and-report.
+    # read-and-report. IMPLEMENT's denied suite command (#626) is added at dispatch, because
+    # the command comes from the project adapter, not the stage.
     tool_policy: ToolPolicy | None = None
 
 
@@ -424,6 +425,21 @@ _TEST_VERDICT_VERIFIED_DIRECTIVE = (
     "regressions, then commit and return. If you do need a wide run, use the declared command "
     "exactly as written."
 )
+
+
+def _unit_suite_denied_directive(command: str) -> str:
+    """The #626 IMPLEMENT block explaining the whole-suite denial.
+
+    The CLI's refusal is its own fixed text ("Permission to use Bash ... has been denied") and
+    cannot carry a reason, so the reason is stated here. It is also the only statement of the
+    rule on a lane that cannot enforce it."""
+    return (
+        "\n\n## Full test suite\n"
+        f"Do not run `{command}` in this stage: TEST runs the full suite next. Run only the "
+        "tests for what you changed, by naming them, and report those results. A permission "
+        "refusal of that command comes from this rule, not a broken tool, so do not reword "
+        "the command to get past it."
+    )
 
 
 # The #41 docs-only directive, verbatim. Hoisted to a constant so the single-reviewer
@@ -864,6 +880,7 @@ def render_prompt(
     impacted_tests: Sequence[str] | None = None,
     test_verdict_verified: bool = False,
     keep_open_issue: int | None = None,
+    denied_unit_suite: str | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -936,6 +953,10 @@ def render_prompt(
       ``Part of``, so the stage gets the right keyword rather than a rule to remember.
       Default None, so every other task's prompt is byte-identical.
 
+    - IMPLEMENT + ``denied_unit_suite`` (#626): names the project's whole-suite command, which
+      this dispatch's ``tool_policy`` denies, and says TEST runs it next. Default None, so a
+      project with no declared unit command gets a byte-identical prompt.
+
     The frontend and inherited-changes blocks read model-influenced context rather than
     ENGINE-lane parameters (unlike ``change_class``) because both ADD scrutiny or attribution — never a relaxation; see
     ``render_review_plan`` for the same boundary stated over the finder set.
@@ -955,6 +976,8 @@ def render_prompt(
             _DELIVER_CLOSES_SENTENCE, _deliver_keep_open_sentence(keep_open_issue)
         )
     instruction = f"## {stage.value.upper()}\n{template}"
+    if stage is Stage.IMPLEMENT and denied_unit_suite:
+        instruction += _unit_suite_denied_directive(denied_unit_suite)
     # #41: a deterministically-tagged docs-only change has no behavioral surface. Tell REVIEW
     # to skip test-coverage / tests_meaningful criteria for it, so the
     # reviewer doesn't demand (or reject over) unreachable coverage. The tag is set only by

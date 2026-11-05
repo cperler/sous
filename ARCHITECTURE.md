@@ -88,6 +88,11 @@ written.
   adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
   it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
   prompted), independent of the permission gate below.
+  **IMPLEMENT** carries `ToolPolicy.denied_commands` naming the project's declared unit-suite
+  command (#626), because TEST runs it next and waiting on it here caused IMPLEMENT timeouts.
+  Claude translates it to `Bash(<command>)`, which refuses the bare, piped and wrapped forms and
+  leaves targeted runs alone. Codex has no per-command flag, so there the rule is prompt-only and
+  `tool_policy_unenforced` says so (`CapabilityDescriptor.enforces_command_denials`).
 - **REVIEW execution isolation** (#301). Every in-process headless REVIEW transport call runs
   in an independent throwaway local clone seeded with the live worktree payload (including
   ignored dependencies and dirty state, excluding its linked `.git`). The clone has its own

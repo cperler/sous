@@ -57,6 +57,8 @@ class HeadlessClaudeRunner:
                 # is enforced even under `--dangerously-skip-permissions` (probed: the tool is
                 # absent from the toolset, not merely prompted for).
                 enforces_tool_policy=True,
+                # #626: `--disallowedTools "Bash(<command>)"` refuses that one command.
+                enforces_command_denials=True,
                 verifies_worktree_origin=True,
                 verifies_test_verdict=self._project is not None,
                 status=SUPPORTED,
