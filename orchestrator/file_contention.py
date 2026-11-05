@@ -29,8 +29,11 @@ a claim about the edit, not about the file — the same `tests/test_x.py` can ta
 independent new test case from one task and a rewritten fixture from another — so the
 classification comes from SCOPE (a per-path ``append``/``rewrite`` mode), never from a
 path glob the engine owns. A glob list would be project-specific policy inside a
-project-agnostic engine; if a project wants one it belongs to its adapter, which can
-shape what SCOPE declares.
+project-agnostic engine, so the list belongs to the adapter and the engine owns only the
+matching (#628): ``relax_claims`` moves a claim on a path the adapter's
+``parallel_safe_paths`` globs match from ``rewrite`` to ``append``, whatever the model wrote,
+and returns what it moved so the engine can event it. A cautious model never declared
+``append`` on a doc, so 15 of 28 contention waits across 61 runs were markdown-only.
 
 The rule is asymmetric, because only a REWRITE can produce the silent breakage the gate
 exists to prevent:
@@ -41,7 +44,8 @@ exists to prevent:
 * any ``rewrite`` on a path serializes everything else on it, in either direction.
 
 ``rewrite`` is the default and the fallback for anything unclear, so a declaration that
-predates #426, omits the mode, or gets the mode wrong behaves exactly as it did before.
+predates #426, omits the mode, or gets the mode wrong behaves exactly as it did before,
+unless the adapter marked that path parallel-safe.
 """
 
 from __future__ import annotations
@@ -67,7 +71,8 @@ _MAX_NOTICE_VALUE = 200
 #: The declared edit mode for one claimed path (#426). ``REWRITE`` is the DEFAULT in every
 #: direction — a bare-string declaration, an absent mode, a task doc written before #426,
 #: and a mode the engine could not parse all mean ``REWRITE`` — so the gate can only ever
-#: get *more* permissive by an explicit, well-formed claim.
+#: get *more* permissive by an explicit, well-formed claim or an adapter's parallel-safe
+#: glob (#628).
 MODE_APPEND = "append"
 MODE_REWRITE = "rewrite"
 MODES = (MODE_APPEND, MODE_REWRITE)
@@ -110,6 +115,24 @@ class ClaimDeclaration(NamedTuple):
     claims: tuple[str, ...]
     modes: dict[str, str]
     notices: list[dict[str, object]]
+
+
+class ClaimRelaxation(NamedTuple):
+    """What :func:`relax_claims` decided: the append map to store, and what it moved.
+
+    ``relaxed`` has one notice per path moved from ``rewrite`` to ``append``, naming the
+    glob that matched, for the caller to event as ``file_claim_mode_relaxed``.
+    """
+
+    modes: dict[str, str]
+    relaxed: list[dict[str, object]]
+
+
+class ParallelSafeGlobs(NamedTuple):
+    """An adapter's ``parallel_safe_paths`` value, checked: the usable globs and the rest."""
+
+    globs: tuple[str, ...]
+    rejected: list[dict[str, object]]
 
 
 class Deferral(NamedTuple):
@@ -239,6 +262,74 @@ def normalize_claims(raw: object) -> ClaimDeclaration:
     kept = set(claims)
     appends = {p: m for p, m in modes.items() if m == MODE_APPEND and p in kept}
     return ClaimDeclaration(tuple(claims), appends, notices)
+
+
+def normalize_parallel_safe_globs(raw: object) -> ParallelSafeGlobs:
+    """An adapter's ``parallel_safe_paths`` value → usable globs plus a notice per reject.
+
+    Anything unusable relaxes nothing, because a claim left at ``rewrite`` still serializes,
+    which is the safe direction. A bare string is rejected rather than read as a sequence of
+    one-letter globs.
+    """
+    if isinstance(raw, str) or not isinstance(raw, Sequence):
+        return ParallelSafeGlobs((), [{"reason": "not_a_list", "value": _bound(raw)}])
+    globs: list[str] = []
+    rejected: list[dict[str, object]] = []
+    for item in raw:
+        if not isinstance(item, str):
+            rejected.append({"reason": "not_a_string", "value": _bound(item)})
+        elif not item.strip():
+            rejected.append({"reason": "empty", "value": _bound(item)})
+        else:
+            globs.append(item.strip())
+    return ParallelSafeGlobs(tuple(dict.fromkeys(globs)), rejected)
+
+
+def _glob_regex(glob: str) -> re.Pattern[str]:
+    """Compile one parallel-safe glob, with gitignore-style rules and case-sensitively.
+
+    ``*`` and ``?`` stop at ``/``, ``**/`` matches zero or more directories, and a trailing
+    ``**`` matches everything below. A glob with no ``/`` matches the file name at any depth.
+    ``fnmatch`` cannot express this: its ``*`` crosses ``/``, and its ``docs/**/*.md`` needs
+    a directory between the two, so it would miss ``docs/DEPLOY.md``.
+    """
+    pattern = glob.removeprefix("./")
+    parts: list[str] = [] if "/" in pattern else ["(?:[^/]+/)*"]
+    i = 0
+    while i < len(pattern):
+        at_segment_start = i == 0 or pattern[i - 1] == "/"
+        if at_segment_start and pattern.startswith("**/", i):
+            parts.append("(?:[^/]+/)*")
+            i += 3
+        elif at_segment_start and pattern[i:] == "**":
+            parts.append(".*")
+            i += 2
+        else:
+            char = pattern[i]
+            parts.append({"*": "[^/]*", "?": "[^/]"}.get(char, re.escape(char)))
+            i += 1
+    return re.compile("".join(parts))
+
+
+def relax_claims(
+    claims: Sequence[str], modes: Mapping[str, str], globs: Sequence[str]
+) -> ClaimRelaxation:
+    """Move each ``rewrite`` claim on an adapter-declared parallel-safe path to ``append``.
+
+    A path already declared ``append`` is not a relaxation, so it gets no notice. Pure: the
+    globs are an input, so the fold layer can call this and stay deterministic.
+    """
+    compiled = [(glob, _glob_regex(glob)) for glob in globs]
+    relaxed_modes = dict(modes)
+    relaxed: list[dict[str, object]] = []
+    for path in claims:
+        if modes.get(path, MODE_REWRITE) == MODE_APPEND:
+            continue
+        matched = next((glob for glob, regex in compiled if regex.fullmatch(path)), None)
+        if matched is not None:
+            relaxed_modes[path] = MODE_APPEND
+            relaxed.append({"path": path, "glob": matched, "declared_mode": MODE_REWRITE})
+    return ClaimRelaxation(relaxed_modes, relaxed)
 
 
 #: A URL is removed before path extraction, so ``https://host/a/b.py`` never yields a claim.
@@ -402,6 +493,8 @@ def summarize_contention(events: Sequence[Mapping[str, object]]) -> dict[str, ob
     Those are the deferrals the #426 rule kept on purpose (an appender held by a rewriter);
     an append-vs-append pair no longer produces an event at all, so a falling
     ``append_waiter_deferrals`` alongside a falling total is the mode rule working.
+    ``relaxed_paths`` counts the claims an adapter's parallel-safe glob moved to ``append``
+    (#628), so a later merge conflict on one of those paths can be traced to the relaxation.
 
     Pure: no clock, no I/O. A deferral logged before #426 carries no ``modes`` key and is
     counted as ``mode_unknown`` rather than assumed to be a rewrite — absence is not the
@@ -414,10 +507,16 @@ def summarize_contention(events: Sequence[Mapping[str, object]]) -> dict[str, ob
     claims = 0
     append_waiter_deferrals = 0
     mode_unknown_deferrals = 0
+    relaxed_paths: dict[str, int] = {}
     for ev in events:
         etype = ev.get("type")
         if etype == "file_claim_acquired":
             claims += 1
+            continue
+        if etype == "file_claim_mode_relaxed":
+            relaxed_path = ev.get("path")
+            if isinstance(relaxed_path, str):
+                relaxed_paths[relaxed_path] = relaxed_paths.get(relaxed_path, 0) + 1
             continue
         if etype != "dispatch_deferred_file_contention":
             continue
@@ -446,6 +545,8 @@ def summarize_contention(events: Sequence[Mapping[str, object]]) -> dict[str, ob
         "paths": dict(sorted(paths.items(), key=lambda kv: (-kv[1], kv[0]))),
         "append_waiter_deferrals": append_waiter_deferrals,
         "mode_unknown_deferrals": mode_unknown_deferrals,
+        "relaxed_claims": sum(relaxed_paths.values()),
+        "relaxed_paths": dict(sorted(relaxed_paths.items(), key=lambda kv: (-kv[1], kv[0]))),
     }
 
 

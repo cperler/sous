@@ -202,6 +202,11 @@ class SelfHostConfig:
         # CI — would fail.
         return ["uv", "run", "mypy"]
 
+    def parallel_safe_paths(self) -> list[str]:
+        # The worst case for two tasks editing one markdown file is a textual conflict, which
+        # the batch integration gate reports. It cannot auto-merge into a runtime break (#628).
+        return ["*.md"]
+
     def infra_reset(self) -> list[str]:
         return _NOOP
 

@@ -304,7 +304,9 @@ class Task(_StatusModel):
     # whole-context ceiling can evict a key, which would silently un-serialize a run.
     # ``scope_file_modes`` (#426) is the per-path edit mode SCOPE declared, stored ONLY for
     # the non-default (append) paths: an absent entry means ``rewrite``, so a pre-#426 doc
-    # and a task that declared no modes both contend on every path exactly as before.
+    # and a task that declared no modes both contend on every path exactly as before. A path
+    # the adapter's ``parallel_safe_paths`` globs match is stored as append whatever SCOPE
+    # wrote (#628), and that move is evented as ``file_claim_mode_relaxed``.
     # ``scope_files_inferred`` (#428) marks ``scope_files`` as GUESSED from the issue text
     # at registration rather than declared by an approved SCOPE: a pipeline with no SCOPE
     # stage (micro, lite, a decomposition child) has no other source of claims, and without

@@ -618,19 +618,28 @@ never satisfy.
   independent additions to one file can at worst conflict textually, which is loud and
   cheap. "Append-only" is a claim about the EDIT, not the file, so the classification comes
   from SCOPE and never from a path glob the engine owns: a glob list would be
-  project-specific policy inside a project-agnostic engine, and belongs to the project
-  adapter if anywhere. `rewrite` is the default in every direction — a bare string, an
-  absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
-  `rewrite` — so the rule can only ever be relaxed by an explicit, well-formed claim, and
-  `scope_file_modes` stores only the non-default entries. `events_audit`'s `contention`
-  block reports what the gate actually cost a run (deferrals, distinct tasks deferred, the
-  most-contended paths, and how many deferrals held an append-only waiter), so the
+  project-specific policy inside a project-agnostic engine. The exception is the adapter's
+  own list (#628): SCOPE almost never declared `append`, even for a doc it only added a
+  section to, so about 11 of 20 hours of contention waiting across 61 runs were
+  markdown-only. The optional `parallel_safe_paths()` hook returns globs (selfhost: `*.md`),
+  and a declared or inferred claim on a matching path is stored as `append` whatever SCOPE
+  wrote, at the SCOPE fold or at registration. Each move is evented as
+  `file_claim_mode_relaxed` (path, glob, source), and an unusable hook or entry as
+  `parallel_safe_paths_rejected`, which relaxes nothing. A `rewrite` on a path the globs do
+  not match still serializes. `rewrite` is otherwise the default in every direction — a bare
+  string, an absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
+  `rewrite` — so the rule can only be relaxed by an explicit, well-formed claim or an
+  adapter glob, and `scope_file_modes` stores only the non-default entries.
+  `events_audit`'s `contention` block reports what the gate actually cost a run (deferrals,
+  distinct tasks deferred, the most-contended paths, how many deferrals held an append-only
+  waiter, and which paths were relaxed), so the
   strictness stays re-judgeable from any finished run instead of by hand-grepping
   `events.jsonl` — #377 shipped deliberately over-strict pending exactly that data, and
   `docs/reviews/2026-08-29-file-contention-measurement.md` records the first read of it. A
   task whose pipeline has no SCOPE stage (the `micro`/`lite` presets, a decomposition child)
   gets a model-free guess instead (#428): `add_task` runs `infer_claims_from_text` over the
-  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims,
+  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims
+  (unless an adapter glob relaxes them),
   marks them `scope_files_inferred`, and records a `file_claims_inferred` receipt (empty
   when the text names no file). `refresh_spec` re-guesses until the claim is held. The guess
   only knows what the text names and the gate matches exact paths, so a miss leaves that

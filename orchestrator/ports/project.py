@@ -257,6 +257,19 @@ class ProjectConfig(Protocol):
     # contract): ``keep_open_labels = ("experiment",)`` makes a task sourced from an issue with
     # one of these labels (compared ignoring case) keep that issue open, as if it had been
     # planned with ``keep_issue_open``. A task's own explicit choice still wins.
+    # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
+    # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
+    #   parallel_safe_paths() -> list[str]
+    #       Globs for files whose worst case under two concurrent edits is a textual conflict,
+    #       such as a project's docs. The file-contention gate treats a declared or inferred
+    #       claim on a matching path as ``append`` whatever SCOPE wrote, so two such tasks run
+    #       in parallel, and each move is evented as ``file_claim_mode_relaxed``. ``*`` and
+    #       ``?`` stop at ``/``, ``**/`` matches zero or more directories, a trailing ``**``
+    #       matches everything below, and a glob with no ``/`` matches the file name at any
+    #       depth. Matching is case-sensitive. Absent means no path is relaxed. A hook that
+    #       raises or returns a non-list relaxes nothing and emits
+    #       ``parallel_safe_paths_rejected``. Never list code: only a rewrite can cause the
+    #       silent merge breakage the gate exists to prevent, and this removes the rewrite.
     # Optional impacted-test selection hooks (#558; duck-typed via ``getattr``, NOT part of
     # the versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   impacted_tests(changed: list[str], *, cwd: str | None = None) -> list[str] | None
