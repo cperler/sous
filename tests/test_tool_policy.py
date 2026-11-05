@@ -14,6 +14,7 @@ The load-bearing properties under test:
 * each transport TRANSLATES it (claude `--disallowedTools`, codex `--sandbox read-only` on
   BOTH the fresh and resume call shapes, so continuity can't silently revert the posture);
 * an unset posture leaves every argv and every content_hash byte-identical to pre-#272;
+* #626 — IMPLEMENT is denied the project's whole-suite command and no other stage is;
 * a panel's finders and verifiers INHERIT it (the 12-agent hole);
 * a lane that cannot enforce says so, and the engine says so out loud once per dispatch.
 
@@ -35,6 +36,8 @@ from __future__ import annotations
 import json
 import subprocess
 from pathlib import Path
+
+import pytest
 
 from adapters.execution import transport
 from adapters.execution.base import Registry, default_registry
@@ -60,7 +63,7 @@ from orchestrator.schemas.work import (
 )
 from orchestrator.stages import STAGE_SPECS, render_prompt
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import FakeProject, make_result
 
 H = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=Provider.CLAUDE)
 READ_ONLY = ToolPolicy(allow_file_writes=False)
@@ -138,9 +141,12 @@ def test_reading_dispatches_carry_the_posture_and_writing_stages_do_not(tmp_path
         # #304: a write-denied stage loses blanket permission with the write tools.
         assert postures[stage] is PermissionPosture.RESTRICTED, stage.value
     # implement legitimately writes; test fixes regressions; deliver pushes.
-    for stage in (Stage.IMPLEMENT, Stage.TEST, Stage.DELIVER):
+    for stage in (Stage.TEST, Stage.DELIVER):
         assert seen[stage] is None, f"{stage.value} must not be write-denied"
         assert postures[stage] is PermissionPosture.BYPASS, stage.value
+    # #626: IMPLEMENT's only denial is the whole-suite command; it still writes and bypasses.
+    assert seen[Stage.IMPLEMENT] == ToolPolicy(denied_commands=("echo unit",))
+    assert postures[Stage.IMPLEMENT] is PermissionPosture.BYPASS
     assert seen[Stage.INTAKE] is None  # deterministic ENGINE lane: no model, no toolset
     assert postures[Stage.INTAKE] is None  # ...and so no permission gate to set either
 
@@ -156,8 +162,11 @@ def test_an_unregistered_lane_counts_as_not_enforcing(tmp_path, project) -> None
     eng.add_task("r1", "t1")
     w = _drive_to_review(eng)
     assert w.tool_policy == READ_ONLY
-    # One per posture-bearing dispatch: SCOPE and REVIEW (#303 widened the posture).
-    assert [e["stage"] for e in _unenforced_events(eng)] == [Stage.SCOPE.value, Stage.REVIEW.value]
+    # One per posture-bearing dispatch: SCOPE and REVIEW (#303 widened the posture), and
+    # IMPLEMENT for its denied suite command (#626).
+    assert [e["stage"] for e in _unenforced_events(eng)] == [
+        Stage.SCOPE.value, Stage.IMPLEMENT.value, Stage.REVIEW.value,
+    ]
 
 
 # --- content_hash: dispatch metadata, not content -----------------------------------------
@@ -359,9 +368,11 @@ def test_unenforced_posture_warns_exactly_once_on_the_interactive_lane(tmp_path,
     w = _drive_to_review(eng)
     assert w.tool_policy == READ_ONLY  # attached anyway — the runner may still honor it
     events = _unenforced_events(eng)
-    # Exactly one per affected dispatch — SCOPE and REVIEW, not one per run and not two for
-    # either stage.
-    assert [e["stage"] for e in events] == [Stage.SCOPE.value, Stage.REVIEW.value]
+    # Exactly one per affected dispatch, not one per run and not two for any stage. IMPLEMENT
+    # is there for its denied suite command (#626).
+    assert [e["stage"] for e in events] == [
+        Stage.SCOPE.value, Stage.IMPLEMENT.value, Stage.REVIEW.value,
+    ]
     ev = events[-1]
     assert ev["stage"] == Stage.REVIEW.value
     assert ev["severity"] == "warning"
@@ -490,7 +501,7 @@ def test_a_lane_can_declare_a_non_bypass_default_for_every_stage(
     eng.create_run("r1")
     eng.add_task("r1", "t1")
     w = _drive_to(eng, Stage.IMPLEMENT)
-    assert w.tool_policy is None  # implement still gets its write tools...
+    assert w.tool_policy.allow_file_writes  # implement still gets its write tools...
     assert w.permission_posture is PermissionPosture.RESTRICTED  # ...but not blanket permission
     # ...and that is what the ARGV must actually say. Withholding the blanket grant must not
     # silently withhold the stage's own authority: with no TTY to answer a permission prompt,
@@ -503,8 +514,8 @@ def test_a_lane_can_declare_a_non_bypass_default_for_every_stage(
     assert "--dangerously-skip-permissions" not in argv
     granted = argv[argv.index("--allowedTools") + 1].split(",")
     assert set(granted) == {"Write", "Edit", "NotebookEdit", "Bash", "BashOutput", "KillShell"}
-    # Nothing is denied (the stage declares no posture), so grant+deny cover the vocabulary.
-    assert "--disallowedTools" not in argv
+    # Only the whole-suite command is denied (#626), and a deny rule beats the Bash pre-grant.
+    assert argv[argv.index("--disallowedTools") + 1] == "Bash(echo unit)"
 
 
 def test_a_lane_level_restriction_does_not_read_only_codex(monkeypatch) -> None:
@@ -585,3 +596,127 @@ def test_a_stage_with_no_posture_gets_no_directive_even_on_a_lane_that_cannot_en
         Stage.IMPLEMENT, task_id="t1", title="x", body="", tool_posture_unenforced=True
     )
     assert "cannot enforce it" not in prompt
+
+
+# --- #626: IMPLEMENT may not run the project's whole suite; TEST runs it next ---------------
+
+_DENIED_SUITE_HEADING = "## Full test suite"
+
+
+class _NoUnitCommand(FakeProject):
+    """A project whose unit getter yields nothing usable, in each way ``_project_commands``
+    tolerates: the no-op sentinel, an empty argv, or a raising getter."""
+
+    def __init__(self, unit) -> None:
+        super().__init__()
+        self._unit = unit
+
+    def test_unit_cmd(self, files=None):
+        if isinstance(self._unit, Exception):
+            raise self._unit
+        return self._unit
+
+
+def _headless_engine(tmp_path, project, provider: Provider = Provider.CLAUDE) -> Engine:
+    eng = _engine(
+        tmp_path, project, registry=build_registry(),
+        router=Router(execution_mode=ExecutionMode.HEADLESS, orchestrator_provider=provider),
+    )
+    eng.create_run("r1")
+    return eng
+
+
+def test_implement_denies_the_declared_unit_command_and_test_does_not(tmp_path, project) -> None:
+    """The issue's done-when, on real engine dispatches with a model TEST."""
+    eng = _headless_engine(tmp_path, project)
+    eng.add_task("r1", "t1", deterministic_stages=())
+    impl = _drive_to(eng, Stage.IMPLEMENT)
+    assert impl.tool_policy == ToolPolicy(denied_commands=("echo unit",))
+    assert _DENIED_SUITE_HEADING in impl.prompt
+    assert "Do not run `echo unit` in this stage: TEST runs the full suite next" in impl.prompt
+    eng.record("r1", make_result(impl))
+    test = _drive_to(eng, Stage.TEST)
+    assert test.tool_policy is None
+    assert _DENIED_SUITE_HEADING not in test.prompt
+
+
+def test_the_denial_is_not_stamped_on_any_other_stage(tmp_path, project) -> None:
+    eng = _headless_engine(tmp_path, project)
+    eng.add_task("r1", "t1", deterministic_stages=())
+    while (w := eng.next_work("r1", "t1")) is not None:
+        denied = w.tool_policy.denied_commands if w.tool_policy else ()
+        assert bool(denied) == (w.stage is Stage.IMPLEMENT), w.stage.value
+        assert (_DENIED_SUITE_HEADING in w.prompt) == (w.stage is Stage.IMPLEMENT), w.stage.value
+        eng.record("r1", make_result(w))
+
+
+def test_implement_on_the_claude_lane_passes_the_exact_pattern(
+    tmp_path, project, monkeypatch
+) -> None:
+    """The real dispatch reaches the CLI as an exact rule with no trailing ``*``, which would
+    also refuse a targeted ``<command> <files>`` run. It keeps every other tool and the lane's
+    bypass, so IMPLEMENT can still write."""
+    eng = _headless_engine(tmp_path, project)
+    eng.add_task("r1", "t1")
+    w = _drive_to(eng, Stage.IMPLEMENT)
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_run(calls))
+    claude_cli_transport()(w)
+    argv = calls[0]
+    assert argv[argv.index("--disallowedTools") + 1] == "Bash(echo unit)"
+    assert "--dangerously-skip-permissions" in argv
+    assert _unenforced_events(eng) == []
+
+
+def test_a_denied_command_joins_the_write_tools_as_one_argument(monkeypatch) -> None:
+    """The flag is variadic: a command's spaces must stay inside one comma-joined value."""
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_run(calls))
+    claude_cli_transport()(_work(tool_policy=ToolPolicy(
+        allow_file_writes=False, denied_commands=("uv run pytest -q",),
+    )))
+    argv = calls[0]
+    assert argv[argv.index("--disallowedTools") + 1] == (
+        "Write,Edit,NotebookEdit,Bash(uv run pytest -q)"
+    )
+
+
+@pytest.mark.parametrize(
+    "unit", [["true"], [], RuntimeError("no suite")], ids=["noop", "empty", "raises"]
+)
+def test_no_declared_unit_command_means_no_denial(tmp_path, unit) -> None:
+    eng = _headless_engine(tmp_path, _NoUnitCommand(unit))
+    eng.add_task("r1", "t1")
+    w = _drive_to(eng, Stage.IMPLEMENT)
+    assert w.tool_policy is None
+    assert _DENIED_SUITE_HEADING not in w.prompt
+
+
+def test_codex_cannot_enforce_the_denial_and_says_so(tmp_path, project, monkeypatch) -> None:
+    """Codex has no per-command flag. The model is still told, the sandbox is not narrowed by
+    a policy that allows writes, and the gap reaches the event stream."""
+    reg = build_registry()
+    codex = LanePolicy(execution_mode=ExecutionMode.HEADLESS, provider=Provider.CODEX)
+    assert reg.describe(H).enforces_command_denials
+    assert not reg.describe(codex).enforces_command_denials
+
+    eng = _headless_engine(tmp_path, project, Provider.CODEX)
+    eng.add_task("r1", "t1")
+    w = _drive_to(eng, Stage.IMPLEMENT)
+    assert w.lane_policy.provider is Provider.CODEX
+    assert w.tool_policy == ToolPolicy(denied_commands=("echo unit",))
+    assert _DENIED_SUITE_HEADING in w.prompt
+    events = [e for e in _unenforced_events(eng) if e["stage"] == Stage.IMPLEMENT.value]
+    assert len(events) == 1
+    assert events[0]["policy"]["denied_commands"] == ["echo unit"]
+
+    calls: list = []
+    monkeypatch.setattr(subprocess, "run", _stub_run(calls))
+    codex_cli_transport()(w.model_copy(update={"model": "gpt-5.5", "cwd": None}))
+    assert "read-only" not in calls[0]
+
+
+def test_the_denied_commands_survive_a_persisted_work_item_round_trip() -> None:
+    """A lease is reloaded from its JSON doc on resume, which turns the tuple into a list."""
+    w = _work(tool_policy=ToolPolicy(denied_commands=("uv run pytest -q",)))
+    assert WorkItem.model_validate_json(w.model_dump_json()).tool_policy == w.tool_policy

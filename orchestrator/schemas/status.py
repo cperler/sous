@@ -304,13 +304,20 @@ class Task(_StatusModel):
     # whole-context ceiling can evict a key, which would silently un-serialize a run.
     # ``scope_file_modes`` (#426) is the per-path edit mode SCOPE declared, stored ONLY for
     # the non-default (append) paths: an absent entry means ``rewrite``, so a pre-#426 doc
-    # and a task that declared no modes both contend on every path exactly as before.
+    # and a task that declared no modes both contend on every path exactly as before. A path
+    # the adapter's ``parallel_safe_paths`` globs match is stored as append whatever SCOPE
+    # wrote (#628), and that move is evented as ``file_claim_mode_relaxed``.
     # ``scope_files_inferred`` (#428) marks ``scope_files`` as GUESSED from the issue text
     # at registration rather than declared by an approved SCOPE: a pipeline with no SCOPE
     # stage (micro, lite, a decomposition child) has no other source of claims, and without
     # one it would neither wait for nor block anybody. The flag tells a status reader a
     # guess from a declaration, and lets ``refresh_spec`` re-guess before the claim is held.
     # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
+    # ``baseline_lint`` (#591) is what the declared lint/type tools already reported at
+    # ``base_sha``, as location-free fingerprints (``orchestrator.policy_gate``). REVIEW blocks
+    # only on findings not listed here. Empty means none, or never captured; either way every
+    # finding reads as new, so a missing baseline blocks exactly as it did before #591.
+    baseline_lint: list[str] = Field(default_factory=list)
     scope_files: list[str] = Field(default_factory=list)
     scope_file_modes: dict[str, str] = Field(default_factory=dict)
     scope_files_inferred: bool = False

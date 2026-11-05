@@ -20,10 +20,10 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Iterable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 
 from .alerting import (
     NOTIFY_RUN_FINALIZED,
@@ -66,9 +66,12 @@ from .file_contention import (
     ClaimEntry,
     ContentionPlan,
     Deferral,
+    ParallelSafeGlobs,
     describe,
     infer_claims_from_text,
+    normalize_parallel_safe_globs,
     plan_deferrals,
+    relax_claims,
     summarize_contention,
 )
 from .gitcmd import run_git
@@ -116,6 +119,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
+from .policy_gate import apply_lint_baseline
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -311,26 +315,70 @@ def _keep_issue_open_event(run_id: str, task_id: str, label: str | None, *, ts: 
             "source": "explicit" if label is None else "label", "label": label}
 
 
+class _InferredClaims(NamedTuple):
+    """Claims guessed from issue text (#428) after the adapter's parallel-safe globs ran
+    (#628): the declaration to store, the paths moved to ``append``, and any rejected globs."""
+
+    declaration: ClaimDeclaration
+    relaxed: list[dict[str, object]]
+    globs_rejected: list[dict[str, object]]
+
+
+def _claims_relaxed_events(
+    run_id: str, task_id: str, relaxed: Sequence[Mapping[str, object]],
+    *, stage: str | None, source: str, ts: str,
+) -> list[dict]:
+    """One ``file_claim_mode_relaxed`` per path an adapter glob moved to ``append`` (#628),
+    so a later merge conflict on that path can be traced to the move. Not warning-grade: on
+    a project that declares the globs, this is the normal case."""
+    return [
+        {"ts": ts, "type": "file_claim_mode_relaxed", "run_id": run_id,
+         "task_id": task_id, "stage": stage, "source": source, **notice}
+        for notice in relaxed
+    ]
+
+
+def _parallel_safe_rejected_events(
+    run_id: str, task_id: str, rejected: Sequence[Mapping[str, object]],
+    *, stage: str | None, ts: str,
+) -> list[dict]:
+    """One warning-grade event per unusable ``parallel_safe_paths`` entry (#628): an adapter
+    whose relaxation silently did nothing would read like a project that never asked for it."""
+    return [
+        {"ts": ts, "type": "parallel_safe_paths_rejected", "level": "warning", "run_id": run_id,
+         "task_id": task_id, "stage": stage, **notice}
+        for notice in rejected
+    ]
+
+
 def _claims_inferred_events(
-    run_id: str, task_id: str, declaration: ClaimDeclaration, *, ts: str
+    run_id: str, task_id: str, inferred: _InferredClaims, *, ts: str
 ) -> list[dict]:
     """The receipt for claims GUESSED from a SCOPE-less task's issue text (#428).
 
     Emitted even when the guess is empty: "looked and the text names no file" and "never
     looked" must not read alike, and only the first one means the task is ungated on
     purpose. A path the guess had to drop is evented the same way a SCOPE-declared one is,
-    with ``stage`` None and ``source`` saying where the path came from.
+    with ``stage`` None and ``source`` saying where the path came from; so is a path the
+    adapter's parallel-safe globs moved to ``append`` (#628).
     """
+    declaration = inferred.declaration
     events: list[dict] = [{
         "ts": ts, "type": "file_claims_inferred", "run_id": run_id, "task_id": task_id,
         "source": "issue_text", "files": list(declaration.claims),
-        "modes": {path: MODE_REWRITE for path in declaration.claims},
+        "modes": {path: declaration.modes.get(path, MODE_REWRITE) for path in declaration.claims},
     }]
     events.extend(
         {"ts": ts, "type": "scope_file_claim_dropped", "run_id": run_id, "task_id": task_id,
          "stage": None, "source": "issue_text", **notice}
         for notice in declaration.notices
     )
+    events.extend(_claims_relaxed_events(
+        run_id, task_id, inferred.relaxed, stage=None, source="issue_text", ts=ts,
+    ))
+    events.extend(_parallel_safe_rejected_events(
+        run_id, task_id, inferred.globs_rejected, stage=None, ts=ts,
+    ))
     return events
 
 
@@ -355,6 +403,9 @@ def _validated_budget(value: float | None, *, field: str, run_id: str) -> float 
 # thousands of lines, but the event/issue only needs the last few for the operator to see
 # what broke. Truncation is never silent — the caller marks a trimmed tail as such.
 _TRUNK_GATE_TAIL_LINES = 40
+# The unit suite's key in ``Engine._project_commands``. IMPLEMENT's denial reads the same joined
+# string the prompt shows the model, so the two cannot name different commands (#626).
+_UNIT_SUITE_LABEL = "test (unit)"
 
 # Bound the post-commit attribution scan (#322). A stage produces a handful of commits; a
 # three-figure range means the anchor was wrong (a stale checkpoint, a rebased branch), and
@@ -1010,7 +1061,7 @@ class Engine:
         # model-free guess from its issue text instead; a pipeline WITH SCOPE is left alone,
         # because its SCOPE fold is the only source of its claims.
         inferred_claims = (
-            infer_claims_from_text(spec.title, spec.body)
+            self._infer_claims(spec.title, spec.body)
             if Stage.SCOPE not in resolved_pipeline else None
         )
         # Register the task ref + dependency edge as a locked read-modify-write so a
@@ -1105,7 +1156,12 @@ class Engine:
                 keep_issue_open_pinned=keep_issue_open is not None,
                 max_attempts=self.max_attempts,
                 max_filed_followups=max_filed_followups,
-                scope_files=list(inferred_claims.claims) if inferred_claims else [],
+                scope_files=(
+                    list(inferred_claims.declaration.claims) if inferred_claims else []
+                ),
+                scope_file_modes=(
+                    dict(inferred_claims.declaration.modes) if inferred_claims else {}
+                ),
                 scope_files_inferred=inferred_claims is not None,
             )
             self.store.write_task_locked(task)
@@ -1147,6 +1203,35 @@ class Engine:
             for event in _claims_inferred_events(run_id, task_id, inferred_claims, ts=_now()):
                 self.store.append_event(run_id, event)
         return task
+
+    def _parallel_safe_globs(self) -> ParallelSafeGlobs:
+        """The project's ``parallel_safe_paths`` globs (#628), or none when it declares none.
+
+        Read through ``getattr`` because the hook is optional. A hook that raises relaxes
+        nothing and comes back as a rejection for the caller to event, so a broken adapter
+        keeps today's serialization and cannot fail ``record()`` or task registration.
+        """
+        hook = getattr(self.project, "parallel_safe_paths", None)
+        if hook is None:
+            return ParallelSafeGlobs((), [])
+        try:
+            value = hook() if callable(hook) else hook
+        except Exception as exc:  # noqa: BLE001 - an adapter hook cannot break a stage
+            return ParallelSafeGlobs((), [{"reason": "hook_raised", "value": repr(exc)[:200]}])
+        return normalize_parallel_safe_globs(value)
+
+    def _infer_claims(self, title: str, body: str) -> _InferredClaims:
+        """Guess a SCOPE-less task's claims (#428) and apply the parallel-safe globs (#628).
+
+        Without the globs, a micro task whose issue merely names a doc would hold ``rewrite``
+        on it and block every task the same globs let run in parallel.
+        """
+        declaration = infer_claims_from_text(title, body)
+        globs = self._parallel_safe_globs()
+        relaxation = relax_claims(declaration.claims, declaration.modes, globs.globs)
+        return _InferredClaims(
+            declaration._replace(modes=relaxation.modes), relaxation.relaxed, globs.rejected,
+        )
 
     def _keep_open_label(self, labels: Iterable[object]) -> str | None:
         """The first of ``labels`` the project declares keep-open (#613), else ``None``.
@@ -1904,12 +1989,27 @@ class Engine:
         # derived — nothing run-level to persist (#206), so re-reading the spec at every
         # dispatch boundary is the whole mechanism.
         tool_policy = None if deterministic else spec.tool_policy
+        project_commands = self._project_commands()
+        # #626: TEST runs the whole suite next, and IMPLEMENT kept timing out waiting on its
+        # own run of it, so IMPLEMENT may not run the project's declared unit command as is.
+        denied_unit_suite = (
+            project_commands.get(_UNIT_SUITE_LABEL)
+            if stage is Stage.IMPLEMENT and not deterministic
+            else None
+        )
+        if denied_unit_suite:
+            tool_policy = (tool_policy or ToolPolicy()).model_copy(
+                update={"denied_commands": (denied_unit_suite,)}
+            )
         # Honesty gate (#272): a lane that cannot translate the posture into a real provider
         # restriction (the interactive shim — its `agent()` call takes no tool argument) still
         # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
         # Resolved BEFORE the prompt render because #302 made it prompt-affecting: on such a
         # lane the posture is stated in-band, which is the only enforcement available there.
-        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
+        unenforced_policy = tool_policy is not None and (
+            not self._lane_enforces_tool_policy(lane)
+            or (bool(tool_policy.denied_commands) and not self._lane_enforces_command_denials(lane))
+        )
         # Permission posture (#304): the lane's declared default, tightened to RESTRICTED by a
         # write-denying stage posture — so `--dangerously-skip-permissions` is a decision made
         # here from (lane, stage), not a constant in the transport. None on the deterministic
@@ -1926,8 +2026,9 @@ class Engine:
             body=task.body,
             learnings=learnings,
             context=task.context,
-            project_commands=self._project_commands(),
+            project_commands=project_commands,
             tool_posture_unenforced=unenforced_policy,
+            denied_unit_suite=denied_unit_suite,
             # #390: the reviewer runs commands in this workspace, so tell it in-band when
             # nothing can prove the workspace's toolchain is its own. Stated on EVERY lane
             # with no declared hooks, not only the lane that also fails the #391 capability
@@ -2283,6 +2384,14 @@ class Engine:
         makes the gap visible rather than assuming protection the lane may not have."""
         try:
             return self.registry.describe(lane).enforces_tool_policy
+        except NoRunnerError:
+            return False
+
+    def _lane_enforces_command_denials(self, lane: LanePolicy) -> bool:
+        """Does the resolved lane turn ``ToolPolicy.denied_commands`` into a refusal (#626)?
+        An unregistered lane counts as NOT enforcing, as in ``_lane_enforces_tool_policy``."""
+        try:
+            return self.registry.describe(lane).enforces_command_denials
         except NoRunnerError:
             return False
 
@@ -3085,6 +3194,11 @@ class Engine:
         # outside the task lock, keeping "only the engine caller emits" true of the locked
         # mutator too. Nothing is mutated before the check, so the doc is pristine.
         lease_rejection: tuple[Task, tuple[str, str]] | None = None
+        # #628: read the adapter hook before taking the task lock, since it is project code.
+        parallel_safe = (
+            self._parallel_safe_globs() if result.stage is Stage.SCOPE
+            else ParallelSafeGlobs((), [])
+        )
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
@@ -3186,7 +3300,8 @@ class Engine:
                     outcome = "stage_rate_limited_cooldown"
             else:
                 fold_notices = apply_result(
-                    t, effective, now=_now(), cost_usd=cost, metered=cost_metered
+                    t, effective, now=_now(), cost_usd=cost, metered=cost_metered,
+                    parallel_safe_paths=parallel_safe.globs,
                 )
                 # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
                 # the fold is no longer invisible — surface each drop as a warning-grade audit
@@ -3220,6 +3335,14 @@ class Engine:
                      "task_id": effective.task_id, "stage": effective.stage.value, **notice}
                     for notice in fold_notices.file_claims
                 )
+                events.extend(_claims_relaxed_events(
+                    run_id, effective.task_id, fold_notices.relaxed_claims,
+                    stage=effective.stage.value, source="scope", ts=_now(),
+                ))
+                events.extend(_parallel_safe_rejected_events(
+                    run_id, effective.task_id, parallel_safe.rejected,
+                    stage=effective.stage.value, ts=_now(),
+                ))
                 if effective.status is ResultStatus.SUCCESS:
                     t.error_signatures = []  # streak resets on a clean stage
                     t.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
@@ -4133,13 +4256,19 @@ class Engine:
         blocking?=True}``. Blocking findings join ``issues`` and force
         ``approved=false`` (severity defaults to critical so a repeated policy finding
         can never convergence-auto-approve past the gate); non-blocking ones join
-        ``non_blocking`` and get filed as follow-up issues at finalize."""
+        ``non_blocking`` and get filed as follow-up issues at finalize, unless they carry
+        their own ``disposition`` (``drop`` is noted, not filed).
+
+        #591: a red lint or type finding that carries ``gate_output`` is compared against
+        ``task.baseline_lint`` here, so only what this change added blocks. A
+        ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
+        event, which is how a green benchmark's load and timing reach the run log."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
+        worktree = task.context.get("worktree")
         try:
-            findings = [f for f in (hook(worktree=task.context.get("worktree")) or [])
-                        if isinstance(f, dict) and str(f.get("description") or "").strip()]
+            raw = [f for f in (hook(worktree=worktree) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -4147,6 +4276,18 @@ class Engine:
                  "task_id": task.task_id, "error": str(exc)},
             )
             return result
+        for entry in raw:
+            if isinstance(entry.get("gate_record"), dict):
+                self.store.append_event(
+                    run_id,
+                    {**entry["gate_record"], "ts": _now(), "type": "policy_gate_result",
+                     "run_id": run_id, "task_id": task.task_id},
+                )
+        findings = apply_lint_baseline(
+            [f for f in raw if str(f.get("description") or "").strip()],
+            task.baseline_lint,
+            worktree if isinstance(worktree, str) else None,
+        )
         if not findings:
             return result
         out = dict(result.structured_output or {})
@@ -4155,7 +4296,7 @@ class Engine:
         if blocking:
             issues = list(out.get("issues") or [])
             for f in blocking:
-                issue = {k: v for k, v in f.items() if k != "blocking"}
+                issue = {k: v for k, v in f.items() if k not in ("blocking", "disposition")}
                 issue.setdefault("severity", "critical")  # a policy gate is a hard gate
                 issues.append(issue)
             out["issues"] = issues
@@ -4163,9 +4304,9 @@ class Engine:
         if advisory:
             nb = list(out.get("non_blocking") or [])
             nb.extend(
-                {"title": str(f.get("description"))[:80],
+                {"title": str(f.get("description")).strip().splitlines()[0][:80],
                  "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"}),
-                 "disposition": "file"}
+                 "disposition": str(f.get("disposition") or "file")}
                 for f in advisory
             )
             out["non_blocking"] = nb
@@ -6868,13 +7009,17 @@ class Engine:
 
         refreshed_at = _now()
         new_title, new_body = spec.title, spec.body
+        # Read outside the task lock, like the source call above: this runs project code.
+        fresh_inference = (
+            self._infer_claims(new_title, new_body) if task.scope_files_inferred else None
+        )
         new_fingerprint = diff["new_fingerprint"]
         # The diff/guards above ran on a PRE-LOCK read, and the source round-trip between
         # them and the write is long enough for a scheduler tick to dispatch this very task.
         # Both are therefore re-decided inside the mutator against the doc actually being
         # overwritten, and ``applied_diff`` (not the pre-lock one) is what the event reports.
         applied_diff = diff
-        reinferred: ClaimDeclaration | None = None
+        reinferred: _InferredClaims | None = None
         keep_open_label: str | None = None
 
         def _refresh(t: Task) -> None:
@@ -6914,10 +7059,10 @@ class Engine:
             # #428: claims GUESSED from the old text follow the new text, but only until
             # the gate has admitted the task — a held claim never changes, so a refresh can
             # neither hand back a path mid-task nor grab one another task is waiting for.
-            if t.scope_files_inferred and t.file_claim_acquired_at is None:
-                reinferred = infer_claims_from_text(new_title, new_body)
-                t.scope_files = list(reinferred.claims)
-                t.scope_file_modes = {}
+            if fresh_inference is not None and t.file_claim_acquired_at is None:
+                reinferred = fresh_inference
+                t.scope_files = list(reinferred.declaration.claims)
+                t.scope_file_modes = dict(reinferred.declaration.modes)
 
         # #199 pattern: commit the doc mutation and its audit event as one unit under the
         # per-task lock, so a refreshed snapshot can never exist without its event. The
@@ -7879,7 +8024,7 @@ class Engine:
         out: dict[str, str] = {}
         for label, getter in (
             ("install", self.project.install_cmd),
-            ("test (unit)", self.project.test_unit_cmd),
+            (_UNIT_SUITE_LABEL, self.project.test_unit_cmd),
             # e2e/shell were declared on the adapter but invisible to prompts — the
             # model could never learn the project HAS an e2e suite. Optional (getattr):
             # a minimal adapter without them still works.

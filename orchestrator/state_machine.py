@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from typing import NamedTuple
 
 from pydantic import ValidationError
 
-from .file_contention import normalize_claims
+from .file_contention import normalize_claims, relax_claims
 from .schemas.enums import (
     STAGE_ORDER,
     Effort,
@@ -110,6 +110,8 @@ class FoldNotices(NamedTuple):
     * ``truncations`` → ``context_value_truncated`` (a capped context value, #289)
     * ``evictions``   → ``context_key_evicted``     (a ceiling-shed context key, #289)
     * ``file_claims`` → ``scope_file_claim_dropped`` (an unusable declared path, #377)
+    * ``relaxed_claims`` → ``file_claim_mode_relaxed`` (a parallel-safe path moved to
+      ``append``, #628); a change rather than a drop, but never silent either
 
     Kept as separate lists rather than one, so the call site needs no per-notice branching
     and each event's payload stays a flat, self-describing shape."""
@@ -118,11 +120,14 @@ class FoldNotices(NamedTuple):
     truncations: list[dict[str, object]]
     evictions: list[dict[str, object]]
     file_claims: list[dict[str, object]]
+    relaxed_claims: list[dict[str, object]]
 
 
 def _no_notices() -> FoldNotices:
     """An empty FoldNotices (fresh lists — never a shared mutable default)."""
-    return FoldNotices(pr_fields=[], truncations=[], evictions=[], file_claims=[])
+    return FoldNotices(
+        pr_fields=[], truncations=[], evictions=[], file_claims=[], relaxed_claims=[],
+    )
 
 
 def apply_result(
@@ -133,6 +138,7 @@ def apply_result(
     cost_usd: float | None,
     metered: bool = True,
     iteration: int | None = None,
+    parallel_safe_paths: Sequence[str] = (),
 ) -> FoldNotices:
     """Fold a StageResult into the task's stage record (status + attribution).
 
@@ -140,6 +146,9 @@ def apply_result(
     two fields and mean nothing apart. ``metered=False`` says the cost is an unknown, not
     a measured zero, so a consumer of the task doc can render it honestly instead of as a
     confident ``$0.0000``. Defaulting to True keeps every existing call site's meaning.
+
+    ``parallel_safe_paths`` is the project adapter's glob list (#628), passed in so the fold
+    stays pure; only a SCOPE result reads it.
 
     Returns the drop notices produced by ``_absorb_outputs`` (all empty on the
     non-SUCCESS branch, which folds nothing) so the engine can emit the warning-grade
@@ -167,7 +176,7 @@ def apply_result(
     if result.status is ResultStatus.SUCCESS:
         rec.status = StageStatus.COMPLETED
         rec.error = None
-        notices = _absorb_outputs(task, result)
+        notices = _absorb_outputs(task, result, parallel_safe_paths)
     else:
         rec.status = StageStatus.FAILED
         rec.error = result.error or result.status.value
@@ -230,6 +239,10 @@ _MAX_ITEM_STR = 500  # a string element inside a list value (the default per-ite
 _MAX_LIST = 40  # elements kept from a list value
 _MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
 _MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice (#201)
+# #591: Task.baseline_lint entries kept. Generous because a repo can carry hundreds of old lint
+# errors, and bounded because the task doc is rewritten on every update. An entry past the cap
+# is reported, and its finding reads as new at REVIEW, which blocks as it did before #591.
+_MAX_BASELINE_LINT = 2000
 
 # #289: the per-item cap is chosen by what a FIELD MEANS, not by the value's python type.
 # A SCOPE ``plan`` is an ordered list of prose subtask INSTRUCTIONS — routinely well over
@@ -385,7 +398,9 @@ def _short_validation_reason(exc: ValidationError) -> str:
     return reason
 
 
-def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
+def _absorb_outputs(
+    task: Task, result: StageResult, parallel_safe_paths: Sequence[str] = ()
+) -> FoldNotices:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
     missing whitelisted key is skipped; a pr_* value that fails field validation is
@@ -434,18 +449,38 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     # run. Normalization is total (a malformed declaration yields no claims, never an
     # exception into record()) and every rejected path comes back as a notice.
     file_claims: list[dict[str, object]] = []
+    relaxed_claims: list[dict[str, object]] = []
     if result.stage is Stage.SCOPE and "files" in out:
         declaration = normalize_claims(out["files"])
         file_claims = declaration.notices
         task.scope_files = list(declaration.claims)
         # #426: only the non-default (append) paths are persisted, so an absent entry —
         # including every task doc written before #426 — reads as ``rewrite`` and gates
-        # exactly as it did before.
-        task.scope_file_modes = dict(declaration.modes)
+        # exactly as it did before. #628: a path the adapter marked parallel-safe is stored
+        # as append whatever the model wrote, and the move comes back as a notice.
+        relaxation = relax_claims(declaration.claims, declaration.modes, parallel_safe_paths)
+        relaxed_claims = relaxation.relaxed
+        task.scope_file_modes = relaxation.modes
+    # #591: what the lint/type tools already report at base. A durable task field, not a context
+    # key: the context plane caps a list at 40 items (the rest would read as new errors) and
+    # feeds every later prompt. ENGINE lane only, so a model cannot excuse its own errors.
+    if result.stage is Stage.INTAKE and engine_lane and "baseline_lint" in out:
+        raw_lint = out["baseline_lint"]
+        entries = (
+            [e for e in raw_lint if isinstance(e, str)] if isinstance(raw_lint, list) else []
+        )
+        task.baseline_lint = entries[:_MAX_BASELINE_LINT]
+        if len(entries) > _MAX_BASELINE_LINT:
+            truncations.append({
+                "field": "baseline_lint",
+                "part": "list_tail",
+                "kept_items": _MAX_BASELINE_LINT,
+                "dropped_items": len(entries) - _MAX_BASELINE_LINT,
+            })
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,
-        file_claims=file_claims,
+        file_claims=file_claims, relaxed_claims=relaxed_claims,
     )
 
 

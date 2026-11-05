@@ -16,6 +16,9 @@ from __future__ import annotations
 import threading
 from contextlib import contextmanager
 
+import pytest
+
+from adapters.project.selfhost.config import SelfHostConfig
 from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.file_contention import (
@@ -24,7 +27,9 @@ from orchestrator.file_contention import (
     ClaimEntry,
     infer_claims_from_text,
     normalize_claims,
+    normalize_parallel_safe_globs,
     plan_deferrals,
+    relax_claims,
     summarize_contention,
 )
 from orchestrator.schemas.enums import ExecutionLane, ResultStatus, Stage, TaskState
@@ -368,6 +373,7 @@ def test_a_quiet_run_summarizes_to_zeroes() -> None:
     assert summarize_contention([]) == {
         "deferrals": 0, "tasks_deferred": 0, "claims": 0, "paths": {},
         "append_waiter_deferrals": 0, "mode_unknown_deferrals": 0,
+        "relaxed_claims": 0, "relaxed_paths": {},
     }
 
 
@@ -889,3 +895,220 @@ def test_refresh_spec_re_infers_only_until_the_claim_is_held(tmp_path, project) 
     assert eng.store.load_task("r1", "t1").scope_files == ["b.py"]
     inferred = [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
     assert [e["files"] for e in inferred] == [["a.py"], ["b.py"]]
+
+
+# --- adapter-declared parallel-safe paths (#628) ------------------------------
+
+
+def _relaxed_paths(claim: str, globs: list[str]) -> list[object]:
+    return [n["path"] for n in relax_claims([claim], {}, globs).relaxed]
+
+
+@pytest.mark.parametrize(
+    ("glob", "path", "matches"),
+    [
+        # No slash: the file name at any depth, which is what selfhost's `*.md` relies on.
+        ("*.md", "ARCHITECTURE.md", True),
+        ("*.md", "docs/reviews/note.md", True),
+        ("*.md", "orchestrator/engine.py", False),
+        ("*.md", "notes.md/engine.py", False),
+        ("*.md", "README.MD", False),  # case-sensitive
+        ("AGENTS.md", "AGENTS.md", True),
+        # `**/` is zero or more directories. fnmatch would miss docs/DEPLOY.md here.
+        ("docs/**/*.md", "docs/DEPLOY.md", True),
+        ("docs/**/*.md", "docs/a/b/DEPLOY.md", True),
+        ("docs/**/*.md", "src/docs/DEPLOY.md", False),
+        ("experiments/**/*.md", "experiments/trial/REPORT.md", True),
+        # With a slash, `*` stays inside one directory and the whole path must match.
+        ("docs/*.md", "docs/DEPLOY.md", True),
+        ("docs/*.md", "docs/a/DEPLOY.md", False),
+        ("docs/**", "docs/a/b.txt", True),
+        ("docs/**", "docsy/b.txt", False),
+        ("docs/?.md", "docs/a.md", True),
+        ("docs/?.md", "docs/ab.md", False),
+        # Regex metacharacters in a glob are literal.
+        ("a+b.md", "a+b.md", True),
+        ("a+b.md", "aab.md", False),
+    ],
+)
+def test_parallel_safe_glob_matching(glob: str, path: str, matches: bool) -> None:
+    assert _relaxed_paths(path, [glob]) == ([path] if matches else [])
+
+
+def test_relaxing_keeps_the_declared_append_map_and_names_the_matching_glob() -> None:
+    relaxation = relax_claims(
+        ["a.md", "b.md", "c.py"], {"b.md": "append"}, ["*.txt", "a.*", "*.md"],
+    )
+    assert relaxation.modes == {"a.md": "append", "b.md": "append"}
+    # b.md was already append, so it is not a relaxation and earns no notice.
+    assert relaxation.relaxed == [{"path": "a.md", "glob": "a.*", "declared_mode": "rewrite"}]
+
+
+def test_a_bad_parallel_safe_value_relaxes_nothing_and_says_why() -> None:
+    for raw in ("*.md", None, 5, {"*.md": True}):
+        globs, rejected = normalize_parallel_safe_globs(raw)
+        assert globs == ()
+        assert [r["reason"] for r in rejected] == ["not_a_list"]
+    globs, rejected = normalize_parallel_safe_globs(["*.md", 7, "  ", " *.txt ", "*.md"])
+    assert globs == ("*.md", "*.txt")
+    assert [r["reason"] for r in rejected] == ["not_a_string", "empty"]
+
+
+def test_summary_reports_relaxed_paths_most_frequent_first() -> None:
+    summary = summarize_contention([
+        {"type": "file_claim_mode_relaxed", "path": "b.md"},
+        {"type": "file_claim_mode_relaxed", "path": "a.md"},
+        {"type": "file_claim_mode_relaxed", "path": "a.md"},
+        {"type": "file_claim_mode_relaxed", "path": None},
+    ])
+    assert summary["relaxed_claims"] == 3
+    assert list(summary["relaxed_paths"].items()) == [("a.md", 2), ("b.md", 1)]
+
+
+def _relaxed_events(eng: Engine) -> list[dict]:
+    return [e for e in eng.store.read_events("r1") if e["type"] == "file_claim_mode_relaxed"]
+
+
+def _rejected_events(eng: Engine) -> list[dict]:
+    return [e for e in eng.store.read_events("r1") if e["type"] == "parallel_safe_paths_rejected"]
+
+
+def test_a_rewrite_on_a_parallel_safe_path_runs_alongside_a_holder(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: ["*.md"]
+    eng = _two_scoped_tasks(tmp_path, project, ["ARCHITECTURE.md"], ["ARCHITECTURE.md"])
+
+    assert eng.store.load_task("r1", "t1").scope_file_modes == {"ARCHITECTURE.md": "append"}
+    assert eng.dispatchable("r1") == ["t1", "t2"]
+    # t2 must also pass while t1 is already holding and in flight on the path.
+    eng.next_work("r1", "t1")
+    assert "t2" in eng.dispatchable("r1")
+    assert eng.store.load_task("r1", "t2").file_contention_deferred_on == []
+
+    events = _relaxed_events(eng)
+    assert [(e["task_id"], e["path"], e["glob"], e["declared_mode"], e["source"], e["stage"])
+            for e in events] == [
+        ("t1", "ARCHITECTURE.md", "*.md", "rewrite", "scope", "scope"),
+        ("t2", "ARCHITECTURE.md", "*.md", "rewrite", "scope", "scope"),
+    ]
+    contention = eng.status("r1")["events_audit"]["contention"]
+    assert contention["relaxed_claims"] == 2
+    assert contention["relaxed_paths"] == {"ARCHITECTURE.md": 2}
+    assert contention["deferrals"] == 0
+
+
+def test_a_non_matching_rewrite_still_defers(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: ["*.md"]
+    eng = _two_scoped_tasks(
+        tmp_path, project, ["schema.py", "ARCHITECTURE.md"], ["schema.py", "ARCHITECTURE.md"],
+    )
+    assert eng.dispatchable("r1") == ["t1"]
+    deferred = [
+        e for e in eng.store.read_events("r1")
+        if e["type"] == "dispatch_deferred_file_contention"
+    ]
+    # The doc is relaxed, so only the code path is named as the reason to wait.
+    assert deferred[0]["files"] == ["schema.py"]
+
+
+def test_an_already_declared_append_is_not_reported_as_relaxed(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: ["*.md"]
+    declared = [{"path": "ARCHITECTURE.md", "mode": "append"}]
+    eng = _two_scoped_tasks(tmp_path, project, declared, declared)
+    assert eng.dispatchable("r1") == ["t1", "t2"]
+    assert _relaxed_events(eng) == []
+
+
+def test_an_adapter_with_no_hook_serializes_as_before(tmp_path, project) -> None:
+    eng = _two_scoped_tasks(tmp_path, project, ["ARCHITECTURE.md"], ["ARCHITECTURE.md"])
+    assert eng.dispatchable("r1") == ["t1"]
+    assert _relaxed_events(eng) == []
+    assert _rejected_events(eng) == []
+
+
+def test_a_hook_that_raises_keeps_the_rewrite_and_warns(tmp_path, project) -> None:
+    def boom() -> list[str]:
+        raise RuntimeError("adapter bug")
+
+    project.parallel_safe_paths = boom
+    eng = _two_scoped_tasks(tmp_path, project, ["ARCHITECTURE.md"], ["ARCHITECTURE.md"])
+
+    assert eng.dispatchable("r1") == ["t1"]
+    rejected = _rejected_events(eng)
+    assert [(e["task_id"], e["reason"], e["level"]) for e in rejected] == [
+        ("t1", "hook_raised", "warning"), ("t2", "hook_raised", "warning"),
+    ]
+    assert "adapter bug" in rejected[0]["value"]
+
+
+def test_a_hook_returning_junk_keeps_the_rewrite_and_warns(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: "*.md"  # a bare string, not a list
+    eng = _two_scoped_tasks(tmp_path, project, ["ARCHITECTURE.md"], ["ARCHITECTURE.md"])
+
+    assert eng.dispatchable("r1") == ["t1"]
+    assert {e["reason"] for e in _rejected_events(eng)} == {"not_a_list"}
+
+
+def test_inferred_claims_are_relaxed_at_registration(tmp_path, project) -> None:
+    # Without this, a micro task whose issue merely names a doc holds a rewrite on it and
+    # blocks every task the same glob lets run in parallel.
+    project.parallel_safe_paths = lambda: ["*.md"]
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Update ARCHITECTURE.md and cli.py.", ExecutionLane.MICRO)
+    _scopeless(eng, project, "t2", "Also add to ARCHITECTURE.md.", ExecutionLane.MICRO)
+
+    assert eng.store.load_task("r1", "t1").scope_file_modes == {"ARCHITECTURE.md": "append"}
+    assert eng.dispatchable("r1") == ["t1", "t2"]
+    inferred = [e for e in eng.store.read_events("r1") if e["type"] == "file_claims_inferred"]
+    # The receipt reports the real mode rather than assuming every guess is a rewrite.
+    assert inferred[0]["modes"] == {"ARCHITECTURE.md": "append", "cli.py": "rewrite"}
+    assert [(e["task_id"], e["path"], e["source"], e["stage"])
+            for e in _relaxed_events(eng)] == [
+        ("t1", "ARCHITECTURE.md", "issue_text", None),
+        ("t2", "ARCHITECTURE.md", "issue_text", None),
+    ]
+
+
+def test_inferred_claims_are_relaxed_again_on_refresh(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: ["*.md"]
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Edit cli.py.", ExecutionLane.MICRO)
+    assert eng.store.load_task("r1", "t1").scope_file_modes == {}
+
+    project.task_source.spec_overrides["t1"] = {"body": "Edit CHANGES.md and cli.py."}
+    eng.refresh_spec("r1", "t1")
+
+    doc = eng.store.load_task("r1", "t1")
+    assert doc.scope_files == ["CHANGES.md", "cli.py"]
+    assert doc.scope_file_modes == {"CHANGES.md": "append"}
+    assert [e["path"] for e in _relaxed_events(eng)] == ["CHANGES.md"]
+
+
+def test_a_refresh_leaves_a_held_inferred_claim_and_emits_nothing(tmp_path, project) -> None:
+    project.parallel_safe_paths = lambda: ["*.md"]
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    _scopeless(eng, project, "t1", "Edit cli.py.", ExecutionLane.MICRO)
+    assert eng.dispatchable("r1") == ["t1"]  # admits t1, so it now holds its claim
+
+    project.task_source.spec_overrides["t1"] = {"body": "Edit CHANGES.md."}
+    eng.refresh_spec("r1", "t1")
+
+    assert eng.store.load_task("r1", "t1").scope_files == ["cli.py"]
+    assert _relaxed_events(eng) == []
+
+
+def test_selfhost_runs_two_tasks_overlapping_only_on_architecture_md(tmp_path, project) -> None:
+    # The Done-when case: batch-613-618 held #613 for 6 minutes on ARCHITECTURE.md alone.
+    selfhost = SelfHostConfig(tasks_path=str(tmp_path / "tasks.json"))
+    project.parallel_safe_paths = selfhost.parallel_safe_paths
+    eng = _two_scoped_tasks(
+        tmp_path, project, ["ARCHITECTURE.md", "a.py"], ["ARCHITECTURE.md", "b.py"],
+    )
+    assert eng.dispatchable("r1") == ["t1", "t2"]
+    eng.next_work("r1", "t1")  # t1 is now in flight, and t2 may still start beside it
+    assert "t2" in eng.dispatchable("r1")
+    assert eng.status("r1")["events_audit"]["contention"]["relaxed_paths"] == {
+        "ARCHITECTURE.md": 2,
+    }

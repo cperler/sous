@@ -81,6 +81,11 @@ class ToolPolicy(BaseModel):
     # write-denied dispatch can still write via the shell, so this posture is a guard
     # against inadvertent mutation, NOT a sandbox (see the transport translation notes).
     allow_command_execution: bool = True
+    # Exact shell commands this dispatch may not run, with command execution otherwise
+    # allowed (#626). IMPLEMENT carries the project's declared whole-suite command, because
+    # TEST runs it next and waiting on it here is how IMPLEMENT kept hitting its time limit.
+    # A lane that cannot translate this says so (``enforces_command_denials``).
+    denied_commands: tuple[str, ...] = ()
 
 
 class TokenUsage(BaseModel):
@@ -304,15 +309,17 @@ class WorkItem(BaseModel):
     phase: str | None = None
     # Tool posture for this dispatch (#272): provider-neutral, translated per execution
     # adapter (claude `--disallowedTools`, codex `--sandbox`). Set from
-    # ``STAGE_SPECS[stage].tool_policy`` on model lanes only; None (the default) on the
-    # deterministic ENGINE lane and every stage that declares no posture.
+    # ``STAGE_SPECS[stage].tool_policy`` on model lanes only, plus IMPLEMENT's denied suite
+    # command (#626); None (the default) on the deterministic ENGINE lane and every other
+    # stage that declares no posture.
     #
     # DISPATCH METADATA — excluded from ``compute_content_hash`` alongside
     # ``cwd``/``timeout_s``/``session_ref``. Why that is safe rather than convenient: the
     # policy is derived deterministically from the stage (already in the hash) and the
     # resolved lane (also in the hash, via ``lane_policy``), so no two dispatches of the
     # same work can legitimately disagree about it — there is nothing for the hash to
-    # discriminate. Excluding it also keeps every content_hash byte-identical to pre-#272,
+    # discriminate. A denied command (#626) is named in the prompt, so the hash covers it
+    # too. Excluding it also keeps every content_hash byte-identical to pre-#272,
     # so an in-flight REVIEW lease still verifies on ``record``.
     tool_policy: ToolPolicy | None = None
     # Permission posture for this dispatch (#304): the LANE's declared default

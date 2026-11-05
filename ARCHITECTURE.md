@@ -88,6 +88,11 @@ written.
   adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
   it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
   prompted), independent of the permission gate below.
+  **IMPLEMENT** carries `ToolPolicy.denied_commands` naming the project's declared unit-suite
+  command (#626), because TEST runs it next and waiting on it here caused IMPLEMENT timeouts.
+  Claude translates it to `Bash(<command>)`, which refuses the bare, piped and wrapped forms and
+  leaves targeted runs alone. Codex has no per-command flag, so there the rule is prompt-only and
+  `tool_policy_unenforced` says so (`CapabilityDescriptor.enforces_command_denials`).
 - **REVIEW execution isolation** (#301). Every in-process headless REVIEW transport call runs
   in an independent throwaway local clone seeded with the live worktree payload (including
   ignored dependencies and dirty state, excluding its linked `.git`). The clone has its own
@@ -407,7 +412,12 @@ never satisfy.
   `max_review_cycles`). Convergence auto-approval (`_review_verdict`): a re-review whose
   blocking issues are a subset of the prior rejection's — no net-new findings — ends the
   loop. Deterministic project policy findings merge in via the `review_findings` hook (#65)
-  and force `approved=false`. An improvement — or a non-blocking finding (#414) —
+  and force `approved=false`, but only for problems the task caused (#591,
+  `orchestrator/policy_gate.py`). INTAKE records what lint and typecheck already report at
+  base as `Task.baseline_lint`, and `_merge_policy_findings` blocks only on findings not in
+  it; the inherited ones are noted, not filed. A red benchmark re-runs once, records load and
+  CPU count on every outcome (`policy_gate_result` event), and blocks only when red twice on
+  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. An improvement — or a non-blocking finding (#414) —
   dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
   requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
   whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains
@@ -625,19 +635,28 @@ never satisfy.
   independent additions to one file can at worst conflict textually, which is loud and
   cheap. "Append-only" is a claim about the EDIT, not the file, so the classification comes
   from SCOPE and never from a path glob the engine owns: a glob list would be
-  project-specific policy inside a project-agnostic engine, and belongs to the project
-  adapter if anywhere. `rewrite` is the default in every direction — a bare string, an
-  absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
-  `rewrite` — so the rule can only ever be relaxed by an explicit, well-formed claim, and
-  `scope_file_modes` stores only the non-default entries. `events_audit`'s `contention`
-  block reports what the gate actually cost a run (deferrals, distinct tasks deferred, the
-  most-contended paths, and how many deferrals held an append-only waiter), so the
+  project-specific policy inside a project-agnostic engine. The exception is the adapter's
+  own list (#628): SCOPE almost never declared `append`, even for a doc it only added a
+  section to, so about 11 of 20 hours of contention waiting across 61 runs were
+  markdown-only. The optional `parallel_safe_paths()` hook returns globs (selfhost: `*.md`),
+  and a declared or inferred claim on a matching path is stored as `append` whatever SCOPE
+  wrote, at the SCOPE fold or at registration. Each move is evented as
+  `file_claim_mode_relaxed` (path, glob, source), and an unusable hook or entry as
+  `parallel_safe_paths_rejected`, which relaxes nothing. A `rewrite` on a path the globs do
+  not match still serializes. `rewrite` is otherwise the default in every direction — a bare
+  string, an absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
+  `rewrite` — so the rule can only be relaxed by an explicit, well-formed claim or an
+  adapter glob, and `scope_file_modes` stores only the non-default entries.
+  `events_audit`'s `contention` block reports what the gate actually cost a run (deferrals,
+  distinct tasks deferred, the most-contended paths, how many deferrals held an append-only
+  waiter, and which paths were relaxed), so the
   strictness stays re-judgeable from any finished run instead of by hand-grepping
   `events.jsonl` — #377 shipped deliberately over-strict pending exactly that data, and
   `docs/reviews/2026-08-29-file-contention-measurement.md` records the first read of it. A
   task whose pipeline has no SCOPE stage (the `micro`/`lite` presets, a decomposition child)
   gets a model-free guess instead (#428): `add_task` runs `infer_claims_from_text` over the
-  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims,
+  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims
+  (unless an adapter glob relaxes them),
   marks them `scope_files_inferred`, and records a `file_claims_inferred` receipt (empty
   when the text names no file). `refresh_spec` re-guesses until the claim is held. The guess
   only knows what the text names and the gate matches exact paths, so a miss leaves that
