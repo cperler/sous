@@ -128,7 +128,9 @@ tracker or fix-forward.
   guidance, which the scheduler could not read. The gate keys on EVERY declared path, so it
   serializes some pairs that would not actually have collided; that is the chosen default,
   because the collision it prevents (#370's silent auto-merge into a runtime break) costs a
-  remediation cycle while the false positive costs only parallelism.
+  remediation cycle while the false positive costs only parallelism. The one relaxation is
+  adapter-owned: a path matching the adapter's `parallel_safe_paths` globs (selfhost: `*.md`)
+  counts as `append`, and each move is evented (#628).
 - **Batch integration is verified both before and after merge** (#370, #229, #216).
   When every task reaches a terminal state, `Engine.batch_integration_gate` gathers the
   completed leaf-task branches in dependency order, merges them over current trunk in a

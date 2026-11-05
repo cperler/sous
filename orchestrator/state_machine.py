@@ -10,12 +10,12 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Collection
+from collections.abc import Collection, Sequence
 from typing import NamedTuple
 
 from pydantic import ValidationError
 
-from .file_contention import normalize_claims
+from .file_contention import normalize_claims, relax_claims
 from .schemas.enums import (
     STAGE_ORDER,
     Effort,
@@ -110,6 +110,8 @@ class FoldNotices(NamedTuple):
     * ``truncations`` → ``context_value_truncated`` (a capped context value, #289)
     * ``evictions``   → ``context_key_evicted``     (a ceiling-shed context key, #289)
     * ``file_claims`` → ``scope_file_claim_dropped`` (an unusable declared path, #377)
+    * ``relaxed_claims`` → ``file_claim_mode_relaxed`` (a parallel-safe path moved to
+      ``append``, #628); a change rather than a drop, but never silent either
 
     Kept as separate lists rather than one, so the call site needs no per-notice branching
     and each event's payload stays a flat, self-describing shape."""
@@ -118,11 +120,14 @@ class FoldNotices(NamedTuple):
     truncations: list[dict[str, object]]
     evictions: list[dict[str, object]]
     file_claims: list[dict[str, object]]
+    relaxed_claims: list[dict[str, object]]
 
 
 def _no_notices() -> FoldNotices:
     """An empty FoldNotices (fresh lists — never a shared mutable default)."""
-    return FoldNotices(pr_fields=[], truncations=[], evictions=[], file_claims=[])
+    return FoldNotices(
+        pr_fields=[], truncations=[], evictions=[], file_claims=[], relaxed_claims=[],
+    )
 
 
 def apply_result(
@@ -133,6 +138,7 @@ def apply_result(
     cost_usd: float | None,
     metered: bool = True,
     iteration: int | None = None,
+    parallel_safe_paths: Sequence[str] = (),
 ) -> FoldNotices:
     """Fold a StageResult into the task's stage record (status + attribution).
 
@@ -140,6 +146,9 @@ def apply_result(
     two fields and mean nothing apart. ``metered=False`` says the cost is an unknown, not
     a measured zero, so a consumer of the task doc can render it honestly instead of as a
     confident ``$0.0000``. Defaulting to True keeps every existing call site's meaning.
+
+    ``parallel_safe_paths`` is the project adapter's glob list (#628), passed in so the fold
+    stays pure; only a SCOPE result reads it.
 
     Returns the drop notices produced by ``_absorb_outputs`` (all empty on the
     non-SUCCESS branch, which folds nothing) so the engine can emit the warning-grade
@@ -167,7 +176,7 @@ def apply_result(
     if result.status is ResultStatus.SUCCESS:
         rec.status = StageStatus.COMPLETED
         rec.error = None
-        notices = _absorb_outputs(task, result)
+        notices = _absorb_outputs(task, result, parallel_safe_paths)
     else:
         rec.status = StageStatus.FAILED
         rec.error = result.error or result.status.value
@@ -385,7 +394,9 @@ def _short_validation_reason(exc: ValidationError) -> str:
     return reason
 
 
-def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
+def _absorb_outputs(
+    task: Task, result: StageResult, parallel_safe_paths: Sequence[str] = ()
+) -> FoldNotices:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
     missing whitelisted key is skipped; a pr_* value that fails field validation is
@@ -434,18 +445,22 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
     # run. Normalization is total (a malformed declaration yields no claims, never an
     # exception into record()) and every rejected path comes back as a notice.
     file_claims: list[dict[str, object]] = []
+    relaxed_claims: list[dict[str, object]] = []
     if result.stage is Stage.SCOPE and "files" in out:
         declaration = normalize_claims(out["files"])
         file_claims = declaration.notices
         task.scope_files = list(declaration.claims)
         # #426: only the non-default (append) paths are persisted, so an absent entry —
         # including every task doc written before #426 — reads as ``rewrite`` and gates
-        # exactly as it did before.
-        task.scope_file_modes = dict(declaration.modes)
+        # exactly as it did before. #628: a path the adapter marked parallel-safe is stored
+        # as append whatever the model wrote, and the move comes back as a notice.
+        relaxation = relax_claims(declaration.claims, declaration.modes, parallel_safe_paths)
+        relaxed_claims = relaxation.relaxed
+        task.scope_file_modes = relaxation.modes
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,
-        file_claims=file_claims,
+        file_claims=file_claims, relaxed_claims=relaxed_claims,
     )
 
 
