@@ -341,8 +341,9 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "suggested_fix}; a rejection re-runs implement→…→review with your issues as "
             "learnings, so make them concrete and actionable; suggestion-only rejections "
             "auto-approve), tests_meaningful (bool or null), mutation_checks (list of "
-            "{mutation, failed_tests}), tests_not_checked_reason (string, when no mutation "
-            "settled it), non_blocking (list of {title, detail, disposition: "
+            "{mutation, failed_tests, blocking?, blocking_reason?}), tests_not_checked_reason "
+            "(string, when no mutation settled it), non_blocking (list of {title, detail, "
+            "disposition: "
             "file|fixup|fix_now|drop}; empty if none), improvement ({title, detail, "
             "disposition: file|fixup|fix_now|drop} or omitted), retrospective ({title, "
             "detail, target?} or omitted)."
@@ -492,6 +493,47 @@ _MUTATION_CHECK_TRUST = (
 )
 
 
+# #614: the stopping rule for a mutation the tests MISS. Without one, every survivor was a
+# blocking finding, each review sampled different mutations, and correct code went through a
+# full implement→…→review cycle per round (pred-1141-1291 #1254/#1310; pred-1396-1382 #1378,
+# where by the third pass the survivors were wording on refusal lines). The rule is stated
+# here but DECIDED by the engine from `mutation_checks[].blocking` + `blocking_reason`
+# (`state_machine.surviving_mutant_disposition`): a survivor never belongs in `issues`.
+_SURVIVOR_STOPPING_RULE = (
+    "A mutation that SURVIVED (no test failed) is not by itself a blocking issue: do NOT "
+    "restate it in `issues`. Record it in `mutation_checks` and set `blocking: true` with a "
+    "`blocking_reason` ONLY when it falls on behaviour the task spec requires or on a guard "
+    "the project marks money-path / safety (a removed guard, a changed money, halt or refusal "
+    "outcome); the reason must name which. Leave `blocking` false for every other survivor "
+    "(wording, labels, tags, a path the spec does not require): the engine reports it once as "
+    "a noted gap and no fix cycle opens. The engine, not you, opens a cycle from that field, "
+    "and it demotes a `blocking: true` that carries no reason.\n"
+)
+
+# #614: a fix cycle that a blocking survivor opened tells the re-review which mutations to
+# re-apply, so it checks that those closed instead of sampling a fresh set and finding more.
+# Conditional, so a first review's prompt is byte-identical.
+_NAMED_SURVIVORS_HEADING = "## Named survivors to re-check"
+
+
+def _named_survivors_directive(open_mutants: Sequence[str] | None) -> str:
+    """The #614 re-check block, or ``""`` when no fix cycle named a survivor."""
+    named = [str(m).strip() for m in (open_mutants or []) if str(m).strip()]
+    if not named:
+        return ""
+    listed = "\n".join(f"- {m}" for m in named)
+    return (
+        f"\n\n{_NAMED_SURVIVORS_HEADING}\n"
+        "The previous review opened this fix cycle because these mutations survived the "
+        "tests. Re-apply each one FIRST and record it in `mutation_checks` with its `mutation` "
+        "string copied VERBATIM from this list and the tests that now fail on it. Judge "
+        "`tests_meaningful` on these before sampling anything new, and apply the same stopping "
+        "rule to any fresh survivor: `blocking: true` with a reason only on spec-required "
+        "behaviour or a money-path / safety guard.\n"
+        f"{listed}"
+    )
+
+
 # #541: the check itself, moved here from the TEST stage, which kept restating the
 # implementer's coverage claims instead of running one. Stated once for the single reviewer
 # and the panel's `find:tests` lens. The aim-it-past-the-summary and single-window clauses are
@@ -515,6 +557,7 @@ _MUTATION_PROOF_RECIPE = (
     "`tests_meaningful: true` needs a recorded mutation that failed a test. If no mutation "
     "can settle it, say why in `tests_not_checked_reason`: that passes, but is recorded as "
     "unproven. An approval with neither is sent back by the engine and this review re-runs.\n"
+    + _SURVIVOR_STOPPING_RULE
 )
 
 
@@ -864,6 +907,7 @@ def render_prompt(
     impacted_tests: Sequence[str] | None = None,
     test_verdict_verified: bool = False,
     keep_open_issue: int | None = None,
+    open_mutants: Sequence[str] | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -975,6 +1019,8 @@ def render_prompt(
         # #541: where the posture is unenforced REVIEW has no disposable copy to mutate in.
         if tool_posture_unenforced:
             instruction += _NO_DISPOSABLE_WORKSPACE_DIRECTIVE
+        # #614: a re-review after a survivor-driven fix cycle re-checks the named survivors.
+        instruction += _named_survivors_directive(open_mutants)
         # #310: a task stacked on unmerged batch dependencies (#216) is told which commits
         # are its own, so the reviewer doesn't judge the PR's trunk-relative diff — which
         # carries the dependencies' commits too — as if it were this task's change. Empty
@@ -1255,6 +1301,7 @@ def render_review_plan(
     change_class: str | None = None,
     diff_stat: DiffStat | None = None,
     no_disposable_workspace: bool = False,
+    open_mutants: Sequence[str] | None = None,
 ) -> ReviewPlan:
     """Resolve the multi-agent REVIEW plan deterministically at ``next_work`` (design §1).
 
@@ -1318,6 +1365,9 @@ def render_review_plan(
         instruction = lens.body
         if lens is _LENS_TESTS and no_disposable_workspace:
             instruction += _NO_DISPOSABLE_WORKSPACE_DIRECTIVE
+        # #614: only the lens that mutates is told which survivors to re-apply.
+        if lens is _LENS_TESTS:
+            instruction += _named_survivors_directive(open_mutants)
         # The docs-only directive is ENGINE-trusted (parameter, not context) and rides every
         # surviving lens so a finder doesn't demand unreachable test coverage.
         if docs_only:

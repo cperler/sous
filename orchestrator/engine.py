@@ -193,6 +193,8 @@ from .state_machine import (
     reset_for_fix_cycle,
     resume_point,
     review_proof_gate,
+    surviving_mutant_disposition,
+    unchecked_named_survivors,
     unjudged_tests_notice,
 )
 from .status_store import StatusStore
@@ -1945,6 +1947,8 @@ class Engine:
             keep_open_issue=(
                 task.issue_number if stage is Stage.DELIVER and task.keep_issue_open else None
             ),
+            # #614: a re-review after a survivor-driven fix cycle re-applies the named ones.
+            open_mutants=task.open_mutants if stage is Stage.REVIEW else None,
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -2591,6 +2595,7 @@ class Engine:
             ),
             diff_stat=self._deterministic_diff_stat(task),
             no_disposable_workspace=not self._lane_enforces_tool_policy(lane),
+            open_mutants=task.open_mutants,
         )
 
     @staticmethod
@@ -2982,6 +2987,11 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
+            # #614: the stopping rule for surviving mutants — the same deterministic seam, so
+            # the verdict below reads a blocking survivor as an issue and every other one as
+            # a noted gap, whatever the reviewer wrote in ``issues``.
+            effective, survivor_events = self._dispose_surviving_mutants(run_id, task, effective)
+            events.extend(survivor_events)
             # #541: an approval must carry its proof that the tests mean anything. Here, not
             # in ``_stage_gate``, because only now does a panel review have its folded output.
             if (proof_error := review_proof_gate(task, effective)) is not None:
@@ -3060,6 +3070,8 @@ class Engine:
         review_verdict: dict | None = None
         test_validation: dict[str, object] | None = None
         workspace_origin: dict[str, object] | None = None
+        # #614: the fix cycle's named survivors this REVIEW did not re-apply (evented).
+        named_survivors_unchecked: list[str] = []
         review_fixup_actions: list[dict[str, object]] = []
         fixups_applied: list[ReviewFixup] = []
         review_filings_carried: list[CarriedReviewFiling] = []
@@ -3078,7 +3090,7 @@ class Engine:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
             nonlocal test_validation, review_fixup_actions, fixups_applied
             nonlocal review_filings_carried
-            nonlocal workspace_origin
+            nonlocal workspace_origin, named_survivors_unchecked
             nonlocal cooldown_until, cooldown_wait_source, cooldown_budget_charged
             nonlocal provider_reset_at, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
@@ -3248,6 +3260,13 @@ class Engine:
                     # #411: and did the reviewer confirm the workspace it ran those
                     # commands in was its own? Same observability-only posture.
                     workspace_origin = self._unconfirmed_workspace_origin(t, effective)
+                    # #614: did this re-review re-apply the survivors the last rejection
+                    # named? Read BEFORE the verdict overwrites or clears the list; a review
+                    # that did not re-check them is evented, never vetoed.
+                    if effective.stage is Stage.REVIEW:
+                        named_survivors_unchecked = unchecked_named_survivors(
+                            t.open_mutants, effective.structured_output or {}
+                        )
                     if scope_blocked_reason is not None:
                         t.state = TaskState.BLOCKED_ON_HUMAN
                         outcome = "scope_not_feasible_held"
@@ -3279,6 +3298,10 @@ class Engine:
                                     for f in review_fixups
                                 ]
                     else:
+                        # #614: an approving (or auto-approved) review closes the survivors
+                        # the last rejection named; a fixup cycle's re-review starts clean.
+                        if effective.stage is Stage.REVIEW:
+                            t.open_mutants = []
                         if review_fixups:
                             outcome, review_fixup_actions = self._apply_review_fixups(
                                 t, review_fixups
@@ -3481,6 +3504,20 @@ class Engine:
                     {"ts": _now(), "type": "test_validation_skipped", "level": "warning",
                      "run_id": run_id, "task_id": result.task_id,
                      "stage": result.stage.value, **test_validation}
+                )
+            # #614: the re-review was told which survivors opened this fix cycle and did not
+            # re-apply them, so whether the fix closed them is unmeasured. Report-only.
+            if named_survivors_unchecked:
+                events.append(
+                    {"ts": _now(), "type": "named_survivor_unchecked", "level": "warning",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value,
+                     "mutations": list(named_survivors_unchecked),
+                     "reason": (
+                         "the fix cycle named these surviving mutations and this review's "
+                         "mutation_checks re-applied none of them, so whether the fix closed "
+                         "them was not measured (report-only, not a veto)"
+                     )}
                 )
             # #411: the reviewer ran its checks in a workspace nothing could prove was its
             # own, and did not come back with a confirmation. Warning-grade and report-only
@@ -4140,6 +4177,69 @@ class Engine:
         )
         return result.model_copy(update={"structured_output": out})
 
+    def _dispose_surviving_mutants(
+        self, run_id: str, task: Task, result: StageResult
+    ) -> tuple[StageResult, list[dict]]:
+        """Apply the #614 stopping rule to a completed REVIEW's ``mutation_checks``.
+
+        The pure ``state_machine.surviving_mutant_disposition`` decides; this fold writes.
+        A survivor flagged ``blocking: true`` WITH a reason joins ``issues`` (deduped by the
+        convergence fingerprint, so a reviewer that also wrote it there does not double it)
+        and forces ``approved=false`` — the same deterministic override a policy finding
+        makes. Every other survivor joins ``non_blocking`` as a ``drop`` entry, deduped the
+        same way against entries already there (a panel may have listed one). A flag with no
+        reason is demoted, and that is evented per entry because it is the reviewer asking for
+        a cycle the engine refused. Returns the result plus the events for the caller's
+        atomic batch (#277); byte-identical and event-free when nothing survived.
+        """
+        if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+            return result, []
+        out = dict(result.structured_output or {})
+        blocking, noted, demoted = surviving_mutant_disposition(out)
+        if not (blocking or noted or demoted):
+            return result, []
+        events: list[dict] = [
+            {"ts": _now(), "type": "surviving_mutant_demoted", "level": "warning",
+             "run_id": run_id, "task_id": task.task_id, "stage": result.stage.value,
+             **entry}
+            for entry in demoted
+        ]
+        added_blocking = 0
+        if blocking:
+            raw = out.get("issues")
+            issues = list(raw) if isinstance(raw, list) else []
+            have = {issue_fingerprint(i) for i in issues}
+            for issue in blocking:
+                fp = issue_fingerprint(issue)
+                if fp in have:
+                    continue
+                have.add(fp)
+                issues.append(issue)
+                added_blocking += 1
+            out["issues"] = issues
+            out["approved"] = False  # deterministic override of the model's approval
+        if noted:
+            raw_nb = out.get("non_blocking")
+            nb = list(raw_nb) if isinstance(raw_nb, list) else []
+            have_nb = {
+                issue_fingerprint(str(e.get("title") or "")) for e in nb if isinstance(e, dict)
+            }
+            for gap in noted:
+                fp = issue_fingerprint(gap["title"])
+                if fp in have_nb:
+                    continue
+                have_nb.add(fp)
+                nb.append(gap)
+            out["non_blocking"] = nb
+        events.append(
+            {"ts": _now(), "type": "surviving_mutants_disposed", "run_id": run_id,
+             "task_id": task.task_id, "stage": result.stage.value,
+             "blocking": len(blocking), "noted": len(noted), "demoted": len(demoted),
+             "issues_added": added_blocking,
+             "blocking_mutations": [str(i["mutation"]) for i in blocking]}
+        )
+        return result.model_copy(update={"structured_output": out}), events
+
     # --- OPTIMIZE benchmark gate (#520) -------------------------------------------------
 
     def _benchmark_tolerance(self) -> tuple[float, dict[str, str] | None]:
@@ -4690,7 +4790,15 @@ class Engine:
             kind = "converged_auto_approved"
         else:
             kind = "rejected"
-        return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints}
+        # #614: the survivors the engine itself promoted to issues, by their verbatim
+        # mutation text — what a fix cycle's re-review is told to re-apply.
+        open_mutants = [
+            str(i["mutation"]) for i in issues
+            if isinstance(i, dict) and i.get("source") == "mutation_check"
+            and str(i.get("mutation") or "").strip()
+        ]
+        return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints,
+                "open_mutants": open_mutants}
 
     @staticmethod
     def _review_fixups(result: StageResult) -> list[ReviewFixup]:
@@ -4942,6 +5050,9 @@ class Engine:
         # The convergence key (#15): the NEXT re-review compares its issues against
         # this rejection's fingerprints — a subset (no net-new findings) auto-approves.
         task.last_review_rejection = list(verdict.get("fingerprints") or [])
+        # #614: the surviving mutations behind this rejection, for the re-review to re-apply
+        # (held or cycled, the next REVIEW is the one that checks they closed).
+        task.open_mutants = list(verdict.get("open_mutants") or [])
         # Fix work must not inherit the reviewer's session (same rationale as warm-retry
         # OFF: a rejecting session's context is as likely poisoned as useful).
         task.session_ref = None
@@ -7128,6 +7239,12 @@ class Engine:
             if "tests_meaningful" in review_out:
                 task_status["tests_meaningful"] = review_out["tests_meaningful"]
                 task_status["proving_mutations"] = proving_mutation_count(review_out)
+                # #614: and how many survived, split by whether one opened a fix cycle.
+                survivors = surviving_mutant_disposition(review_out)
+                task_status["surviving_mutations"] = (
+                    len(survivors.blocking) + len(survivors.noted)
+                )
+                task_status["blocking_mutations"] = len(survivors.blocking)
             if task.quality_tier is not None:
                 task_status.update({
                     "agent_role": task.agent_role,

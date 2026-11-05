@@ -303,6 +303,23 @@ so its cost and failures are visible without restoring the old opaque quality lo
   docs-only change or a pipeline with no TEST stage is exempt, as is a `none`-tier child, which has
   no REVIEW and so no verdict. Interactive REVIEW has no disposable copy, so it is told not to
   mutate and to state that as the reason.
+- **A surviving mutant has a stopping rule (#614).** Each review samples different mutations,
+  so treating every survivor as a blocking finding re-opened implement→…→review per round on
+  code that was correct every time. A `mutation_checks` entry the tests missed opens a fix
+  cycle only when the reviewer marks it `blocking: true` with a `blocking_reason` naming the
+  spec-required behaviour or money-path/safety guard it falls on; the pure
+  `state_machine.surviving_mutant_disposition` decides, and `Engine._dispose_surviving_mutants`
+  applies it at the same seam as the policy-findings merge, before the verdict is read: a
+  qualifying survivor becomes an `important` issue (`source: mutation_check`) that forces
+  `approved=false`, a flag with no reason is demoted and evented (`surviving_mutant_demoted`),
+  and every other survivor joins `non_blocking` once as a `drop` entry, deduped by fingerprint
+  against what the reviewer already listed. `surviving_mutants_disposed` is the receipt. The
+  rejection persists the blocking survivors' verbatim mutation text on `Task.open_mutants`; the
+  re-review prompt (single reviewer and the `find:tests` lens) carries a "Named survivors to
+  re-check" block telling it to re-apply those first, an approval clears the list, and a
+  re-review whose `mutation_checks` match none of them is evented `named_survivor_unchecked`
+  (report-only). `status` adds `surviving_mutations` / `blocking_mutations` beside
+  `proving_mutations`.
 - **The declared commands decide a model TEST's verdict.** On the in-process model lanes
   (headless×claude, any×codex), `test_verdict.py` re-runs the ENGINE lane's evaluation
   (`DeterministicTestRunner.evaluate`) after the model: a claimed green that the declared

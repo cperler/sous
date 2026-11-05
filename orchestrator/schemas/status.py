@@ -349,6 +349,11 @@ class Task(_StatusModel):
     # ``file`` requests from reviews a fix cycle superseded (#546) — kept here for the same
     # reason as ``review_fixups``: the REVIEW record they came from was reset. Additive.
     carried_review_filings: list[CarriedReviewFiling] = Field(default_factory=list)
+    # The surviving mutations whose blocking findings opened the LAST review fix cycle (#614):
+    # the verbatim ``mutation`` strings, so the re-review is told to re-apply exactly these
+    # instead of sampling a fresh set (which is how correct code cycled). Set by a rejection,
+    # cleared by an approval. Additive: older task docs load with an empty list.
+    open_mutants: list[str] = Field(default_factory=list)
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
