@@ -116,6 +116,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
+from .policy_gate import apply_lint_baseline
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -4096,13 +4097,19 @@ class Engine:
         blocking?=True}``. Blocking findings join ``issues`` and force
         ``approved=false`` (severity defaults to critical so a repeated policy finding
         can never convergence-auto-approve past the gate); non-blocking ones join
-        ``non_blocking`` and get filed as follow-up issues at finalize."""
+        ``non_blocking`` and get filed as follow-up issues at finalize, unless they carry
+        their own ``disposition`` (``drop`` is noted, not filed).
+
+        #591: a red lint or type finding that carries ``gate_output`` is compared against
+        ``task.baseline_lint`` here, so only what this change added blocks. A
+        ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
+        event, which is how a green benchmark's load and timing reach the run log."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
+        worktree = task.context.get("worktree")
         try:
-            findings = [f for f in (hook(worktree=task.context.get("worktree")) or [])
-                        if isinstance(f, dict) and str(f.get("description") or "").strip()]
+            raw = [f for f in (hook(worktree=worktree) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -4110,6 +4117,18 @@ class Engine:
                  "task_id": task.task_id, "error": str(exc)},
             )
             return result
+        for entry in raw:
+            if isinstance(entry.get("gate_record"), dict):
+                self.store.append_event(
+                    run_id,
+                    {**entry["gate_record"], "ts": _now(), "type": "policy_gate_result",
+                     "run_id": run_id, "task_id": task.task_id},
+                )
+        findings = apply_lint_baseline(
+            [f for f in raw if str(f.get("description") or "").strip()],
+            task.baseline_lint,
+            worktree if isinstance(worktree, str) else None,
+        )
         if not findings:
             return result
         out = dict(result.structured_output or {})
@@ -4118,7 +4137,7 @@ class Engine:
         if blocking:
             issues = list(out.get("issues") or [])
             for f in blocking:
-                issue = {k: v for k, v in f.items() if k != "blocking"}
+                issue = {k: v for k, v in f.items() if k not in ("blocking", "disposition")}
                 issue.setdefault("severity", "critical")  # a policy gate is a hard gate
                 issues.append(issue)
             out["issues"] = issues
@@ -4126,9 +4145,9 @@ class Engine:
         if advisory:
             nb = list(out.get("non_blocking") or [])
             nb.extend(
-                {"title": str(f.get("description"))[:80],
+                {"title": str(f.get("description")).strip().splitlines()[0][:80],
                  "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"}),
-                 "disposition": "file"}
+                 "disposition": str(f.get("disposition") or "file")}
                 for f in advisory
             )
             out["non_blocking"] = nb
