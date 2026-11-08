@@ -221,6 +221,9 @@ so its cost and failures are visible without restoring the old opaque quality lo
   never read like one that passed — and the completion note's heading comes off that block's
   real `reverted` flag, so it cannot print "REVERTED" over a commit still on the branch. The
   model's own `measurements` stay in the output as profiling detail and decide nothing.
+  A confirmed revert also folds an engine-written `optimize_reverted` line into the context
+  later stages read (the commit, and why: metric slower vs benchmark broken at that commit),
+  and the next pass that reports no revert, or a non-code skip, clears it (#564).
   Because the opt-in inserts OPTIMIZE into EVERY task's pipeline, a task that changed only
   non-code files would still pay a high-effort dispatch to hear `impact: none`. So at
   dispatch time `next_work` reads the task's own change (`base_sha`..worktree — `base_sha`

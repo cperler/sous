@@ -386,6 +386,19 @@ def test_a_test_only_fix_cycle_skips_optimize_after_a_src_first_cycle(tmp_path, 
     assert f"since the reviewed commit {reviewed[:12]} (this review fix cycle)" in note
 
 
+def test_a_non_code_skip_clears_an_earlier_cycles_revert_note(tmp_path, repo) -> None:
+    """A cycle that ran no pass must not keep reporting the last pass's revert as current."""
+    wt, base = repo
+    eng = _engine(tmp_path, NonCodeTestsProject())
+    _first_cycle_to_rejection(eng, wt, base)
+    eng.store.update_task("r1", "t1", lambda t: t.context.update(optimize_reverted="old note"))
+
+    work = _fix_cycle_to(eng, wt, "tests/test_x.py")
+
+    assert work.stage is not Stage.OPTIMIZE
+    assert "optimize_reverted" not in eng.store.load_task("r1", "t1").context
+
+
 def test_a_fix_cycle_that_changes_src_still_dispatches_optimize(tmp_path, repo) -> None:
     wt, base = repo
     eng = _engine(tmp_path, NonCodeTestsProject())

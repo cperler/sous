@@ -184,6 +184,7 @@ from .spec_refresh import diff_summary as spec_diff_summary
 from .spec_refresh import fingerprint as spec_fingerprint
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
+    OPTIMIZE_REVERT_KEY,
     apply_result,
     begin_stage,
     deliver_push_mismatch,
@@ -456,6 +457,37 @@ _OPTIMIZE_UNRESTORED_VETO = (
     "optimize benchmark gate: a failed measurement reset left the worktree off the stage's "
     "commit and it could not be restored"
 )
+
+# #564: why a confirmed revert happened, in the words later stages read. A pass whose commit broke
+# a benchmark that was green at the anchor stays reverted (the pass itself broke the measurement);
+# a benchmark already broken at the anchor never reaches this note, because it keeps the commit.
+_OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED = (
+    "git could not restore the commit after the benchmark's baseline run, so the worktree stayed "
+    "at the earlier commit and the benchmark never judged the pass"
+)
+_OPTIMIZE_REVERT_CAUSES = {
+    "regressed": "metric slower: a benchmark metric got slower past the tolerance",
+    "failed": "the benchmark ran at the earlier commit but could not run or be read at this "
+              "commit, so the pass broke the measurement",
+}
+
+
+def _optimize_revert_note(block: dict) -> str | None:
+    """The ``optimize_reverted`` context line for a gate verdict, or None if it kept the commit.
+
+    Reads ``block['reverted']``, which is the gate's CONFIRMED answer, so the note never claims a
+    revert that did not happen."""
+    if block.get("reverted") is not True:
+        return None
+    cause = (
+        _OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED if block.get("reason") == "head_restore_failed"
+        else _OPTIMIZE_REVERT_CAUSES.get(str(block.get("status")), "the benchmark gate rejected it")
+    )
+    return (
+        f"the engine reverted OPTIMIZE commit {str(block.get('head'))[:12]} back to "
+        f"{str(block.get('anchor'))[:12]}: {cause}. That commit is not on this branch, so do not "
+        "describe its changes as part of this work."
+    )
 
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
@@ -2573,6 +2605,8 @@ class Engine:
             rec.lane = ExecutionMode.ENGINE
             rec.cost_usd = 0.0
             rec.output = dict(output)
+            # This cycle ran no pass, so an earlier cycle's revert note is no longer current.
+            t.context.pop(OPTIMIZE_REVERT_KEY, None)
 
         event = {
             "ts": now, "type": "optimize_skipped_non_code", "level": "info",
@@ -4820,7 +4854,10 @@ class Engine:
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
         the record of a reverted worktree until the locked commit would leave a window where
         the tree and the log disagree. No leg carries raw stdout into the block, so the event
-        is the block verbatim rather than a thinned copy of it."""
+        is the block verbatim rather than a thinned copy of it.
+
+        A confirmed revert also puts ``optimize_reverted`` in the stage output (#564), which
+        the fold carries into every later stage's context with its cause."""
         if revert and worktree and anchor:
             reset = run_git(worktree, "reset", "--hard", anchor)
             if reset.returncode != 0:
@@ -4845,6 +4882,10 @@ class Engine:
         )
         out = dict(result.structured_output or {})
         out["benchmark"] = block
+        # #564: only the engine may say a commit was reverted, so a model's value never folds.
+        out.pop(OPTIMIZE_REVERT_KEY, None)
+        if (revert_note := _optimize_revert_note(block)) is not None:
+            out[OPTIMIZE_REVERT_KEY] = revert_note
         return result.model_copy(update={
             "structured_output": out,
             **({"checkpoint": None} if strip_checkpoint else {}),
