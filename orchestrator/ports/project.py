@@ -267,6 +267,11 @@ class ProjectConfig(Protocol):
     # project's tasks. A task budget still applies on top: ``short`` is 15 minutes and ``long``
     # is 60 minutes or this value, whichever is longer. Anything but a positive int is ignored
     # and evented as ``implement_timeout_rejected``.
+    # Optional REVIEW default (#624; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``review_timeout_s = 1200`` replaces the 10-minute REVIEW limit. ``long`` (a
+    # task pin, a diff of 1500+ changed lines, or the retry after a REVIEW timeout) is 30
+    # minutes or this value, whichever is longer. Anything but a positive int is ignored and
+    # evented as ``review_timeout_rejected``.
     # Optional test timeout (#642; duck-typed via ``getattr``, NOT part of the versioned
     # contract): ``test_timeout_s`` is a positive int attribute or zero-arg callable giving
     # the seconds each declared test command may run in the ENGINE-lane TEST stage and in
