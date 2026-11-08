@@ -187,6 +187,11 @@ def apply_result(
     return notices
 
 
+# #564: the context key naming an OPTIMIZE revert and its cause. A fix cycle re-runs OPTIMIZE, so
+# a key that only ever overwrote would keep reporting an old revert after a pass that kept its
+# commit; the fold and the non-code skip clear it instead.
+OPTIMIZE_REVERT_KEY = "optimize_reverted"
+
 # Engine-owned context-fold whitelist (2026-07-01 context-plane design note). Per stage,
 # the generic stage-contract keys folded into task.context for downstream prompts. Only
 # these keys (present in the canonical schemas/stages/*.json) are folded — never whole
@@ -208,11 +213,12 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.SCOPE: ("plan", "blocked_reason", "performance"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),
-    # #519: nothing folded. The suggestions the engine files are read from the stage
-    # RECORD at finalize, and its measurements are its own account of a pass a later
-    # stage does not act on — #520 makes them engine-run, which is when they become
-    # evidence worth carrying into a downstream prompt.
-    Stage.OPTIMIZE: (),
+    # #519: the suggestions the engine files are read from the stage RECORD at finalize, and
+    # the model's measurements decide nothing, so neither is folded. #564: the one fact a later
+    # stage must act on is that the engine took the pass's commit back off the branch, so TEST,
+    # DELIVER and REVIEW do not describe code that is gone. Engine-authored: the benchmark gate
+    # strips any model value, and the fold clears it when a later pass reports no revert.
+    Stage.OPTIMIZE: (OPTIMIZE_REVERT_KEY,),
     Stage.TEST: ("failures", "validation_notes", "change_class", "test_scope"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
@@ -445,6 +451,10 @@ def _absorb_outputs(
         bounded, cap_notices = _cap_value(key, out[key])
         task.context[key] = bounded
         truncations.extend(cap_notices)
+    # #564: a pass that reports no revert ends the previous pass's note, or a fix cycle would
+    # keep telling later stages about a commit that this pass has moved past.
+    if result.stage is Stage.OPTIMIZE and OPTIMIZE_REVERT_KEY not in out:
+        task.context.pop(OPTIMIZE_REVERT_KEY, None)
     # #377: the SCOPE-declared edit surface is a SCHEDULING input, so it folds onto its own
     # durable task field rather than into the context plane — a context key can be evicted
     # by the whole-context ceiling, and an evicted claim would silently un-serialize the
@@ -891,7 +901,9 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review")
     """Re-open the tail of the pipeline for a fix cycle: every pipeline stage at/after
     ``from_stage`` gets a fresh PENDING record, so ``next_stage`` returns ``from_stage`` and
     the fix re-runs implement→…→review. ``cause`` (what sent it back: ``review`` or ``test``)
-    only names the cycle in the resume hint.
+    names the cycle in the resume hint; a ``review`` cycle also records the commit that
+    review saw (``last_checkpoint.sha``) as ``Task.review_fix_base_sha`` (#564), so the
+    cycle's OPTIMIZE can classify the cycle's own diff rather than the whole task's.
 
     History is not lost — every prior execution is already durable in the per-stage
     logs (``write_stage_log``); the stage RECORD is working state, not the audit trail.
@@ -903,6 +915,9 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review")
     reset = list(task.pipeline[idx:])
     for stage in reset:
         task.stages[stage] = StageRecord()
+    if cause == "review":
+        reviewed = (task.last_checkpoint or {}).get("sha")
+        task.review_fix_base_sha = str(reviewed) if reviewed else None
     task.resume_cursor = ResumeCursor(
         stage=from_stage, hint=f"{cause} fix cycle: re-running from {from_stage.value}"
     )

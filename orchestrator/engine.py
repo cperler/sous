@@ -184,6 +184,7 @@ from .spec_refresh import diff_summary as spec_diff_summary
 from .spec_refresh import fingerprint as spec_fingerprint
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
+    OPTIMIZE_REVERT_KEY,
     apply_result,
     begin_stage,
     deliver_push_mismatch,
@@ -456,6 +457,37 @@ _OPTIMIZE_UNRESTORED_VETO = (
     "optimize benchmark gate: a failed measurement reset left the worktree off the stage's "
     "commit and it could not be restored"
 )
+
+# #564: why a confirmed revert happened, in the words later stages read. A pass whose commit broke
+# a benchmark that was green at the anchor stays reverted (the pass itself broke the measurement);
+# a benchmark already broken at the anchor never reaches this note, because it keeps the commit.
+_OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED = (
+    "git could not restore the commit after the benchmark's baseline run, so the worktree stayed "
+    "at the earlier commit and the benchmark never judged the pass"
+)
+_OPTIMIZE_REVERT_CAUSES = {
+    "regressed": "metric slower: a benchmark metric got slower past the tolerance",
+    "failed": "the benchmark ran at the earlier commit but could not run or be read at this "
+              "commit, so the pass broke the measurement",
+}
+
+
+def _optimize_revert_note(block: dict) -> str | None:
+    """The ``optimize_reverted`` context line for a gate verdict, or None if it kept the commit.
+
+    Reads ``block['reverted']``, which is the gate's CONFIRMED answer, so the note never claims a
+    revert that did not happen."""
+    if block.get("reverted") is not True:
+        return None
+    cause = (
+        _OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED if block.get("reason") == "head_restore_failed"
+        else _OPTIMIZE_REVERT_CAUSES.get(str(block.get("status")), "the benchmark gate rejected it")
+    )
+    return (
+        f"the engine reverted OPTIMIZE commit {str(block.get('head'))[:12]} back to "
+        f"{str(block.get('anchor'))[:12]}: {cause}. That commit is not on this branch, so do not "
+        "describe its changes as part of this work."
+    )
 
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
@@ -2560,9 +2592,14 @@ class Engine:
 
         The changed files are the task's OWN change: ``base_sha`` is captured by INTAKE
         AFTER any dependency branches are composed in (#216), so ``base_sha``..worktree
-        excludes dep code. Read with the same helper the TEST stage's impacted-test
-        selection uses (committed + uncommitted tracked changes + untracked files), then
-        classified by the pure ``non_code.classify_non_code`` against the project's
+        excludes dep code. On a review fix cycle the range is the CYCLE's own change (#564):
+        ``Task.review_fix_base_sha`` (the commit the rejecting review saw)..worktree, because
+        the first cycle's OPTIMIZE already had its pass over the earlier source change — a
+        cycle that only added a test has nothing new to speed up. With no recorded review
+        commit the range falls back to ``base_sha``; the range used is on the record and the
+        ``optimize_skipped_non_code`` event (``diff_range``/``diff_from``). Read with the same
+        helper the TEST stage's impacted-test selection uses (committed + uncommitted tracked
+        changes + untracked files), then classified by the pure ``non_code.classify_non_code`` against the project's
         ``non_code_globs`` (or the defaults).
 
         Never skips on uncertainty: a missing ``base_sha``/worktree or a failed git read
@@ -2586,26 +2623,33 @@ class Engine:
             return False
         base_sha = task.context.get("base_sha")
         worktree = task.context.get("worktree")
+        # #564: a review fix cycle classifies its own diff, from the commit the rejecting
+        # review saw; otherwise (first cycle, or no recorded commit) the whole task's.
+        diff_from, diff_range = (
+            (task.review_fix_base_sha, "review_fix_cycle") if task.review_fix_base_sha
+            else (base_sha, "base_sha")
+        )
         why: str | None = None
         changed: list[str] | None = None
-        if not base_sha:
+        if not diff_from:
             why = "no base_sha in the task context"
         elif not worktree or not Path(str(worktree)).is_dir():
             why = "task worktree missing"
         else:
             try:
-                changed = test_changed_files(str(worktree), str(base_sha))
+                changed = test_changed_files(str(worktree), str(diff_from))
             except Exception as exc:  # noqa: BLE001 - uncertainty dispatches, never skips
                 why = f"git read raised {type(exc).__name__}: {exc}"
             else:
                 if changed is None:
-                    why = f"git diff against base_sha {str(base_sha)[:12]} failed"
+                    why = f"git diff against {diff_range} {str(diff_from)[:12]} failed"
         if changed is None:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "optimize_skip_check_failed", "level": "info",
                  "run_id": run_id, "task_id": task.task_id, "stage": Stage.OPTIMIZE.value,
                  "reason": why or "changed files unknown",
+                 "diff_range": diff_range, "diff_from": str(diff_from) if diff_from else None,
                  "detail": "could not tell whether the change is code; dispatching OPTIMIZE"},
             )
             return False
@@ -2618,6 +2662,8 @@ class Engine:
             "changed_files": shown,
             "changed_files_count": len(verdict.non_code),
             "non_code_globs": list(globs),
+            "diff_range": diff_range,
+            "diff_from": str(diff_from),
         }
         now = _now()
 
@@ -2637,6 +2683,8 @@ class Engine:
             rec.lane = ExecutionMode.ENGINE
             rec.cost_usd = 0.0
             rec.output = dict(output)
+            # This cycle ran no pass, so an earlier cycle's revert note is no longer current.
+            t.context.pop(OPTIMIZE_REVERT_KEY, None)
 
         event = {
             "ts": now, "type": "optimize_skipped_non_code", "level": "info",
@@ -2644,6 +2692,7 @@ class Engine:
             "changed_files": shown, "changed_files_count": len(verdict.non_code),
             "changed_files_truncated": len(verdict.non_code) > len(shown),
             "non_code_globs": list(globs),
+            "diff_range": diff_range, "diff_from": str(diff_from),
         }
         try:
             self.store.commit_task_events(run_id, task.task_id, _skip, [event])
@@ -4904,7 +4953,10 @@ class Engine:
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
         the record of a reverted worktree until the locked commit would leave a window where
         the tree and the log disagree. No leg carries raw stdout into the block, so the event
-        is the block verbatim rather than a thinned copy of it."""
+        is the block verbatim rather than a thinned copy of it.
+
+        A confirmed revert also puts ``optimize_reverted`` in the stage output (#564), which
+        the fold carries into every later stage's context with its cause."""
         if revert and worktree and anchor:
             reset = run_git(worktree, "reset", "--hard", anchor)
             if reset.returncode != 0:
@@ -4929,6 +4981,10 @@ class Engine:
         )
         out = dict(result.structured_output or {})
         out["benchmark"] = block
+        # #564: only the engine may say a commit was reverted, so a model's value never folds.
+        out.pop(OPTIMIZE_REVERT_KEY, None)
+        if (revert_note := _optimize_revert_note(block)) is not None:
+            out[OPTIMIZE_REVERT_KEY] = revert_note
         return result.model_copy(update={
             "structured_output": out,
             **({"checkpoint": None} if strip_checkpoint else {}),

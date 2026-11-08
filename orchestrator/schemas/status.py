@@ -361,6 +361,13 @@ class Task(_StatusModel):
     # instead of sampling a fresh set (which is how correct code cycled). Set by a rejection,
     # cleared by an approval. Additive: older task docs load with an empty list.
     open_mutants: list[str] = Field(default_factory=list)
+    # The commit the rejecting REVIEW looked at (#564): ``last_checkpoint.sha`` when a review
+    # re-opened implement→…→review. A fix cycle's OPTIMIZE classifies only the files changed
+    # since this commit, so a cycle that touched only tests does not re-pay for the first
+    # cycle's source change. None = no review fix cycle yet (diff from ``base_sha``). A later
+    # review overwrites it; a TEST fix cycle leaves it, which only widens the range.
+    # Additive: older task docs load with None.
+    review_fix_base_sha: str | None = None
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
