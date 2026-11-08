@@ -343,6 +343,11 @@ def test_a_non_verifying_model_test_still_gets_no_context(tmp_path, project) -> 
     assert work is not None and work.context is None
 
 
+def _flaky_reasons(run) -> dict[str, list[str]]:
+    return {n["reason"]: n["failures"] for n in run.notices
+            if n["notice"] == "test_flaky_failures_cleared"}
+
+
 def test_a_failure_already_flaky_at_base_is_not_caused_and_not_rerun(tmp_path) -> None:
     """#607: INTAKE saw this test fail at base and pass on its re-run (``baseline_flaky``).
     The same failure in TEST is recorded flaky without spending a re-run, never caused."""
@@ -355,7 +360,7 @@ def test_a_failure_already_flaky_at_base_is_not_caused_and_not_rerun(tmp_path) -
     assert run.out["flaky_failures"] == [_FLAKY]
     assert "already known flaky at base" in run.out["validation_notes"]
     assert len(marker.read_text().splitlines()) == 1  # no re-run
-    assert any(n["notice"] == "test_flaky_failures_cleared" for n in run.notices)
+    assert _flaky_reasons(run) == {"known_flaky_at_base": [_FLAKY]}
 
 
 def test_a_known_flaky_test_does_not_excuse_a_different_failure(tmp_path) -> None:
@@ -364,3 +369,15 @@ def test_a_known_flaky_test_does_not_excuse_a_different_failure(tmp_path) -> Non
     wi = wi.model_copy(update={"context": {"baseline_flaky": [_FLAKY]}})
     run = DeterministicTestRunner(proj).evaluate(wi)
     assert run.ok is False and run.out["failures"] == ["tests/t.py::test_x"]
+
+
+def test_flaky_notices_keep_a_base_flaky_test_apart_from_one_that_passed_on_rerun(tmp_path) -> None:
+    """#607: one run with both kinds of flaky failure events each under its own reason."""
+    marker, other = tmp_path / "ran", "tests/t.py::test_other"
+    proj = _Proj(["sh", "-c", f"if [ -f {marker} ]; then exit 0; fi; touch {marker}; "
+                              f"echo 'FAILED {_FLAKY}'; echo 'FAILED {other}'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is True and sorted(run.out["flaky_failures"]) == sorted([_FLAKY, other])
+    assert _flaky_reasons(run) == {"known_flaky_at_base": [_FLAKY], "passed_on_rerun": [other]}

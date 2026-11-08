@@ -338,7 +338,8 @@ so its cost and failures are visible without restoring the old opaque quality lo
   ran a parallel-declared suite serially and timed out green code twice. Up to five failing
   unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors
   it, else the whole unit command); failures that do not reproduce are recorded as
-  `flaky_failures` with a `test_flaky_failures_cleared` notice, not counted against the change.
+  `flaky_failures` with a `test_flaky_failures_cleared` notice (`reason: passed_on_rerun`, or
+  `known_flaky_at_base` for a `baseline_flaky` test TEST never re-ran), not counted against the change.
   The re-run clears them on exit 0, or on a non-zero exit whose parsed failures are all in the
   baseline (#618). A non-zero exit that parses nothing, or any parsed failure outside the
   baseline, stays caused. An unnarrowed suite that stops early (`-x`) can stop at a baseline

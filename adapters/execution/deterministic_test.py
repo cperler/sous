@@ -44,7 +44,8 @@ failures are recorded under ``flaky_failures`` and a warning notice, not counted
 Prediction run ``batch-418-419-377-386-388`` failed a task three times on three different
 timing-sensitive tests its change never touched; one failing run is not proof. A UNIT failure
 already in intake's ``baseline_flaky`` (failed at base, passed on INTAKE's re-run, #607) is
-recorded the same way without a re-run and does not use up the re-run cap.
+recorded the same way without a re-run and does not use up the re-run cap; its notice carries
+its own reason, ``known_flaky_at_base``, because TEST never re-ran it.
 """
 
 from __future__ import annotations
@@ -231,15 +232,8 @@ class DeterministicTestRunner:
         notices = origin.notices
         if self._timeout_notice is not None:
             notices = notices + (self._timeout_notice,)
-        if flaky := out.get("flaky_failures"):
-            notice: dict[str, object] = {
-                "notice": "test_flaky_failures_cleared",
-                "reason": "passed_on_rerun",
-                "failures": list(flaky)[:10],
-                "detail": "unit test failure(s) did not reproduce when re-run once, or were "
-                          "already flaky at base; not counted against the change",
-            }
-            notices = notices + (notice,)
+        known_flaky = set(_as_ids((work.context or {}).get("baseline_flaky")))
+        notices = notices + _flaky_notices(_as_ids(out.get("flaky_failures")), known_flaky)
         return TestRun(out, error, ok, notices=notices)
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
@@ -493,3 +487,24 @@ def _as_ids(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(x) for x in value]
     return []
+
+
+def _flaky_notices(flaky: list[str], known_flaky: set[str]) -> tuple[dict[str, object], ...]:
+    """One ``test_flaky_failures_cleared`` notice per reason a failure was not counted.
+
+    A test TEST re-ran and saw pass and a ``baseline_flaky`` test it never re-ran (#607) rest on
+    different evidence, so the event log keeps them apart even when one run has both."""
+    groups: tuple[tuple[str, list[str], str], ...] = (
+        ("passed_on_rerun", [t for t in flaky if t not in known_flaky],
+         "unit test failure(s) did not reproduce when re-run once; "
+         "not counted against the change"),
+        ("known_flaky_at_base", [t for t in flaky if t in known_flaky],
+         "unit test failure(s) already flaky at base (baseline_flaky), not re-run here; "
+         "not counted against the change"),
+    )
+    return tuple(
+        {"notice": "test_flaky_failures_cleared", "reason": reason,
+         "failures": failures[:10], "detail": detail}
+        for reason, failures, detail in groups
+        if failures
+    )

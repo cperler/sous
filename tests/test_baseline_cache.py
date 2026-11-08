@@ -335,6 +335,24 @@ def test_a_base_failure_that_passes_on_rerun_is_flaky_and_sharers_inherit_it(tmp
     assert second["baseline_failures"] == [_B] and second["baseline_flaky"] == [_A]
 
 
+def test_the_custom_setup_task_path_reports_the_flaky_split(tmp_path) -> None:
+    """Without ``baseline_flaky`` here, a test that left ``baseline_failures`` on this path
+    would count as caused at TEST."""
+    worktree = tmp_path / "custom"
+    worktree.mkdir()
+
+    class _Override(_RerunProj):
+        def setup_task(self, task_id: str) -> dict:
+            return {"branch": "b/5", "worktree": str(worktree)}
+
+    proj = _Override(tmp_path, tmp_path / "count", tmp_path / "reruns",
+                     base=[_A, _B], rerun=f"echo 'FAILED {_B}'; exit 1")
+
+    out = _intake(proj, tmp_path / "run", "#5")
+
+    assert out["baseline_failures"] == [_B] and out["baseline_flaky"] == [_A]
+
+
 def test_a_green_rerun_marks_every_base_failure_flaky(tmp_path) -> None:
     proj, _, _, cache = _rerun_setup(tmp_path, base=[_A, _B], rerun="exit 0")
     out = _intake(proj, cache, "#5")
