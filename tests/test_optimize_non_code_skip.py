@@ -312,3 +312,136 @@ def test_the_completion_note_says_the_pass_was_skipped(tmp_path, repo) -> None:
     note = render_completion_note(eng.store.load_task("r1", "t1"))
     assert "Speed pass skipped — only non-code files changed" in note
     assert "1 changed file(s)" in note
+
+
+# --- a review fix cycle classifies its own diff (#564) ------------------------------------
+
+
+class NonCodeTestsProject(OptimizingProject):
+    non_code_globs = (*DEFAULT_NON_CODE_GLOBS, "tests/**")
+
+
+_REJECT = {
+    "approved": False,
+    "issues": [{"severity": "critical", "file": "src/app.py", "description": "missing a test"}],
+}
+
+
+def _head(wt) -> str:
+    return _git(wt, "rev-parse", "HEAD").stdout.strip()
+
+
+def _checkpoint(wt, stage: str) -> dict:
+    return {"tag": f"task/r1/t1/{stage}/0", "sha": _head(wt)}
+
+
+def _first_cycle_to_rejection(eng: Engine, wt, base) -> str:
+    """Cycle 1 changes ``src/``; OPTIMIZE must dispatch. Drive it to a rejecting REVIEW and
+    return the commit that review saw (DELIVER's checkpoint)."""
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1")
+    eng.record("r1", make_result(eng.next_work("r1", "t1"), structured_output=_intake(wt, base)))
+    seen_optimize = False
+    while (work := eng.next_work("r1", "t1")).stage is not Stage.REVIEW:
+        if work.stage is Stage.IMPLEMENT:
+            _commit(wt, "src/app.py", "print('feature')\n")
+        seen_optimize |= work.stage is Stage.OPTIMIZE
+        eng.record("r1", make_result(work, checkpoint=_checkpoint(wt, work.stage.value)))
+    assert seen_optimize, "the first cycle changed src/, so OPTIMIZE must have dispatched"
+    reviewed = _head(wt)
+    out = eng.record("r1", make_result(work, structured_output=_REJECT))
+    assert out["outcome"] == "review_rejected_fix_cycle"
+    assert eng.store.load_task("r1", "t1").review_fix_base_sha == reviewed
+    return reviewed
+
+
+def _fix_cycle_to(eng: Engine, wt, change: str) -> object:
+    """Run the fix cycle's IMPLEMENT (committing ``change``) until OPTIMIZE or TEST."""
+    while (work := eng.next_work("r1", "t1")).stage not in (Stage.OPTIMIZE, Stage.TEST):
+        if work.stage is Stage.IMPLEMENT:
+            _commit(wt, change, "def test_x():\n    assert True\n")
+        eng.record("r1", make_result(work, checkpoint=_checkpoint(wt, work.stage.value)))
+    return work
+
+
+def test_a_test_only_fix_cycle_skips_optimize_after_a_src_first_cycle(tmp_path, repo) -> None:
+    wt, base = repo
+    eng = _engine(tmp_path, NonCodeTestsProject())
+    reviewed = _first_cycle_to_rejection(eng, wt, base)
+    assert not _events(eng, "optimize_skipped_non_code")  # cycle 1 ran it
+
+    work = _fix_cycle_to(eng, wt, "tests/test_app.py")
+    assert work.stage is Stage.TEST  # the fix cycle's OPTIMIZE was passed over
+    optimize_dispatches = [
+        e for e in _events(eng, "stage_dispatched") if e["stage"] == "optimize"
+    ]
+    assert len(optimize_dispatches) == 1  # cycle 1 only
+    (event,) = _events(eng, "optimize_skipped_non_code")
+    assert event["diff_range"] == "review_fix_cycle" and event["diff_from"] == reviewed
+    assert event["changed_files"] == ["tests/test_app.py"]  # not cycle 1's src/app.py
+    rec = eng.store.load_task("r1", "t1").stages[Stage.OPTIMIZE]
+    assert rec.status is StageStatus.SKIPPED
+    assert rec.output and rec.output["diff_range"] == "review_fix_cycle"
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+    assert f"since the reviewed commit {reviewed[:12]} (this review fix cycle)" in note
+
+
+def test_a_non_code_skip_clears_an_earlier_cycles_revert_note(tmp_path, repo) -> None:
+    """A cycle that ran no pass must not keep reporting the last pass's revert as current."""
+    wt, base = repo
+    eng = _engine(tmp_path, NonCodeTestsProject())
+    _first_cycle_to_rejection(eng, wt, base)
+    eng.store.update_task("r1", "t1", lambda t: t.context.update(optimize_reverted="old note"))
+
+    work = _fix_cycle_to(eng, wt, "tests/test_x.py")
+
+    assert work.stage is not Stage.OPTIMIZE
+    assert "optimize_reverted" not in eng.store.load_task("r1", "t1").context
+
+
+def test_a_fix_cycle_that_changes_src_still_dispatches_optimize(tmp_path, repo) -> None:
+    wt, base = repo
+    eng = _engine(tmp_path, NonCodeTestsProject())
+    _first_cycle_to_rejection(eng, wt, base)
+    assert _fix_cycle_to(eng, wt, "src/guard.py").stage is Stage.OPTIMIZE
+    assert not _events(eng, "optimize_skipped_non_code")
+
+
+def test_an_unreadable_review_commit_dispatches_with_a_notice(tmp_path, repo) -> None:
+    """Never skip on uncertainty: a recorded review commit git cannot diff against does not
+    quietly fall back to a narrower or wider guess — OPTIMIZE dispatches and says why."""
+    wt, base = repo
+    eng = _engine(tmp_path, NonCodeTestsProject())
+    _first_cycle_to_rejection(eng, wt, base)
+    eng.store.update_task("r1", "t1", lambda t: setattr(t, "review_fix_base_sha", "0" * 40))
+    assert _fix_cycle_to(eng, wt, "tests/test_app.py").stage is Stage.OPTIMIZE
+    (notice,) = _events(eng, "optimize_skip_check_failed")
+    assert notice["diff_range"] == "review_fix_cycle" and "failed" in notice["reason"]
+
+
+def test_a_first_cycle_skip_names_the_base_sha_range(tmp_path, repo) -> None:
+    wt, base = repo
+    _commit(wt, "README.md", "# docs\n")
+    eng = _engine(tmp_path, OptimizingProject())
+    _drive(eng, intake=_intake(wt, base))
+    (event,) = _events(eng, "optimize_skipped_non_code")
+    assert event["diff_range"] == "base_sha" and event["diff_from"] == base
+    note = render_completion_note(eng.store.load_task("r1", "t1"))
+    assert "this review fix cycle" not in note
+
+
+def test_only_a_review_fix_cycle_records_the_reviewed_commit() -> None:
+    from orchestrator.schemas.status import Task
+    from orchestrator.state_machine import reset_for_fix_cycle
+
+    task = Task(
+        run_id="r1", task_id="t1", created_at="t", updated_at="t",
+        last_checkpoint={"tag": "x", "sha": "abc123"},
+    )
+    reset_for_fix_cycle(task, Stage.IMPLEMENT, cause="test")
+    assert task.review_fix_base_sha is None
+    reset_for_fix_cycle(task, Stage.IMPLEMENT)
+    assert task.review_fix_base_sha == "abc123"
+    task.last_checkpoint = None  # no anchor: fall back to base_sha rather than keep a stale one
+    reset_for_fix_cycle(task, Stage.IMPLEMENT)
+    assert task.review_fix_base_sha is None

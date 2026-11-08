@@ -834,3 +834,82 @@ def test_rerun_keeps_existing_task_source_against_a_defaulted_profile(tmp_path) 
     incoming = profile_from_languages("svc", ["python"], MANIFEST)
     incoming.task_source = "github-issues"
     assert merge_profiles(existing, incoming, MANIFEST).task_source == "github-issues"
+
+
+def test_bench_paths_round_trip_and_merge(tmp_path) -> None:
+    """#634: profile.toml's [bench] paths survives write/read and a re-scaffold merge."""
+    prof = profile_from_languages("reach-svc", ["python"], MANIFEST)
+    prof.commands["bench"] = ["bench"]
+    prof.bench = {"paths": ["src/taker", "src/shared/*.py"]}
+    scaffold_adapter("reach-svc", tmp_path, profile=prof)
+    rp = read_profile(tmp_path / "reach_svc" / "profile.toml")
+    assert rp.bench == {"paths": ["src/taker", "src/shared/*.py"]}
+    incoming = profile_from_languages("reach-svc", ["python"], MANIFEST)
+    assert merge_profiles(rp, incoming, MANIFEST).bench == rp.bench
+    incoming.bench = {"paths": ["src/new"]}
+    assert merge_profiles(rp, incoming, MANIFEST).bench == {"paths": ["src/new"]}
+    cfg = _import_adapter(tmp_path, "reach-svc").get_config()
+    assert cfg.bench_paths == ("src/taker", "src/shared/*.py")
+
+
+def test_bench_paths_string_value_is_one_path_not_characters(tmp_path) -> None:
+    """#634 review: ``paths = "src/taker"`` (a string, not a list) must read as one path.
+    ``list()`` on it gave single characters, which matched nothing and skipped the benchmark
+    for a change that touches src/taker. A non-list scalar must not crash the read either."""
+    from orchestrator.policy_gate import bench_unreachable
+
+    path = tmp_path / "profile.toml"
+    path.write_text(
+        '[project]\nname = "str-svc"\n\n[bench]\npaths = "src/taker"\ntimeout_s = 1800\n'
+        'mixed = ["a", 1]\n',
+        encoding="utf-8",
+    )
+    rp = read_profile(path)
+    assert rp.bench == {"paths": ["src/taker"]}
+    assert bench_unreachable(["src/taker/x.py"], tuple(rp.bench["paths"])) is None
+    assert bench_unreachable(["tools/x.py"], tuple(rp.bench["paths"])) is not None
+
+
+def test_generated_benchmark_leg_skips_a_change_outside_bench_paths(
+    tmp_path, monkeypatch
+) -> None:
+    prof = profile_from_languages("reach2-svc", ["python"], MANIFEST)
+    prof.commands["bench"] = ["bench"]
+    prof.bench = {"paths": ["src/taker"]}
+    scaffold_adapter("reach2-svc", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "reach2-svc").get_config()
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+    calls: list[list[str]] = []
+
+    def fake_bench(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(cfg, "_run_bench", fake_bench)
+
+    (skipped,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["tools/x.py"])
+    assert skipped["gate_record"]["verdict"] == "skipped" and calls == []
+
+    (ran,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["src/taker/book.py"])
+    assert ran["gate_record"]["verdict"] == "passed" and calls == [["bench"]]
+
+    # Not told what changed (an older engine): the benchmark runs as before.
+    (ran,) = cfg.review_findings(worktree=str(tmp_path))
+    assert ran["gate_record"]["verdict"] == "passed" and len(calls) == 2
+
+
+def test_adapter_without_bench_paths_always_runs_the_benchmark(tmp_path, monkeypatch) -> None:
+    cfg = _bench_adapter(tmp_path, "reach3-svc", ["bench"])
+    assert not hasattr(cfg, "bench_paths")
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+    monkeypatch.setattr(
+        cfg, "_run_bench", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    (ran,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["tools/x.py"])
+    assert ran["gate_record"]["verdict"] == "passed"

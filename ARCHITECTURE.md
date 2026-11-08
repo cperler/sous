@@ -221,6 +221,9 @@ so its cost and failures are visible without restoring the old opaque quality lo
   never read like one that passed — and the completion note's heading comes off that block's
   real `reverted` flag, so it cannot print "REVERTED" over a commit still on the branch. The
   model's own `measurements` stay in the output as profiling detail and decide nothing.
+  A confirmed revert also folds an engine-written `optimize_reverted` line into the context
+  later stages read (the commit, and why: metric slower vs benchmark broken at that commit),
+  and the next pass that reports no revert, or a non-code skip, clears it (#564).
   Because the opt-in inserts OPTIMIZE into EVERY task's pipeline, a task that changed only
   non-code files would still pay a high-effort dispatch to hear `impact: none`. So at
   dispatch time `next_work` reads the task's own change (`base_sha`..worktree — `base_sha`
@@ -292,8 +295,12 @@ so its cost and failures are visible without restoring the old opaque quality lo
   never adopted), and captures the test baseline — once per run for every task that starts
   from the same clean tree, keyed on (HEAD tree after #216 dep composition, `test_unit_cmd`
   argv, lockfile hash) and persisted under `<run dir>/baseline-cache/` (#553,
-  `baseline_cache.py`; a reused baseline's note says `reused from #N at tree …`, a flaky
-  test is shared by every sharer, `ORCHESTRATOR_NO_BASELINE_CACHE` opts out);
+  `baseline_cache.py`; a reused baseline's note says `reused from #N at tree …`,
+  `ORCHESTRATOR_NO_BASELINE_CACHE` opts out). A red base with at most five parsed failures
+  re-runs just those ids once (#607, only when `test_unit_cmd(ids)` narrows); ones that pass
+  move to `baseline_flaky`, the rest stay in `baseline_failures`, and the cached entry
+  carries the split so sharers inherit it. Deterministic TEST records a failure in
+  `baseline_flaky` as flaky, never caused;
   `deterministic_test.py` runs the suite and
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
@@ -342,7 +349,8 @@ so its cost and failures are visible without restoring the old opaque quality lo
   ran a parallel-declared suite serially and timed out green code twice. Up to five failing
   unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors
   it, else the whole unit command); failures that do not reproduce are recorded as
-  `flaky_failures` with a `test_flaky_failures_cleared` notice, not counted against the change.
+  `flaky_failures` with a `test_flaky_failures_cleared` notice (`reason: passed_on_rerun`, or
+  `known_flaky_at_base` for a `baseline_flaky` test TEST never re-ran), not counted against the change.
   The re-run clears them on exit 0, or on a non-zero exit whose parsed failures are all in the
   baseline (#618). A non-zero exit that parses nothing, or any parsed failure outside the
   baseline, stays caused. An unnarrowed suite that stops early (`-x`) can stop at a baseline
@@ -425,7 +433,10 @@ never satisfy.
   base as `Task.baseline_lint`, and `_merge_policy_findings` blocks only on findings not in
   it; the inherited ones are noted, not filed. A red benchmark re-runs once, records load and
   CPU count on every outcome (`policy_gate_result` event), and blocks only when red twice on
-  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. An improvement — or a non-blocking finding (#414) —
+  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. The engine
+  also passes the task's changed files to a hook that accepts `changed_files` (#634), and
+  when the adapter declares `bench_paths` (profile.toml `[bench] paths`) and the change
+  touches none of them, the benchmark is not run and the record says `skipped`. An improvement — or a non-blocking finding (#414) —
   dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
   requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
   whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains

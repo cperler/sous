@@ -235,3 +235,126 @@ def test_a_model_lane_intake_cannot_excuse_its_own_errors() -> None:
     assert task.baseline_lint == []
     _absorb_outputs(task, result(ExecutionMode.ENGINE, Provider.NONE))
     assert task.baseline_lint == ["a.py: E722 bare"]  # and a non-string entry is dropped
+
+
+# --- #634: the hook learns the task's changed files ---------------------------------------
+
+
+def _git_worktree(path) -> str:
+    """A real repo with one commit (returned as base_sha) and then a tools-only change:
+    one modified tracked file and one untracked new file."""
+    import subprocess
+
+    def git(*args: str) -> str:
+        return subprocess.run(["git", "-C", str(path), *args], check=True,
+                              capture_output=True, text=True).stdout.strip()
+
+    path.mkdir()
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (path / "tools").mkdir()
+    (path / "tools" / "report.py").write_text("x = 1\n")
+    git("add", ".")
+    git("commit", "-q", "-m", "base")
+    base_sha = git("rev-parse", "HEAD")
+    (path / "tools" / "report.py").write_text("x = 2\n")
+    (path / "tools" / "new.py").write_text("y = 1\n")
+    return base_sha
+
+
+class _ReachProject(FakeProject):
+    """A hook that takes ``changed_files`` and hands it to the shared benchmark gate."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.seen: list = []
+
+    def review_findings(self, *, worktree=None, changed_files=None):
+        from orchestrator.policy_gate import run_bench_gate
+
+        self.seen.append(changed_files)
+
+        def never(argv, cwd):  # noqa: ANN001, ARG001
+            raise AssertionError("an unreachable benchmark must not run")
+
+        return run_bench_gate(["bench"], worktree, never, changed_files=changed_files,
+                              bench_paths=("src/taker",))
+
+
+def test_hook_that_accepts_changed_files_gets_them_and_skips_the_benchmark(tmp_path) -> None:
+    repo = tmp_path / "repo"
+    base_sha = _git_worktree(repo)
+    project = _ReachProject()
+    eng = _engine(tmp_path / "store", project)
+    w = _advance_to_review(eng, intake={**_INTAKE, "worktree": str(repo), "base_sha": base_sha})
+    out = eng.record("r1", make_result(w, structured_output=dict(_APPROVE)))
+    assert out["outcome"] == "task_completed"
+    assert [sorted(c) for c in project.seen] == [["tools/new.py", "tools/report.py"]]
+    (event,) = [e for e in eng.store.read_events("r1") if e["type"] == "policy_gate_result"]
+    assert event["verdict"] == "skipped" and event["runs"] == []
+    assert event["changed_files_count"] == 2 and event["bench_paths"] == ["src/taker"]
+    assert project.task_source.followups == []
+
+
+def test_moving_a_module_out_of_bench_paths_still_runs_the_benchmark(tmp_path) -> None:
+    """A rename out of ``src/taker`` removed code the benchmark imports, so the diff DOES
+    reach it: both sides of the move are listed and the benchmark runs (#634)."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    _git_worktree(repo)
+    (repo / "src" / "taker").mkdir(parents=True)
+    (repo / "src" / "taker" / "x.py").write_text("z = 1\n")
+    for args in (("add", "."), ("commit", "-q", "-m", "add taker")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    for args in (("mv", "src/taker/x.py", "tools/x.py"), ("commit", "-q", "-m", "move")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    project = _ReachProject()
+    ran: list = []
+
+    def hook(*, worktree=None, changed_files=None):
+        from orchestrator.policy_gate import run_bench_gate
+
+        project.seen.append(changed_files)
+
+        def bench(argv, cwd):  # noqa: ANN001, ARG001
+            ran.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        return run_bench_gate(["bench"], worktree, bench, changed_files=changed_files,
+                              bench_paths=("src/taker",))
+
+    project.review_findings = hook  # type: ignore[method-assign]
+    eng = _engine(tmp_path / "store", project)
+    w = _advance_to_review(eng, intake={**_INTAKE, "worktree": str(repo), "base_sha": base_sha})
+    eng.record("r1", make_result(w, structured_output=dict(_APPROVE)))
+    (seen,) = project.seen
+    assert "src/taker/x.py" in seen and "tools/x.py" in seen
+    assert ran == [["bench"]]
+
+
+def test_changed_files_is_none_when_the_diff_cannot_be_read(tmp_path) -> None:
+    """No base_sha (and a worktree that does not exist): the hook is told it cannot know,
+    so the benchmark would run as before."""
+    project = _ReachProject()
+    project.review_findings = lambda *, worktree=None, changed_files=None: (  # type: ignore[method-assign]
+        project.seen.append(changed_files) or [])
+    eng = _engine(tmp_path, project)
+    w = _advance_to_review(eng, intake=_INTAKE)
+    eng.record("r1", make_result(w, structured_output=dict(_APPROVE)))
+    assert project.seen == [None]
+
+
+def test_legacy_hook_is_not_passed_changed_files(tmp_path) -> None:
+    """A ``review_findings(*, worktree)`` hook written before #634 keeps working."""
+    project = _PolicyProject([])
+    eng = _engine(tmp_path, project)
+    w = _advance_to_review(eng, intake=_INTAKE)
+    out = eng.record("r1", make_result(w, structured_output=dict(_APPROVE)))
+    assert out["outcome"] == "task_completed"
+    assert project.seen_worktrees == ["/wt/42"]
+    assert not [e for e in eng.store.read_events("r1") if e["type"] == "policy_findings_failed"]

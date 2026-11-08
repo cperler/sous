@@ -361,6 +361,13 @@ class Task(_StatusModel):
     # instead of sampling a fresh set (which is how correct code cycled). Set by a rejection,
     # cleared by an approval. Additive: older task docs load with an empty list.
     open_mutants: list[str] = Field(default_factory=list)
+    # The commit the rejecting REVIEW looked at (#564): ``last_checkpoint.sha`` when a review
+    # re-opened implement→…→review. A fix cycle's OPTIMIZE classifies only the files changed
+    # since this commit, so a cycle that touched only tests does not re-pay for the first
+    # cycle's source change. None = no review fix cycle yet (diff from ``base_sha``). A later
+    # review overwrites it; a TEST fix cycle leaves it, which only widens the range.
+    # Additive: older task docs load with None.
+    review_fix_base_sha: str | None = None
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
@@ -396,6 +403,11 @@ class Task(_StatusModel):
     # retry (#59); consumed by next_work to SUPPRESS the pre-dispatch checkpoint reset so
     # the retry inherits the work. Transient — cleared when the dispatch is committed.
     salvage_in_place: bool = False
+    # #642: set when the deterministic TEST runner reported only an infra failure (a test
+    # command timed out or could not start). The retry then waits until no other task is
+    # running TEST, because the usual cause is concurrent suites overloading the host.
+    # Read by ``dispatchable``/``next_work``; cleared when the TEST is dispatched again.
+    test_wait_for_quiet: bool = False
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing

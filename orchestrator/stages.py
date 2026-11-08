@@ -248,7 +248,8 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "introduced, and re-run until green or no progress. Tests listed under "
             "baseline_failures in the context above were ALREADY failing at base — "
             "inherited, not yours: do not fix them and do not count them against this "
-            "change.\n"
+            "change. Tests under baseline_flaky failed at base but passed on a re-run: "
+            "they are unreliable, so re-run one that fails before treating it as caused.\n"
             "Return: passed, failures (list of failing test ids), validation_notes (what "
             "ran and what failed)."
         ),
