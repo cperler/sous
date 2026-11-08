@@ -5,6 +5,7 @@ Real git in tmp, and a counting test command (appends to a file OUTSIDE the work
 
 from __future__ import annotations
 
+import json
 import subprocess
 import threading
 from pathlib import Path
@@ -279,3 +280,126 @@ def test_registry_wires_the_run_dir_as_the_cache_dir(tmp_path) -> None:
 
     assert _runs(counter) == 1
     assert list((run_dir / baseline_cache.CACHE_DIRNAME).glob("*.json"))
+
+
+# --- #607: a red base re-runs its failures once; ones that pass are flaky, not broken ----
+
+_A, _B = "tests/test_x.py::a", "tests/test_x.py::b"
+
+
+class _LineClassifier:
+    def classify(self, output: str) -> list[_Failure]:
+        return [_Failure(line.split(" ", 1)[1]) for line in output.splitlines()
+                if line.startswith("FAILED ")]
+
+
+class _RerunProj:
+    """The whole suite fails ``base``; narrowed to ids it runs ``rerun`` (a shell snippet)
+    and appends each narrowed call to ``reruns``. ``narrows=False`` ignores the ids."""
+
+    classifier = _LineClassifier()
+
+    def __init__(self, repo: Path, counter: Path, reruns: Path, *, base: list[str],
+                 rerun: str, narrows: bool = True) -> None:
+        self.repo_root = str(repo)
+        self._counter, self._reruns = counter, reruns
+        self._base, self._rerun, self._narrows = base, rerun, narrows
+
+    def install_cmd(self) -> list[str]:
+        return ["true"]
+
+    def test_unit_cmd(self, files=None) -> list[str]:
+        if files and self._narrows:
+            return ["sh", "-c", f"echo {' '.join(files)} >> '{self._reruns}'; {self._rerun}"]
+        fails = "; ".join(f"echo 'FAILED {t}'" for t in self._base)
+        return ["sh", "-c", f"echo run >> '{self._counter}'; {fails}; exit 1"]
+
+
+def _rerun_setup(tmp_path, **kw) -> tuple[_RerunProj, Path, Path, Path]:
+    repo, counter, reruns = _repo(tmp_path / "repo"), tmp_path / "count", tmp_path / "reruns"
+    return _RerunProj(repo, counter, reruns, **kw), counter, reruns, tmp_path / "run"
+
+
+def test_a_base_failure_that_passes_on_rerun_is_flaky_and_sharers_inherit_it(tmp_path) -> None:
+    proj, counter, reruns, cache = _rerun_setup(
+        tmp_path, base=[_A, _B], rerun=f"echo 'FAILED {_B}'; exit 1")
+
+    first = _intake(proj, cache, "#5")
+    second = _intake(proj, cache, "#6")
+
+    assert first["baseline_failures"] == [_B] and first["baseline_flaky"] == [_A]
+    assert "1 passed on re-run (flaky)" in first["baseline"]
+    assert reruns.read_text().split() == [_A, _B]  # only the failed ids, once
+    assert _runs(counter) == 1 and _runs(reruns) == 1  # the sharer re-ran nothing
+    assert second["baseline_reused_from"] == "#5"
+    assert second["baseline_failures"] == [_B] and second["baseline_flaky"] == [_A]
+
+
+def test_a_green_rerun_marks_every_base_failure_flaky(tmp_path) -> None:
+    proj, _, _, cache = _rerun_setup(tmp_path, base=[_A, _B], rerun="exit 0")
+    out = _intake(proj, cache, "#5")
+    assert out["baseline_failures"] == [] and out["baseline_flaky"] == [_A, _B]
+
+
+def test_a_rerun_that_fails_everything_again_moves_nothing(tmp_path) -> None:
+    proj, _, _, cache = _rerun_setup(
+        tmp_path, base=[_A], rerun=f"echo 'FAILED {_A}'; exit 1")
+    out = _intake(proj, cache, "#5")
+    assert out["baseline_failures"] == [_A] and out["baseline_flaky"] == []
+    assert "all failed again on re-run" in out["baseline"]
+
+
+def test_an_inconclusive_rerun_moves_nothing(tmp_path) -> None:
+    """An id outside the re-run set (a collection error) or nothing parsed proves nothing."""
+    reruns = ("echo 'FAILED tests/test_x.py'; exit 2", "echo crash; exit 139")
+    for i, rerun in enumerate(reruns):
+        proj, _, _, cache = _rerun_setup(tmp_path / str(i), base=[_A, _B], rerun=rerun)
+        out = _intake(proj, cache, "#5")
+        assert out["baseline_failures"] == [_A, _B] and out["baseline_flaky"] == []
+        assert "re-run inconclusive" in out["baseline"]
+
+
+def test_a_rerun_timeout_moves_nothing(tmp_path) -> None:
+    proj, _, _, cache = _rerun_setup(tmp_path, base=[_A], rerun="sleep 5; exit 0")
+    proj.test_timeout_s = 1  # type: ignore[attr-defined]
+    out = _intake(proj, cache, "#5")
+    assert out["baseline_failures"] == [_A] and out["baseline_flaky"] == []
+    assert "re-run inconclusive (timed out" in out["baseline"]
+
+
+def test_no_rerun_when_the_adapter_does_not_narrow(tmp_path) -> None:
+    proj, counter, reruns, cache = _rerun_setup(
+        tmp_path, base=[_A], rerun="exit 0", narrows=False)
+    out = _intake(proj, cache, "#5")
+    assert out["baseline_failures"] == [_A] and out["baseline_flaky"] == []
+    assert _runs(counter) == 1 and not reruns.exists()  # the full suite never ran twice
+    assert "does not narrow" in out["baseline"]
+
+
+def test_no_rerun_for_more_than_five_base_failures(tmp_path) -> None:
+    many = [f"tests/test_x.py::t{i}" for i in range(6)]
+    proj, _, reruns, cache = _rerun_setup(tmp_path, base=many, rerun="exit 0")
+    out = _intake(proj, cache, "#5")
+    assert out["baseline_failures"] == many and out["baseline_flaky"] == []
+    assert not reruns.exists()
+
+
+def test_a_cache_entry_from_before_the_flaky_split_reads_as_no_flaky(tmp_path) -> None:
+    repo, counter, cache = _repo(tmp_path / "repo"), tmp_path / "count", tmp_path / "run"
+    proj = _CountingProj(repo, counter, rc=1, failing=[_A])
+    _intake(proj, cache, "#5")
+    for entry in (cache / baseline_cache.CACHE_DIRNAME).glob("*.json"):
+        doc = json.loads(entry.read_text())
+        doc["result"].pop("flaky", None)
+        entry.write_text(json.dumps(doc))
+
+    second = _intake(proj, cache, "#6")
+
+    assert second["baseline_reused_from"] == "#5"
+    assert second["baseline_failures"] == [_A] and second["baseline_flaky"] == []
+
+
+def test_baseline_flaky_is_folded_into_the_task_context() -> None:
+    from orchestrator.state_machine import CONTEXT_KEYS
+
+    assert "baseline_flaky" in CONTEXT_KEYS[Stage.INTAKE]

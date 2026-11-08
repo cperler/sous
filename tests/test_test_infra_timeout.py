@@ -127,7 +127,8 @@ def test_an_explicit_timeout_wins_over_the_declaration(tmp_path, project) -> Non
 def test_the_intake_baseline_uses_the_same_declared_timeout(tmp_path, project) -> None:
     project.test_timeout_s = 1
     out = DeterministicSetupRunner(project)._run_baseline(tmp_path, ["sleep", "5"], None)
-    assert out == {"captured": False, "failures": [], "note": "baseline run timed out (1s)"}
+    assert out == {"captured": False, "failures": [], "flaky": [],
+                   "note": "baseline run timed out (1s)"}
 
 
 def test_an_origin_probe_that_only_timed_out_reports_infra(tmp_path, project, monkeypatch) -> None:

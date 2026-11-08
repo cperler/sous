@@ -42,7 +42,9 @@ unnarrowed suite that stops early (``-x``, ``--maxfail``) can stop at a baseline
 reaching the flaky test and clear it unproven; a narrowed re-run has no such gap. Cleared
 failures are recorded under ``flaky_failures`` and a warning notice, not counted as caused.
 Prediction run ``batch-418-419-377-386-388`` failed a task three times on three different
-timing-sensitive tests its change never touched; one failing run is not proof.
+timing-sensitive tests its change never touched; one failing run is not proof. A UNIT failure
+already in intake's ``baseline_flaky`` (failed at base, passed on INTAKE's re-run, #607) is
+recorded the same way without a re-run and does not use up the re-run cap.
 """
 
 from __future__ import annotations
@@ -234,14 +236,17 @@ class DeterministicTestRunner:
                 "notice": "test_flaky_failures_cleared",
                 "reason": "passed_on_rerun",
                 "failures": list(flaky)[:10],
-                "detail": "unit test failure(s) did not reproduce when re-run once; not "
-                          "counted against the change",
+                "detail": "unit test failure(s) did not reproduce when re-run once, or were "
+                          "already flaky at base; not counted against the change",
             }
             notices = notices + (notice,)
         return TestRun(out, error, ok, notices=notices)
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
         baseline = set(_as_ids((work.context or {}).get("baseline_failures")))
+        # #607: tests INTAKE saw fail at base and then pass on a re-run. A failure here is
+        # the same flakiness again, so it is recorded as flaky, never counted as caused.
+        known_flaky = set(_as_ids((work.context or {}).get("baseline_flaky")))
         caused: list[str] = []
         caused_kinds: set[str] = set()
         inherited_count = 0
@@ -326,6 +331,14 @@ class DeterministicTestRunner:
             new = [f for f in failures if f.test not in baseline]
             inherited = [f for f in failures if f.test in baseline]
             inherited_count += len(inherited)
+            if label == "unit" and (base_flaky := [f.test for f in new
+                                                   if f.test in known_flaky]):
+                flaky.extend(base_flaky)
+                new = [f for f in new if f.test not in known_flaky]
+                notes.append(f"{label}: {len(base_flaky)} failure(s) already known flaky at "
+                             "base (baseline_flaky), not counted: " + ", ".join(base_flaky))
+                if not new and not inherited:
+                    continue
             if new and label == "unit" and len(new) <= _MAX_FLAKY_RERUN:
                 ids = [f.test for f in new]
                 cleared, how, also_failed = self._rerun_cleared(

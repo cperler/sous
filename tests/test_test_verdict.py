@@ -341,3 +341,26 @@ def test_a_non_verifying_model_test_still_gets_no_context(tmp_path, project) -> 
     work = _at_test(eng, "r1", "t1")
 
     assert work is not None and work.context is None
+
+
+def test_a_failure_already_flaky_at_base_is_not_caused_and_not_rerun(tmp_path) -> None:
+    """#607: INTAKE saw this test fail at base and pass on its re-run (``baseline_flaky``).
+    The same failure in TEST is recorded flaky without spending a re-run, never caused."""
+    marker = tmp_path / "ran"
+    proj = _Proj(["sh", "-c", f"echo x >> {marker}; echo 'FAILED {_FLAKY}'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_failures": [], "baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is True and run.out["failures"] == []
+    assert run.out["flaky_failures"] == [_FLAKY]
+    assert "already known flaky at base" in run.out["validation_notes"]
+    assert len(marker.read_text().splitlines()) == 1  # no re-run
+    assert any(n["notice"] == "test_flaky_failures_cleared" for n in run.notices)
+
+
+def test_a_known_flaky_test_does_not_excuse_a_different_failure(tmp_path) -> None:
+    proj = _Proj(["sh", "-c", f"echo 'FAILED {_FLAKY}'; echo 'FAILED tests/t.py::test_x'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is False and run.out["failures"] == ["tests/t.py::test_x"]
