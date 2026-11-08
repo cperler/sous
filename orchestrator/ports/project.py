@@ -262,6 +262,11 @@ class ProjectConfig(Protocol):
     # project's tasks. A task budget still applies on top: ``short`` is 15 minutes and ``long``
     # is 60 minutes or this value, whichever is longer. Anything but a positive int is ignored
     # and evented as ``implement_timeout_rejected``.
+    # Optional REVIEW default (#624; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``review_timeout_s = 1200`` replaces the 10-minute REVIEW limit. ``long`` (a
+    # task pin, a diff of 1500+ changed lines, or the retry after a REVIEW timeout) is 30
+    # minutes or this value, whichever is longer. Anything but a positive int is ignored and
+    # evented as ``review_timeout_rejected``.
     # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
     # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   parallel_safe_paths() -> list[str]

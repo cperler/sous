@@ -508,6 +508,12 @@ def main(argv: list[str] | None = None) -> int:
                          "task 60 minutes instead of the project default (30 unless the "
                          "adapter sets implement_timeout_s), 'short' 15. Persisted on the "
                          "task and wins over SCOPE's own sizing; omitted, SCOPE may raise it")
+    at.add_argument("--review-budget", default=None, choices=["standard", "long"],
+                    help="per-task REVIEW wall-clock budget (#624): 'long' gives a large "
+                         "change 30 minutes instead of the project default (10 unless the "
+                         "adapter sets review_timeout_s); 'standard' turns off diff-size "
+                         "scaling. Persisted on the task; omitted, a diff of 1500+ changed "
+                         "lines is reviewed on the long limit")
     at.add_argument("--max-filed-followups", type=int, default=None,
                     help="per-task cap on how many non-blocking review findings are FILED as "
                          "follow-up issues (#191); overrides the engine-wide default for a task "
@@ -1708,7 +1714,8 @@ def main(argv: list[str] | None = None) -> int:
                             model=args.model, effort=args.effort,
                             max_filed_followups=args.max_filed_followups,
                             keep_issue_open=args.keep_issue_open,
-                            implementation_budget=args.implementation_budget)
+                            implementation_budget=args.implementation_budget,
+                            review_budget=args.review_budget)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
@@ -1719,6 +1726,9 @@ def main(argv: list[str] | None = None) -> int:
                "implementation_budget": (
                    task.implementation_budget.value
                    if task.implementation_budget is not None else None
+               ),
+               "review_budget": (
+                   task.review_budget.value if task.review_budget is not None else None
                )})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into

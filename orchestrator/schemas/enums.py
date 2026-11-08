@@ -338,6 +338,20 @@ class ImplementationBudget(StrEnum):
     LONG = "long"
 
 
+class ReviewBudget(StrEnum):
+    """Per-task REVIEW wall-clock budget (#624), the REVIEW sibling of ``ImplementationBudget``.
+
+    ``standard`` is the project's REVIEW default (10 minutes unless the adapter declares
+    ``review_timeout_s``) and turns off diff-size scaling. ``long`` is 30 minutes, never
+    below the project default. Unset, a diff large enough is reviewed on the long limit
+    anyway. Pinned at ``add-task`` / in a batch plan, and raised to ``long`` by the engine
+    when a REVIEW attempt times out. Persisted on the task.
+    """
+
+    STANDARD = "standard"
+    LONG = "long"
+
+
 # Lane PRESETS: named pipelines (ported from full/lite/micro). A lane is resolved to a
 # concrete task.pipeline at add_task; the engine sequences on the pipeline, not the lane.
 LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {

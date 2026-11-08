@@ -203,7 +203,8 @@ def apply_plan(
     ``None``, which is exactly today's role-default behavior), its ``keep_issue_open``
     choice (#613 — omitted passes ``None``, which follows the project's keep-open labels),
     and its ``implementation_budget`` (#615 — omitted passes ``None``: the project's
-    IMPLEMENT default, which SCOPE may still raise to ``long``).
+    IMPLEMENT default, which SCOPE may still raise to ``long``), and its ``review_budget``
+    (#624 — omitted passes ``None``: the REVIEW default, scaled up for a large diff).
     Emits ONE ``batch_planned`` event summarizing what was added.
 
     ``dry_run`` adds nothing and emits no event — it returns exactly what WOULD be added so
@@ -236,6 +237,7 @@ def apply_plan(
             "effort": t.get("effort"),
             "keep_issue_open": t.get("keep_issue_open"),
             "implementation_budget": t.get("implementation_budget"),
+            "review_budget": t.get("review_budget"),
             "rationale": t.get("rationale", ""),
         }
         if not dry_run:
@@ -250,6 +252,7 @@ def apply_plan(
                 effort=t.get("effort"),
                 keep_issue_open=t.get("keep_issue_open"),
                 implementation_budget=t.get("implementation_budget"),
+                review_budget=t.get("review_budget"),
             )
         added.append(entry)
 

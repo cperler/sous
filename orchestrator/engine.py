@@ -162,6 +162,7 @@ from .schemas.enums import (
     Provider,
     QualityTier,
     ResultStatus,
+    ReviewBudget,
     RunState,
     Stage,
     StageStatus,
@@ -202,7 +203,13 @@ from .state_machine import (
     unjudged_tests_notice,
 )
 from .status_store import StatusStore
-from .stream_probe import probe_current_stream, prompt_filename, prompt_relpath
+from .stream_probe import (
+    attempt_stream_paths,
+    probe_current_stream,
+    prompt_filename,
+    prompt_relpath,
+    review_progress_digest,
+)
 from .supervisor_context import DEFAULT_MIN_REMAINING_PCT, SupervisorContext
 from .test_selection import changed_files as test_changed_files
 from .test_selection import select_tests
@@ -272,6 +279,41 @@ def implement_timeout_s(
     if budget is ImplementationBudget.LONG:
         return max(_IMPLEMENT_TIMEOUTS[ImplementationBudget.LONG], base)
     return base
+
+
+# #624: REVIEW's long limit, and the diff size (lines added + deleted, from the engine's own
+# ``git diff --numstat``) at which an unpinned task is reviewed on it. prediction#1365's
+# 4,579-line change timed out twice at 10 minutes while still doing real work.
+_REVIEW_LONG_TIMEOUT_S = 1800
+_REVIEW_LONG_DIFF_LINES = 1500
+# The ceiling on ``Task.review_progress`` (#624): it rides every later REVIEW prompt, so a
+# second timeout's digest pushes the oldest text out rather than growing the prompt.
+_REVIEW_PROGRESS_MAX_CHARS = 16000
+
+
+def review_timeout_s(
+    budget: ReviewBudget | None,
+    *,
+    spec_timeout_s: int,
+    project_default_s: int | None,
+    diff_lines: int | None,
+) -> tuple[int, str]:
+    """The REVIEW wall-clock limit for a task (#624), and why it is that.
+
+    ``standard`` (pinned) is the project's declared default, else the stage spec's, and
+    turns diff-size scaling off. ``long`` is 30 minutes, or the project default when that is
+    already longer, so asking for more time never shortens the limit. With no budget, a
+    diff of at least ``_REVIEW_LONG_DIFF_LINES`` changed lines gets the long limit; an
+    unmeasured diff (``None``) gets the default. The reason is one of ``spec_default``,
+    ``project_default``, ``budget_long`` or ``diff_size``."""
+    base = project_default_s if project_default_s is not None else spec_timeout_s
+    base_reason = "project_default" if project_default_s is not None else "spec_default"
+    long_s = max(_REVIEW_LONG_TIMEOUT_S, base)
+    if budget is ReviewBudget.LONG:
+        return long_s, "budget_long"
+    if budget is None and diff_lines is not None and diff_lines >= _REVIEW_LONG_DIFF_LINES:
+        return long_s, "diff_size"
+    return base, base_reason
 
 
 def _hash_preview(value: str | None) -> str | None:
@@ -564,6 +606,7 @@ _REVIEW_SUPERSEDING_OUTCOMES: dict[str, int] = {
     "review_rejected_fix_cycle": 1,
     "review_fixup_held": 0,
     "review_rejected_held": 0,
+    "review_timed_out_held": 0,
 }
 
 # The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
@@ -903,6 +946,7 @@ class Engine:
         agent_role: str | None = None,
         quality_tier: str | QualityTier | None = None,
         implementation_budget: str | ImplementationBudget | None = None,
+        review_budget: str | ReviewBudget | None = None,
         max_filed_followups: int | None = None,
         hold_before: Stage | None = None,
         keep_issue_open: bool | None = None,
@@ -928,7 +972,9 @@ class Engine:
         tier selects the child's explicit quality pipeline and the budget selects the
         IMPLEMENT timeout (``implement_timeout_s``). The budget is also the per-task pin
         ``add-task --implementation-budget`` / a batch plan pass (#615), which a later
-        SCOPE sizing cannot override. ``max_filed_followups`` (#191) caps how many
+        SCOPE sizing cannot override. ``review_budget`` (#624) pins the REVIEW limit
+        (``review_timeout_s``): ``long`` for a change too large to review in the default,
+        ``standard`` to turn diff-size scaling off. ``max_filed_followups`` (#191) caps how many
         non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
@@ -1017,6 +1063,9 @@ class Engine:
         resolved_budget = (
             ImplementationBudget(implementation_budget)
             if implementation_budget is not None else None
+        )
+        resolved_review_budget = (
+            ReviewBudget(review_budget) if review_budget is not None else None
         )
         # Per-task filing cap (#191): validated BEFORE any state is written, like the pins.
         # None inherits the engine default; a negative cap is nonsensical (a cap of 0 already
@@ -1163,6 +1212,7 @@ class Engine:
                 agent_role=agent_role,
                 quality_tier=resolved_quality,
                 implementation_budget=resolved_budget,
+                review_budget=resolved_review_budget,
                 model_pin=model_pin,
                 effort_pin=effort_pin,
                 issue_number=spec.issue_number,
@@ -1259,6 +1309,18 @@ class Engine:
         declares nothing, and ``(None, <repr>)`` for a value the engine ignores, so the
         caller can event the rejection rather than silently fall back to the default."""
         raw = getattr(self.project, "implement_timeout_s", None)
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None, repr(raw)[:80]
+        return raw, None
+
+    def _project_review_timeout(self) -> tuple[int | None, str | None]:
+        """The adapter's optional ``review_timeout_s`` (#624) and, if unusable, why.
+
+        Same shape as ``_project_implement_timeout``: ``(seconds, None)`` for a positive
+        int, ``(None, None)`` when undeclared, ``(None, <repr>)`` for a value to event."""
+        raw = getattr(self.project, "review_timeout_s", None)
         if raw is None:
             return None, None
         if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
@@ -2082,6 +2144,8 @@ class Engine:
             ),
             # #614: a re-review after a survivor-driven fix cycle re-applies the named ones.
             open_mutants=task.open_mutants if stage is Stage.REVIEW else None,
+            # #624: a REVIEW after a timed-out one continues from what that attempt ran.
+            review_progress=task.review_progress if stage is Stage.REVIEW else None,
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -2110,6 +2174,8 @@ class Engine:
                 spec_timeout_s=spec.timeout_s,
                 project_default_s=project_default,
             )
+        elif stage is Stage.REVIEW and not deterministic:
+            timeout_s = self._review_dispatch_timeout(task, run_id, spec_timeout_s=spec.timeout_s)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -2637,6 +2703,43 @@ class Engine:
         return list(selection.files) if selection.scope == "impacted" else None
 
     # --- multi-agent REVIEW plan (#73) -----------------------------------------
+    def _review_dispatch_timeout(self, task: Task, run_id: str, *, spec_timeout_s: int) -> int:
+        """Pick a model REVIEW dispatch's limit (#624) and event any departure from the spec.
+
+        The diff is measured only when it can matter (no budget on the task), with the same
+        bounded engine-side read the review plan uses; a failed read keeps the default and
+        the event says the diff was unmeasured. An unusable adapter value is evented as
+        ``review_timeout_rejected``; a limit other than the spec's as ``review_timeout_set``."""
+        project_default, rejected = self._project_review_timeout()
+        if rejected is not None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "review_timeout_rejected", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "value": rejected,
+                 "reason": "review_timeout_s must be a positive int; using the default"},
+            )
+        diff_lines: int | None = None
+        if task.review_budget is None:
+            stat = self._deterministic_diff_stat(task)
+            diff_lines = stat.lines if stat is not None else None
+        seconds, reason = review_timeout_s(
+            task.review_budget,
+            spec_timeout_s=spec_timeout_s,
+            project_default_s=project_default,
+            diff_lines=diff_lines,
+        )
+        if seconds != spec_timeout_s:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "review_timeout_set", "run_id": run_id,
+                 "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "timeout_s": seconds, "reason": reason,
+                 "budget": task.review_budget.value if task.review_budget else None,
+                 "diff_lines": diff_lines, "long_diff_lines": _REVIEW_LONG_DIFF_LINES},
+            )
+        return seconds
+
     def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:
         """Measure the change under review with a bounded, best-effort ENGINE-lane git read
         (``git diff --numstat <base_sha>..HEAD`` in the task's worktree).
@@ -2749,6 +2852,7 @@ class Engine:
             diff_stat=self._deterministic_diff_stat(task),
             no_disposable_workspace=not self._lane_enforces_tool_policy(lane),
             open_mutants=task.open_mutants,
+            review_progress=task.review_progress,
         )
 
     @staticmethod
@@ -3401,6 +3505,9 @@ class Engine:
                     t.infra_resets = 0  # ... and the infra-reset budget (#14)
                     t.salvage_count = 0  # ... and the salvage-keep budget (#59)
                     t.salvage_in_place = False  # a clean stage leaves nothing to keep
+                    if effective.stage is Stage.REVIEW:
+                        # #624: a REVIEW that returned a result consumed the carried progress.
+                        t.review_progress = None
                     # Session chaining (design pass §2): reuse across SUCCESSFUL stage
                     # transitions only. A runner that reports no ref leaves the prior one
                     # in place (resuming a slightly-stale session is safe: prompts are
@@ -5547,6 +5654,15 @@ class Engine:
             self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
             return "stage_infra_reset_retry"
 
+        # #624: a REVIEW that ran out of time was doing real work, not failing at it. Whatever
+        # follows (a retry, or a hold for a human), the next REVIEW gets the long limit and
+        # what this attempt had already run, so it continues instead of starting over.
+        review_timed_out = (
+            result.stage is Stage.REVIEW and result.status is ResultStatus.TIMEOUT
+        )
+        if review_timed_out:
+            self._carry_timed_out_review(task, result)
+
         # Reuse the tested CircuitBreaker over the persisted signature streak.
         breaker = CircuitBreaker(self.breaker_threshold)
         for s in task.error_signatures:
@@ -5554,6 +5670,22 @@ class Engine:
         # result.attempt is trustworthy: content_hash (which includes attempt) was
         # validated against the dispatched WorkItem, so it equals the engine's count.
         attempts_done = result.attempt + 1
+        if (attempts_done >= task.max_attempts or breaker.tripped) and review_timed_out:
+            # #624: no verdict is not a rejected change. Park for a human review the way a
+            # held rejection does (REVIEW FAILED, so approve() re-dispatches it) instead of
+            # failing a task whose code may be fine.
+            task.error_signatures = []
+            rec = task.stages[Stage.REVIEW]
+            rec.status = StageStatus.FAILED
+            rec.error = (
+                f"review timed out on attempt {result.attempt}: no verdict, needs a human "
+                f"review (the code may be fine)"
+            )
+            task.last_error = rec.error
+            task.state = TaskState.BLOCKED_ON_HUMAN
+            self._settle_failed_session(task, result, run=run, infra_only=infra_only,
+                                        retrying=False)
+            return "review_timed_out_held"
         if attempts_done >= task.max_attempts or breaker.tripped:
             task.state = TaskState.FAILED
             task.error_signatures = []  # don't carry a poisoned streak into a re-queue
@@ -5589,6 +5721,65 @@ class Engine:
         task.state = TaskState.RETRYING
         self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
         return "stage_failed_will_retry"
+
+    def _carry_timed_out_review(self, task: Task, result: StageResult) -> None:
+        """Set up the next REVIEW after a timed-out one (#624): raise the task's REVIEW
+        budget to ``long`` and fold a digest of what this attempt ran into
+        ``Task.review_progress`` (appended to an earlier timeout's, newest kept on overflow).
+
+        The digest is read from the attempt's retained streams, which a timed-out dispatch
+        does not report back, so the paths are rebuilt from the dispatch's own (attempt,
+        cycle). Both steps are evented: ``review_budget_raised`` when the budget changed, and
+        ``review_progress_carried`` always, with ``carried: 0`` and a reason when there was
+        nothing to read (an interactive lane, or a stream that never got written)."""
+        previous = task.review_budget
+        if previous is not ReviewBudget.LONG:
+            task.review_budget = ReviewBudget.LONG
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "review_budget_raised", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "attempt": result.attempt,
+                 "from": previous.value if previous is not None else None,
+                 "to": ReviewBudget.LONG.value, "reason": "review_timed_out"},
+            )
+        cycle = task.review_cycles + task.test_fix_cycles
+        root = Path(self.store.root)
+        streams: list[tuple[str, str]] = []
+        unreadable = 0
+        for path in attempt_stream_paths(
+            root, task.task_id, Stage.REVIEW.value, result.attempt, cycle=cycle
+        ):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                unreadable += 1
+                continue
+            label = path.name.removesuffix(".stream.jsonl")
+            streams.append((label, text))
+        digest = review_progress_digest(streams)
+        text = str(digest["text"])
+        event: dict[str, object] = {
+            "ts": _now(), "type": "review_progress_carried", "run_id": task.run_id,
+            "task_id": task.task_id, "stage": Stage.REVIEW.value, "attempt": result.attempt,
+            "streams": len(streams), "unreadable_streams": unreadable,
+            "carried": digest["steps"], "dropped_steps": digest["dropped_steps"],
+            "notes": digest["notes"], "dropped_notes": digest["dropped_notes"],
+        }
+        if not text:
+            event["reason"] = "no_stream" if not streams else "nothing_recorded"
+            event["level"] = "warning"
+        else:
+            section = f"### Attempt {result.attempt}\n{text}"
+            combined = f"{task.review_progress}\n\n{section}" if task.review_progress else section
+            trimmed = 0
+            if len(combined) > _REVIEW_PROGRESS_MAX_CHARS:
+                trimmed = len(combined) - _REVIEW_PROGRESS_MAX_CHARS
+                combined = "[earlier progress cut]\n" + combined[trimmed:]
+            task.review_progress = combined
+            event["chars"] = len(combined)
+            event["trimmed_chars"] = trimmed
+        self.store.append_event(task.run_id, event)
 
     @staticmethod
     def _red_test_implicates_code(task: Task, result: StageResult, *, infra_only: bool) -> bool:
@@ -7451,6 +7642,9 @@ class Engine:
                         if task.implementation_budget is not None else None
                     ),
                 })
+            # #624: a raised REVIEW limit (pinned, or after a timeout) is visible in status.
+            if task.review_budget is not None:
+                task_status["review_budget"] = task.review_budget.value
             if task.decomposition_children:
                 task_status["decomposition"] = {
                     "mapping": task.decomposition_mapping,

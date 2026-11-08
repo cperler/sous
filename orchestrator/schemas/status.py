@@ -27,6 +27,7 @@ from .enums import (
     ImplementationBudget,
     Provider,
     QualityTier,
+    ReviewBudget,
     RunState,
     Stage,
     StageStatus,
@@ -227,6 +228,9 @@ class Task(_StatusModel):
     agent_role: str | None = None
     quality_tier: QualityTier | None = None
     implementation_budget: ImplementationBudget | None = None
+    # Per-task REVIEW wall-clock budget (#624): an add-task / batch-plan pin, or ``long``
+    # once a REVIEW attempt timed out. Additive field: older task docs load with None.
+    review_budget: ReviewBudget | None = None
     # Per-task model pin (#84): a canonical model id (e.g. "claude-fable-5") that overrides the
     # role default on a model-lane stage so a brainstorm/heavy-architecture task runs on a higher
     # tier. Resolved + provider-validated at add_task (an alias like "fable" is normalized to the
@@ -361,6 +365,11 @@ class Task(_StatusModel):
     # instead of sampling a fresh set (which is how correct code cycled). Set by a rejection,
     # cleared by an approval. Additive: older task docs load with an empty list.
     open_mutants: list[str] = Field(default_factory=list)
+    # What a timed-out REVIEW attempt had already run (#624): a bounded digest of its commands
+    # and their results, read from the retained stream, so the next REVIEW continues rather
+    # than re-reads everything. Rendered into REVIEW's prompt only; cleared once a REVIEW
+    # returns a result. Additive: older task docs load with None.
+    review_progress: str | None = None
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None

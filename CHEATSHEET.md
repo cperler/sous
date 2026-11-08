@@ -201,6 +201,12 @@ the issue's text does not work.
 minutes instead of 30, or declare `implement_timeout_s` on the adapter for a project-wide default.
 SCOPE may also choose `long` itself; a pin wins over SCOPE.
 
+**A big change that times out in REVIEW needs `review_budget`.** A diff of 1500+ changed lines
+already gets 30 minutes instead of 10; set `"review_budget": "long"` in the plan
+(`add-task --review-budget long`) to force it, or `review_timeout_s` on the adapter for a
+project-wide default. A timed-out REVIEW retries on the long limit with what it had already run,
+and a REVIEW that runs out of attempts is held for a human review, not failed (#624).
+
 **Never `rm -rf runs/<run>/`.** Worktrees, branches, and checkpoint tags are cleanup targets;
 the run log dir is the durable audit trail and is pruned only by a human, deliberately.
 

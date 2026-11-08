@@ -557,6 +557,26 @@ def _named_survivors_directive(open_mutants: Sequence[str] | None) -> str:
     )
 
 
+# #624: a REVIEW retried after a timeout is handed what the timed-out attempt had already run.
+# Conditional, so a review that never timed out has a byte-identical prompt.
+_REVIEW_PROGRESS_HEADING = "## Progress from the timed-out review"
+
+
+def _review_progress_directive(progress: str | None) -> str:
+    """The #624 carry-over block, or ``""`` when no REVIEW attempt timed out."""
+    if not (progress and progress.strip()):
+        return ""
+    return (
+        f"\n\n{_REVIEW_PROGRESS_HEADING}\n"
+        "An earlier REVIEW attempt of this change ran out of time before returning a verdict. "
+        "Below is what it had already run, with the results. Continue from it: do not re-read "
+        "files or re-run checks whose results are listed unless you must confirm one, and "
+        "keep enough time to return the verdict. Findings it reached still count; re-check "
+        "them briefly rather than rediscovering them.\n"
+        f"{progress.strip()}"
+    )
+
+
 # #541: the check itself, moved here from the TEST stage, which kept restating the
 # implementer's coverage claims instead of running one. Stated once for the single reviewer
 # and the panel's `find:tests` lens. The aim-it-past-the-summary and single-window clauses are
@@ -932,6 +952,7 @@ def render_prompt(
     keep_open_issue: int | None = None,
     denied_unit_suite: str | None = None,
     open_mutants: Sequence[str] | None = None,
+    review_progress: str | None = None,
 ) -> str:
     """Assemble a stage prompt as ordered sections, stable parts FIRST for prompt-cache
     reuse (2026-07-01 context-plane design note §4):
@@ -1051,6 +1072,8 @@ def render_prompt(
             instruction += _NO_DISPOSABLE_WORKSPACE_DIRECTIVE
         # #614: a re-review after a survivor-driven fix cycle re-checks the named survivors.
         instruction += _named_survivors_directive(open_mutants)
+        # #624: a retry after a timeout continues from what the timed-out attempt ran.
+        instruction += _review_progress_directive(review_progress)
         # #310: a task stacked on unmerged batch dependencies (#216) is told which commits
         # are its own, so the reviewer doesn't judge the PR's trunk-relative diff — which
         # carries the dependencies' commits too — as if it were this task's change. Empty
@@ -1332,6 +1355,7 @@ def render_review_plan(
     diff_stat: DiffStat | None = None,
     no_disposable_workspace: bool = False,
     open_mutants: Sequence[str] | None = None,
+    review_progress: str | None = None,
 ) -> ReviewPlan:
     """Resolve the multi-agent REVIEW plan deterministically at ``next_work`` (design §1).
 
@@ -1398,6 +1422,8 @@ def render_review_plan(
         # #614: only the lens that mutates is told which survivors to re-apply.
         if lens is _LENS_TESTS:
             instruction += _named_survivors_directive(open_mutants)
+        # #624: every finder sees what a timed-out attempt had already run.
+        instruction += _review_progress_directive(review_progress)
         # The docs-only directive is ENGINE-trusted (parameter, not context) and rides every
         # surviving lens so a finder doesn't demand unreachable test coverage.
         if docs_only:

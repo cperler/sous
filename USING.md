@@ -337,6 +337,19 @@ change its own default with `implement_timeout_s = 2700` on the adapter; `long` 
 below that default. Without a pin, SCOPE may return `implementation_budget: long` for a large task
 it chose not to split; each choice it makes is evented as `implementation_budget_set` (#615).
 
+### Giving a large change more REVIEW time
+
+REVIEW stops after 10 minutes by default. A change of 1500 or more changed lines gets 30 minutes
+automatically. Set `"review_budget": "long"` on a plan task (`add-task --review-budget long`) to
+always allow 30 minutes, or `standard` to keep 10 minutes whatever the diff size. A project can
+change its own default with `review_timeout_s = 1200` on the adapter; `long` never comes out
+below that default.
+
+When REVIEW times out, the retry gets the long limit and a summary of the commands the timed-out
+attempt ran and their results, so it continues rather than starts over. If REVIEW times out on
+its last attempt, the task is held for a human review instead of failing: the change has no
+verdict yet, and the code may be fine. `orchestrator approve` re-runs REVIEW (#624).
+
 ### Keeping an issue open past the merge
 
 Set `"keep_issue_open": true` on a plan task (`add-task --keep-issue-open`) when merging its PR

@@ -49,6 +49,9 @@ topological order. **Applying mutates a real run: the human confirms the plan be
    - **IMPLEMENT time** (`implementation_budget`): set `long` (60 minutes instead of 30) for a
      task too large to finish in one 30-minute IMPLEMENT that should still ship as one change,
      such as many findings in one review (#615). Omit it otherwise; SCOPE can still raise it.
+   - **REVIEW time** (`review_budget`): set `long` (30 minutes instead of 10) for a change too
+     large to review in 10 minutes. A diff of 1500+ changed lines gets it without asking; set
+     `standard` only to keep a large diff on 10 minutes (#624). Omit it otherwise.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

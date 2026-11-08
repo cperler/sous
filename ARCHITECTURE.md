@@ -260,6 +260,19 @@ so its cost and failures are visible without restoring the old opaque quality lo
   `implement_timeout_s` or the stage spec's 1800s. An unusable adapter value is evented as
   `implement_timeout_rejected`.
 
+- **REVIEW's limit follows the task's budget and the diff (#624).** `Task.review_budget` is
+  pinned by a plan field or `add-task --review-budget`. `engine.review_timeout_s` maps it at
+  dispatch: `long` is max(1800s, project default), `standard` is the adapter's optional
+  `review_timeout_s` or the stage spec's 600s, and an unpinned task whose diff (the engine's own
+  `git diff --numstat`, never a model's report) has 1500+ changed lines gets `long`. A limit
+  other than the spec's is evented as `review_timeout_set`. A REVIEW TIMEOUT raises the budget
+  to `long` (`review_budget_raised`) and reads the attempt's retained streams into a bounded
+  digest of the commands it ran and their results (`stream_probe.review_progress_digest`),
+  stored on `Task.review_progress` and rendered only into later REVIEW prompts until a REVIEW
+  returns (`review_progress_carried`, with `carried: 0` and a reason when there was nothing to
+  read). A REVIEW that times out on its last attempt parks BLOCKED_ON_HUMAN as
+  `review_timed_out_held` instead of failing the task: no verdict is not a rejected change.
+
 - **A keep-open task's PR must not close its issue (#613).** `Task.keep_issue_open` is set from a
   plan field, an `add-task` flag, or the adapter's optional `keep_open_labels` (an explicit value
   wins and is pinned against a later label refresh; a refresh can only turn a label's match on).
