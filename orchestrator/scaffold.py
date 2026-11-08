@@ -125,6 +125,10 @@ class Profile:
     # REVIEW checkout must rebuild, and which launchers/modules must resolve inside the
     # worktree under test. Derived from the stack + commands; hand-editable in profile.toml.
     worktree: dict[str, list[str]] = field(default_factory=dict)
+    # TEST-stage settings (#642), kept out of ``[commands]`` because that table holds only
+    # argv lists. ``timeout_s`` becomes the generated adapter's ``test_timeout_s``; absent
+    # means the engine default (900 s).
+    test: dict[str, int] = field(default_factory=dict)
     # The adapter-contract version the generated files target (checked at load for
     # project-owned adapters). (Re)generation always writes the engine's current one.
     contract_version: int = ADAPTER_CONTRACT_VERSION
@@ -340,6 +344,7 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
     merged.worktree = derive_worktree(merged.languages, merged.commands, manifest)
     merged.worktree.update({**ex_worktree, **in_worktree})
     merged.layers = {**existing.layers, **incoming.layers}
+    merged.test = {**existing.test, **incoming.test}
     merged.seed = _keep_local_agents(
         select_kit_assets(merged, manifest), manifest, existing.seed, incoming.seed
     )
@@ -500,6 +505,8 @@ def _toml_value(v: object) -> str:
         return "true" if v else "false"
     if isinstance(v, str):
         return _toml_str(v)
+    if isinstance(v, int):
+        return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     raise TypeError(f"unsupported TOML value: {v!r}")
@@ -519,7 +526,8 @@ def profile_to_toml(profile: Profile) -> str:
     ]
     for section, data in (
         ("commands", profile.commands), ("roster", profile.roster),
-        ("layers", profile.layers), ("worktree", profile.worktree), ("seed", profile.seed),
+        ("layers", profile.layers), ("worktree", profile.worktree), ("test", profile.test),
+        ("seed", profile.seed),
     ):
         if data:
             lines += ["", f"[{section}]"]
@@ -542,6 +550,7 @@ def read_profile(path: Path) -> Profile:
         roster=dict(raw.get("roster", {})),
         layers=dict(raw.get("layers", {})),
         worktree={k: list(v) for k, v in raw.get("worktree", {}).items()},
+        test=dict(raw.get("test", {})),
         seed={k: list(v) for k, v in raw.get("seed", {}).items()},
         contract_version=int(proj.get("contract_version", ADAPTER_CONTRACT_VERSION)),
     )
@@ -808,6 +817,20 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
     return helpers, methods
 
 
+def _test_timeout_attr(profile: Profile) -> str:
+    """The generated ``test_timeout_s`` class attribute (#642), or "" when profile.toml's
+    ``[test]`` table declares no ``timeout_s`` (the engine then uses its 900 s default).
+    The value is baked as written; the engine checks it and falls back, with a notice, on
+    anything that is not a positive int."""
+    if "timeout_s" not in profile.test:
+        return ""
+    return (
+        "\n    # Seconds each declared test command may run in TEST and the INTAKE baseline\n"
+        "    # (profile.toml [test] timeout_s, #642).\n"
+        f"    test_timeout_s = {profile.test['timeout_s']!r}\n"
+    )
+
+
 def render_config(name: str, profile: Profile) -> str:
     """Render config.py as a generated VIEW of the profile (commands + roster baked in)."""
     cls, env = _class_name(name), _env_var(name)
@@ -816,6 +839,7 @@ def render_config(name: str, profile: Profile) -> str:
         _command_method(m, k, f, profile, name) for m, k, f in _COMMAND_METHODS
     )
     worktree_helpers, worktree_methods = _worktree_methods(profile)
+    test_timeout = _test_timeout_attr(profile)
     return f'''"""{name} project-config adapter (GENERATED from profile.toml — do not hand-edit).
 
 Edit profile.toml (or re-run orchestrator-scaffold) and this file is regenerated.
@@ -872,7 +896,7 @@ class {cls}:
     # intake falls back to the DRIVER's process CWD — the engine checkout, i.e. the wrong
     # repo (#368). The adapter always lives at <repo>/.orchestration, so self-locate.
     repo_root = str(Path(__file__).resolve().parent.parent)
-
+{test_timeout}
     def __init__(self, tasks_path: str = "tasks.json") -> None:
         self._classifier = {cls}Classifier()
         self._task_source = LocalTaskSource(tasks_path)

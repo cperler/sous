@@ -108,16 +108,17 @@ def test_lite_gets_the_same_cycle(tmp_path, project) -> None:
 
 
 def test_a_run_that_only_timed_out_retries_test_instead(tmp_path, project) -> None:
-    """The code was never shown to be wrong, so nothing goes back to the implementer."""
+    """The code was never shown to be wrong, so nothing goes back to the implementer. Since
+    #642 the runner's own infra verdict takes the infra-reset loop, so no attempt is spent."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
     out = _red(eng, _to_test(eng), {
         "passed": False, "failures": ["<unit timeout>"], "failure_kinds": ["infra"],
     })
-    assert out["outcome"] == "stage_failed_will_retry"
+    assert out["outcome"] == "stage_infra_reset_retry"
     w = eng.next_work("r1", "t1")
-    assert w.stage is Stage.TEST and w.attempt == 1
+    assert w.stage is Stage.TEST and w.attempt == 0
 
 
 def test_a_timeout_alongside_a_real_failure_still_goes_to_the_implementer(tmp_path, project) -> None:

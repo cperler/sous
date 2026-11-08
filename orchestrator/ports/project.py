@@ -257,6 +257,13 @@ class ProjectConfig(Protocol):
     # contract): ``keep_open_labels = ("experiment",)`` makes a task sourced from an issue with
     # one of these labels (compared ignoring case) keep that issue open, as if it had been
     # planned with ``keep_issue_open``. A task's own explicit choice still wins.
+    # Optional test timeout (#642; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``test_timeout_s`` is a positive int attribute or zero-arg callable giving
+    # the seconds each declared test command may run in the ENGINE-lane TEST stage and in
+    # INTAKE's baseline capture. Absent means 900. An unusable value (raises, not a positive
+    # int) also means 900 and is evented as a ``test_timeout_invalid`` notice. A scaffolded
+    # adapter sets it from profile.toml's ``[test] timeout_s``. A command that times out is
+    # reported as an ``infra`` failure, which the engine re-runs without spending an attempt.
     # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
     # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   parallel_safe_paths() -> list[str]

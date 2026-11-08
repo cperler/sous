@@ -538,12 +538,18 @@ class DeterministicSetupRunner:
     ) -> dict:
         """Actually run the suite once and classify the outcome (the uncached capture)."""
         env = {**os.environ, **port_env} if port_env else None
+        # #642: the same cap the TEST stage uses, so a project that raised it for a slow
+        # suite does not lose its baseline to the old hardcoded 900 s.
+        from .deterministic_test import resolve_test_timeout
+
+        timeout_s, _ = resolve_test_timeout(self._project)
         try:
             proc = subprocess.run(  # noqa: S603
-                argv, cwd=worktree, capture_output=True, text=True, timeout=900, env=env
+                argv, cwd=worktree, capture_output=True, text=True, timeout=timeout_s, env=env
             )
         except subprocess.TimeoutExpired:
-            return {"captured": False, "failures": [], "note": "baseline run timed out (900s)"}
+            return {"captured": False, "failures": [],
+                    "note": f"baseline run timed out ({timeout_s}s)"}
         except (OSError, subprocess.SubprocessError) as exc:
             return {"captured": False, "failures": [],
                     "note": f"baseline run error ({type(exc).__name__})"}

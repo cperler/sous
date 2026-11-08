@@ -396,6 +396,11 @@ class Task(_StatusModel):
     # retry (#59); consumed by next_work to SUPPRESS the pre-dispatch checkpoint reset so
     # the retry inherits the work. Transient — cleared when the dispatch is committed.
     salvage_in_place: bool = False
+    # #642: set when the deterministic TEST runner reported only an infra failure (a test
+    # command timed out or could not start). The retry then waits until no other task is
+    # running TEST, because the usual cause is concurrent suites overloading the host.
+    # Read by ``dispatchable``/``next_work``; cleared when the TEST is dispatched again.
+    test_wait_for_quiet: bool = False
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing
