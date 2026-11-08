@@ -546,6 +546,25 @@ def write_profile(profile: Profile, path: Path) -> None:
     path.write_text(profile_to_toml(profile), encoding="utf-8")
 
 
+def _bench_table(raw: object) -> dict[str, list[str]]:
+    """profile.toml's ``[bench]`` table as ``{key: [str, ...]}`` (#634).
+
+    A string value is kept as a one-item list: ``list("src/taker")`` would split it into
+    single characters, and those match nothing, so a change to ``src/taker`` would wrongly
+    skip the benchmark. A value that is neither a string nor a list of strings (a
+    ``timeout_s = 1800``, say) is dropped rather than crashing the read; the benchmark leg
+    only skips on a well-formed ``paths``, so a dropped value can only make it run."""
+    if not isinstance(raw, dict):
+        return {}
+    table: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            table[key] = [value]
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            table[key] = list(value)
+    return table
+
+
 def read_profile(path: Path) -> Profile:
     raw = tomllib.loads(path.read_text(encoding="utf-8"))
     proj = raw.get("project", {})
@@ -558,7 +577,7 @@ def read_profile(path: Path) -> Profile:
         layers=dict(raw.get("layers", {})),
         worktree={k: list(v) for k, v in raw.get("worktree", {}).items()},
         test=dict(raw.get("test", {})),
-        bench={k: list(v) for k, v in raw.get("bench", {}).items()},
+        bench=_bench_table(raw.get("bench", {})),
         seed={k: list(v) for k, v in raw.get("seed", {}).items()},
         contract_version=int(proj.get("contract_version", ADAPTER_CONTRACT_VERSION)),
     )

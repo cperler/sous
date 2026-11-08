@@ -852,6 +852,24 @@ def test_bench_paths_round_trip_and_merge(tmp_path) -> None:
     assert cfg.bench_paths == ("src/taker", "src/shared/*.py")
 
 
+def test_bench_paths_string_value_is_one_path_not_characters(tmp_path) -> None:
+    """#634 review: ``paths = "src/taker"`` (a string, not a list) must read as one path.
+    ``list()`` on it gave single characters, which matched nothing and skipped the benchmark
+    for a change that touches src/taker. A non-list scalar must not crash the read either."""
+    from orchestrator.policy_gate import bench_unreachable
+
+    path = tmp_path / "profile.toml"
+    path.write_text(
+        '[project]\nname = "str-svc"\n\n[bench]\npaths = "src/taker"\ntimeout_s = 1800\n'
+        'mixed = ["a", 1]\n',
+        encoding="utf-8",
+    )
+    rp = read_profile(path)
+    assert rp.bench == {"paths": ["src/taker"]}
+    assert bench_unreachable(["src/taker/x.py"], tuple(rp.bench["paths"])) is None
+    assert bench_unreachable(["tools/x.py"], tuple(rp.bench["paths"])) is not None
+
+
 def test_generated_benchmark_leg_skips_a_change_outside_bench_paths(
     tmp_path, monkeypatch
 ) -> None:
