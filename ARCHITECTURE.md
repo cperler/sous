@@ -417,7 +417,10 @@ never satisfy.
   base as `Task.baseline_lint`, and `_merge_policy_findings` blocks only on findings not in
   it; the inherited ones are noted, not filed. A red benchmark re-runs once, records load and
   CPU count on every outcome (`policy_gate_result` event), and blocks only when red twice on
-  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. An improvement — or a non-blocking finding (#414) —
+  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. The engine
+  also passes the task's changed files to a hook that accepts `changed_files` (#634), and
+  when the adapter declares `bench_paths` (profile.toml `[bench] paths`) and the change
+  touches none of them, the benchmark is not run and the record says `skipped`. An improvement — or a non-blocking finding (#414) —
   dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
   requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
   whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains

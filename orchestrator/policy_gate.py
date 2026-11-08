@@ -13,6 +13,12 @@ Two independent halves:
   records the load average and CPU count with every result. One red reading, or a red reading
   on an overloaded machine, is ``inconclusive`` (advisory). Only two red readings on a machine
   that was not overloaded block. Same idea as the flaky-test re-run in ``4dd12e6``.
+* **A benchmark the diff cannot reach is not run (#634).** When the adapter declares the
+  paths its benchmark imports (``bench_paths``) and the engine knows the task's changed
+  files, ``bench_unreachable`` decides whether any changed file falls under them. If none
+  does, ``run_bench_gate`` records a ``skipped`` verdict without starting the benchmark, so a
+  tools-only change no longer spends two benchmark timeouts inside REVIEW. Anything unknown
+  (no declaration, a broken one, changed files not read) runs the benchmark as before.
 
 The parsing and comparison functions are pure. ``run_bench_gate`` is the one function that
 touches the clock and the load average; its subprocess call is injected.
@@ -20,13 +26,16 @@ touches the clock and the load average; its subprocess call is injected.
 
 from __future__ import annotations
 
+import inspect
 import os
 import re
 import time
 from collections import Counter
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from .test_selection import matches_global
 
 if TYPE_CHECKING:
     import subprocess
@@ -276,10 +285,64 @@ def _runs_summary(runs: list[_BenchRun], cpu_count: int | None) -> str:
     return f"{'; '.join(parts)}; {cpu_count or 'unknown'} CPUs"
 
 
+_GLOB_CHARS = frozenset("*?[")
+
+
+def hook_accepts_changed_files(hook: object) -> bool:
+    """Whether a ``review_findings`` hook takes the optional ``changed_files`` keyword
+    (#634). Offered, not imposed: a ``review_findings(*, worktree)`` hook written before it
+    existed keeps working unchanged."""
+    try:
+        params = inspect.signature(hook).parameters  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
+    return "changed_files" in params or any(p.kind is p.VAR_KEYWORD for p in params.values())
+
+
+def _under_bench_path(path: str, pattern: str) -> bool:
+    """Whether one changed path falls under one ``bench_paths`` entry. A pattern with no glob
+    characters is a file or a directory prefix (``src/taker`` and ``src/taker/`` both cover
+    ``src/taker/book.py``); anything else matches like ``test_global_paths``."""
+    path = _strip_dot(path.strip())
+    if not _GLOB_CHARS.intersection(pattern):
+        prefix = _strip_dot(pattern.strip()).rstrip("/")
+        return bool(prefix) and (path == prefix or path.startswith(prefix + "/"))
+    return matches_global(path, [pattern]) is not None
+
+
+def _strip_dot(path: str) -> str:
+    return path[2:] if path.startswith("./") else path
+
+
+def bench_unreachable(changed_files: object, bench_paths: object) -> str | None:
+    """Why the benchmark cannot be affected by this change, or None when it might be.
+
+    Skips only on positive evidence: ``bench_paths`` is a non-empty list/tuple of non-empty
+    strings AND ``changed_files`` is a known list AND no changed file falls under any entry.
+    No declaration, a malformed one, or changed files that could not be read all return None,
+    so the benchmark runs exactly as before. A broken declaration must never cause a skip."""
+    if not isinstance(bench_paths, (list, tuple)) or not bench_paths:
+        return None
+    if not all(isinstance(p, str) and p.strip() for p in bench_paths):
+        return None
+    if not isinstance(changed_files, (list, tuple)):
+        return None
+    if not all(isinstance(f, str) for f in changed_files):
+        return None
+    for path in changed_files:
+        if any(_under_bench_path(path, pat) for pat in bench_paths):
+            return None
+    return (f"none of the {len(changed_files)} changed file(s) is under the benchmarked "
+            f"paths ({', '.join(bench_paths)})")
+
+
 def run_bench_gate(
     argv: list[str],
     cwd: str,
     run: Callable[[list[str], str], subprocess.CompletedProcess[str]],
+    *,
+    changed_files: list[str] | None = None,
+    bench_paths: Sequence[str] | None = None,
 ) -> list[dict]:
     """Run the benchmark leg. Returns the finding (if any) plus one ``gate_record`` entry the
     engine events on every outcome, green included.
@@ -291,8 +354,18 @@ def run_bench_gate(
     describes the machine at that moment rather than work anyone should pick up.
 
     Every message says the gate's result is the record: a stage told to go and recover the
-    timings by hand spent its whole budget re-running a ten-minute benchmark (#591)."""
+    timings by hand spent its whole budget re-running a ten-minute benchmark (#591).
+
+    ``changed_files`` and ``bench_paths`` (#634): when ``bench_unreachable`` says the change
+    cannot reach the benchmarked code, ``run`` is never called and the only entry returned is
+    a ``skipped`` gate record, with no finding to file or block on."""
     command = " ".join(argv)
+    if (why_skip := bench_unreachable(changed_files, bench_paths)) is not None:
+        return [{"gate_record": {
+            "leg": "benchmark", "verdict": "skipped", "command": command, "reason": why_skip,
+            "bench_paths": list(bench_paths or ()),
+            "changed_files_count": len(changed_files or []), "runs": [],
+        }}]
     cpu_count = os.cpu_count()
     runs = [_bench_once(argv, cwd, run)]
     first = runs[0]

@@ -119,7 +119,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
-from .policy_gate import apply_lint_baseline
+from .policy_gate import apply_lint_baseline, hook_accepts_changed_files
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -4340,13 +4340,21 @@ class Engine:
         #591: a red lint or type finding that carries ``gate_output`` is compared against
         ``task.baseline_lint`` here, so only what this change added blocks. A
         ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
-        event, which is how a green benchmark's load and timing reach the run log."""
+        event, which is how a green benchmark's load and timing reach the run log.
+
+        #634: a hook that accepts ``changed_files`` gets the task's own changed files
+        (``base_sha``..worktree, read once here), or None when they cannot be read, so an
+        adapter can skip a benchmark the change cannot reach. A legacy
+        ``review_findings(*, worktree)`` hook is called exactly as before."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
         worktree = task.context.get("worktree")
+        kwargs: dict[str, object] = {"worktree": worktree}
+        if hook_accepts_changed_files(hook):
+            kwargs["changed_files"] = self._review_changed_files(task)
         try:
-            raw = [f for f in (hook(worktree=worktree) or []) if isinstance(f, dict)]
+            raw = [f for f in (hook(**kwargs) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -4395,6 +4403,19 @@ class Engine:
              "findings": [format_review_issue(f)[:200] for f in findings[:10]]},
         )
         return result.model_copy(update={"structured_output": out})
+
+    @staticmethod
+    def _review_changed_files(task: Task) -> list[str] | None:
+        """The task's own changed files for the REVIEW policy hook (#634), or None when they
+        cannot be read. None never narrows anything: the adapter then runs every leg."""
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        if not base_sha or not worktree or not Path(str(worktree)).is_dir():
+            return None
+        try:
+            return test_changed_files(str(worktree), str(base_sha))
+        except Exception:  # noqa: BLE001 - a policy hook's input must never break record()
+            return None
 
     def _dispose_surviving_mutants(
         self, run_id: str, task: Task, result: StageResult
