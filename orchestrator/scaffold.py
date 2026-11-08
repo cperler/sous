@@ -88,6 +88,8 @@ _METHOD_NOTES: dict[str, str] = {
         "    # metrics object from the LAST stdout line (rc 0 on both runs); the REVIEW gate\n"
         "    # below runs it too (rc 1 twice on a machine with spare capacity blocks; a single\n"
         "    # rc 1 or an overloaded machine is an inconclusive advisory; other rcs are UNVERIFIED).\n"
+        "    # profile.toml's [bench] paths, when declared, skips that REVIEW leg for a change\n"
+        "    # that touches none of them (#634).\n"
     ),
 }
 
@@ -125,6 +127,14 @@ class Profile:
     # REVIEW checkout must rebuild, and which launchers/modules must resolve inside the
     # worktree under test. Derived from the stack + commands; hand-editable in profile.toml.
     worktree: dict[str, list[str]] = field(default_factory=dict)
+    # TEST-stage settings (#642), kept out of ``[commands]`` because that table holds only
+    # argv lists. ``timeout_s`` becomes the generated adapter's ``test_timeout_s``; absent
+    # means the engine default (900 s).
+    test: dict[str, int] = field(default_factory=dict)
+    # Benchmark settings (#634). ``paths`` lists the repo paths the ``bench`` command imports
+    # (directories, files or globs) and becomes the generated adapter's ``bench_paths``: the
+    # REVIEW benchmark leg is skipped when a task changes none of them. Absent means always run.
+    bench: dict[str, list[str]] = field(default_factory=dict)
     # The adapter-contract version the generated files target (checked at load for
     # project-owned adapters). (Re)generation always writes the engine's current one.
     contract_version: int = ADAPTER_CONTRACT_VERSION
@@ -340,6 +350,8 @@ def merge_profiles(existing: Profile, incoming: Profile, manifest: dict) -> Prof
     merged.worktree = derive_worktree(merged.languages, merged.commands, manifest)
     merged.worktree.update({**ex_worktree, **in_worktree})
     merged.layers = {**existing.layers, **incoming.layers}
+    merged.test = {**existing.test, **incoming.test}
+    merged.bench = {**existing.bench, **incoming.bench}
     merged.seed = _keep_local_agents(
         select_kit_assets(merged, manifest), manifest, existing.seed, incoming.seed
     )
@@ -500,6 +512,8 @@ def _toml_value(v: object) -> str:
         return "true" if v else "false"
     if isinstance(v, str):
         return _toml_str(v)
+    if isinstance(v, int):
+        return str(v)
     if isinstance(v, list):
         return "[" + ", ".join(_toml_value(x) for x in v) + "]"
     raise TypeError(f"unsupported TOML value: {v!r}")
@@ -519,7 +533,8 @@ def profile_to_toml(profile: Profile) -> str:
     ]
     for section, data in (
         ("commands", profile.commands), ("roster", profile.roster),
-        ("layers", profile.layers), ("worktree", profile.worktree), ("seed", profile.seed),
+        ("layers", profile.layers), ("worktree", profile.worktree), ("test", profile.test),
+        ("bench", profile.bench), ("seed", profile.seed),
     ):
         if data:
             lines += ["", f"[{section}]"]
@@ -529,6 +544,25 @@ def profile_to_toml(profile: Profile) -> str:
 
 def write_profile(profile: Profile, path: Path) -> None:
     path.write_text(profile_to_toml(profile), encoding="utf-8")
+
+
+def _bench_table(raw: object) -> dict[str, list[str]]:
+    """profile.toml's ``[bench]`` table as ``{key: [str, ...]}`` (#634).
+
+    A string value is kept as a one-item list: ``list("src/taker")`` would split it into
+    single characters, and those match nothing, so a change to ``src/taker`` would wrongly
+    skip the benchmark. A value that is neither a string nor a list of strings (a
+    ``timeout_s = 1800``, say) is dropped rather than crashing the read; the benchmark leg
+    only skips on a well-formed ``paths``, so a dropped value can only make it run."""
+    if not isinstance(raw, dict):
+        return {}
+    table: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            table[key] = [value]
+        elif isinstance(value, list) and all(isinstance(v, str) for v in value):
+            table[key] = list(value)
+    return table
 
 
 def read_profile(path: Path) -> Profile:
@@ -542,6 +576,8 @@ def read_profile(path: Path) -> Profile:
         roster=dict(raw.get("roster", {})),
         layers=dict(raw.get("layers", {})),
         worktree={k: list(v) for k, v in raw.get("worktree", {}).items()},
+        test=dict(raw.get("test", {})),
+        bench=_bench_table(raw.get("bench", {})),
         seed={k: list(v) for k, v in raw.get("seed", {}).items()},
         contract_version=int(proj.get("contract_version", ADAPTER_CONTRACT_VERSION)),
     )
@@ -808,6 +844,32 @@ def _worktree_methods(profile: Profile) -> tuple[str, str]:
     return helpers, methods
 
 
+def _test_timeout_attr(profile: Profile) -> str:
+    """The generated ``test_timeout_s`` class attribute (#642), or "" when profile.toml's
+    ``[test]`` table declares no ``timeout_s`` (the engine then uses its 900 s default).
+    The value is baked as written; the engine checks it and falls back, with a notice, on
+    anything that is not a positive int."""
+    if "timeout_s" not in profile.test:
+        return ""
+    return (
+        "\n    # Seconds each declared test command may run in TEST and the INTAKE baseline\n"
+        "    # (profile.toml [test] timeout_s, #642).\n"
+        f"    test_timeout_s = {profile.test['timeout_s']!r}\n"
+    )
+
+
+def _bench_paths_attr(profile: Profile) -> str:
+    """The generated ``bench_paths`` class attribute (#634), or "" when profile.toml's
+    ``[bench]`` table declares no ``paths`` (the REVIEW benchmark leg then always runs)."""
+    if "paths" not in profile.bench:
+        return ""
+    return (
+        "\n    # Paths the benchmark imports (profile.toml [bench] paths, #634). REVIEW skips its\n"
+        "    # benchmark leg when a task changes none of them.\n"
+        f"    bench_paths = {tuple(profile.bench['paths'])!r}\n"
+    )
+
+
 def render_config(name: str, profile: Profile) -> str:
     """Render config.py as a generated VIEW of the profile (commands + roster baked in)."""
     cls, env = _class_name(name), _env_var(name)
@@ -816,6 +878,8 @@ def render_config(name: str, profile: Profile) -> str:
         _command_method(m, k, f, profile, name) for m, k, f in _COMMAND_METHODS
     )
     worktree_helpers, worktree_methods = _worktree_methods(profile)
+    test_timeout = _test_timeout_attr(profile)
+    bench_paths = _bench_paths_attr(profile)
     return f'''"""{name} project-config adapter (GENERATED from profile.toml — do not hand-edit).
 
 Edit profile.toml (or re-run orchestrator-scaffold) and this file is regenerated.
@@ -872,7 +936,7 @@ class {cls}:
     # intake falls back to the DRIVER's process CWD — the engine checkout, i.e. the wrong
     # repo (#368). The adapter always lives at <repo>/.orchestration, so self-locate.
     repo_root = str(Path(__file__).resolve().parent.parent)
-
+{test_timeout}{bench_paths}
     def __init__(self, tasks_path: str = "tasks.json") -> None:
         self._classifier = {cls}Classifier()
         self._task_source = LocalTaskSource(tasks_path)
@@ -910,7 +974,9 @@ class {cls}:
     def schema_for(self, ref: str) -> dict | None:
         return resolve_stage_schema(ref, local_dir=_SCHEMA_DIR)
 
-    def review_findings(self, *, worktree: str | None = None) -> list[dict]:
+    def review_findings(
+        self, *, worktree: str | None = None, changed_files: list[str] | None = None
+    ) -> list[dict]:
         """Run profile-declared lint/typecheck/benchmark policy gates in the task worktree.
 
         A red command blocks REVIEW, except for what this change did not cause (#591): lint
@@ -922,7 +988,9 @@ class {cls}:
         The methods are the ENGINE's leg names, not the tools' (#412): ``typecheck_cmd`` is
         the lint leg, ``types_cmd`` the static-typing leg. Calling exactly the pair both
         merge gates call is what keeps REVIEW and merge from checking different things.
-        The benchmark leg (``benchmark_cmd``, profile.toml's ``bench``) is REVIEW-only.
+        The benchmark leg (``benchmark_cmd``, profile.toml's ``bench``) is REVIEW-only, and
+        is skipped when ``[bench] paths`` is declared and ``changed_files`` (the task's own
+        changes, passed by the engine) touches none of them (#634).
         """
         if not worktree or not os.path.isdir(worktree):
             return []
@@ -931,7 +999,7 @@ class {cls}:
                             ("typecheck", self.types_cmd())):
             if (finding := self._gate(worktree, label, argv)) is not None:
                 findings.append(finding)
-        findings.extend(self._bench_gate(worktree, self.benchmark_cmd()))
+        findings.extend(self._bench_gate(worktree, self.benchmark_cmd(), changed_files))
         return findings
 
     def _gate(self, worktree: str, label: str, argv: list[str]) -> dict | None:
@@ -961,12 +1029,16 @@ class {cls}:
             **gate_output_fields(label, proc),
         }}
 
-    def _bench_gate(self, worktree: str, argv: list[str]) -> list[dict]:
-        """Run the benchmark leg: the engine's ``run_bench_gate`` owns the re-run and the load
-        check, so a fix to either reaches this adapter without regenerating it (#591)."""
+    def _bench_gate(
+        self, worktree: str, argv: list[str], changed_files: list[str] | None = None
+    ) -> list[dict]:
+        """Run the benchmark leg: the engine's ``run_bench_gate`` owns the re-run, the load
+        check and the unreachable-diff skip, so a fix to any of them reaches this adapter
+        without regenerating it (#591, #634)."""
         if not argv or argv == _NOOP:
             return []
-        return run_bench_gate(argv, worktree, self._run_bench)
+        return run_bench_gate(argv, worktree, self._run_bench, changed_files=changed_files,
+                              bench_paths=getattr(self, "bench_paths", None))
 
     @staticmethod
     def _run_gate(argv: list[str], cwd: str) -> subprocess.CompletedProcess[str]:

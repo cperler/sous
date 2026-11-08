@@ -34,8 +34,12 @@ Two consequences, stated deliberately:
     result is a pass/fail list; since only one sharer per key runs the suite, port allocation
     cannot make two sharers' outcomes diverge. A suite whose pass/fail genuinely depends on
     which port block it got would already be non-deterministic per task.
-  - A flaky test now lands in every sharer's baseline at once rather than independently. That
-    is accepted; set ``ORCHESTRATOR_NO_BASELINE_CACHE`` to capture per task again.
+  - One capture's verdict reaches every sharer at once rather than independently. INTAKE
+    re-runs a red base's listed failures once before storing (#607), and the stored
+    ``result`` carries the split: ``failures`` (failed twice) and ``flaky`` (passed on the
+    re-run), so sharers inherit both. An entry written before #607 has no ``flaky`` key and
+    reads as an empty list. A test flaky enough to fail twice still lands in every sharer's
+    baseline; set ``ORCHESTRATOR_NO_BASELINE_CACHE`` to capture per task again.
 """
 
 from __future__ import annotations

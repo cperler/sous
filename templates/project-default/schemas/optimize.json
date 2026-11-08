@@ -67,6 +67,10 @@
       },
       "additionalProperties": true
     },
+    "optimize_reverted": {
+      "type": "string",
+      "description": "ENGINE-OWNED (#564) — do NOT author this key: whatever a stage returns here is discarded. Present only when the engine confirmed it reverted this pass's commit, naming the commit, the commit it went back to, and the cause. It folds into every later stage's context."
+    },
     "suggestions": {
       "type": "array",
       "description": "cross-cutting or architectural changes this stage judged out of its own scope and did NOT apply (a process-pool restructure, a shared-memory layout, a different lock strategy) — so a task never turns into a redesign and the idea is not lost. Optional; omit or return an empty array when there are none. The engine files one as an enhancement issue at finalize only when it carries an explicit `file` disposition, subject to the same per-task cap and title dedupe as a review finding.",

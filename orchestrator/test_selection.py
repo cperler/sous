@@ -55,11 +55,13 @@ def _full(reason: str) -> TestSelection:
 
 def changed_files(cwd: str, base_sha: str) -> list[str] | None:
     """Files changed between ``base_sha`` and the current worktree — committed AND
-    uncommitted tracked changes (``git diff --name-only <base>``) plus untracked new files
-    (``git ls-files --others``). Returns None on any git error, so a read we can't do never
+    uncommitted tracked changes (``git diff --name-only --no-renames <base>``) plus untracked
+    new files (``git ls-files --others``). ``--no-renames`` lists BOTH sides of a rename: a
+    module moved out of a path still changed that path, and rename detection would report
+    only its new location (#634). Returns None on any git error, so a read we can't do never
     narrows a test run (or tags a change docs-only)."""
     try:
-        diff = run_git(cwd, "diff", "--name-only", base_sha)
+        diff = run_git(cwd, "diff", "--name-only", "--no-renames", base_sha)
     except (OSError, ValueError):
         return None
     if diff.returncode != 0:

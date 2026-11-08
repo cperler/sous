@@ -119,7 +119,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
-from .policy_gate import apply_lint_baseline
+from .policy_gate import apply_lint_baseline, hook_accepts_changed_files
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -185,6 +185,7 @@ from .spec_refresh import diff_summary as spec_diff_summary
 from .spec_refresh import fingerprint as spec_fingerprint
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
+    OPTIMIZE_REVERT_KEY,
     apply_result,
     begin_stage,
     deliver_push_mismatch,
@@ -516,6 +517,37 @@ _OPTIMIZE_UNRESTORED_VETO = (
     "commit and it could not be restored"
 )
 
+# #564: why a confirmed revert happened, in the words later stages read. A pass whose commit broke
+# a benchmark that was green at the anchor stays reverted (the pass itself broke the measurement);
+# a benchmark already broken at the anchor never reaches this note, because it keeps the commit.
+_OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED = (
+    "git could not restore the commit after the benchmark's baseline run, so the worktree stayed "
+    "at the earlier commit and the benchmark never judged the pass"
+)
+_OPTIMIZE_REVERT_CAUSES = {
+    "regressed": "metric slower: a benchmark metric got slower past the tolerance",
+    "failed": "the benchmark ran at the earlier commit but could not run or be read at this "
+              "commit, so the pass broke the measurement",
+}
+
+
+def _optimize_revert_note(block: dict) -> str | None:
+    """The ``optimize_reverted`` context line for a gate verdict, or None if it kept the commit.
+
+    Reads ``block['reverted']``, which is the gate's CONFIRMED answer, so the note never claims a
+    revert that did not happen."""
+    if block.get("reverted") is not True:
+        return None
+    cause = (
+        _OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED if block.get("reason") == "head_restore_failed"
+        else _OPTIMIZE_REVERT_CAUSES.get(str(block.get("status")), "the benchmark gate rejected it")
+    )
+    return (
+        f"the engine reverted OPTIMIZE commit {str(block.get('head'))[:12]} back to "
+        f"{str(block.get('anchor'))[:12]}: {cause}. That commit is not on this branch, so do not "
+        "describe its changes as part of this work."
+    )
+
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
     """The last ``n_lines`` of ``text`` plus whether anything was dropped, so a
@@ -634,6 +666,43 @@ def _ref_safe(s: str) -> str:
     anything outside [word . -] becomes '-', which also rules out the refname-forbidden
     sequences ('..', '@{', '~', '^', ':', '?', '*', '[', space)."""
     return re.sub(r"[^\w.\-]", "-", s) or "x"
+
+
+def _tests_in_flight(tasks: Iterable[Task]) -> list[str]:
+    """The tasks among ``tasks`` holding a dispatch lease on their TEST stage (#642)."""
+    return [
+        t.task_id for t in tasks
+        if t.pending_work_item_id is not None and next_stage(t) is Stage.TEST
+    ]
+
+
+def _hold_tests_for_quiet(live: list[Task], eligible: list[str]) -> list[str]:
+    """Drop from ``eligible`` the TEST retries that must wait for a quiet host (#642).
+
+    A task whose last TEST failed only on infra (``Task.test_wait_for_quiet``) waits while
+    any live task is running TEST. With none running, only the FIRST such waiter in run
+    order is released, so several timed-out suites re-run one at a time instead of
+    overloading the host together again. Pure over docs ``dispatchable`` already loaded:
+    no store reads and no events (the wait was evented once when it began, and the
+    re-dispatch carries ``waited_for_quiet``). A non-waiting task entering TEST is never
+    held, so the wait cannot starve the run: once nothing is in flight, a waiter goes."""
+    eligible_ids = set(eligible)
+    waiting = [
+        t.task_id for t in live
+        if t.task_id in eligible_ids and t.test_wait_for_quiet and next_stage(t) is Stage.TEST
+    ]
+    if not waiting:
+        return eligible
+    held = set(waiting) if _tests_in_flight(live) else set(waiting[1:])
+    return [task_id for task_id in eligible if task_id not in held]
+
+
+def _load_avg_1m() -> float | None:
+    """The host's 1-minute load average, or None where the platform cannot report it."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        return None
 
 
 class Engine:
@@ -1415,6 +1484,10 @@ class Engine:
         Semantics chosen over the old ``ready()`` (PENDING/BLOCKED-only, lease-ignoring),
         which was wrong for the scheduler: it excluded RETRYING tasks (a retry must be
         re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
+
+        A TEST retry that waits for a quiet host (``Task.test_wait_for_quiet``, #642) is
+        also held out of the set while any live task is running TEST, and only the first
+        such waiter is released when none is (``_hold_tests_for_quiet``).
         """
         self._resume_pending_decompositions(run_id)
         self._complete_ready_umbrellas(run_id)
@@ -1473,7 +1546,17 @@ class Engine:
             out = self._apply_file_contention_gate(
                 run_id, lambda: self._reload_claim_tasks(run_id, live_ids), out
             )
-        return out
+        return _hold_tests_for_quiet(live, out)
+
+    def _sibling_tasks(self, run_id: str, task_id: str) -> list[Task]:
+        """Every other non-terminal task doc in the run, in run order (#642's TEST load
+        reads: the retry hold on the direct path and the dispatch event's in-flight count)."""
+        run = self.store.load_run(run_id)
+        return [
+            self.store.load_task(run_id, ref.task_id)
+            for ref in run.task_refs
+            if ref.task_id != task_id and ref.state not in TERMINAL_TASK_STATES
+        ]
 
     def _reload_claim_tasks(self, run_id: str, task_ids: list[str]) -> list[Task]:
         """Re-read the contention-relevant task docs, in run order, for a gate pass.
@@ -1698,7 +1781,8 @@ class Engine:
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
-        exhausted, or a declared-file claim held by another live task). Before selecting
+        exhausted, a declared-file claim held by another live task, or a TEST retry
+        waiting for a quiet host, #642). Before selecting
         a stage, a normal dispatch resumes any approved, partially-filed SCOPE
         decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
         leave execution to their children on the run DAG.
@@ -1868,6 +1952,16 @@ class Engine:
             # to dispatch"), but not silent: the gate evented the wait and named its
             # blocker. Admission stamped the claim onto `task` in place, so the dispatch
             # below carries the same doc the gate just wrote.
+            return None
+        # #642: the same TEST-retry hold `dispatchable` applies, so a direct per-task
+        # caller does not re-run an infra-timed-out TEST into the load that timed it out.
+        # Only a flagged task pays the extra reads of its siblings' docs.
+        if (
+            not resume
+            and stage is Stage.TEST
+            and task.test_wait_for_quiet
+            and _tests_in_flight(self._sibling_tasks(run_id, task_id))
+        ):
             return None
 
         spec = STAGE_SPECS[stage]
@@ -2257,6 +2351,17 @@ class Engine:
         # be made self-describing — its `stage_dispatched` will never get a matching
         # `stage_recorded`, so a naive counter would over-count dispatches without it.
         superseded_lease: str | None = None
+        # #642: what else was running TEST when this one started, and how loaded the host
+        # was, so a TEST timeout can be attributed from events.jsonl alone. Read before the
+        # lock (a slightly stale count is fine for attribution) and only for TEST.
+        test_load: dict | None = None
+        if stage is Stage.TEST:
+            test_load = {
+                "tests_in_flight": len(_tests_in_flight(self._sibling_tasks(run_id, task_id))),
+                "load_avg_1m": _load_avg_1m(),
+            }
+            if task.test_wait_for_quiet:
+                test_load["waited_for_quiet"] = True
 
         def _commit(t: Task) -> None:
             nonlocal superseded_lease
@@ -2278,6 +2383,8 @@ class Engine:
             t.pending_fallback_model = None  # consumed into this dispatch's model
             t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
             t.salvage_in_place = False  # consumed: this dispatch honored (or ignored) it
+            if stage is Stage.TEST:
+                t.test_wait_for_quiet = False  # #642: consumed by this TEST dispatch
             # Persist the intake KB fold (#72) into the durable context so it survives on
             # disk and renders in the later stages' prompts too (not just this dispatch's).
             if prior_learnings and "prior_learnings" not in t.context:
@@ -2332,6 +2439,9 @@ class Engine:
                 "prompt_chars": len(prompt),
                 "prompt_file": prompt_file,
             }
+            # #642: TEST only, so every other stage's dispatch event stays byte-identical.
+            if test_load is not None:
+                event.update(test_load)
             # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
             # supersedes so a reader can tell a genuine crash-recovery re-lease from a
             # fresh dispatch without joining on `work_item_id` against `stage_recorded`.
@@ -2592,9 +2702,14 @@ class Engine:
 
         The changed files are the task's OWN change: ``base_sha`` is captured by INTAKE
         AFTER any dependency branches are composed in (#216), so ``base_sha``..worktree
-        excludes dep code. Read with the same helper the TEST stage's impacted-test
-        selection uses (committed + uncommitted tracked changes + untracked files), then
-        classified by the pure ``non_code.classify_non_code`` against the project's
+        excludes dep code. On a review fix cycle the range is the CYCLE's own change (#564):
+        ``Task.review_fix_base_sha`` (the commit the rejecting review saw)..worktree, because
+        the first cycle's OPTIMIZE already had its pass over the earlier source change — a
+        cycle that only added a test has nothing new to speed up. With no recorded review
+        commit the range falls back to ``base_sha``; the range used is on the record and the
+        ``optimize_skipped_non_code`` event (``diff_range``/``diff_from``). Read with the same
+        helper the TEST stage's impacted-test selection uses (committed + uncommitted tracked
+        changes + untracked files), then classified by the pure ``non_code.classify_non_code`` against the project's
         ``non_code_globs`` (or the defaults).
 
         Never skips on uncertainty: a missing ``base_sha``/worktree or a failed git read
@@ -2618,26 +2733,33 @@ class Engine:
             return False
         base_sha = task.context.get("base_sha")
         worktree = task.context.get("worktree")
+        # #564: a review fix cycle classifies its own diff, from the commit the rejecting
+        # review saw; otherwise (first cycle, or no recorded commit) the whole task's.
+        diff_from, diff_range = (
+            (task.review_fix_base_sha, "review_fix_cycle") if task.review_fix_base_sha
+            else (base_sha, "base_sha")
+        )
         why: str | None = None
         changed: list[str] | None = None
-        if not base_sha:
+        if not diff_from:
             why = "no base_sha in the task context"
         elif not worktree or not Path(str(worktree)).is_dir():
             why = "task worktree missing"
         else:
             try:
-                changed = test_changed_files(str(worktree), str(base_sha))
+                changed = test_changed_files(str(worktree), str(diff_from))
             except Exception as exc:  # noqa: BLE001 - uncertainty dispatches, never skips
                 why = f"git read raised {type(exc).__name__}: {exc}"
             else:
                 if changed is None:
-                    why = f"git diff against base_sha {str(base_sha)[:12]} failed"
+                    why = f"git diff against {diff_range} {str(diff_from)[:12]} failed"
         if changed is None:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "optimize_skip_check_failed", "level": "info",
                  "run_id": run_id, "task_id": task.task_id, "stage": Stage.OPTIMIZE.value,
                  "reason": why or "changed files unknown",
+                 "diff_range": diff_range, "diff_from": str(diff_from) if diff_from else None,
                  "detail": "could not tell whether the change is code; dispatching OPTIMIZE"},
             )
             return False
@@ -2650,6 +2772,8 @@ class Engine:
             "changed_files": shown,
             "changed_files_count": len(verdict.non_code),
             "non_code_globs": list(globs),
+            "diff_range": diff_range,
+            "diff_from": str(diff_from),
         }
         now = _now()
 
@@ -2669,6 +2793,8 @@ class Engine:
             rec.lane = ExecutionMode.ENGINE
             rec.cost_usd = 0.0
             rec.output = dict(output)
+            # This cycle ran no pass, so an earlier cycle's revert note is no longer current.
+            t.context.pop(OPTIMIZE_REVERT_KEY, None)
 
         event = {
             "ts": now, "type": "optimize_skipped_non_code", "level": "info",
@@ -2676,6 +2802,7 @@ class Engine:
             "changed_files": shown, "changed_files_count": len(verdict.non_code),
             "changed_files_truncated": len(verdict.non_code) > len(shown),
             "non_code_globs": list(globs),
+            "diff_range": diff_range, "diff_from": str(diff_from),
         }
         try:
             self.store.commit_task_events(run_id, task.task_id, _skip, [event])
@@ -4421,13 +4548,21 @@ class Engine:
         #591: a red lint or type finding that carries ``gate_output`` is compared against
         ``task.baseline_lint`` here, so only what this change added blocks. A
         ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
-        event, which is how a green benchmark's load and timing reach the run log."""
+        event, which is how a green benchmark's load and timing reach the run log.
+
+        #634: a hook that accepts ``changed_files`` gets the task's own changed files
+        (``base_sha``..worktree, read once here), or None when they cannot be read, so an
+        adapter can skip a benchmark the change cannot reach. A legacy
+        ``review_findings(*, worktree)`` hook is called exactly as before."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
         worktree = task.context.get("worktree")
+        kwargs: dict[str, object] = {"worktree": worktree}
+        if hook_accepts_changed_files(hook):
+            kwargs["changed_files"] = self._review_changed_files(task)
         try:
-            raw = [f for f in (hook(worktree=worktree) or []) if isinstance(f, dict)]
+            raw = [f for f in (hook(**kwargs) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -4476,6 +4611,19 @@ class Engine:
              "findings": [format_review_issue(f)[:200] for f in findings[:10]]},
         )
         return result.model_copy(update={"structured_output": out})
+
+    @staticmethod
+    def _review_changed_files(task: Task) -> list[str] | None:
+        """The task's own changed files for the REVIEW policy hook (#634), or None when they
+        cannot be read. None never narrows anything: the adapter then runs every leg."""
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        if not base_sha or not worktree or not Path(str(worktree)).is_dir():
+            return None
+        try:
+            return test_changed_files(str(worktree), str(base_sha))
+        except Exception:  # noqa: BLE001 - a policy hook's input must never break record()
+            return None
 
     def _dispose_surviving_mutants(
         self, run_id: str, task: Task, result: StageResult
@@ -4964,7 +5112,10 @@ class Engine:
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
         the record of a reverted worktree until the locked commit would leave a window where
         the tree and the log disagree. No leg carries raw stdout into the block, so the event
-        is the block verbatim rather than a thinned copy of it."""
+        is the block verbatim rather than a thinned copy of it.
+
+        A confirmed revert also puts ``optimize_reverted`` in the stage output (#564), which
+        the fold carries into every later stage's context with its cause."""
         if revert and worktree and anchor:
             reset = run_git(worktree, "reset", "--hard", anchor)
             if reset.returncode != 0:
@@ -4989,6 +5140,10 @@ class Engine:
         )
         out = dict(result.structured_output or {})
         out["benchmark"] = block
+        # #564: only the engine may say a commit was reverted, so a model's value never folds.
+        out.pop(OPTIMIZE_REVERT_KEY, None)
+        if (revert_note := _optimize_revert_note(block)) is not None:
+            out[OPTIMIZE_REVERT_KEY] = revert_note
         return result.model_copy(update={
             "structured_output": out,
             **({"checkpoint": None} if strip_checkpoint else {}),
@@ -5574,6 +5729,17 @@ class Engine:
         return task.salvage_in_place
 
     def _handle_failure(self, task: Task, result: StageResult, *, run: Run) -> str:
+        """Decide what a FAILED (or otherwise non-successful) stage result does to the task,
+        apply it, and return the outcome name recorded on ``stage_recorded``.
+
+        Order: a rejected invocation fails the task at once; an infra-only failure takes
+        the bounded environment-reset loop (same attempt, no breaker streak); then the
+        circuit breaker or attempt budget fails the task; a red ENGINE-lane TEST reopens
+        IMPLEMENT; anything else retries the stage. An ENGINE-lane TEST that reports
+        ``failure_kinds == ["infra"]`` counts as infra whatever the project's classifier
+        says, and sets ``Task.test_wait_for_quiet`` so its re-run waits until no other
+        task is running TEST (#642).
+        """
         # #375: the provider CLI refused to PARSE the command the harness built (a removed or
         # misspelled flag). Terminal on the FIRST attempt, ahead of every other failure path:
         # the retry would re-send a byte-identical argv, so the whole attempt budget burns in
@@ -5604,20 +5770,43 @@ class Engine:
         # below) it earns an environment reset + a free re-run of the SAME attempt
         # instead of burning the retry budget on a broken runner.
         classified = self._classify_failure(result)
-        infra_only = bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
+        # #642: the ENGINE-lane runner knows when a command timed out or never started, and
+        # says so as ``failure_kinds: ["infra"]``. That is authoritative whatever the
+        # project's classifier makes of the text: a scaffolded classifier only parses
+        # ``FAILED <id>`` lines, so it returned nothing for ``<unit timeout>`` and two
+        # timeouts on an overloaded host tripped the breaker on code that was fine.
+        runner_infra = self._runner_reported_infra(result)
+        infra_only = runner_infra or (
+            bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
+        )
         if not infra_only:
             task.error_signatures.append(sig)
         baseline = task.context.get("baseline_failures")
         task.learnings.append(
             self._failure_learning(result, failures, classified, infra_only, baseline)
         )
-        if classified:
+        if classified or runner_infra:
+            event: dict = {
+                "ts": _now(), "type": "failure_classified", "run_id": task.run_id,
+                "task_id": task.task_id, "stage": result.stage.value,
+                "kinds": sorted({f.kind.value for f in classified}
+                                | ({FailureKind.INFRA.value} if runner_infra else set())),
+                "infra_only": infra_only,
+            }
+            if runner_infra:  # conditional, so a classifier-only event stays byte-identical
+                event["runner_reported_infra"] = True
+            self.store.append_event(task.run_id, event)
+        # #642: an infra TEST failure is usually a host overloaded by concurrent suites, so
+        # an immediate re-run would hit the same load. Hold the retry (whichever path below
+        # takes it) until no other task is running TEST; ``dispatchable`` enforces it.
+        if runner_infra and not task.test_wait_for_quiet:
+            task.test_wait_for_quiet = True
             self.store.append_event(
                 task.run_id,
-                {"ts": _now(), "type": "failure_classified", "run_id": task.run_id,
+                {"ts": _now(), "type": "test_retry_waiting_for_quiet", "run_id": task.run_id,
                  "task_id": task.task_id, "stage": result.stage.value,
-                 "kinds": sorted({f.kind.value for f in classified}),
-                 "infra_only": infra_only},
+                 "attempt": result.attempt,
+                 "failures": list((result.structured_output or {}).get("failures") or [])[:10]},
             )
 
         # Salvage (#59): before any reset decision, if the failure's KIND doesn't implicate
@@ -5821,6 +6010,19 @@ class Engine:
         except (OSError, subprocess.SubprocessError) as exc:
             return f"error ({type(exc).__name__})"
         return "ok" if proc.returncode == 0 else f"rc={proc.returncode}"
+
+    @staticmethod
+    def _runner_reported_infra(result: StageResult) -> bool:
+        """True when an ENGINE-lane TEST failed ONLY on infra (#642): the deterministic
+        runner records a command that timed out or could not start as a ``<label ...>``
+        failure with ``failure_kinds == ["infra"]``. Limited to the ENGINE lane because
+        there the runner, not a model, wrote ``failure_kinds``."""
+        if result.stage is not Stage.TEST:
+            return False
+        if result.lane_used.execution_mode is not ExecutionMode.ENGINE:
+            return False
+        out = result.structured_output or {}
+        return bool(out.get("failures")) and out.get("failure_kinds") == ["infra"]
 
     def _classify_failure(self, result: StageResult) -> list:
         """Run the project's failure classifier over a failed TEST result's output

@@ -120,7 +120,7 @@ class TaskSource(Protocol):
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
     # itself rather than the task source):
-    #   review_findings(*, worktree: str | None) -> list[dict]
+    #   review_findings(*, worktree: str | None, changed_files=None) -> list[dict]
     #       Deterministic review policy gates (#65 — the seam for the old e2e-policy
     #       gate / API-contract trigger / TSC gate family). Called by the engine when
     #       a REVIEW stage completes; each finding is {description, severity?, file?,
@@ -135,6 +135,11 @@ class TaskSource(Protocol):
     #       the output against Task.baseline_lint, so only what the change added blocks;
     #       and a `{gate_record: {...}}` entry is not a finding but a `policy_gate_result`
     #       event, which is how a green benchmark's load and timing reach the run log.
+    #       #634: a hook whose signature accepts `changed_files` (or **kwargs) is also
+    #       passed `changed_files: list[str] | None`, the task's own changed files
+    #       (`base_sha`..worktree: committed, uncommitted and untracked), or None when they
+    #       could not be read. Pass it with the adapter's `bench_paths` to
+    #       `run_bench_gate`, which then skips a benchmark the change cannot reach.
     #
     #   notify(kind: str, payload: dict) -> None
     #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify
@@ -267,6 +272,13 @@ class ProjectConfig(Protocol):
     # task pin, a diff of 1500+ changed lines, or the retry after a REVIEW timeout) is 30
     # minutes or this value, whichever is longer. Anything but a positive int is ignored and
     # evented as ``review_timeout_rejected``.
+    # Optional test timeout (#642; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``test_timeout_s`` is a positive int attribute or zero-arg callable giving
+    # the seconds each declared test command may run in the ENGINE-lane TEST stage and in
+    # INTAKE's baseline capture. Absent means 900. An unusable value (raises, not a positive
+    # int) also means 900 and is evented as a ``test_timeout_invalid`` notice. A scaffolded
+    # adapter sets it from profile.toml's ``[test] timeout_s``. A command that times out is
+    # reported as an ``infra`` failure, which the engine re-runs without spending an attempt.
     # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
     # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   parallel_safe_paths() -> list[str]
