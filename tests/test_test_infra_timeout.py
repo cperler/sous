@@ -146,6 +146,20 @@ def test_an_origin_mismatch_is_still_not_infra(tmp_path, project) -> None:
     assert not run.ok and run.refused and run.out is None
 
 
+def test_a_mismatch_beside_a_probe_timeout_is_not_infra(tmp_path, project, monkeypatch) -> None:
+    """Only an all-timeout probe set is infra: a probe that resolved OUTSIDE the worktree is
+    a real mismatch, even when another probe timed out, and must not re-run for free."""
+    from adapters.execution import worktree_origin
+
+    monkeypatch.setattr(worktree_origin, "_PROBE_TIMEOUT_S", 1)
+    project.worktree_origin_probes = lambda: [
+        ("elsewhere", ["echo", "/usr/bin/env"], "source"),
+        ("slow", ["sleep", "5"], "source"),
+    ]
+    run = DeterministicTestRunner(project).evaluate(_work(tmp_path))
+    assert not run.ok and run.refused and run.out is None
+
+
 # --- the engine treats a runner-reported timeout as infra ------------------------------
 
 
@@ -224,6 +238,21 @@ def test_a_waiter_does_not_hold_a_task_entering_test_for_the_first_time(tmp_path
     _timed_out(eng, _to_test(eng, "t1"))
     eng.next_work("r1", "t1")  # t1's re-run is in flight
     assert _to_test(eng, "t2").stage is Stage.TEST
+
+
+def test_only_a_test_lease_counts_as_a_test_in_flight(tmp_path, project) -> None:
+    """A sibling leased on IMPLEMENT is not running a suite, so it neither holds a waiter
+    nor counts toward ``tests_in_flight`` on the waiter's TEST dispatch."""
+    eng = _two_tasks(tmp_path, project)
+    _timed_out(eng, _to_test(eng, "t1"))
+    while (w := eng.next_work("r1", "t2")).stage is not Stage.IMPLEMENT:
+        eng.record("r1", make_result(w))
+    assert eng.store.load_task("r1", "t2").pending_work_item_id is not None  # leased
+    assert "t1" in eng.dispatchable("r1")
+    assert eng.next_work("r1", "t1").stage is Stage.TEST
+    dispatched = [e for e in _events(eng, "stage_dispatched")
+                  if e["task_id"] == "t1" and e["stage"] == "test"]
+    assert dispatched[-1]["tests_in_flight"] == 0
 
 
 # --- the dispatch event says how loaded the host was -----------------------------------
