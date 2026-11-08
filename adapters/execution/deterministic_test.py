@@ -26,6 +26,12 @@ raising, returning None, a global test input touched, an empty set — runs the 
 (``orchestrator.test_selection``), and the result records ``test_scope`` (impacted|full),
 ``tests_selected`` and ``test_scope_reason`` so a green subset never reads as a full green.
 
+Timeout (#642): each command may run ``resolve_test_timeout(project)`` seconds, the
+project's optional ``test_timeout_s`` or 900. A command that exceeds it, or cannot start,
+is reported as ``failure_kinds: ["infra"]``, which the engine re-runs without spending an
+attempt (``Engine._handle_failure``); a worktree-origin probe that only timed out is
+reported the same way.
+
 Flaky failures: when the UNIT command fails on a few named tests, those tests are re-run
 once — narrowed via ``test_unit_cmd(failed)`` when the adapter honors it, else the whole
 unit command again. The re-run clears them when it exits 0, or when it exits non-zero and every
@@ -56,6 +62,38 @@ from .worktree_origin import verify_worktree_origin
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
 # More caused unit failures than this is treated as a real break, not flakiness — no re-run.
 _MAX_FLAKY_RERUN = 5
+# #642: the per-command cap when the project declares no ``test_timeout_s``. Sized for a
+# quiet host; a project whose suite runs long under concurrent load raises it on its adapter.
+DEFAULT_TEST_TIMEOUT_S = 900
+
+
+def resolve_test_timeout(project: object) -> tuple[int, dict[str, object] | None]:
+    """The per-command test timeout the project declares, and a notice when it is unusable.
+
+    ``test_timeout_s`` is an optional, duck-typed adapter member (#642): a positive int
+    attribute or a zero-arg callable returning one. Absent means
+    ``DEFAULT_TEST_TIMEOUT_S`` with no notice. A value that raises, is not an int (``bool``
+    included), or is not positive also falls back to the default, but returns a
+    ``test_timeout_invalid`` notice so a bad declaration is visible instead of silently
+    replaced. Shared by the TEST runner and INTAKE's baseline capture, so both use one cap."""
+    hook = getattr(project, "test_timeout_s", None)
+    if hook is None:
+        return DEFAULT_TEST_TIMEOUT_S, None
+    try:
+        value = hook() if callable(hook) else hook
+    except Exception as exc:  # noqa: BLE001 - an adapter hook must never fail the stage
+        value, why = None, f"raised {type(exc).__name__}"
+    else:
+        why = f"not a positive int: {value!r}"[:200]
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value, None
+    notice: dict[str, object] = {
+        "notice": "test_timeout_invalid",
+        "reason": "invalid_declaration",
+        "detail": f"project test_timeout_s {why}; using the default "
+                  f"{DEFAULT_TEST_TIMEOUT_S}s",
+    }
+    return DEFAULT_TEST_TIMEOUT_S, notice
 
 # Documentation-file classification for the #41 docs-only change tag. Deliberately
 # conservative: a change is "docs-only" only when EVERY changed file is unambiguously
@@ -115,11 +153,27 @@ class TestRun:
     refused: bool = False
 
 
-class DeterministicTestRunner:
-    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell)."""
+def _is_probe_timeout(notice: dict[str, object]) -> bool:
+    """A worktree-origin notice for a probe that timed out, rather than one that ran and
+    named a path outside the worktree (#642)."""
+    return (notice.get("notice") == "worktree_origin_probe_failed"
+            and str(notice.get("reason", "")).startswith("TimeoutExpired"))
 
-    def __init__(self, project: object, *, timeout_s: int = 900) -> None:
+
+class DeterministicTestRunner:
+    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell).
+
+    ``timeout_s`` caps each declared command. ``None`` (the default) defers to the
+    project's ``test_timeout_s`` and then to ``DEFAULT_TEST_TIMEOUT_S``; an explicit value
+    wins over both. An unusable project declaration is reported as a
+    ``test_timeout_invalid`` notice on every ``TestRun`` this runner returns."""
+
+    def __init__(self, project: object, *, timeout_s: int | None = None) -> None:
         self._project = project  # ProjectConfig: test_*_cmd surfaces + optional classifier
+        # #642: an explicit value wins, else the project's ``test_timeout_s``, else 900 s.
+        self._timeout_notice: dict[str, object] | None = None
+        if timeout_s is None:
+            timeout_s, self._timeout_notice = resolve_test_timeout(project)
         self._timeout_s = timeout_s
 
     def dispatch(self, work: WorkItem) -> StageResult:
@@ -151,6 +205,19 @@ class DeterministicTestRunner:
                                  "commands", False, refused=True)
         origin = verify_worktree_origin(self._project, Path(work.cwd))
         if not origin.trusted:
+            if origin.notices and all(_is_probe_timeout(n) for n in origin.notices):
+                # #642: every probe failed only by timing out, which on a loaded host says
+                # nothing about the worktree. Still refuse the results, but report it as
+                # infra so the engine re-runs TEST instead of spending an attempt on it.
+                infra_out: dict = {
+                    "passed": False,
+                    "failures": ["<worktree origin probe timeout>"],
+                    "failure_kinds": ["infra"],
+                    "validation_notes": "worktree origin probe(s) timed out, so the toolchain "
+                                        "origin is unverified and no test was run (infra)",
+                }
+                return TestRun(infra_out, "worktree origin probe timed out; refusing to trust test "
+                                    "results", False, notices=origin.notices, refused=True)
             return TestRun(None, "worktree toolchain origin mismatch; refusing to trust test "
                                  "results", False, notices=origin.notices, refused=True)
         try:
@@ -160,6 +227,8 @@ class DeterministicTestRunner:
             # path to clear it). Mirror deterministic_setup's convert-to-FAILURE contract.
             return TestRun(None, str(exc), False, notices=origin.notices, refused=True)
         notices = origin.notices
+        if self._timeout_notice is not None:
+            notices = notices + (self._timeout_notice,)
         if flaky := out.get("flaky_failures"):
             notice: dict[str, object] = {
                 "notice": "test_flaky_failures_cleared",
