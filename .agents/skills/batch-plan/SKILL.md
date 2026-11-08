@@ -42,6 +42,9 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      issue's done-when: a reading after a release, a server change still to make, data still
      to arrive. DELIVER then writes `Part of #N`, and a PR that would close the issue fails
      the stage. Omit it to follow the project's keep-open labels; `false` overrides them.
+   - **IMPLEMENT time** (`implementation_budget`): set `long` (60 minutes instead of 30) for a
+     task too large to finish in one 30-minute IMPLEMENT that should still ship as one change,
+     such as many findings in one review (#615). Omit it otherwise; SCOPE can still raise it.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

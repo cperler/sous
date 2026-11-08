@@ -200,8 +200,10 @@ def apply_plan(
     impose no scheduling constraint and the engine's ``Dag`` rejects edges to non-tasks),
     its lane preset (from the ``pipeline`` hint), its ``provider_tag``,
     ``deterministic_stages``, and its ``model``/``effort`` pins (#287 — omitted pins pass
-    ``None``, which is exactly today's role-default behavior), and its ``keep_issue_open``
-    choice (#613 — omitted passes ``None``, which follows the project's keep-open labels).
+    ``None``, which is exactly today's role-default behavior), its ``keep_issue_open``
+    choice (#613 — omitted passes ``None``, which follows the project's keep-open labels),
+    and its ``implementation_budget`` (#615 — omitted passes ``None``: the project's
+    IMPLEMENT default, which SCOPE may still raise to ``long``).
     Emits ONE ``batch_planned`` event summarizing what was added.
 
     ``dry_run`` adds nothing and emits no event — it returns exactly what WOULD be added so
@@ -233,6 +235,7 @@ def apply_plan(
             "model": t.get("model"),
             "effort": t.get("effort"),
             "keep_issue_open": t.get("keep_issue_open"),
+            "implementation_budget": t.get("implementation_budget"),
             "rationale": t.get("rationale", ""),
         }
         if not dry_run:
@@ -246,6 +249,7 @@ def apply_plan(
                 model=t.get("model"),
                 effort=t.get("effort"),
                 keep_issue_open=t.get("keep_issue_open"),
+                implementation_budget=t.get("implementation_budget"),
             )
         added.append(entry)
 

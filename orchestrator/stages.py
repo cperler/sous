@@ -131,11 +131,14 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "components hand data to each other, what can run in parallel — and what to "
             "avoid. Keep it to a line when the work is off the hot path (\"not on a "
             "latency-sensitive path\" is a complete note).\n"
+            "If the task is large but should still ship as one change, set "
+            "`implementation_budget` to `long` to give IMPLEMENT 60 minutes instead of 30 "
+            "(#615); omit it otherwise.\n"
             "Return: feasible, blocked_reason, plan (list of prose subtasks), files (list "
-            "of repo-relative paths, or {path, mode} objects), performance (string), and "
-            "optional subtasks (list "
+            "of repo-relative paths, or {path, mode} objects), performance (string), "
+            "optional implementation_budget (standard|long), and optional subtasks (list "
             "of {id, description, agent, quality_tier: full|light|none, "
-            "implementation_budget: standard|short, depends_on: [local ids]})."
+            "implementation_budget: standard|short|long, depends_on: [local ids]})."
         ),
     ),
     Stage.IMPLEMENT: StageSpec(

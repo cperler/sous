@@ -257,6 +257,11 @@ class ProjectConfig(Protocol):
     # contract): ``keep_open_labels = ("experiment",)`` makes a task sourced from an issue with
     # one of these labels (compared ignoring case) keep that issue open, as if it had been
     # planned with ``keep_issue_open``. A task's own explicit choice still wins.
+    # Optional IMPLEMENT default (#615; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``implement_timeout_s = 2700`` replaces the 30-minute IMPLEMENT limit for this
+    # project's tasks. A task budget still applies on top: ``short`` is 15 minutes and ``long``
+    # is 60 minutes or this value, whichever is longer. Anything but a positive int is ignored
+    # and evented as ``implement_timeout_rejected``.
     # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
     # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   parallel_safe_paths() -> list[str]
