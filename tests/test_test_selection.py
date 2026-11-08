@@ -183,6 +183,16 @@ def test_changed_files_reads_committed_and_untracked_and_none_on_git_error(tmp_p
     assert changed_files(str(tmp_path), "not-a-sha") is None
 
 
+def test_changed_files_lists_both_sides_of_a_rename(tmp_path) -> None:
+    """#634: rename detection would report only the new path, hiding that the old one
+    changed — a module moved out of a benchmarked or tested path must still count there."""
+    base = _repo(tmp_path)
+    (tmp_path / "tools").mkdir()
+    _git(tmp_path, "mv", "pkg/mod.py", "tools/mod.py")
+    _git(tmp_path, "commit", "-qm", "move")
+    assert sorted(changed_files(str(tmp_path), base)) == ["pkg/mod.py", "tools/mod.py"]
+
+
 # --- deterministic TEST runner ----------------------------------------------------------
 def test_runner_narrows_only_the_unit_command_and_records_the_scope(tmp_path) -> None:
     base = _repo(tmp_path)

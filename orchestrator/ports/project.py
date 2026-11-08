@@ -120,7 +120,7 @@ class TaskSource(Protocol):
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
     # itself rather than the task source):
-    #   review_findings(*, worktree: str | None) -> list[dict]
+    #   review_findings(*, worktree: str | None, changed_files=None) -> list[dict]
     #       Deterministic review policy gates (#65 — the seam for the old e2e-policy
     #       gate / API-contract trigger / TSC gate family). Called by the engine when
     #       a REVIEW stage completes; each finding is {description, severity?, file?,
@@ -135,6 +135,11 @@ class TaskSource(Protocol):
     #       the output against Task.baseline_lint, so only what the change added blocks;
     #       and a `{gate_record: {...}}` entry is not a finding but a `policy_gate_result`
     #       event, which is how a green benchmark's load and timing reach the run log.
+    #       #634: a hook whose signature accepts `changed_files` (or **kwargs) is also
+    #       passed `changed_files: list[str] | None`, the task's own changed files
+    #       (`base_sha`..worktree: committed, uncommitted and untracked), or None when they
+    #       could not be read. Pass it with the adapter's `bench_paths` to
+    #       `run_bench_gate`, which then skips a benchmark the change cannot reach.
     #
     #   notify(kind: str, payload: dict) -> None
     #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify

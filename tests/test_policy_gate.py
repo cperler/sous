@@ -328,3 +328,80 @@ def test_a_long_list_of_new_findings_is_capped_and_says_so() -> None:
 def test_output_too_large_to_read_whole_is_not_sent() -> None:
     assert gate_output_fields("ruff", _proc(1, "x" * (MAX_GATE_OUTPUT_CHARS + 1))) == {}
     assert gate_output_fields("ruff", _proc(1, "x")) == {"gate_leg": "ruff", "gate_output": "x"}
+
+
+# --- a benchmark the diff cannot reach (#634) ---------------------------------------------
+
+def _bench_with_reach(monkeypatch, outcomes: list, changed, paths):
+    """Run the gate with a changed-file list and a ``bench_paths`` declaration."""
+    monkeypatch.setattr(os, "getloadavg", lambda: (1.0, 1.0, 1.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    calls: list[list[str]] = []
+
+    def run(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the adapter's subprocess function
+        calls.append(argv)
+        return outcomes.pop(0)
+
+    entries = run_bench_gate(["bench"], "/wt", run, changed_files=changed, bench_paths=paths)
+    records = [e["gate_record"] for e in entries if "gate_record" in e]
+    findings = [e for e in entries if "gate_record" not in e]
+    assert len(records) == 1, "every outcome is recorded exactly once"
+    return findings, records[0], calls
+
+
+@pytest.mark.parametrize("paths", [
+    ("src/taker",), ["src/taker/"], ("./src/taker",), ("src/taker/**",), ("src/*/book.py",),
+])
+def test_change_outside_the_bench_paths_skips_without_running(monkeypatch, paths) -> None:
+    changed = ["tools/report.py", "docs/x.md", "src/maker/quote.py", "src/takerx/a.py"]
+    findings, record, calls = _bench_with_reach(monkeypatch, [], changed, paths)
+    assert calls == [] and findings == []
+    assert record["verdict"] == "skipped" and record["runs"] == []
+    assert record["changed_files_count"] == 4
+    assert record["bench_paths"] == list(paths)
+    assert "none of the 4 changed file(s)" in record["reason"]
+
+
+@pytest.mark.parametrize("changed", [
+    ["tools/report.py", "src/taker/book.py"],  # one file under a directory prefix
+    ["src/taker"],                             # the declared path itself
+    ["./src/taker/new_module.py"],             # an untracked new file, ./-prefixed
+])
+def test_change_touching_the_bench_paths_runs_as_before(monkeypatch, changed) -> None:
+    findings, record, calls = _bench_with_reach(monkeypatch, [_proc(0)], changed, ["src/taker"])
+    assert len(calls) == 1 and findings == [] and record["verdict"] == "passed"
+
+
+def test_glob_bench_path_that_matches_runs(monkeypatch) -> None:
+    _, record, calls = _bench_with_reach(
+        monkeypatch, [_proc(0)], ["src/taker/book.py"], ["src/*/book.py"]
+    )
+    assert len(calls) == 1 and record["verdict"] == "passed"
+
+
+def test_red_reading_on_a_touched_path_still_reruns_and_blocks(monkeypatch) -> None:
+    findings, record, calls = _bench_with_reach(
+        monkeypatch, [_proc(1), _proc(1, "request 1.4x")], ["src/taker/book.py"], ["src/taker"]
+    )
+    assert len(calls) == 2 and record["verdict"] == "regressed"
+    assert findings[0]["blocking"] is True and "request 1.4x" in findings[0]["description"]
+
+
+@pytest.mark.parametrize("changed,paths", [
+    (None, ["src/taker"]),            # changed files could not be read
+    (["tools/x.py"], None),           # nothing declared
+    (["tools/x.py"], []),             # empty declaration
+    (["tools/x.py"], "src/taker"),    # a bare string, not a list
+    (["tools/x.py"], ["src/taker", ""]),  # an empty entry
+    (["tools/x.py"], ["src/taker", 3]),   # a non-string entry
+    ("tools/x.py", ["src/taker"]),    # changed files not a list
+])
+def test_unknown_reach_or_a_broken_declaration_never_skips(monkeypatch, changed, paths) -> None:
+    _, record, calls = _bench_with_reach(monkeypatch, [_proc(0)], changed, paths)
+    assert len(calls) == 1 and record["verdict"] == "passed"
+
+
+def test_empty_change_with_bench_paths_skips(monkeypatch) -> None:
+    """A known, empty change cannot reach anything."""
+    _, record, calls = _bench_with_reach(monkeypatch, [], [], ["src/taker"])
+    assert calls == [] and record["verdict"] == "skipped"
