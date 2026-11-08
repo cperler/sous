@@ -323,14 +323,19 @@ class QualityTier(StrEnum):
 
 
 class ImplementationBudget(StrEnum):
-    """Per-child IMPLEMENT wall-clock budget emitted by SCOPE decomposition.
+    """Per-task IMPLEMENT wall-clock budget.
 
-    The engine maps ``standard`` to 30 minutes and ``short`` to 15 minutes; the
-    selected value is persisted on the task and copied to its implementation work.
+    Set by a SCOPE decomposition child, by SCOPE for a large task it chose not to split,
+    or pinned at ``add-task`` / in a batch plan (#615). The engine maps ``standard`` to
+    the project's IMPLEMENT default (30 minutes unless the adapter declares
+    ``implement_timeout_s``), ``short`` to 15 minutes and ``long`` to 60 minutes (never
+    below the project default). The value is persisted on the task, so every later
+    subcommand reads the same limit.
     """
 
     STANDARD = "standard"
     SHORT = "short"
+    LONG = "long"
 
 
 # Lane PRESETS: named pipelines (ported from full/lite/micro). A lane is resolved to a

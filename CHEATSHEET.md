@@ -196,6 +196,11 @@ the plan (`add-task --keep-issue-open`), or declare `keep_open_labels` on the ad
 then writes `Part of #N`, and a PR that would still close the issue fails the stage. Saying so in
 the issue's text does not work.
 
+**A big task that keeps timing out in IMPLEMENT needs `implementation_budget`.** Set
+`"implementation_budget": "long"` in the plan (`add-task --implementation-budget long`) for 60
+minutes instead of 30, or declare `implement_timeout_s` on the adapter for a project-wide default.
+SCOPE may also choose `long` itself; a pin wins over SCOPE.
+
 **Never `rm -rf runs/<run>/`.** Worktrees, branches, and checkpoint tags are cleanup targets;
 the run log dir is the durable audit trail and is pruned only by a human, deliberately.
 

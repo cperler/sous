@@ -20,6 +20,7 @@ from .schemas.enums import (
     STAGE_ORDER,
     Effort,
     ExecutionMode,
+    ImplementationBudget,
     Provider,
     ResultStatus,
     Stage,
@@ -112,6 +113,8 @@ class FoldNotices(NamedTuple):
     * ``file_claims`` → ``scope_file_claim_dropped`` (an unusable declared path, #377)
     * ``relaxed_claims`` → ``file_claim_mode_relaxed`` (a parallel-safe path moved to
       ``append``, #628); a change rather than a drop, but never silent either
+    * ``budgets`` → ``implementation_budget_set`` (SCOPE sized the task's IMPLEMENT limit,
+      #615); ``applied`` is false when a per-task pin, or an unknown value, kept it out
 
     Kept as separate lists rather than one, so the call site needs no per-notice branching
     and each event's payload stays a flat, self-describing shape."""
@@ -121,12 +124,14 @@ class FoldNotices(NamedTuple):
     evictions: list[dict[str, object]]
     file_claims: list[dict[str, object]]
     relaxed_claims: list[dict[str, object]]
+    budgets: list[dict[str, object]]
 
 
 def _no_notices() -> FoldNotices:
     """An empty FoldNotices (fresh lists — never a shared mutable default)."""
     return FoldNotices(
         pr_fields=[], truncations=[], evictions=[], file_claims=[], relaxed_claims=[],
+        budgets=[],
     )
 
 
@@ -489,11 +494,40 @@ def _absorb_outputs(
                 "kept_items": _MAX_BASELINE_LINT,
                 "dropped_items": len(entries) - _MAX_BASELINE_LINT,
             })
+    budgets: list[dict[str, object]] = []
+    if result.stage is Stage.SCOPE and "implementation_budget" in out:
+        budgets = _absorb_scope_budget(task, out["implementation_budget"])
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,
-        file_claims=file_claims, relaxed_claims=relaxed_claims,
+        file_claims=file_claims, relaxed_claims=relaxed_claims, budgets=budgets,
     )
+
+
+# What SCOPE may say about an undecomposed task's IMPLEMENT limit. ``short`` stays a
+# decomposition-child control: SCOPE shortening its own task is never asked for.
+_SCOPE_BUDGETS = (ImplementationBudget.STANDARD, ImplementationBudget.LONG)
+
+
+def _absorb_scope_budget(task: Task, raw: object) -> list[dict[str, object]]:
+    """Fold SCOPE's sizing of a task it chose not to decompose (#615) onto the task.
+
+    Only ``long`` changes anything: ``standard`` is what an unsized task already gets. A
+    budget already on the task (an ``add-task``/batch-plan pin, or a decomposition child's)
+    wins, and an unknown value is ignored; both come back as a not-applied notice so the
+    engine can event them. A re-folded ``long`` that is already in place says nothing."""
+    wanted = next((b for b in _SCOPE_BUDGETS if b.value == raw), None)
+    if wanted is None:
+        return [{"source": "scope", "requested": str(raw)[:40], "applied": False,
+                 "reason": "unknown_budget"}]
+    current = task.implementation_budget
+    if wanted is not ImplementationBudget.LONG or current is wanted:
+        return []
+    if current is not None:
+        return [{"source": "scope", "requested": wanted.value, "current": current.value,
+                 "applied": False, "reason": "pinned"}]
+    task.implementation_budget = wanted
+    return [{"source": "scope", "requested": wanted.value, "current": None, "applied": True}]
 
 
 _PR_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)/?$")

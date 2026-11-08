@@ -329,6 +329,14 @@ a mutation and recording which tests failed on it. To use a model TEST anyway, p
 Optional per-task pins: `model` (e.g. `fable` for architecture-heavy design work) and
 `effort`.
 
+### Giving a large task more IMPLEMENT time
+
+IMPLEMENT stops after 30 minutes by default. Set `"implementation_budget": "long"` on a plan task
+(`add-task --implementation-budget long`) to allow 60 minutes, or `short` for 15. A project can
+change its own default with `implement_timeout_s = 2700` on the adapter; `long` never comes out
+below that default. Without a pin, SCOPE may return `implementation_budget: long` for a large task
+it chose not to split; each choice it makes is evented as `implementation_budget_set` (#615).
+
 ### Keeping an issue open past the merge
 
 Set `"keep_issue_open": true` on a plan task (`add-task --keep-issue-open`) when merging its PR

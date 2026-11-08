@@ -255,6 +255,14 @@ so its cost and failures are visible without restoring the old opaque quality lo
   completion-time PR check (`completion_pr_invalid`) stays as the backstop for what
   this cannot see, such as a PR closed or retargeted after DELIVER.
 
+- **IMPLEMENT's limit follows the task's budget (#615).** `Task.implementation_budget` is pinned
+  by a plan field or `add-task --implementation-budget`, set by a decomposition child, or raised
+  to `long` by SCOPE's own sizing when nothing pinned it (the pure fold returns a notice; the
+  engine emits `implementation_budget_set`). `engine.implement_timeout_s` maps it at dispatch:
+  `short` 900s, `long` max(3600s, project default), otherwise the adapter's optional
+  `implement_timeout_s` or the stage spec's 1800s. An unusable adapter value is evented as
+  `implement_timeout_rejected`.
+
 - **A keep-open task's PR must not close its issue (#613).** `Task.keep_issue_open` is set from a
   plan field, an `add-task` flag, or the adapter's optional `keep_open_labels` (an explicit value
   wins and is pinned against a later label refresh; a refresh can only turn a label's match on).

@@ -255,7 +255,24 @@ _CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
 _IMPLEMENT_TIMEOUTS: dict[ImplementationBudget, int] = {
     ImplementationBudget.STANDARD: 1800,
     ImplementationBudget.SHORT: 900,
+    ImplementationBudget.LONG: 3600,
 }
+
+
+def implement_timeout_s(
+    budget: ImplementationBudget | None, *, spec_timeout_s: int, project_default_s: int | None
+) -> int:
+    """The IMPLEMENT wall-clock limit for a task's ``implementation_budget`` (#615).
+
+    ``short`` is always 15 minutes. ``standard`` (and no budget at all) is the project's
+    declared default, else the stage spec's. ``long`` is 60 minutes, or the project default
+    when that is already longer, so asking for more time can never shorten the limit."""
+    base = project_default_s if project_default_s is not None else spec_timeout_s
+    if budget is ImplementationBudget.SHORT:
+        return _IMPLEMENT_TIMEOUTS[ImplementationBudget.SHORT]
+    if budget is ImplementationBudget.LONG:
+        return max(_IMPLEMENT_TIMEOUTS[ImplementationBudget.LONG], base)
+    return base
 
 
 def _hash_preview(value: str | None) -> str | None:
@@ -977,8 +994,10 @@ class Engine:
         (low/medium/high, #96) that overrides the stage-spec defaults the same way.
         ``agent_role``/``quality_tier``/``implementation_budget`` carry SCOPE-authored
         child controls (#60). The role is resolved through the project adapter; the quality
-        tier selects the child's explicit quality pipeline and the budget selects a 30- or
-        15-minute IMPLEMENT timeout. ``max_filed_followups`` (#191) caps how many
+        tier selects the child's explicit quality pipeline and the budget selects the
+        IMPLEMENT timeout (``implement_timeout_s``). The budget is also the per-task pin
+        ``add-task --implementation-budget`` / a batch plan pass (#615), which a later
+        SCOPE sizing cannot override. ``max_filed_followups`` (#191) caps how many
         non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
@@ -1301,6 +1320,19 @@ class Engine:
         return _InferredClaims(
             declaration._replace(modes=relaxation.modes), relaxation.relaxed, globs.rejected,
         )
+
+    def _project_implement_timeout(self) -> tuple[int | None, str | None]:
+        """The adapter's optional ``implement_timeout_s`` (#615) and, if unusable, why.
+
+        Returns ``(seconds, None)`` for a positive int, ``(None, None)`` when the adapter
+        declares nothing, and ``(None, <repr>)`` for a value the engine ignores, so the
+        caller can event the rejection rather than silently fall back to the default."""
+        raw = getattr(self.project, "implement_timeout_s", None)
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None, repr(raw)[:80]
+        return raw, None
 
     def _keep_open_label(self, labels: Iterable[object]) -> str | None:
         """The first of ``labels`` the project declares keep-open (#613), else ``None``.
@@ -2156,6 +2188,22 @@ class Engine:
             if deterministic
             else self._review_plan_for(task, stage=stage, run=run, lane=lane, util_pct=util_pct)
         )
+        timeout_s = spec.timeout_s
+        if stage is Stage.IMPLEMENT:
+            project_default, rejected = self._project_implement_timeout()
+            if rejected is not None:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "implement_timeout_rejected", "level": "warning",
+                     "run_id": run_id, "task_id": task_id, "stage": stage.value,
+                     "value": rejected,
+                     "reason": "implement_timeout_s must be a positive int; using the default"},
+                )
+            timeout_s = implement_timeout_s(
+                task.implementation_budget,
+                spec_timeout_s=spec.timeout_s,
+                project_default_s=project_default,
+            )
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -2172,11 +2220,7 @@ class Engine:
             lane_policy=lane,
             created_at=_now(),
             attempt=attempt,
-            timeout_s=(
-                _IMPLEMENT_TIMEOUTS[task.implementation_budget]
-                if stage is Stage.IMPLEMENT and task.implementation_budget is not None
-                else spec.timeout_s
-            ),
+            timeout_s=timeout_s,
             # Run in the task's worktree (folded from intake) so the headless lane stops
             # depending on process CWD. None on intake itself (it creates the worktree).
             cwd=task.context.get("worktree"),
@@ -3466,6 +3510,14 @@ class Engine:
                     run_id, effective.task_id, fold_notices.relaxed_claims,
                     stage=effective.stage.value, source="scope", ts=_now(),
                 ))
+                # #615: SCOPE sized this task's IMPLEMENT limit. A pinned or unknown value it
+                # could not apply is warning-grade: the task runs on a limit SCOPE disagreed with.
+                events.extend(
+                    {"ts": _now(), "type": "implementation_budget_set", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value,
+                     **({} if notice["applied"] else {"level": "warning"}), **notice}
+                    for notice in fold_notices.budgets
+                )
                 events.extend(_parallel_safe_rejected_events(
                     run_id, effective.task_id, parallel_safe.rejected,
                     stage=effective.stage.value, ts=_now(),
