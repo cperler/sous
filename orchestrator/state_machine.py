@@ -889,7 +889,9 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review")
     """Re-open the tail of the pipeline for a fix cycle: every pipeline stage at/after
     ``from_stage`` gets a fresh PENDING record, so ``next_stage`` returns ``from_stage`` and
     the fix re-runs implement→…→review. ``cause`` (what sent it back: ``review`` or ``test``)
-    only names the cycle in the resume hint.
+    names the cycle in the resume hint; a ``review`` cycle also records the commit that
+    review saw (``last_checkpoint.sha``) as ``Task.review_fix_base_sha`` (#564), so the
+    cycle's OPTIMIZE can classify the cycle's own diff rather than the whole task's.
 
     History is not lost — every prior execution is already durable in the per-stage
     logs (``write_stage_log``); the stage RECORD is working state, not the audit trail.
@@ -901,6 +903,9 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review")
     reset = list(task.pipeline[idx:])
     for stage in reset:
         task.stages[stage] = StageRecord()
+    if cause == "review":
+        reviewed = (task.last_checkpoint or {}).get("sha")
+        task.review_fix_base_sha = str(reviewed) if reviewed else None
     task.resume_cursor = ResumeCursor(
         stage=from_stage, hint=f"{cause} fix cycle: re-running from {from_stage.value}"
     )
