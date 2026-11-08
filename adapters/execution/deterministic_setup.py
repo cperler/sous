@@ -62,6 +62,9 @@ from .worktree_origin import (
 # #591: bound for one lint/typecheck leg at intake, the same as the REVIEW gate's bound.
 _LINT_BASELINE_TIMEOUT_S = 300
 _LINT_BASELINE_LEGS = (("lint", "typecheck_cmd"), ("typecheck", "types_cmd"))
+# #607: at most this many base failures are re-run once to tell flaky from broken — the same
+# cap TEST uses (``deterministic_test._MAX_FLAKY_RERUN``). More is a real break; no re-run.
+_MAX_BASELINE_RERUN = 5
 
 
 def _ref_safe(s: str) -> str:
@@ -248,6 +251,7 @@ class DeterministicSetupRunner:
                     **lint_fields,
                     "baseline_captured": baseline["captured"],
                     "baseline_failures": baseline["failures"],
+                    "baseline_flaky": baseline["flaky"],
                     "baseline": (
                         f"custom worktree; install: {install_note}; "
                         f"tests: {baseline['note']}"
@@ -375,6 +379,8 @@ class DeterministicSetupRunner:
             "base_sha": base_full,
             "baseline_captured": baseline["captured"],
             "baseline_failures": baseline["failures"],
+            # #607: failed at base but passed on one re-run — unreliable, not known-broken.
+            "baseline_flaky": baseline["flaky"],
             # #216: the dep branches actually merged into this worktree (audit trail).
             "composed_deps": composed_deps,
             "baseline": (
@@ -509,7 +515,8 @@ class DeterministicSetupRunner:
         except Exception:  # noqa: BLE001 - a project command surface must never fail setup
             argv = None
         if not argv or argv == ["true"]:  # the no-op sentinel
-            return {"captured": False, "failures": [], "note": "n/a (no unit-test command)"}
+            return {"captured": False, "failures": [], "flaky": [],
+                    "note": "n/a (no unit-test command)"}
         keyed = (
             baseline_cache.compute_key(worktree, argv, self._project)
             if self._baseline_cache_dir is not None
@@ -528,6 +535,8 @@ class DeterministicSetupRunner:
         return {
             **result,
             "failures": list(result["failures"]),
+            # #607: an entry stored before the flaky split has no ``flaky`` key.
+            "flaky": list(result.get("flaky") or []),
             "note": f"reused from {source} at tree {src_tree[:12]} ({result['note']})",
             "reused_from": source,
             "tree": src_tree,
@@ -536,10 +545,15 @@ class DeterministicSetupRunner:
     def _run_baseline(
         self, worktree: Path, argv: list[str], port_env: dict[str, str] | None
     ) -> dict:
-        """Actually run the suite once and classify the outcome (the uncached capture).
+        """Actually run the suite and classify the outcome (the uncached capture).
 
         The run is capped at the project's ``test_timeout_s`` (default 900 s, #642), the
-        same cap the TEST stage uses; a timeout yields ``captured: False`` naming the cap."""
+        same cap the TEST stage uses; a timeout yields ``captured: False`` naming the cap.
+
+        #607: a red base with at most ``_MAX_BASELINE_RERUN`` parsed failures re-runs just
+        those tests once (``_rerun_baseline``). Ones that pass move to ``flaky``, and
+        ``failures`` keeps only the ones that failed twice. This runs inside the cache's
+        ``run_fn``, so the stored result carries the split and every sharer inherits it."""
         env = {**os.environ, **port_env} if port_env else None
         # #642: the same cap the TEST stage uses, so a project that raised it for a slow
         # suite does not lose its baseline to the old hardcoded 900 s.
@@ -551,13 +565,13 @@ class DeterministicSetupRunner:
                 argv, cwd=worktree, capture_output=True, text=True, timeout=timeout_s, env=env
             )
         except subprocess.TimeoutExpired:
-            return {"captured": False, "failures": [],
+            return {"captured": False, "failures": [], "flaky": [],
                     "note": f"baseline run timed out ({timeout_s}s)"}
         except (OSError, subprocess.SubprocessError) as exc:
-            return {"captured": False, "failures": [],
+            return {"captured": False, "failures": [], "flaky": [],
                     "note": f"baseline run error ({type(exc).__name__})"}
         if proc.returncode == 0:
-            return {"captured": True, "failures": [], "note": "green at base"}
+            return {"captured": True, "failures": [], "flaky": [], "note": "green at base"}
         failures = self._classify_baseline(f"{proc.stdout}\n{proc.stderr}")
         note = (
             f"RED at base (rc={proc.returncode}): {len(failures)} known-failing test(s)"
@@ -565,7 +579,60 @@ class DeterministicSetupRunner:
             else f"RED at base (rc={proc.returncode}); failures unparsed — "
                  f"regression diff unavailable"
         )
-        return {"captured": True, "failures": failures[:40], "note": note}
+        flaky: list[str] = []
+        if failures:
+            flaky, rerun_note = self._rerun_baseline(argv, failures, worktree, env, timeout_s)
+            failures = [f for f in failures if f not in flaky]
+            note += f"; {rerun_note}"
+        return {"captured": True, "failures": failures[:40], "flaky": flaky, "note": note}
+
+    def _rerun_baseline(
+        self,
+        argv: list[str],
+        failed: list[str],
+        worktree: Path,
+        env: dict[str, str] | None,
+        timeout_s: int,
+    ) -> tuple[list[str], str]:
+        """Re-run the base failures once; return ``(flaky ids, note)`` (#607).
+
+        Only the failed ids are re-run, via ``test_unit_cmd(failed)``. An adapter that does
+        not narrow (same argv as the no-arg call), or more than ``_MAX_BASELINE_RERUN``
+        failures, means no re-run: repeating the whole suite at INTAKE would double its cost.
+
+        Conservative, so a broken test is never relabelled flaky on weak evidence. Exit 0
+        clears every id. A non-zero exit clears the ids it did not report, but only when it
+        parsed at least one failure and all of them are among ``failed``. Anything else (a
+        timeout, a run error, nothing parsed, an id outside ``failed`` such as a collection
+        error) is inconclusive and moves nothing."""
+        if len(failed) > _MAX_BASELINE_RERUN:
+            return [], f"not re-run (more than {_MAX_BASELINE_RERUN} failures)"
+        unit = getattr(self._project, "test_unit_cmd", None)
+        try:
+            narrowed = list(unit(list(failed))) if callable(unit) else None
+        except Exception:  # noqa: BLE001 - a project command surface must never fail setup
+            narrowed = None
+        if not narrowed or narrowed == ["true"] or narrowed == list(argv):
+            return [], "not re-run (the unit command does not narrow to test ids)"
+        try:
+            proc = subprocess.run(  # noqa: S603
+                narrowed, cwd=worktree, capture_output=True, text=True,
+                timeout=timeout_s, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return [], f"re-run inconclusive (timed out after {timeout_s}s)"
+        except (OSError, subprocess.SubprocessError) as exc:
+            return [], f"re-run inconclusive (run error {type(exc).__name__})"
+        if proc.returncode == 0:
+            flaky = list(failed)
+        else:
+            again = set(self._classify_baseline(f"{proc.stdout}\n{proc.stderr}"))
+            if not again or not again <= set(failed):
+                return [], f"re-run inconclusive (rc={proc.returncode})"
+            flaky = [f for f in failed if f not in again]
+        if not flaky:
+            return [], "all failed again on re-run"
+        return flaky, f"{len(flaky)} passed on re-run (flaky): {', '.join(flaky)}"
 
     def _capture_lint_baseline(
         self, worktree: Path, inherited: dict[str, object], *, task_id: str

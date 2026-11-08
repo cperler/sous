@@ -194,6 +194,8 @@ def apply_result(
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.INTAKE: ("branch", "worktree", "base_sha", "baseline_failures",
+                   # #607: failed at base but passed on one re-run — flaky, not broken.
+                   "baseline_flaky",
                    "port_base", "port_count", "composed_deps",
                    # #385: uncommitted work a REUSED worktree inherited from a previous,
                    # dead run. Folded for the same reason baseline_failures is — it is

@@ -14,6 +14,11 @@
       "items": {"type": "string"},
       "description": "test ids already failing at base — inherited, not regressions; the TEST stage and the engine's regression split exclude them"
     },
+    "baseline_flaky": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "#607: test ids that failed at base but passed when re-run once — unreliable, not known-broken. Not in baseline_failures; the deterministic TEST runner does not count a failure listed here as caused"
+    },
     "baseline_lint": {
       "type": "array",
       "items": {"type": "string"},
