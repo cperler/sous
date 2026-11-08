@@ -297,6 +297,46 @@ def test_hook_that_accepts_changed_files_gets_them_and_skips_the_benchmark(tmp_p
     assert project.task_source.followups == []
 
 
+def test_moving_a_module_out_of_bench_paths_still_runs_the_benchmark(tmp_path) -> None:
+    """A rename out of ``src/taker`` removed code the benchmark imports, so the diff DOES
+    reach it: both sides of the move are listed and the benchmark runs (#634)."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    _git_worktree(repo)
+    (repo / "src" / "taker").mkdir(parents=True)
+    (repo / "src" / "taker" / "x.py").write_text("z = 1\n")
+    for args in (("add", "."), ("commit", "-q", "-m", "add taker")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+    base_sha = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"], check=True,
+                              capture_output=True, text=True).stdout.strip()
+    for args in (("mv", "src/taker/x.py", "tools/x.py"), ("commit", "-q", "-m", "move")):
+        subprocess.run(["git", "-C", str(repo), *args], check=True, capture_output=True)
+
+    project = _ReachProject()
+    ran: list = []
+
+    def hook(*, worktree=None, changed_files=None):
+        from orchestrator.policy_gate import run_bench_gate
+
+        project.seen.append(changed_files)
+
+        def bench(argv, cwd):  # noqa: ANN001, ARG001
+            ran.append(argv)
+            return subprocess.CompletedProcess(argv, 0, "ok", "")
+
+        return run_bench_gate(["bench"], worktree, bench, changed_files=changed_files,
+                              bench_paths=("src/taker",))
+
+    project.review_findings = hook  # type: ignore[method-assign]
+    eng = _engine(tmp_path / "store", project)
+    w = _advance_to_review(eng, intake={**_INTAKE, "worktree": str(repo), "base_sha": base_sha})
+    eng.record("r1", make_result(w, structured_output=dict(_APPROVE)))
+    (seen,) = project.seen
+    assert "src/taker/x.py" in seen and "tools/x.py" in seen
+    assert ran == [["bench"]]
+
+
 def test_changed_files_is_none_when_the_diff_cannot_be_read(tmp_path) -> None:
     """No base_sha (and a worktree that does not exist): the hook is told it cannot know,
     so the benchmark would run as before."""
