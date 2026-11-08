@@ -536,7 +536,10 @@ class DeterministicSetupRunner:
     def _run_baseline(
         self, worktree: Path, argv: list[str], port_env: dict[str, str] | None
     ) -> dict:
-        """Actually run the suite once and classify the outcome (the uncached capture)."""
+        """Actually run the suite once and classify the outcome (the uncached capture).
+
+        The run is capped at the project's ``test_timeout_s`` (default 900 s, #642), the
+        same cap the TEST stage uses; a timeout yields ``captured: False`` naming the cap."""
         env = {**os.environ, **port_env} if port_env else None
         # #642: the same cap the TEST stage uses, so a project that raised it for a slow
         # suite does not lose its baseline to the old hardcoded 900 s.

@@ -1358,6 +1358,10 @@ class Engine:
         Semantics chosen over the old ``ready()`` (PENDING/BLOCKED-only, lease-ignoring),
         which was wrong for the scheduler: it excluded RETRYING tasks (a retry must be
         re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
+
+        A TEST retry that waits for a quiet host (``Task.test_wait_for_quiet``, #642) is
+        also held out of the set while any live task is running TEST, and only the first
+        such waiter is released when none is (``_hold_tests_for_quiet``).
         """
         self._resume_pending_decompositions(run_id)
         self._complete_ready_umbrellas(run_id)
@@ -1651,7 +1655,8 @@ class Engine:
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
-        exhausted, or a declared-file claim held by another live task). Before selecting
+        exhausted, a declared-file claim held by another live task, or a TEST retry
+        waiting for a quiet host, #642). Before selecting
         a stage, a normal dispatch resumes any approved, partially-filed SCOPE
         decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
         leave execution to their children on the run DAG.
@@ -5488,6 +5493,17 @@ class Engine:
         return task.salvage_in_place
 
     def _handle_failure(self, task: Task, result: StageResult, *, run: Run) -> str:
+        """Decide what a FAILED (or otherwise non-successful) stage result does to the task,
+        apply it, and return the outcome name recorded on ``stage_recorded``.
+
+        Order: a rejected invocation fails the task at once; an infra-only failure takes
+        the bounded environment-reset loop (same attempt, no breaker streak); then the
+        circuit breaker or attempt budget fails the task; a red ENGINE-lane TEST reopens
+        IMPLEMENT; anything else retries the stage. An ENGINE-lane TEST that reports
+        ``failure_kinds == ["infra"]`` counts as infra whatever the project's classifier
+        says, and sets ``Task.test_wait_for_quiet`` so its re-run waits until no other
+        task is running TEST (#642).
+        """
         # #375: the provider CLI refused to PARSE the command the harness built (a removed or
         # misspelled flag). Terminal on the FIRST attempt, ahead of every other failure path:
         # the retry would re-send a byte-identical argv, so the whole attempt budget burns in

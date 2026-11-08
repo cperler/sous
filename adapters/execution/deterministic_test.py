@@ -26,6 +26,12 @@ raising, returning None, a global test input touched, an empty set — runs the 
 (``orchestrator.test_selection``), and the result records ``test_scope`` (impacted|full),
 ``tests_selected`` and ``test_scope_reason`` so a green subset never reads as a full green.
 
+Timeout (#642): each command may run ``resolve_test_timeout(project)`` seconds, the
+project's optional ``test_timeout_s`` or 900. A command that exceeds it, or cannot start,
+is reported as ``failure_kinds: ["infra"]``, which the engine re-runs without spending an
+attempt (``Engine._handle_failure``); a worktree-origin probe that only timed out is
+reported the same way.
+
 Flaky failures: when the UNIT command fails on a few named tests, those tests are re-run
 once — narrowed via ``test_unit_cmd(failed)`` when the adapter honors it, else the whole
 unit command again. The re-run clears them when it exits 0, or when it exits non-zero and every
@@ -155,7 +161,12 @@ def _is_probe_timeout(notice: dict[str, object]) -> bool:
 
 
 class DeterministicTestRunner:
-    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell)."""
+    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell).
+
+    ``timeout_s`` caps each declared command. ``None`` (the default) defers to the
+    project's ``test_timeout_s`` and then to ``DEFAULT_TEST_TIMEOUT_S``; an explicit value
+    wins over both. An unusable project declaration is reported as a
+    ``test_timeout_invalid`` notice on every ``TestRun`` this runner returns."""
 
     def __init__(self, project: object, *, timeout_s: int | None = None) -> None:
         self._project = project  # ProjectConfig: test_*_cmd surfaces + optional classifier
