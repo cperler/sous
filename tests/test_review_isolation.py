@@ -198,6 +198,35 @@ def test_bytecode_caches_are_not_copied_into_the_disposable_review_copy(tmp_path
     assert (live / "__pycache__" / "top.cpython-313.pyc").is_file()  # live tree unchanged
 
 
+def test_the_review_copy_keeps_the_live_worktrees_origin_main(tmp_path) -> None:
+    """A project test that checks a sha is on `origin/main` must not fail in every review
+    (prediction's base-on-main pins, runs pred-748-1656 #1656/#1677): the copy keeps the live
+    worktree's remote-tracking refs as plain refs, with still no remote to push to."""
+    live = _repo(tmp_path / "live")
+    main = tmp_path / "live-main"
+    base = _git(main, "rev-parse", "HEAD")
+    _git(main, "update-ref", "refs/remotes/origin/main", base)
+    _git(main, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+    (live / "tracked.txt").write_text("changed\n", encoding="utf-8")
+    _git(live, "commit", "-qam", "task change")
+    seen: list[tuple[str, str, str]] = []
+
+    def transport(work: WorkItem) -> RawResult:
+        cwd = Path(work.cwd or "")
+        on_main = subprocess.run(["git", "merge-base", "--is-ancestor", base, "origin/main"],
+                                 cwd=cwd, capture_output=True, text=True)
+        seen.append((_git(cwd, "rev-parse", "origin/main"), _git(cwd, "remote"),
+                     str(on_main.returncode)))
+        return RawResult({"approved": True, "issues": [], "tests_meaningful": True})
+
+    work = _work(live).model_copy(update={"env": None})
+    result = HeadlessClaudeRunner(transport).dispatch(work)
+
+    assert result.status is ResultStatus.SUCCESS
+    # origin/main is the live repo's remote main, not its local branch (the task's commit).
+    assert seen == [(base, "", "0")]
+
+
 def test_port_exhaustion_fails_closed_without_calling_reviewer(tmp_path, monkeypatch) -> None:
     live = _repo(tmp_path / "live")
     project = PortProject(tmp_path / "ports.json")
