@@ -67,6 +67,10 @@ class CapabilityDescriptor(BaseModel):
     # tool restriction on its ``agent()`` call — pairs with #262) and for the deterministic
     # ENGINE lane (no model, hence no toolset to narrow).
     enforces_tool_policy: bool = False
+    # #626: does this cell translate ``ToolPolicy.denied_commands`` into a real refusal? Read
+    # for honesty like ``enforces_tool_policy``, and separate from it because codex enforces
+    # the file-write bit through its sandbox but has no per-command flag to pass.
+    enforces_command_denials: bool = False
     # #381: can this cell provision an isolated REVIEW workspace and run the project's
     # declared toolchain-origin probes before the reviewer may trust tests? Interactive
     # Workflow code has no filesystem, so it must stay False there. In-process model runners

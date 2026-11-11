@@ -34,7 +34,20 @@ topological order. **Applying mutates a real run: the human confirms the plan be
      sequence — an unnecessary edge serializes work that could parallelize.
    - **Lane fit** (`pipeline`): docs-only / pure-config → `micro` (and put `test`,`deliver` in
      `deterministic_stages` — a docs change needs no model test/PR-writing); small mechanical /
-     localized → `lite`; risky, cross-cutting, or ambiguous → `full`.
+     localized → `lite`; risky, cross-cutting, or ambiguous → `full`. Omit
+     `deterministic_stages` to take the lane's default (TEST runs no model on any lane); `[]`
+     explicitly runs every stage on a model, so use it only when a task really needs a model
+     TEST.
+   - **Issue stays open** (`keep_issue_open`): set `true` when merging the PR cannot meet the
+     issue's done-when: a reading after a release, a server change still to make, data still
+     to arrive. DELIVER then writes `Part of #N`, and a PR that would close the issue fails
+     the stage. Omit it to follow the project's keep-open labels; `false` overrides them.
+   - **IMPLEMENT time** (`implementation_budget`): set `long` (60 minutes instead of 30) for a
+     task too large to finish in one 30-minute IMPLEMENT that should still ship as one change,
+     such as many findings in one review (#615). Omit it otherwise; SCOPE can still raise it.
+   - **REVIEW time** (`review_budget`): set `long` (30 minutes instead of 10) for a change too
+     large to review in 10 minutes. A diff of 1500+ changed lines gets it without asking; set
+     `standard` only to keep a large diff on 10 minutes (#624). Omit it otherwise.
    - **Provider** (`provider_tag`): set `codex` only when a body/label calls for it; else omit.
    - **Model tier** (`model`) and **effort** (`effort`): for an architecture-heavy /
      brainstorming-shaped task, pin the Mythos tier in the plan — `"model": "fable"`

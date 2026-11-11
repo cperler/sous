@@ -173,20 +173,20 @@ def test_crash_resume_of_a_checkpoint_stage_carries_the_anchor(tmp_path, project
 
 
 def test_gate_vetoed_checkpoint_is_not_absorbed(tmp_path, project) -> None:
-    # A test stage that reports tests_meaningful=false is vetoed to FAILURE by the
-    # engine gate — its commits must not become a reset anchor.
+    # A DELIVER that reports no PR is vetoed to FAILURE by the engine gate — its commits
+    # must not become a reset anchor.
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
     eng.add_task("r1", "t1")
-    for _ in range(3):  # intake, scope, implement
+    for _ in range(4):  # intake, scope, implement, test
         eng.record("r1", make_result(eng.next_work("r1", "t1")))
     before = eng.store.load_task("r1", "t1").last_checkpoint
-    test_w = eng.next_work("r1", "t1")
-    assert test_w.stage is Stage.TEST
+    deliver_w = eng.next_work("r1", "t1")
+    assert deliver_w.stage is Stage.DELIVER
     eng.record("r1", make_result(
-        test_w,
-        structured_output={"passed": True, "failures": [], "tests_meaningful": False},
-        checkpoint={"tag": "task/r1/t1/test/0", "sha": "bbb"},
+        deliver_w,
+        structured_output={"pr_number": None, "pr_url": None},
+        checkpoint={"tag": "task/r1/t1/deliver/0", "sha": "bbb"},
     ))
     assert eng.store.load_task("r1", "t1").last_checkpoint == before
 

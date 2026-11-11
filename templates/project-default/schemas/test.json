@@ -1,19 +1,15 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "test",
-  "description": "Stage output contract: tests run + the test-validate self-report (the 'verify' half). tests_meaningful is required so a codex runner that omits it is a SCHEMA_VIOLATION (the schema-enforced form of the engine's fail-open gate); null is the explicit 'I could not judge this' answer a runner that cannot judge meaningfulness must give instead of a fake true (#261).",
+  "description": "Stage output contract: tests run. Whether the tests are meaningful is REVIEW's required output, not this stage's (#541).",
   "type": "object",
-  "required": ["passed", "failures", "tests_meaningful"],
+  "required": ["passed", "failures"],
   "properties": {
     "passed": {"type": "boolean"},
     "failures": {
       "type": "array",
       "items": {"type": "string"},
       "description": "ids of failing tests (empty when green)"
-    },
-    "tests_meaningful": {
-      "type": ["boolean", "null"],
-      "description": "true only if the tests genuinely exercise the change (would fail if it regressed); false if they do not (the engine vetoes the stage). null means NO verdict was reached — the runner could not judge meaningfulness (the deterministic ENGINE lane cannot, #261). A boolean is a real judgment; null is an honest abstention (fail-OPEN, and evented as test_validation_skipped when REVIEW abstains too). Omitting the key entirely is still a contract violation."
     },
     "validation_notes": {"type": "string", "description": "what the tests assert / any gaps"},
     "change_class": {
@@ -34,6 +30,11 @@
       "type": "integer",
       "minimum": 0,
       "description": "#558: number of test files the impacted run selected (0 for a full run). Set only by the ENGINE-lane runner."
+    },
+    "failure_kinds": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "#541: the kinds of the failures in a red run. Only ['infra'] means no test reached a verdict (the run timed out or could not start), so the engine retries TEST instead of sending it back to IMPLEMENT. Set only by the ENGINE-lane runner."
     },
     "test_scope_reason": {
       "type": "string",

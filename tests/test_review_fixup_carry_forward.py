@@ -15,7 +15,7 @@ from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 
 def _engine(tmp_path, project, **kw) -> Engine:
@@ -45,7 +45,7 @@ FILE_FINDING = {"title": "Retries block the exec loop", "detail": "Handed-off RF
                 "disposition": "file"}
 FILE_IDEA = {"title": "Move retries onto a worker", "detail": "So EXEC never waits.",
              "disposition": "file"}
-APPROVED = {"approved": True, "issues": []}
+APPROVED = {"approved": True, "issues": [], **REVIEW_PROOF}
 
 
 def _events(eng: Engine, kind: str) -> list[dict]:

@@ -48,6 +48,18 @@ def test_usage_limit_notice_on_stdout_is_rate_limited() -> None:
     assert classify_raw(raw) is ResultStatus.RATE_LIMITED
 
 
+def test_five_hour_limit_notice_on_stdout_is_rate_limited() -> None:
+    """Live pred-1186: the CLI's newer wording named the window instead of "usage"/"session",
+    matched no marker, and three tasks burned both attempts into the limit at $0."""
+    raw = RawResult(None, exit_code=1, error="",
+                    raw_output="You've hit your 5-hour limit · resets 2:10pm (America/New_York)")
+    assert classify_raw(raw) is ResultStatus.RATE_LIMITED
+    now = datetime(2026, 10, 31, 18, 0, tzinfo=UTC)  # 2:00pm in New York
+    assert parse_rate_limit_reset_at(raw, now=now) == datetime(
+        2026, 10, 31, 18, 10, tzinfo=UTC
+    ).isoformat()
+
+
 def test_bare_reset_uses_local_timezone() -> None:
     raw = RawResult(
         None,

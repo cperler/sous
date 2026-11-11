@@ -200,8 +200,12 @@ def apply_plan(
     impose no scheduling constraint and the engine's ``Dag`` rejects edges to non-tasks),
     its lane preset (from the ``pipeline`` hint), its ``provider_tag``,
     ``deterministic_stages``, and its ``model``/``effort`` pins (#287 — omitted pins pass
-    ``None``, which is exactly today's role-default behavior). Emits ONE ``batch_planned``
-    event summarizing what was added.
+    ``None``, which is exactly today's role-default behavior), its ``keep_issue_open``
+    choice (#613 — omitted passes ``None``, which follows the project's keep-open labels),
+    and its ``implementation_budget`` (#615 — omitted passes ``None``: the project's
+    IMPLEMENT default, which SCOPE may still raise to ``long``), and its ``review_budget``
+    (#624 — omitted passes ``None``: the REVIEW default, scaled up for a large diff).
+    Emits ONE ``batch_planned`` event summarizing what was added.
 
     ``dry_run`` adds nothing and emits no event — it returns exactly what WOULD be added so
     the caller (and the human) can inspect the plan before committing to it. Returns
@@ -220,15 +224,20 @@ def apply_plan(
         external = [d for d in all_deps if d not in plan_ids]
         if external:
             dropped[tid] = external
-        det = [Stage(s) for s in (t.get("deterministic_stages") or [])] or None
+        # None takes the preset's default; [] is an explicit choice of model stages (#541).
+        raw_det = t.get("deterministic_stages")
+        det = None if raw_det is None else [Stage(s) for s in raw_det]
         entry = {
             "task_id": tid,
             "depends_on": internal_deps,
             "pipeline": t.get("pipeline"),
             "provider_tag": t.get("provider_tag"),
-            "deterministic_stages": [s.value for s in (det or ())],
+            "deterministic_stages": None if det is None else [s.value for s in det],
             "model": t.get("model"),
             "effort": t.get("effort"),
+            "keep_issue_open": t.get("keep_issue_open"),
+            "implementation_budget": t.get("implementation_budget"),
+            "review_budget": t.get("review_budget"),
             "rationale": t.get("rationale", ""),
         }
         if not dry_run:
@@ -241,6 +250,9 @@ def apply_plan(
                 deterministic_stages=det,
                 model=t.get("model"),
                 effort=t.get("effort"),
+                keep_issue_open=t.get("keep_issue_open"),
+                implementation_budget=t.get("implementation_budget"),
+                review_budget=t.get("review_budget"),
             )
         added.append(entry)
 

@@ -23,7 +23,10 @@ tracker or fix-forward.
   policy-gate seam — runs ruff and mypy over the task worktree at REVIEW and returns a
   BLOCKING finding on red, which overrides an approving reviewer and re-opens the fix
   cycle with the tool output as learnings. A leg that cannot run at all degrades to
-  advisory, so unverified never reads as green.
+  advisory, so unverified never reads as green. Only what the task caused blocks (#591):
+  INTAKE records what ruff and mypy already report at `base_sha` as `Task.baseline_lint`,
+  and a generated adapter's benchmark must be red twice on a machine that was not
+  overloaded (`orchestrator/policy_gate.py`).
 - **Nothing is silently dropped** (`gh issue list -R cperler/sous`).
   Anything cut, thinned, or found-missing while building gets an ordinary issue with a
   `**Source:** #N` line naming the task that cut it — that line, not a label, is what
@@ -128,7 +131,9 @@ tracker or fix-forward.
   guidance, which the scheduler could not read. The gate keys on EVERY declared path, so it
   serializes some pairs that would not actually have collided; that is the chosen default,
   because the collision it prevents (#370's silent auto-merge into a runtime break) costs a
-  remediation cycle while the false positive costs only parallelism.
+  remediation cycle while the false positive costs only parallelism. The one relaxation is
+  adapter-owned: a path matching the adapter's `parallel_safe_paths` globs (selfhost: `*.md`)
+  counts as `append`, and each move is evented (#628).
 - **Batch integration is verified both before and after merge** (#370, #229, #216).
   When every task reaches a terminal state, `Engine.batch_integration_gate` gathers the
   completed leaf-task branches in dependency order, merges them over current trunk in a
@@ -151,6 +156,25 @@ tracker or fix-forward.
   shelled — never hardcoded pytest/ruff/mypy — keeping the engine project-agnostic. Neither
   gate performs PR-merge orchestration or starts an automatic remediation run (file-only).
 
+- **TEST runs no model by default; REVIEW owns whether the tests mean anything** (#541). TEST is
+  on the ENGINE lane on every lane, FULL included (`LANE_DETERMINISTIC_STAGES`). A task opts into
+  a model TEST with `--deterministic-stages none` (a batch plan's `"deterministic_stages": []`), a
+  project with `model_test_stage = True` on its adapter. A red ENGINE-lane TEST re-opens
+  IMPLEMENT (`test_failed_fix_cycle`, bounded by `Task.test_fix_cycles`), because retrying it
+  would re-run identical code. REVIEW must return `tests_meaningful` and `mutation_checks`;
+  `state_machine.review_proof_gate` sends back an approval that has neither a mutation which
+  failed a test nor a `tests_not_checked_reason`, and a stated reason is evented as
+  `test_validation_skipped` so an unproven pass never reads like a proven one.
+  **A surviving mutant has a stopping rule (#614).** A mutation the tests miss is never a
+  blocking issue by itself: it opens a fix cycle only when the reviewer marks the
+  `mutation_checks` entry `blocking: true` with a `blocking_reason` naming the spec-required
+  behaviour or money-path/safety guard it falls on, and the engine
+  (`state_machine.surviving_mutant_disposition`) promotes it to the issue, demotes a flag with
+  no reason (`surviving_mutant_demoted`), and reports every other survivor once as a `drop`
+  non-blocking gap. The rejection stores the blocking survivors on `Task.open_mutants`, so the
+  re-review is told to re-apply exactly those instead of sampling fresh mutations; a re-review
+  that re-applies none of them is evented `named_survivor_unchecked`, never vetoed.
+
 ## Running a batch: headless is the default lane
 Use the **`orchestrate-batch-headless`** skill for ordinary batches. One `run-headless` driver
 owns the run — backgrounded from the session, detached via fork+`os.setsid()`, or run in a
@@ -162,7 +186,8 @@ per stage, so no stage prompt or output passes through the session. Measured on
 real per-stage dollars in `stage-costs.jsonl`, `lane_audit` clean.
 
 An all-codex batch requires the global `--provider codex` flag: `provider_tag` routes only
-`routing.DEFAULT_CODEX_ELIGIBLE` (IMPLEMENT/TEST/SIMPLIFY), not the remaining stages. Even then,
+`routing.DEFAULT_CODEX_ELIGIBLE` (IMPLEMENT/TEST/SIMPLIFY), not the remaining stages. TEST itself
+runs on the ENGINE lane by default on every lane unless opted out (#541). Even then,
 `routing.engine_lane_required` vetoes DELIVER onto deterministic `ENGINE:none`, at `$0` and
 without the model DELIVER's docstring refresh; the warning-grade
 `stage_rerouted_to_engine_lane` records the move. The codex sandbox turns DELIVER's `git push`

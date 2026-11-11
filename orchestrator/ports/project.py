@@ -74,6 +74,12 @@ class TaskSource(Protocol):
     #       ``head_sha`` lets a MERGED PR prove that it contains this run's delivered head,
     #       rather than merely sharing a stale recorded URL. The GitHub source implements
     #       it; sources without PR lifecycle semantics may omit it.
+    #   closing_issue_numbers(pr_url) -> list[int]
+    #       The issue numbers, in this source's own tracker, that the PR closes on merge as
+    #       the tracker itself reports them (#613). The engine reads it for a task that keeps
+    #       its issue open, after DELIVER and again at completion. A missing or raising hook
+    #       reads as unverified (warning event), never as clean. The GitHub source implements
+    #       it; sources without PR lifecycle semantics may omit it.
 
     # Optional evidence-out hooks (NOT part of the versioned contract — the engine calls
     # them only via ``getattr`` at task finalize, so an older external adapter that omits
@@ -114,14 +120,26 @@ class TaskSource(Protocol):
     #
     # Optional PROJECT-CONFIG hook (same duck-typed pattern, on the ProjectConfig
     # itself rather than the task source):
-    #   review_findings(*, worktree: str | None) -> list[dict]
+    #   review_findings(*, worktree: str | None, changed_files=None) -> list[dict]
     #       Deterministic review policy gates (#65 — the seam for the old e2e-policy
     #       gate / API-contract trigger / TSC gate family). Called by the engine when
     #       a REVIEW stage completes; each finding is {description, severity?, file?,
     #       line?, suggested_fix?, blocking?=True}. Blocking findings merge into the
     #       review's `issues` and force approved=false (the model cannot skip a policy
-    #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups.
-    #       Must be best-effort and fast — it runs inline in record().
+    #       gate); non-blocking ones join `non_blocking` and are filed as follow-ups,
+    #       unless they carry `disposition` (`drop` is noted, not filed). Must be
+    #       best-effort and fast — it runs inline in record(). The exception is a red
+    #       benchmark, re-run once, so it can take two bench timeouts inline (#591).
+    #       Two optional additions (#591, helpers in orchestrator/policy_gate.py):
+    #       `gate_leg` + `gate_output` on a red lint/type finding make the engine compare
+    #       the output against Task.baseline_lint, so only what the change added blocks;
+    #       and a `{gate_record: {...}}` entry is not a finding but a `policy_gate_result`
+    #       event, which is how a green benchmark's load and timing reach the run log.
+    #       #634: a hook whose signature accepts `changed_files` (or **kwargs) is also
+    #       passed `changed_files: list[str] | None`, the task's own changed files
+    #       (`base_sha`..worktree: committed, uncommitted and untracked), or None when they
+    #       could not be read. Pass it with the adapter's `bench_paths` to
+    #       `run_bench_gate`, which then skips a benchmark the change cannot reach.
     #
     #   notify(kind: str, payload: dict) -> None
     #       Alerting sink (#55 — the seam the old bash monitor's email + desktop-notify
@@ -235,6 +253,45 @@ class ProjectConfig(Protocol):
     #       project has no type checker distinct from ``typecheck_cmd`` (e.g. a TS project whose
     #       ``typecheck_cmd`` IS ``tsc --noEmit``).
     #
+    # Optional model TEST opt-in (#541; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``model_test_stage = True`` drops TEST from a task's preset- or cost-derived
+    # deterministic stages, so this project's tasks run TEST on a model lane instead of the
+    # ENGINE lane. A task's own explicit stages still win. The declared test commands still
+    # decide that stage's verdict, and tests-meaningful stays REVIEW's either way.
+    # Optional keep-open labels (#613; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``keep_open_labels = ("experiment",)`` makes a task sourced from an issue with
+    # one of these labels (compared ignoring case) keep that issue open, as if it had been
+    # planned with ``keep_issue_open``. A task's own explicit choice still wins.
+    # Optional IMPLEMENT default (#615; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``implement_timeout_s = 2700`` replaces the 30-minute IMPLEMENT limit for this
+    # project's tasks. A task budget still applies on top: ``short`` is 15 minutes and ``long``
+    # is 60 minutes or this value, whichever is longer. Anything but a positive int is ignored
+    # and evented as ``implement_timeout_rejected``.
+    # Optional REVIEW default (#624; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``review_timeout_s = 1200`` replaces the 10-minute REVIEW limit. ``long`` (a
+    # task pin, a diff of 1500+ changed lines, or the retry after a REVIEW timeout) is 30
+    # minutes or this value, whichever is longer. Anything but a positive int is ignored and
+    # evented as ``review_timeout_rejected``.
+    # Optional test timeout (#642; duck-typed via ``getattr``, NOT part of the versioned
+    # contract): ``test_timeout_s`` is a positive int attribute or zero-arg callable giving
+    # the seconds each declared test command may run in the ENGINE-lane TEST stage and in
+    # INTAKE's baseline capture. Absent means 900. An unusable value (raises, not a positive
+    # int) also means 900 and is evented as a ``test_timeout_invalid`` notice. A scaffolded
+    # adapter sets it from profile.toml's ``[test] timeout_s``. A command that times out is
+    # reported as an ``infra`` failure, which the engine re-runs without spending an attempt.
+    # Optional parallel-safe paths (#628; duck-typed via ``getattr``, NOT part of the versioned
+    # contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
+    #   parallel_safe_paths() -> list[str]
+    #       Globs for files whose worst case under two concurrent edits is a textual conflict,
+    #       such as a project's docs. The file-contention gate treats a declared or inferred
+    #       claim on a matching path as ``append`` whatever SCOPE wrote, so two such tasks run
+    #       in parallel, and each move is evented as ``file_claim_mode_relaxed``. ``*`` and
+    #       ``?`` stop at ``/``, ``**/`` matches zero or more directories, a trailing ``**``
+    #       matches everything below, and a glob with no ``/`` matches the file name at any
+    #       depth. Matching is case-sensitive. Absent means no path is relaxed. A hook that
+    #       raises or returns a non-list relaxes nothing and emits
+    #       ``parallel_safe_paths_rejected``. Never list code: only a rewrite can cause the
+    #       silent merge breakage the gate exists to prevent, and this removes the rewrite.
     # Optional impacted-test selection hooks (#558; duck-typed via ``getattr``, NOT part of
     # the versioned contract, no CONTRACT_VERSION bump — same pattern as ``types_cmd``):
     #   impacted_tests(changed: list[str], *, cwd: str | None = None) -> list[str] | None

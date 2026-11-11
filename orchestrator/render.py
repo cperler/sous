@@ -1042,9 +1042,15 @@ def render_completion_note(
         count = optimize.get("changed_files_count")
         lines += ["", _OPTIMIZE_SKIPPED_NON_CODE_HEADING]
         if isinstance(count, int) and not isinstance(count, bool):
+            # #564: a fix-cycle skip judged only that cycle's diff, not the whole task's.
+            scope = (
+                f" since the reviewed commit {str(optimize.get('diff_from'))[:12]} "
+                "(this review fix cycle)"
+                if optimize.get("diff_range") == "review_fix_cycle" else ""
+            )
             lines.append(
-                f"- {count} changed file(s), all matching the project's non-code globs; "
-                "no model was called"
+                f"- {count} changed file(s){scope}, all matching the project's non-code "
+                "globs; no model was called"
             )
     # The reasoning pass's own account: each fix with its one-line why, under the impact
     # class it judged the change to have (absent on outputs recorded before the redesign).
@@ -1225,6 +1231,8 @@ def render_progress(task: Task, *, now: str | None = None) -> str:
     notes = []
     if task.review_cycles:
         notes.append(f"{task.review_cycles} review cycle(s)")
+    if task.test_fix_cycles:
+        notes.append(f"{task.test_fix_cycles} test fix cycle(s)")
     if task.salvage_count:
         notes.append(f"{task.salvage_count} salvage-keep(s)")
     if task.infra_resets:

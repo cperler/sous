@@ -99,7 +99,7 @@ def test_continuity_rate_is_derivable_from_events_alone(tmp_path, project) -> No
     process — just events.jsonl."""
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     while (w := eng.next_work("r1", "t1")) is not None:
         # every model stage reports the same session back, so each following stage resumes
         eng.record("r1", make_result(w, session_ref="sess-abc"))

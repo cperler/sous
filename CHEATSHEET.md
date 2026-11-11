@@ -151,6 +151,8 @@ Then `/triage-followups`.
 | `lite` | Small, mechanical, localized | |
 | `full` | Risky, cross-cutting, ambiguous | Default |
 
+TEST runs no model on any lane by default. For a model TEST: `--deterministic-stages none`.
+
 Optional per-task: `--model fable` (architecture-heavy design work), `--effort high`.
 Via `/batch-plan` these are **plan fields** — hand-writing `add-task --model` costs you
 `apply`'s topological ordering.
@@ -188,6 +190,22 @@ runs detached or in a foreground terminal.
 
 **A multi-issue `Closes #7, #8` only closes the first.** Verify issue closures by hand after
 merging.
+
+**A PR that does not finish its issue needs `keep_issue_open`.** Set `"keep_issue_open": true` in
+the plan (`add-task --keep-issue-open`), or declare `keep_open_labels` on the adapter. DELIVER
+then writes `Part of #N`, and a PR that would still close the issue fails the stage. Saying so in
+the issue's text does not work.
+
+**A big task that keeps timing out in IMPLEMENT needs `implementation_budget`.** Set
+`"implementation_budget": "long"` in the plan (`add-task --implementation-budget long`) for 60
+minutes instead of 30, or declare `implement_timeout_s` on the adapter for a project-wide default.
+SCOPE may also choose `long` itself; a pin wins over SCOPE.
+
+**A big change that times out in REVIEW needs `review_budget`.** A diff of 1500+ changed lines
+already gets 30 minutes instead of 10; set `"review_budget": "long"` in the plan
+(`add-task --review-budget long`) to force it, or `review_timeout_s` on the adapter for a
+project-wide default. A timed-out REVIEW retries on the long limit with what it had already run,
+and a REVIEW that runs out of attempts is held for a human review, not failed (#624).
 
 **Never `rm -rf runs/<run>/`.** Worktrees, branches, and checkpoint tags are cleanup targets;
 the run log dir is the durable audit trail and is pruned only by a human, deliberately.

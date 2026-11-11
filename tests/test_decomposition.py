@@ -476,3 +476,21 @@ def test_marker_lookup_does_not_collide_on_an_id_prefix(tmp_path, project) -> No
     assert parent.decomposition_mapping["ab"] == "child-ab"
     assert parent.decomposition_mapping["a"] != "child-ab"
     assert len(set(parent.decomposition_mapping.values())) == 2
+
+
+def test_children_inherit_the_parents_test_lane(tmp_path, project) -> None:
+    """#541: a child's pipeline is pinned, so the preset default cannot reach it. It inherits
+    the parent's choice, or decomposed work would quietly keep a model TEST."""
+    for name, parent_det, expected in (("default", None, (Stage.TEST,)), ("model", (), ())):
+        project._task_source = CreatingSource()
+        eng = _engine(tmp_path / name, project)
+        eng.create_run("r1", ExecutionLane.FULL)
+        eng.add_task("r1", "parent", deterministic_stages=parent_det)
+        eng.record("r1", make_result(eng.next_work("r1", "parent")))  # intake
+        scope = eng.next_work("r1", "parent")
+        assert scope.stage is Stage.SCOPE
+        eng.record("r1", make_result(scope, structured_output=_scope_output()))
+        children = eng.store.load_task("r1", "parent").decomposition_children
+        assert children
+        for child in children:
+            assert eng.store.load_task("r1", child).deterministic_stages == expected

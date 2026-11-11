@@ -10,15 +10,17 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Collection, Sequence
 from typing import NamedTuple
 
 from pydantic import ValidationError
 
-from .file_contention import normalize_claims
+from .file_contention import normalize_claims, relax_claims
 from .schemas.enums import (
     STAGE_ORDER,
     Effort,
     ExecutionMode,
+    ImplementationBudget,
     Provider,
     ResultStatus,
     Stage,
@@ -109,6 +111,10 @@ class FoldNotices(NamedTuple):
     * ``truncations`` → ``context_value_truncated`` (a capped context value, #289)
     * ``evictions``   → ``context_key_evicted``     (a ceiling-shed context key, #289)
     * ``file_claims`` → ``scope_file_claim_dropped`` (an unusable declared path, #377)
+    * ``relaxed_claims`` → ``file_claim_mode_relaxed`` (a parallel-safe path moved to
+      ``append``, #628); a change rather than a drop, but never silent either
+    * ``budgets`` → ``implementation_budget_set`` (SCOPE sized the task's IMPLEMENT limit,
+      #615); ``applied`` is false when a per-task pin, or an unknown value, kept it out
 
     Kept as separate lists rather than one, so the call site needs no per-notice branching
     and each event's payload stays a flat, self-describing shape."""
@@ -117,11 +123,16 @@ class FoldNotices(NamedTuple):
     truncations: list[dict[str, object]]
     evictions: list[dict[str, object]]
     file_claims: list[dict[str, object]]
+    relaxed_claims: list[dict[str, object]]
+    budgets: list[dict[str, object]]
 
 
 def _no_notices() -> FoldNotices:
     """An empty FoldNotices (fresh lists — never a shared mutable default)."""
-    return FoldNotices(pr_fields=[], truncations=[], evictions=[], file_claims=[])
+    return FoldNotices(
+        pr_fields=[], truncations=[], evictions=[], file_claims=[], relaxed_claims=[],
+        budgets=[],
+    )
 
 
 def apply_result(
@@ -132,6 +143,7 @@ def apply_result(
     cost_usd: float | None,
     metered: bool = True,
     iteration: int | None = None,
+    parallel_safe_paths: Sequence[str] = (),
 ) -> FoldNotices:
     """Fold a StageResult into the task's stage record (status + attribution).
 
@@ -139,6 +151,9 @@ def apply_result(
     two fields and mean nothing apart. ``metered=False`` says the cost is an unknown, not
     a measured zero, so a consumer of the task doc can render it honestly instead of as a
     confident ``$0.0000``. Defaulting to True keeps every existing call site's meaning.
+
+    ``parallel_safe_paths`` is the project adapter's glob list (#628), passed in so the fold
+    stays pure; only a SCOPE result reads it.
 
     Returns the drop notices produced by ``_absorb_outputs`` (all empty on the
     non-SUCCESS branch, which folds nothing) so the engine can emit the warning-grade
@@ -166,7 +181,7 @@ def apply_result(
     if result.status is ResultStatus.SUCCESS:
         rec.status = StageStatus.COMPLETED
         rec.error = None
-        notices = _absorb_outputs(task, result)
+        notices = _absorb_outputs(task, result, parallel_safe_paths)
     else:
         rec.status = StageStatus.FAILED
         rec.error = result.error or result.status.value
@@ -177,6 +192,11 @@ def apply_result(
     return notices
 
 
+# #564: the context key naming an OPTIMIZE revert and its cause. A fix cycle re-runs OPTIMIZE, so
+# a key that only ever overwrote would keep reporting an old revert after a pass that kept its
+# commit; the fold and the non-code skip clear it instead.
+OPTIMIZE_REVERT_KEY = "optimize_reverted"
+
 # Engine-owned context-fold whitelist (2026-07-01 context-plane design note). Per stage,
 # the generic stage-contract keys folded into task.context for downstream prompts. Only
 # these keys (present in the canonical schemas/stages/*.json) are folded — never whole
@@ -184,6 +204,8 @@ def apply_result(
 # INJECTIVE across stages (no two stages write the same context key); enforced by test.
 CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.INTAKE: ("branch", "worktree", "base_sha", "baseline_failures",
+                   # #607: failed at base but passed on one re-run — flaky, not broken.
+                   "baseline_flaky",
                    "port_base", "port_count", "composed_deps",
                    # #385: uncommitted work a REUSED worktree inherited from a previous,
                    # dead run. Folded for the same reason baseline_failures is — it is
@@ -196,13 +218,13 @@ CONTEXT_KEYS: dict[Stage, tuple[str, ...]] = {
     Stage.SCOPE: ("plan", "blocked_reason", "performance"),
     Stage.IMPLEMENT: ("files_changed", "summary"),
     Stage.SIMPLIFY: (),
-    # #519: nothing folded. The suggestions the engine files are read from the stage
-    # RECORD at finalize, and its measurements are its own account of a pass a later
-    # stage does not act on — #520 makes them engine-run, which is when they become
-    # evidence worth carrying into a downstream prompt.
-    Stage.OPTIMIZE: (),
-    Stage.TEST: ("failures", "tests_meaningful", "validation_notes", "change_class",
-                 "test_scope"),
+    # #519: the suggestions the engine files are read from the stage RECORD at finalize, and
+    # the model's measurements decide nothing, so neither is folded. #564: the one fact a later
+    # stage must act on is that the engine took the pass's commit back off the branch, so TEST,
+    # DELIVER and REVIEW do not describe code that is gone. Engine-authored: the benchmark gate
+    # strips any model value, and the fold clears it when a later pass reports no revert.
+    Stage.OPTIMIZE: (OPTIMIZE_REVERT_KEY,),
+    Stage.TEST: ("failures", "validation_notes", "change_class", "test_scope"),
     Stage.DELIVER: ("pr_number", "pr_url"),
     Stage.REVIEW: ("issues",),
 }
@@ -230,6 +252,10 @@ _MAX_ITEM_STR = 500  # a string element inside a list value (the default per-ite
 _MAX_LIST = 40  # elements kept from a list value
 _MAX_CONTEXT_BYTES = 16_384  # whole-context ceiling
 _MAX_DROPPED_VALUE = 200  # a dropped pr_* value / its reason, in a drop notice (#201)
+# #591: Task.baseline_lint entries kept. Generous because a repo can carry hundreds of old lint
+# errors, and bounded because the task doc is rewritten on every update. An entry past the cap
+# is reported, and its finding reads as new at REVIEW, which blocks as it did before #591.
+_MAX_BASELINE_LINT = 2000
 
 # #289: the per-item cap is chosen by what a FIELD MEANS, not by the value's python type.
 # A SCOPE ``plan`` is an ordered list of prose subtask INSTRUCTIONS — routinely well over
@@ -315,7 +341,7 @@ def _enforce_context_ceiling(task: Task) -> list[dict[str, object]]:
     """Keep task.context under the whole-context ceiling by a per-KEY size-weighted
     sweep, heaviest-first: each pass evicts the single folded key that weighs the most
     bytes, so a fat key is shed while its small stage-siblings survive (dropping a
-    near-ceiling ``test.failures`` no longer takes ``tests_meaningful`` /
+    near-ceiling ``test.failures`` no longer takes ``change_class`` /
     ``validation_notes`` down with it — whole-stage eviction was needlessly coarse).
     Ties break reverse-pipeline (review's keys first, intake's last) then the fixed key
     order within that stage's ``CONTEXT_KEYS`` tuple — downstream stages need the earliest
@@ -385,7 +411,9 @@ def _short_validation_reason(exc: ValidationError) -> str:
     return reason
 
 
-def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
+def _absorb_outputs(
+    task: Task, result: StageResult, parallel_safe_paths: Sequence[str] = ()
+) -> FoldNotices:
     """Fold a stage's well-known structured-output fields into task.pr_* and the
     engine-owned task.context plane (2026-07-01 design note). Fold is tolerant (a
     missing whitelisted key is skipped; a pr_* value that fails field validation is
@@ -428,25 +456,78 @@ def _absorb_outputs(task: Task, result: StageResult) -> FoldNotices:
         bounded, cap_notices = _cap_value(key, out[key])
         task.context[key] = bounded
         truncations.extend(cap_notices)
+    # #564: a pass that reports no revert ends the previous pass's note, or a fix cycle would
+    # keep telling later stages about a commit that this pass has moved past.
+    if result.stage is Stage.OPTIMIZE and OPTIMIZE_REVERT_KEY not in out:
+        task.context.pop(OPTIMIZE_REVERT_KEY, None)
     # #377: the SCOPE-declared edit surface is a SCHEDULING input, so it folds onto its own
     # durable task field rather than into the context plane — a context key can be evicted
     # by the whole-context ceiling, and an evicted claim would silently un-serialize the
     # run. Normalization is total (a malformed declaration yields no claims, never an
     # exception into record()) and every rejected path comes back as a notice.
     file_claims: list[dict[str, object]] = []
+    relaxed_claims: list[dict[str, object]] = []
     if result.stage is Stage.SCOPE and "files" in out:
         declaration = normalize_claims(out["files"])
         file_claims = declaration.notices
         task.scope_files = list(declaration.claims)
         # #426: only the non-default (append) paths are persisted, so an absent entry —
         # including every task doc written before #426 — reads as ``rewrite`` and gates
-        # exactly as it did before.
-        task.scope_file_modes = dict(declaration.modes)
+        # exactly as it did before. #628: a path the adapter marked parallel-safe is stored
+        # as append whatever the model wrote, and the move comes back as a notice.
+        relaxation = relax_claims(declaration.claims, declaration.modes, parallel_safe_paths)
+        relaxed_claims = relaxation.relaxed
+        task.scope_file_modes = relaxation.modes
+    # #591: what the lint/type tools already report at base. A durable task field, not a context
+    # key: the context plane caps a list at 40 items (the rest would read as new errors) and
+    # feeds every later prompt. ENGINE lane only, so a model cannot excuse its own errors.
+    if result.stage is Stage.INTAKE and engine_lane and "baseline_lint" in out:
+        raw_lint = out["baseline_lint"]
+        entries = (
+            [e for e in raw_lint if isinstance(e, str)] if isinstance(raw_lint, list) else []
+        )
+        task.baseline_lint = entries[:_MAX_BASELINE_LINT]
+        if len(entries) > _MAX_BASELINE_LINT:
+            truncations.append({
+                "field": "baseline_lint",
+                "part": "list_tail",
+                "kept_items": _MAX_BASELINE_LINT,
+                "dropped_items": len(entries) - _MAX_BASELINE_LINT,
+            })
+    budgets: list[dict[str, object]] = []
+    if result.stage is Stage.SCOPE and "implementation_budget" in out:
+        budgets = _absorb_scope_budget(task, out["implementation_budget"])
     evictions = _enforce_context_ceiling(task)
     return FoldNotices(
         pr_fields=dropped, truncations=truncations, evictions=evictions,
-        file_claims=file_claims,
+        file_claims=file_claims, relaxed_claims=relaxed_claims, budgets=budgets,
     )
+
+
+# What SCOPE may say about an undecomposed task's IMPLEMENT limit. ``short`` stays a
+# decomposition-child control: SCOPE shortening its own task is never asked for.
+_SCOPE_BUDGETS = (ImplementationBudget.STANDARD, ImplementationBudget.LONG)
+
+
+def _absorb_scope_budget(task: Task, raw: object) -> list[dict[str, object]]:
+    """Fold SCOPE's sizing of a task it chose not to decompose (#615) onto the task.
+
+    Only ``long`` changes anything: ``standard`` is what an unsized task already gets. A
+    budget already on the task (an ``add-task``/batch-plan pin, or a decomposition child's)
+    wins, and an unknown value is ignored; both come back as a not-applied notice so the
+    engine can event them. A re-folded ``long`` that is already in place says nothing."""
+    wanted = next((b for b in _SCOPE_BUDGETS if b.value == raw), None)
+    if wanted is None:
+        return [{"source": "scope", "requested": str(raw)[:40], "applied": False,
+                 "reason": "unknown_budget"}]
+    current = task.implementation_budget
+    if wanted is not ImplementationBudget.LONG or current is wanted:
+        return []
+    if current is not None:
+        return [{"source": "scope", "requested": wanted.value, "current": current.value,
+                 "applied": False, "reason": "pinned"}]
+    task.implementation_budget = wanted
+    return [{"source": "scope", "requested": wanted.value, "current": None, "applied": True}]
 
 
 _PR_URL_RE = re.compile(r"^https?://\S+/pull/(\d+)/?$")
@@ -499,6 +580,26 @@ def remote_branch_sha(ls_remote_stdout: str, branch: str) -> str | None:
     return None
 
 
+def keep_open_violation(issue: int, closing_issues: Collection[int]) -> str | None:
+    """Reason a keep-open task's PR is wrong when GitHub would close its issue — else
+    ``None`` (#613).
+
+    ``closing_issues`` is GitHub's own answer (the PR's closing references), read by the
+    engine, so this post-condition is one the model does not author: on ``pred-1141-1291``
+    PRs said ``Closes`` with "do not close it on merge" in their own context. Pure: the
+    engine call sites turn it into the veto or the completion finding, and the event.
+    """
+    if issue not in closing_issues:
+        return None
+    return (
+        f"keep-open check: issue #{issue} stays open after this PR, but GitHub lists it as "
+        "an issue the PR closes on merge. Edit the PR description (`gh pr edit`) to say "
+        f"'Part of #{issue}' with no closing keyword (a form of close, fix or resolve) in "
+        f"front of #{issue}, and remove any manual link to it from the PR's Development "
+        "section."
+    )
+
+
 def deliver_push_mismatch(checkpoint_sha: str, remote_sha: str | None, branch: str) -> str | None:
     """Veto reason when DELIVER's checkpoint is not what the remote branch holds — else
     ``None`` (#500).
@@ -526,86 +627,289 @@ def deliver_push_mismatch(checkpoint_sha: str, remote_sha: str | None, branch: s
     )
 
 
-def no_model_test_surface(task: Task) -> bool:
-    """#41/#168: does this task have NO model-written/graded test surface for the #13
-    independent test-validate criterion to bite on?
+def no_test_surface(task: Task) -> bool:
+    """#41/#168: does this task have NO test surface for REVIEW's tests-meaningful judgment
+    (#13/#541) to bite on?
 
-    True on any of three signals, ALL fixed at ``add_task`` time or set only by the
+    True on either of two signals, both fixed at ``add_task`` time or set only by the
     deterministic ENGINE lane — so a model can never self-exempt:
 
     (a) #41 the change was deterministically classified ``docs-only`` (the git-diff tag; a
         model claim is dropped at the fold, see ``DETERMINISTIC_ONLY_KEYS``);
-    (b) #168 the pipeline has no TEST stage at all (micro);
-    (c) #168 TEST ran on the deterministic $0 ENGINE runner (#33/#68), so no model wrote or
-        graded the tests the reviewer would be judging.
+    (b) #168 the pipeline has no TEST stage at all (micro).
 
-    Pure (a function of the task doc only). Lives here, next to the fold, because BOTH the
-    engine's ``_review_verdict`` exemption and ``unjudged_tests_notice`` below must read
-    the SAME predicate — two spellings would drift.
+    TEST running on the ENGINE lane is deliberately NOT a signal (#541): that is now every
+    lane's default, and a model (IMPLEMENT) still wrote the tests REVIEW judges.
+
+    Pure (a function of the task doc only). Lives here, next to the fold, because the
+    engine's ``_review_verdict`` exemption, ``review_proof_gate`` and
+    ``unjudged_tests_notice`` below must read the SAME predicate — spellings would drift.
     """
     return (
         task.context.get("change_class") == "docs-only"
         or Stage.TEST not in task.pipeline
-        or Stage.TEST in task.deterministic_stages
+    )
+
+
+def proving_mutation_count(output: dict) -> int:
+    """How many of a REVIEW output's ``mutation_checks`` actually failed a test: a named
+    mutation with at least one failing test id. A survived mutation is a real record, but it
+    proves nothing in favor of the tests. Tolerant of any shape, since a model wrote it."""
+    checks = output.get("mutation_checks")
+    if not isinstance(checks, list):
+        return 0
+    return sum(
+        1 for check in checks
+        if isinstance(check, dict)
+        and str(check.get("mutation") or "").strip()
+        and isinstance(check.get("failed_tests"), list)
+        and any(str(test).strip() for test in check["failed_tests"])
+    )
+
+
+class SurvivorDisposition(NamedTuple):
+    """What ``surviving_mutant_disposition`` made of a REVIEW's survived mutations (#614).
+
+    ``blocking``: structured review issues (``review.json`` issue-object shape, tagged
+    ``source="mutation_check"`` and carrying the verbatim ``mutation``) for every survivor the
+    reviewer flagged ``blocking: true`` WITH a reason. ``noted``: ``non_blocking`` entries
+    (``disposition="drop"``) for every other survivor. ``demoted``: survivors flagged blocking
+    without a reason, which the engine refuses to cycle on and events instead.
+    """
+
+    blocking: list[dict]
+    noted: list[dict]
+    demoted: list[dict]
+
+
+_MUTATION_LOCATION = re.compile(r"^\s*(?P<file>[^\s:]+?)(?::(?P<line>\d+))?(?=[\s:]|$)")
+# The verbatim mutation string is the re-review's lookup key, so it is kept whole up to a
+# bound that still fits the convergence fingerprint's 160-code-point window with the prefix.
+_MAX_MUTATION_TEXT = 120
+# A ``non_blocking`` title (the fingerprint key at finalize) is cut where the filing code cuts.
+_MAX_NOTED_TITLE = 80
+
+
+def _is_blocking_flag(value: object) -> bool:
+    """``blocking: true`` as a model may actually spell it (a bool, or the string)."""
+    return value is True or (isinstance(value, str) and value.strip().casefold() == "true")
+
+
+def _mutation_text(check: dict) -> str:
+    """One check's ``mutation`` string, whitespace-collapsed and bounded; ``""`` when
+    absent or blank (a model may omit it), so callers can skip the check in one test."""
+    return re.sub(r"\s+", " ", str(check.get("mutation") or "")).strip()[:_MAX_MUTATION_TEXT]
+
+
+def surviving_mutant_disposition(output: dict) -> SurvivorDisposition:
+    """The stopping rule for surviving mutants (#614), as a pure walk over a REVIEW output's
+    ``mutation_checks``.
+
+    A reviewer proves ``tests_meaningful`` by mutating the change and watching tests fail.
+    Mutations the tests MISS are real records, but each review samples different ones, so
+    treating any survivor as a blocking finding opened a full implement-through-review cycle
+    per round on code that was correct every time (pred-1141-1291 #1254/#1310, pred-1396-1382
+    #1378). The rule, decided here rather than by the prompt: a survivor opens a cycle only
+    when the reviewer flags it ``blocking: true`` AND names a ``blocking_reason`` (the spec
+    requirement or money-path/safety guard it falls on). A flag without a reason is DEMOTED,
+    never promoted — an unexplained block is the hydra this exists to stop. Everything else is
+    a noted gap, reported once in ``non_blocking`` and never filed.
+
+    Tolerant of any shape, since a model wrote it: a survivor is a named mutation with no
+    recorded failing test (the exact complement of ``proving_mutation_count``), so a check
+    whose ``failed_tests`` is missing or malformed proves nothing and is handled as one.
+    """
+    checks = output.get("mutation_checks")
+    if not isinstance(checks, list):
+        return SurvivorDisposition([], [], [])
+    blocking: list[dict] = []
+    noted: list[dict] = []
+    demoted: list[dict] = []
+    for check in checks:
+        if not isinstance(check, dict):
+            continue
+        mutation = _mutation_text(check)
+        if not mutation:
+            continue
+        failed = check.get("failed_tests")
+        if isinstance(failed, list) and any(str(t).strip() for t in failed):
+            continue  # a proving mutation; not this rule's business
+        reason = check.get("blocking_reason")
+        reason = re.sub(r"\s+", " ", reason).strip()[:300] if isinstance(reason, str) else ""
+        if _is_blocking_flag(check.get("blocking")):
+            if not reason:
+                demoted.append({
+                    "mutation": mutation,
+                    "reason": "flagged blocking with no blocking_reason — noted, not cycled",
+                })
+                noted.append(_noted_gap(mutation, ""))
+                continue
+            issue: dict = {
+                "severity": "important",
+                "description": f"surviving mutant: {mutation} — {reason}",
+                "suggested_fix": (
+                    "add or sharpen a test that fails on exactly this mutation, then re-apply "
+                    "it to confirm"
+                ),
+                "source": "mutation_check",
+                "mutation": mutation,
+            }
+            located = _MUTATION_LOCATION.match(mutation)
+            if located and ("/" in located["file"] or "." in located["file"]):
+                issue["file"] = located["file"]
+                if located["line"] is not None:
+                    issue["line"] = int(located["line"])
+            blocking.append(issue)
+        else:
+            noted.append(_noted_gap(mutation, reason))
+    return SurvivorDisposition(blocking, noted, demoted)
+
+
+def _noted_gap(mutation: str, reason: str) -> dict:
+    """The ``non_blocking`` entry for a survivor that opens no cycle: a ``drop``
+    disposition (noted in the completion note, never filed), titled by the mutation so the
+    engine can dedupe it against an entry the reviewer already wrote, with the reviewer's
+    own note appended when one was given."""
+    detail = (
+        f"The mutation `{mutation}` survived the covering tests (no test failed on it). "
+        "The reviewer did not place it on spec-required behaviour or a money-path/safety "
+        "guard, so under the #614 stopping rule it is noted once and opens no fix cycle."
+    )
+    if reason:
+        detail += f" Reviewer note: {reason}"
+    return {
+        "title": f"surviving mutant: {mutation}"[:_MAX_NOTED_TITLE],
+        "detail": detail,
+        "disposition": "drop",
+    }
+
+
+def unchecked_named_survivors(open_mutants: Collection[str], output: dict) -> list[str]:
+    """Which of a fix cycle's named survivors this re-review did NOT re-apply (#614).
+
+    The re-review is told to copy each named ``mutation`` string verbatim into its own
+    ``mutation_checks``; the match is on the same normalization the convergence fingerprint
+    uses (whitespace-collapsed, case-folded), so cosmetic rewording still counts. Pure; the
+    engine events the misses (``named_survivor_unchecked``) and never vetoes on them — a
+    reviewer that reads the fix instead of re-running it has still reviewed.
+    """
+    if not open_mutants:
+        return []
+    checks = output.get("mutation_checks")
+    seen: set[str] = set()
+    if isinstance(checks, list):
+        for check in checks:
+            if isinstance(check, dict):
+                text = _mutation_text(check)
+                if text:
+                    seen.add(_normalize_mutation(text))
+    return [m for m in open_mutants if _normalize_mutation(m) not in seen]
+
+
+def _normalize_mutation(text: str) -> str:
+    """The match key for a named survivor: the same whitespace/case fold the convergence
+    fingerprint applies, so a re-review's cosmetic rewording of the mutation still counts."""
+    return re.sub(r"\s+", " ", str(text)).strip().casefold()[:_MAX_MUTATION_TEXT]
+
+
+def _not_checked_reason(output: dict) -> str | None:
+    """The reviewer's stated reason for not proving the verdict, or None when blank."""
+    reason = output.get("tests_not_checked_reason")
+    return reason.strip() if isinstance(reason, str) and reason.strip() else None
+
+
+def review_proof_gate(task: Task, result: StageResult) -> str | None:
+    """Why an APPROVING REVIEW must re-run because it did not prove the tests mean anything
+    (#541), or None. Pure; the engine downgrades the result to a failure with this as its
+    error, so the retry reads it as a learning and the breaker bounds the loop.
+
+    Applies to a successful approval on a change with a test surface. It requires either a
+    boolean verdict backed by a mutation that failed a test, or a stated
+    ``tests_not_checked_reason``, which is accepted and evented by ``unjudged_tests_notice``
+    so an unproven pass stays visible. An explicit ``false`` needs no proof (the verdict
+    rejects it anyway), and a rejecting review is not vetoed because it re-runs after the fix.
+    """
+    if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+        return None
+    out = result.structured_output or {}
+    if out.get("approved") is not True or out.get("tests_meaningful") is False:
+        return None
+    if no_test_surface(task) or _not_checked_reason(out) is not None:
+        return None
+    verdict = out.get("tests_meaningful")
+    if isinstance(verdict, bool) and proving_mutation_count(out):
+        return None
+    return (
+        "review proof gate: the review approved a change with tests but recorded no proof "
+        "they mean anything. Apply a mutation to the change's source, run the covering tests, "
+        "and report tests_meaningful plus mutation_checks naming the mutation and the tests "
+        "that failed on it; if no check can settle it, say why in tests_not_checked_reason."
     )
 
 
 def unjudged_tests_notice(task: Task, result: StageResult) -> dict[str, object] | None:
-    """Did anything actually judge whether this change's tests are meaningful (#261)?
+    """Did REVIEW actually judge whether this change's tests are meaningful (#261/#541)?
 
-    Returns a notice dict describing what went unjudged (or was judged and then
-    discarded), else None. PURE — no wall-clock/random/I/O, per the project's
-    "pure functions return what they dropped; the engine emits the event" convention:
-    ``Engine.record`` turns a notice into a warning-grade ``test_validation_skipped``
-    event. This NEVER blocks completion — fail-OPEN is deliberate and load-bearing; the
-    fix is to stop *claiming* a verification that did not happen, not to start blocking.
+    Returns a notice dict describing what went unjudged, unproven, or judged and then
+    discarded, else None. PURE — no wall-clock/random/I/O, per the project's "pure functions
+    return what they dropped; the engine emits the event" convention: ``Engine.record`` turns
+    a notice into a warning-grade ``test_validation_skipped`` event. It never blocks;
+    ``review_proof_gate`` is what blocks, and an approval that reaches here without proof got
+    past it by stating a reason, which this event carries as ``stated_reason``.
 
-    Two shapes, both observed on the lite lane (#255):
+    ``kind="not_judged"`` — REVIEW returned no boolean. Scoped to a plausible test surface: a
+    pipeline that HAS a TEST stage and a change not deterministically classified
+    ``docs-only``. A pipeline with no TEST stage (micro) is out of scope — that lane declares
+    no test verification at all at ``add_task`` time, which is a recorded lane choice rather
+    than a silent skip.
 
-    ``kind="not_judged"`` — neither side produced a boolean: the TEST stage abstained
-    (the deterministic ENGINE runner reports ``tests_meaningful: null`` because a script
-    cannot judge it) AND the REVIEW output omitted/nulled the field. Each side deferred to
-    the other and neither did it. Scoped to a plausible test surface: a pipeline that HAS a
-    TEST stage and a change not deterministically classified ``docs-only``. A pipeline with
-    no TEST stage (micro) is out of scope — that lane declares no test verification at all
-    at ``add_task`` time, which is a recorded lane choice rather than a silent skip.
+    ``kind="unproven"`` — REVIEW answered ``true`` without a mutation that failed a test.
 
     ``kind="verdict_suppressed"`` — the reviewer DID judge (an explicit ``false``) and the
-    #41/#168 no-model-test-surface exemption discarded it. That is the other half of the
-    same mutual deference: on the lite lane a model (IMPLEMENT) wrote those tests even
-    though TEST ran on the ENGINE lane, so the reviewer's verdict was about something real.
-    Behavior is unchanged (the exemption still suppresses); it is no longer silent.
+    #41/#168 no-test-surface exemption discarded it. Behavior is unchanged (the exemption
+    still suppresses); it is no longer silent.
     """
     if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
         return None
-    reviewed = (result.structured_output or {}).get("tests_meaningful")
-    tested = task.context.get("tests_meaningful")
-    exempt = no_model_test_surface(task)
+    out = result.structured_output or {}
+    reviewed = out.get("tests_meaningful")
+    exempt = no_test_surface(task)
     if reviewed is False and exempt:
         return {
             "kind": "verdict_suppressed",
             "test_stage": _test_stage_fact(task),
             "review_reported": False,
             "reason": (
-                "the reviewer judged the tests NOT meaningful, but the no-model-test-surface "
+                "the reviewer judged the tests NOT meaningful, but the no-test-surface "
                 "exemption (#41/#168) discarded that verdict, so it did not reject the task"
             ),
         }
-    if isinstance(reviewed, bool) or isinstance(tested, bool):
-        return None  # somebody judged it — nothing to report
-    if task.context.get("change_class") == "docs-only" or Stage.TEST not in task.pipeline:
-        return None  # no plausible test surface to judge (docs-only / no TEST stage)
+    if exempt or reviewed is False:
+        return None
+    stated = _not_checked_reason(out)
+    if not isinstance(reviewed, bool):
+        return {
+            "kind": "not_judged",
+            "test_stage": _test_stage_fact(task),
+            # Null/absent in the normal case; a non-boolean (a model can return anything
+            # there) is bounded, never carried into the event verbatim.
+            "review_reported": _bound_report(reviewed),
+            "stated_reason": stated[:_MAX_DROPPED_VALUE] if stated else None,
+            "reason": (
+                "nothing judged whether the tests meaningfully exercise this change: REVIEW "
+                "returned no tests_meaningful verdict (fail-OPEN, not blocking)"
+            ),
+        }
+    if proving_mutation_count(out):
+        return None
     return {
-        "kind": "not_judged",
+        "kind": "unproven",
         "test_stage": _test_stage_fact(task),
-        # Null/absent on both sides in the normal case; a non-boolean (a model can return
-        # anything there) is bounded, never carried into the event verbatim.
-        "test_reported": _bound_report(tested),
-        "review_reported": _bound_report(reviewed),
+        "review_reported": True,
+        "stated_reason": stated[:_MAX_DROPPED_VALUE] if stated else None,
         "reason": (
-            "nothing judged whether the tests meaningfully exercise this change: the TEST "
-            "stage reported no verdict and REVIEW omitted tests_meaningful — the #13 "
-            "independent test-validate guarantee did not happen (fail-OPEN, not blocking)"
+            "REVIEW answered tests_meaningful=true without recording a mutation that failed "
+            "a test, so the verdict is the reviewer's reading, not a measurement"
         ),
     }
 
@@ -627,10 +931,13 @@ def _test_stage_fact(task: Task) -> str:
     return "engine" if Stage.TEST in task.deterministic_stages else "model"
 
 
-def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
-    """Re-open the tail of the pipeline for a review-driven fix cycle: every
-    pipeline stage at/after ``from_stage`` gets a fresh PENDING record, so
-    ``next_stage`` returns ``from_stage`` and the fix re-runs implement→…→review.
+def reset_for_fix_cycle(task: Task, from_stage: Stage, *, cause: str = "review") -> list[Stage]:
+    """Re-open the tail of the pipeline for a fix cycle: every pipeline stage at/after
+    ``from_stage`` gets a fresh PENDING record, so ``next_stage`` returns ``from_stage`` and
+    the fix re-runs implement→…→review. ``cause`` (what sent it back: ``review`` or ``test``)
+    names the cycle in the resume hint; a ``review`` cycle also records the commit that
+    review saw (``last_checkpoint.sha``) as ``Task.review_fix_base_sha`` (#564), so the
+    cycle's OPTIMIZE can classify the cycle's own diff rather than the whole task's.
 
     History is not lost — every prior execution is already durable in the per-stage
     logs (``write_stage_log``); the stage RECORD is working state, not the audit trail.
@@ -642,8 +949,11 @@ def reset_for_fix_cycle(task: Task, from_stage: Stage) -> list[Stage]:
     reset = list(task.pipeline[idx:])
     for stage in reset:
         task.stages[stage] = StageRecord()
+    if cause == "review":
+        reviewed = (task.last_checkpoint or {}).get("sha")
+        task.review_fix_base_sha = str(reviewed) if reviewed else None
     task.resume_cursor = ResumeCursor(
-        stage=from_stage, hint=f"review fix cycle: re-running from {from_stage.value}"
+        stage=from_stage, hint=f"{cause} fix cycle: re-running from {from_stage.value}"
     )
     return reset
 

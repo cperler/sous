@@ -130,6 +130,7 @@ _RATE_LIMIT_MARKERS = (
 # narrowness of ``_RATE_LIMIT_MARKERS`` was already guarding against. Case-insensitive.
 _PROVIDER_LIMIT_NOTICE_MARKERS = (
     "hit your session limit", "hit your usage limit",
+    "hit your 5-hour limit", "hit your weekly limit",
     "session limit reached", "usage limit reached",
 )
 
@@ -1244,6 +1245,14 @@ def _claude_tool_policy_flags(work: WorkItem) -> list[str]:
     it is not a sandbox. Isolating a verifier's test run from the live worktree is tracked
     separately.
 
+    A denied command (#626) becomes ``Bash(<command>)`` with NO trailing ``*``. EVIDENCE
+    (probed 2026-11-05, CLI 2.1.318, haiku, under ``--dangerously-skip-permissions``): the
+    exact rule refused ``sh suite.sh -q`` bare, piped (``2>&1 | tail -5``), behind
+    ``timeout 60`` and after ``cd . &&``, and let ``sh suite.sh -q a.py`` and
+    ``sh suite.sh a.py -q`` run. ``Bash(sh suite.sh -q*)`` also refused ``sh suite.sh -q a.py``,
+    which is the targeted form an adapter's ``[*argv, *files]`` command produces. The match is
+    on text, so a whole-suite run with extra flags still gets through.
+
     No policy => an EMPTY list, so the argv stays byte-identical to the pre-#272 one."""
     policy = work.tool_policy
     if policy is None:
@@ -1253,6 +1262,7 @@ def _claude_tool_policy_flags(work: WorkItem) -> list[str]:
         denied += list(_CLAUDE_WRITE_TOOLS)
     if not policy.allow_command_execution:
         denied += list(_CLAUDE_EXEC_TOOLS)
+    denied += [f"Bash({command})" for command in policy.denied_commands]
     if not denied:
         return []
     # Comma-joined single argument: `--disallowedTools` is variadic (comma OR space

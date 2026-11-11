@@ -6,18 +6,12 @@ a red suite as green. This runner shells the project's declared test commands in
 worktree, bounds their output, classifies failures via the project's ``FailureClassifier``,
 and returns the ``test`` stage contract deterministically at $0.
 
-MEANINGFULNESS IS DELIBERATELY NOT JUDGED HERE. The ``test`` schema's ``tests_meaningful``
-asks whether the tests genuinely exercise the change — a judgment a script cannot make.
-So this runner emits ``tests_meaningful: null`` on every exit path (#261): null is the
-honest "no claim" encoding — it is fail-OPEN everywhere (every gate tests ``is False``),
-it keeps the key present so the schema's ``required`` list still catches a codex model that
-simply omits it, and — unlike the ``true`` this used to write — it does not put an
-affirmative verification into the audit record that nobody performed. It never emits
-``false`` either (that is the engine's veto in ``Engine._stage_gate``, which would reject
-the stage over a judgment this runner did not make). The real meaningfulness call belongs to
-the model REVIEW / test-validate path, so a pipeline that runs deterministic TEST MUST keep
-a model REVIEW stage (micro/lite do) — and when NEITHER side judges it, the engine emits a
-warning-grade ``test_validation_skipped`` event rather than passing quietly (#261).
+Whether the tests genuinely exercise the change is not judged here or anywhere in TEST: that
+is REVIEW's required ``tests_meaningful`` / ``mutation_checks`` output (#541), so a pipeline
+that runs this runner keeps a model REVIEW stage. A red run here cannot fix anything itself,
+so the engine sends a regression back to IMPLEMENT (``Engine._handle_failure``); the output
+carries ``failure_kinds`` and a bounded output tail for that, and a run that only timed out
+or could not start reports ``infra`` so it is retried rather than blamed on the code.
 
 Baseline handling mirrors the TEST stage template (orchestrator/stages.py): a failing test
 already present in intake's ``baseline_failures`` was RED at base — inherited, not caused —
@@ -32,12 +26,26 @@ raising, returning None, a global test input touched, an empty set — runs the 
 (``orchestrator.test_selection``), and the result records ``test_scope`` (impacted|full),
 ``tests_selected`` and ``test_scope_reason`` so a green subset never reads as a full green.
 
+Timeout (#642): each command may run ``resolve_test_timeout(project)`` seconds, the
+project's optional ``test_timeout_s`` or 900. A command that exceeds it, or cannot start,
+is reported as ``failure_kinds: ["infra"]``, which the engine re-runs without spending an
+attempt (``Engine._handle_failure``); a worktree-origin probe that only timed out is
+reported the same way.
+
 Flaky failures: when the UNIT command fails on a few named tests, those tests are re-run
 once — narrowed via ``test_unit_cmd(failed)`` when the adapter honors it, else the whole
-unit command again. A re-run that passes means the failures did not reproduce: they are
-recorded under ``flaky_failures`` and a warning notice, not counted as caused. Prediction
-run ``batch-418-419-377-386-388`` failed a task three times on three different
-timing-sensitive tests its change never touched; one failing run is not proof.
+unit command again. The re-run clears them when it exits 0, or when it exits non-zero and every
+failure it reports is already in the baseline (#618): an unnarrowed re-run still runs the known
+red tests, so its exit code says nothing about the flaky ones. A non-zero exit with no parsed
+failures (a crash) does not clear, and neither does any parsed failure outside the baseline. An
+unnarrowed suite that stops early (``-x``, ``--maxfail``) can stop at a baseline failure before
+reaching the flaky test and clear it unproven; a narrowed re-run has no such gap. Cleared
+failures are recorded under ``flaky_failures`` and a warning notice, not counted as caused.
+Prediction run ``batch-418-419-377-386-388`` failed a task three times on three different
+timing-sensitive tests its change never touched; one failing run is not proof. A UNIT failure
+already in intake's ``baseline_flaky`` (failed at base, passed on INTAKE's re-run, #607) is
+recorded the same way without a re-run and does not use up the re-run cap; its notice carries
+its own reason, ``known_flaky_at_base``, because TEST never re-ran it.
 """
 
 from __future__ import annotations
@@ -57,6 +65,38 @@ from .worktree_origin import verify_worktree_origin
 _MAX_TAIL = 4000  # bounded output tail kept in validation_notes (per command)
 # More caused unit failures than this is treated as a real break, not flakiness — no re-run.
 _MAX_FLAKY_RERUN = 5
+# #642: the per-command cap when the project declares no ``test_timeout_s``. Sized for a
+# quiet host; a project whose suite runs long under concurrent load raises it on its adapter.
+DEFAULT_TEST_TIMEOUT_S = 900
+
+
+def resolve_test_timeout(project: object) -> tuple[int, dict[str, object] | None]:
+    """The per-command test timeout the project declares, and a notice when it is unusable.
+
+    ``test_timeout_s`` is an optional, duck-typed adapter member (#642): a positive int
+    attribute or a zero-arg callable returning one. Absent means
+    ``DEFAULT_TEST_TIMEOUT_S`` with no notice. A value that raises, is not an int (``bool``
+    included), or is not positive also falls back to the default, but returns a
+    ``test_timeout_invalid`` notice so a bad declaration is visible instead of silently
+    replaced. Shared by the TEST runner and INTAKE's baseline capture, so both use one cap."""
+    hook = getattr(project, "test_timeout_s", None)
+    if hook is None:
+        return DEFAULT_TEST_TIMEOUT_S, None
+    try:
+        value = hook() if callable(hook) else hook
+    except Exception as exc:  # noqa: BLE001 - an adapter hook must never fail the stage
+        value, why = None, f"raised {type(exc).__name__}"
+    else:
+        why = f"not a positive int: {value!r}"[:200]
+    if isinstance(value, int) and not isinstance(value, bool) and value > 0:
+        return value, None
+    notice: dict[str, object] = {
+        "notice": "test_timeout_invalid",
+        "reason": "invalid_declaration",
+        "detail": f"project test_timeout_s {why}; using the default "
+                  f"{DEFAULT_TEST_TIMEOUT_S}s",
+    }
+    return DEFAULT_TEST_TIMEOUT_S, notice
 
 # Documentation-file classification for the #41 docs-only change tag. Deliberately
 # conservative: a change is "docs-only" only when EVERY changed file is unambiguously
@@ -116,11 +156,27 @@ class TestRun:
     refused: bool = False
 
 
-class DeterministicTestRunner:
-    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell)."""
+def _is_probe_timeout(notice: dict[str, object]) -> bool:
+    """A worktree-origin notice for a probe that timed out, rather than one that ran and
+    named a path outside the worktree (#642)."""
+    return (notice.get("notice") == "worktree_origin_probe_failed"
+            and str(notice.get("reason", "")).startswith("TimeoutExpired"))
 
-    def __init__(self, project: object, *, timeout_s: int = 900) -> None:
+
+class DeterministicTestRunner:
+    """In-process ENGINE-lane runner for the TEST stage (delegated from the ENGINE cell).
+
+    ``timeout_s`` caps each declared command. ``None`` (the default) defers to the
+    project's ``test_timeout_s`` and then to ``DEFAULT_TEST_TIMEOUT_S``; an explicit value
+    wins over both. An unusable project declaration is reported as a
+    ``test_timeout_invalid`` notice on every ``TestRun`` this runner returns."""
+
+    def __init__(self, project: object, *, timeout_s: int | None = None) -> None:
         self._project = project  # ProjectConfig: test_*_cmd surfaces + optional classifier
+        # #642: an explicit value wins, else the project's ``test_timeout_s``, else 900 s.
+        self._timeout_notice: dict[str, object] | None = None
+        if timeout_s is None:
+            timeout_s, self._timeout_notice = resolve_test_timeout(project)
         self._timeout_s = timeout_s
 
     def dispatch(self, work: WorkItem) -> StageResult:
@@ -152,6 +208,19 @@ class DeterministicTestRunner:
                                  "commands", False, refused=True)
         origin = verify_worktree_origin(self._project, Path(work.cwd))
         if not origin.trusted:
+            if origin.notices and all(_is_probe_timeout(n) for n in origin.notices):
+                # #642: every probe failed only by timing out, which on a loaded host says
+                # nothing about the worktree. Still refuse the results, but report it as
+                # infra so the engine re-runs TEST instead of spending an attempt on it.
+                infra_out: dict = {
+                    "passed": False,
+                    "failures": ["<worktree origin probe timeout>"],
+                    "failure_kinds": ["infra"],
+                    "validation_notes": "worktree origin probe(s) timed out, so the toolchain "
+                                        "origin is unverified and no test was run (infra)",
+                }
+                return TestRun(infra_out, "worktree origin probe timed out; refusing to trust test "
+                                    "results", False, notices=origin.notices, refused=True)
             return TestRun(None, "worktree toolchain origin mismatch; refusing to trust test "
                                  "results", False, notices=origin.notices, refused=True)
         try:
@@ -161,19 +230,17 @@ class DeterministicTestRunner:
             # path to clear it). Mirror deterministic_setup's convert-to-FAILURE contract.
             return TestRun(None, str(exc), False, notices=origin.notices, refused=True)
         notices = origin.notices
-        if flaky := out.get("flaky_failures"):
-            notice: dict[str, object] = {
-                "notice": "test_flaky_failures_cleared",
-                "reason": "passed_on_rerun",
-                "failures": list(flaky)[:10],
-                "detail": "unit test failure(s) did not reproduce when re-run once; not "
-                          "counted against the change",
-            }
-            notices = notices + (notice,)
+        if self._timeout_notice is not None:
+            notices = notices + (self._timeout_notice,)
+        known_flaky = set(_as_ids((work.context or {}).get("baseline_flaky")))
+        notices = notices + _flaky_notices(_as_ids(out.get("flaky_failures")), known_flaky)
         return TestRun(out, error, ok, notices=notices)
 
     def _run_tests(self, work: WorkItem) -> tuple[dict, str | None, bool]:
         baseline = set(_as_ids((work.context or {}).get("baseline_failures")))
+        # #607: tests INTAKE saw fail at base and then pass on a re-run. A failure here is
+        # the same flakiness again, so it is recorded as flaky, never counted as caused.
+        known_flaky = set(_as_ids((work.context or {}).get("baseline_flaky")))
         caused: list[str] = []
         caused_kinds: set[str] = set()
         inherited_count = 0
@@ -195,7 +262,6 @@ class DeterministicTestRunner:
             out = {
                 "passed": True,
                 "failures": [],
-                "tests_meaningful": None,  # not judged here — see module docstring / REVIEW
                 "change_class": "docs-only",
                 "skipped": "docs-only",
                 "validation_notes": "docs-only change (every changed file is documentation): "
@@ -218,10 +284,8 @@ class DeterministicTestRunner:
             out = {
                 "passed": True,
                 "failures": [],
-                "tests_meaningful": None,  # not judged here — see module docstring / REVIEW
                 "validation_notes": "deterministic test run: no test commands defined "
-                                    "(nothing to run); meaningfulness NOT judged here "
-                                    "(reported as null) — the model REVIEW path judges it.",
+                                    "(nothing to run).",
                 **extra,
             }
             return out, None, True
@@ -261,9 +325,19 @@ class DeterministicTestRunner:
             new = [f for f in failures if f.test not in baseline]
             inherited = [f for f in failures if f.test in baseline]
             inherited_count += len(inherited)
+            if label == "unit" and (base_flaky := [f.test for f in new
+                                                   if f.test in known_flaky]):
+                flaky.extend(base_flaky)
+                new = [f for f in new if f.test not in known_flaky]
+                notes.append(f"{label}: {len(base_flaky)} failure(s) already known flaky at "
+                             "base (baseline_flaky), not counted: " + ", ".join(base_flaky))
+                if not new and not inherited:
+                    continue
             if new and label == "unit" and len(new) <= _MAX_FLAKY_RERUN:
                 ids = [f.test for f in new]
-                cleared, how = self._rerun_cleared(argv, ids, work.cwd, proc_env)
+                cleared, how, also_failed = self._rerun_cleared(
+                    argv, ids, baseline, work.cwd, proc_env
+                )
                 if cleared:
                     flaky.extend(ids)
                     notes.append(f"{label}: rc={proc.returncode}, but {len(ids)} failure(s) "
@@ -271,11 +345,15 @@ class DeterministicTestRunner:
                                  + ", ".join(ids))
                     continue
                 notes.append(f"{label}: re-ran {how} once; still red")
+                if also_failed:
+                    notes.append(f"{label}: the re-run also failed, outside the baseline: "
+                                 + ", ".join(also_failed[:10]))
             if new:
                 caused.extend(f.test for f in new)
                 caused_kinds.update(f.kind for f in new)
                 notes.append(f"{label}: FAILED rc={proc.returncode} — {len(new)} caused"
                              + (f", {len(inherited)} inherited (excluded)" if inherited else ""))
+                notes.append(f"{label} output tail: {combined.strip()[-_MAX_TAIL:]}")
             elif inherited:
                 # Every failure was already red at base — inherited, not caused by this change.
                 notes.append(f"{label}: rc={proc.returncode} but all {len(inherited)} failures "
@@ -291,17 +369,15 @@ class DeterministicTestRunner:
         if inherited_count:
             notes.append(f"{inherited_count} inherited baseline failure(s) excluded "
                          "(RED at base — not this change's regression).")
-        notes.append("tests_meaningful not judged by this runner (reported as null) — the "
-                     "model REVIEW path verifies the tests genuinely exercise the change.")
         passed = not caused
         out = {
             "passed": passed,
             "failures": caused[:40],
-            "tests_meaningful": None,  # see module docstring: no claim, never a fake true
             "validation_notes": "; ".join(notes),
             **extra,
             **scope,
             **({"flaky_failures": flaky} if flaky else {}),
+            **({"failure_kinds": sorted(caused_kinds)} if caused else {}),
         }
         error = None if passed else (
             f"test stage red: {len(caused)} caused failure(s) "
@@ -310,10 +386,22 @@ class DeterministicTestRunner:
         return out, error, passed
 
     def _rerun_cleared(
-        self, argv: list[str], failed: list[str], cwd: str | None, env: dict[str, str] | None,
-    ) -> tuple[bool, str]:
-        """Re-run once the unit tests that just failed; True when that run is green. Uses
-        ``test_unit_cmd(failed)`` when the adapter narrows on it, else ``argv`` again."""
+        self,
+        argv: list[str],
+        failed: list[str],
+        baseline: set[str],
+        cwd: str | None,
+        env: dict[str, str] | None,
+    ) -> tuple[bool, str, list[str]]:
+        """Re-run once the unit tests that just failed. Uses ``test_unit_cmd(failed)`` when
+        the adapter narrows on it, else ``argv`` again. Returns whether the failures cleared,
+        what was re-run, and any failure the re-run showed that is neither in ``failed`` nor
+        in ``baseline``.
+
+        Cleared means exit 0, or a non-zero exit where at least one failure parsed and all of
+        them are in ``baseline`` (#618). This is stricter than "no id from ``failed`` came
+        back": a collection error parses as a new id (``ERROR tests/x.py``) and has not shown
+        the failed tests passing, so nothing outside the baseline may clear them."""
         unit = getattr(self._project, "test_unit_cmd", None)
         narrowed = _argv_of(unit, failed)
         if narrowed and narrowed != _argv_of(unit):
@@ -326,8 +414,14 @@ class DeterministicTestRunner:
                 timeout=self._timeout_s, env=env,
             )
         except (OSError, subprocess.SubprocessError):
-            return False, how
-        return proc.returncode == 0, how
+            return False, how, []
+        if proc.returncode == 0:
+            return True, how, []
+        parsed = [f.test for f in self._classify(f"{proc.stdout}\n{proc.stderr}")]
+        outside_baseline = [test for test in parsed if test not in baseline]
+        if parsed and not outside_baseline:
+            return True, how, []
+        return False, how, [test for test in outside_baseline if test not in failed]
 
     def _commands(
         self, selection: TestSelection
@@ -393,3 +487,24 @@ def _as_ids(value: object) -> list[str]:
     if isinstance(value, list):
         return [str(x) for x in value]
     return []
+
+
+def _flaky_notices(flaky: list[str], known_flaky: set[str]) -> tuple[dict[str, object], ...]:
+    """One ``test_flaky_failures_cleared`` notice per reason a failure was not counted.
+
+    A test TEST re-ran and saw pass and a ``baseline_flaky`` test it never re-ran (#607) rest on
+    different evidence, so the event log keeps them apart even when one run has both."""
+    groups: tuple[tuple[str, list[str], str], ...] = (
+        ("passed_on_rerun", [t for t in flaky if t not in known_flaky],
+         "unit test failure(s) did not reproduce when re-run once; "
+         "not counted against the change"),
+        ("known_flaky_at_base", [t for t in flaky if t in known_flaky],
+         "unit test failure(s) already flaky at base (baseline_flaky), not re-run here; "
+         "not counted against the change"),
+    )
+    return tuple(
+        {"notice": "test_flaky_failures_cleared", "reason": reason,
+         "failures": failures[:10], "detail": detail}
+        for reason, failures, detail in groups
+        if failures
+    )

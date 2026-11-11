@@ -14,6 +14,17 @@
       "items": {"type": "string"},
       "description": "test ids already failing at base — inherited, not regressions; the TEST stage and the engine's regression split exclude them"
     },
+    "baseline_flaky": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "#607: test ids that failed at base but passed when re-run once — unreliable, not known-broken. Not in baseline_failures; the deterministic TEST runner does not count a failure listed here as caused"
+    },
+    "baseline_lint": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "#591: location-free fingerprints of what the declared lint/type tools already report at base. REVIEW's policy gate blocks only on findings not listed here. Read from the ENGINE lane only."
+    },
+    "baseline_lint_note": {"type": "string", "description": "#591: what the lint/type baseline capture did, per leg. A leg that could not be captured contributes nothing, so its findings block at REVIEW as new."},
     "baseline": {"type": "string", "description": "optional human note about the captured baseline"},
     "install_skipped": {"type": "boolean", "description": "#63: true when the dependency install was skipped because this worktree already holds a successful install of the same lockfiles"},
     "install_reason": {"type": "string", "description": "#63: why install ran or was skipped (lockfile-hash-match | installed | no-lockfiles | install-failed | cache-disabled)"},

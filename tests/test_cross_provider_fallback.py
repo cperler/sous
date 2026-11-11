@@ -55,7 +55,7 @@ def _advance_codex_task_to(eng, target: Stage, *, mint_codex_session: bool = Fal
     intake is the ENGINE lane and SCOPE is claude. Optionally mint a codex session on the
     successful IMPLEMENT so a later TEST fallthrough has a codex ref to (not) leak."""
     eng.create_run("r1", ExecutionLane.FULL, cross_provider_fallback=True)
-    eng.add_task("r1", "t1", provider_tag="codex")
+    eng.add_task("r1", "t1", provider_tag="codex", deterministic_stages=())
     while (w := eng.next_work("r1", "t1")) is not None and w.stage is not target:
         sess = "c-impl" if (mint_codex_session and w.stage is Stage.IMPLEMENT) else None
         prov = Provider.CODEX if w.lane_policy.provider is Provider.CODEX else None

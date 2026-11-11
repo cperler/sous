@@ -8,7 +8,8 @@ are scripts, not model calls. This runner serves the whole
   - INTAKE  → this module: create/reuse an isolated worktree+branch, report any uncommitted
     work a REUSED worktree inherited from a previous, dead run (#385 — report-only),
     best-effort install, tag the baseline, actually run the unit tests to capture the
-    baseline (``intake``).
+    baseline — shared across the run's tasks that start from the same tree (#553,
+    ``baseline_cache``) (``intake``).
     Ports ``run_setup_stage`` from the reference bash system.
   - TEST    → ``deterministic_test.DeterministicTestRunner`` (#33): run the project's test
     commands, classify failures, split inherited baseline red from caused (``test``).
@@ -38,6 +39,7 @@ import subprocess
 from collections.abc import Callable
 from pathlib import Path
 
+from orchestrator.policy_gate import fingerprints
 from orchestrator.port_registry import (
     port_env_for,
     project_needs_ports,
@@ -48,7 +50,7 @@ from orchestrator.ports.project import ProjectConfig
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import StageResult, WorkItem
 
-from . import install_cache
+from . import baseline_cache, install_cache
 from .transport import RawResult, _git, _tag_head, to_stage_result
 from .worktree_origin import (
     environment_reset_notice,
@@ -56,6 +58,13 @@ from .worktree_origin import (
     remove_fresh_install_paths,
     verify_worktree_origin,
 )
+
+# #591: bound for one lint/typecheck leg at intake, the same as the REVIEW gate's bound.
+_LINT_BASELINE_TIMEOUT_S = 300
+_LINT_BASELINE_LEGS = (("lint", "typecheck_cmd"), ("typecheck", "types_cmd"))
+# #607: at most this many base failures are re-run once to tell flaky from broken — the same
+# cap TEST uses (``deterministic_test._MAX_FLAKY_RERUN``). More is a real break; no re-run.
+_MAX_BASELINE_RERUN = 5
 
 
 def _ref_safe(s: str) -> str:
@@ -148,6 +157,14 @@ def _inherited_changes(worktree: Path) -> tuple[dict[str, object],
     return fields, (notice,)
 
 
+def _baseline_provenance(baseline: dict) -> dict[str, object]:
+    """#553: the structured reuse fields for the intake output — empty for a fresh run, so
+    only a SHARED baseline carries ``baseline_reused_from``/``baseline_tree``."""
+    if "reused_from" not in baseline:
+        return {}
+    return {"baseline_reused_from": baseline["reused_from"], "baseline_tree": baseline["tree"]}
+
+
 class _SetupError(Exception):
     """A deterministic-setup failure (e.g. git error) — surfaced as ResultStatus.FAILURE."""
 
@@ -159,9 +176,18 @@ class _SetupError(Exception):
 class DeterministicSetupRunner:
     """In-process runner for the deterministic ENGINE lane (currently: intake setup)."""
 
-    def __init__(self, project: ProjectConfig, *, base_ref: str = "HEAD") -> None:
+    def __init__(
+        self,
+        project: ProjectConfig,
+        *,
+        base_ref: str = "HEAD",
+        baseline_cache_dir: str | Path | None = None,
+    ) -> None:
         self._project = project  # ProjectConfig (install_cmd; optional setup_task override)
         self._base_ref = base_ref
+        # #553: the run dir whose ``baseline-cache/`` lets same-tree tasks share one baseline
+        # run. None => every intake captures its own (the pre-#553 behavior).
+        self._baseline_cache_dir = baseline_cache_dir
 
     def capabilities(self) -> list[CapabilityDescriptor]:
         return [
@@ -216,14 +242,21 @@ class DeterministicSetupRunner:
                     raise
                 notices = inherited_notices + notices
                 port_env = port_env_for(self._project, *ports) if ports else None
-                baseline = self._capture_baseline(worktree, port_env)
+                baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
+                lint_fields, lint_notices = self._capture_lint_baseline(
+                    worktree, inherited, task_id=work.task_id
+                )
+                notices += lint_notices
                 out.update({
+                    **lint_fields,
                     "baseline_captured": baseline["captured"],
                     "baseline_failures": baseline["failures"],
+                    "baseline_flaky": baseline["flaky"],
                     "baseline": (
                         f"custom worktree; install: {install_note}; "
                         f"tests: {baseline['note']}"
                     ),
+                    **_baseline_provenance(baseline),
                     **install_meta,
                     # #385: engine-verified, so it overrides any claim the override made.
                     **inherited,
@@ -327,7 +360,11 @@ class DeterministicSetupRunner:
         # #5: capture the baseline with the task's port block exported, so a suite that boots
         # a server binds this task's ports even at the intake baseline run.
         port_env = port_env_for(self._project, *ports) if ports else None
-        baseline = self._capture_baseline(worktree, port_env)
+        baseline = self._capture_baseline(worktree, port_env, task_id=work.task_id)
+        lint_fields, lint_notices = self._capture_lint_baseline(
+            worktree, inherited, task_id=work.task_id
+        )
+        notices += lint_notices
         dep_note = (
             f"; composed deps: {', '.join(composed_deps)}" if composed_deps else ""
         )
@@ -342,12 +379,16 @@ class DeterministicSetupRunner:
             "base_sha": base_full,
             "baseline_captured": baseline["captured"],
             "baseline_failures": baseline["failures"],
+            # #607: failed at base but passed on one re-run — unreliable, not known-broken.
+            "baseline_flaky": baseline["flaky"],
             # #216: the dep branches actually merged into this worktree (audit trail).
             "composed_deps": composed_deps,
             "baseline": (
                 f"isolated worktree off {base_sha}{dep_note}; install: {install_note}; "
                 f"tests: {baseline['note']}"
             ),
+            **_baseline_provenance(baseline),  # #553: set only when the result was reused
+            **lint_fields,  # #591: what lint/typecheck already report at base
             **install_meta,  # #63: install_skipped / install_reason / install_lockfiles
             # #385: what the worktree already held before this run touched it.
             **inherited,
@@ -451,31 +492,86 @@ class DeterministicSetupRunner:
             return None
         return Path(gd.stdout.strip()) / install_cache.MARKER_NAME
 
-    def _capture_baseline(self, worktree: Path, port_env: dict[str, str] | None = None) -> dict:
+    def _capture_baseline(
+        self,
+        worktree: Path,
+        port_env: dict[str, str] | None = None,
+        *,
+        task_id: str = "",
+    ) -> dict:
         """Run ``test_unit_cmd`` at base and classify the failures (via the project's
         classifier when present). Never fatal: a missing/no-op command, a timeout, or an
         unrunnable suite yields ``captured: False`` with the reason in the note — an
         HONEST miss, never a fabricated baseline. ``port_env`` (#5) is merged over the
-        process env so the baseline run uses the task's port block."""
+        process env so the baseline run uses the task's port block.
+
+        #553: with a run cache dir and a clean git worktree, the result is shared per
+        (tree, argv, lockfile) key across the run's tasks — see ``baseline_cache``. A reused
+        result says so in its note and carries ``reused_from``/``tree``, so it never reads
+        like a fresh run."""
         getter = getattr(self._project, "test_unit_cmd", None)
         try:
             argv = getter() if callable(getter) else None
         except Exception:  # noqa: BLE001 - a project command surface must never fail setup
             argv = None
         if not argv or argv == ["true"]:  # the no-op sentinel
-            return {"captured": False, "failures": [], "note": "n/a (no unit-test command)"}
+            return {"captured": False, "failures": [], "flaky": [],
+                    "note": "n/a (no unit-test command)"}
+        keyed = (
+            baseline_cache.compute_key(worktree, argv, self._project)
+            if self._baseline_cache_dir is not None
+            else None
+        )
+        if keyed is None or self._baseline_cache_dir is None:
+            return self._run_baseline(worktree, argv, port_env)
+        key, tree = keyed
+        result, provenance = baseline_cache.cached_or_run(
+            self._baseline_cache_dir, key, tree=tree, task_id=task_id,
+            run_fn=lambda: self._run_baseline(worktree, argv, port_env),
+        )
+        if provenance is None:
+            return result
+        source, src_tree = provenance["source_task"], provenance["tree"]
+        return {
+            **result,
+            "failures": list(result["failures"]),
+            # #607: an entry stored before the flaky split has no ``flaky`` key.
+            "flaky": list(result.get("flaky") or []),
+            "note": f"reused from {source} at tree {src_tree[:12]} ({result['note']})",
+            "reused_from": source,
+            "tree": src_tree,
+        }
+
+    def _run_baseline(
+        self, worktree: Path, argv: list[str], port_env: dict[str, str] | None
+    ) -> dict:
+        """Actually run the suite and classify the outcome (the uncached capture).
+
+        The run is capped at the project's ``test_timeout_s`` (default 900 s, #642), the
+        same cap the TEST stage uses; a timeout yields ``captured: False`` naming the cap.
+
+        #607: a red base with at most ``_MAX_BASELINE_RERUN`` parsed failures re-runs just
+        those tests once (``_rerun_baseline``). Ones that pass move to ``flaky``, and
+        ``failures`` keeps only the ones that failed twice. This runs inside the cache's
+        ``run_fn``, so the stored result carries the split and every sharer inherits it."""
         env = {**os.environ, **port_env} if port_env else None
+        # #642: the same cap the TEST stage uses, so a project that raised it for a slow
+        # suite does not lose its baseline to the old hardcoded 900 s.
+        from .deterministic_test import resolve_test_timeout
+
+        timeout_s, _ = resolve_test_timeout(self._project)
         try:
             proc = subprocess.run(  # noqa: S603
-                argv, cwd=worktree, capture_output=True, text=True, timeout=900, env=env
+                argv, cwd=worktree, capture_output=True, text=True, timeout=timeout_s, env=env
             )
         except subprocess.TimeoutExpired:
-            return {"captured": False, "failures": [], "note": "baseline run timed out (900s)"}
+            return {"captured": False, "failures": [], "flaky": [],
+                    "note": f"baseline run timed out ({timeout_s}s)"}
         except (OSError, subprocess.SubprocessError) as exc:
-            return {"captured": False, "failures": [],
+            return {"captured": False, "failures": [], "flaky": [],
                     "note": f"baseline run error ({type(exc).__name__})"}
         if proc.returncode == 0:
-            return {"captured": True, "failures": [], "note": "green at base"}
+            return {"captured": True, "failures": [], "flaky": [], "note": "green at base"}
         failures = self._classify_baseline(f"{proc.stdout}\n{proc.stderr}")
         note = (
             f"RED at base (rc={proc.returncode}): {len(failures)} known-failing test(s)"
@@ -483,7 +579,139 @@ class DeterministicSetupRunner:
             else f"RED at base (rc={proc.returncode}); failures unparsed — "
                  f"regression diff unavailable"
         )
-        return {"captured": True, "failures": failures[:40], "note": note}
+        flaky: list[str] = []
+        if failures:
+            flaky, rerun_note = self._rerun_baseline(argv, failures, worktree, env, timeout_s)
+            failures = [f for f in failures if f not in flaky]
+            note += f"; {rerun_note}"
+        return {"captured": True, "failures": failures[:40], "flaky": flaky, "note": note}
+
+    def _rerun_baseline(
+        self,
+        argv: list[str],
+        failed: list[str],
+        worktree: Path,
+        env: dict[str, str] | None,
+        timeout_s: int,
+    ) -> tuple[list[str], str]:
+        """Re-run the base failures once; return ``(flaky ids, note)`` (#607).
+
+        Only the failed ids are re-run, via ``test_unit_cmd(failed)``. An adapter that does
+        not narrow (same argv as the no-arg call), or more than ``_MAX_BASELINE_RERUN``
+        failures, means no re-run: repeating the whole suite at INTAKE would double its cost.
+
+        Conservative, so a broken test is never relabelled flaky on weak evidence. Exit 0
+        clears every id. A non-zero exit clears the ids it did not report, but only when it
+        parsed at least one failure and all of them are among ``failed``. Anything else (a
+        timeout, a run error, nothing parsed, an id outside ``failed`` such as a collection
+        error) is inconclusive and moves nothing."""
+        if len(failed) > _MAX_BASELINE_RERUN:
+            return [], f"not re-run (more than {_MAX_BASELINE_RERUN} failures)"
+        unit = getattr(self._project, "test_unit_cmd", None)
+        try:
+            narrowed = list(unit(list(failed))) if callable(unit) else None
+        except Exception:  # noqa: BLE001 - a project command surface must never fail setup
+            narrowed = None
+        if not narrowed or narrowed == ["true"] or narrowed == list(argv):
+            return [], "not re-run (the unit command does not narrow to test ids)"
+        try:
+            proc = subprocess.run(  # noqa: S603
+                narrowed, cwd=worktree, capture_output=True, text=True,
+                timeout=timeout_s, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return [], f"re-run inconclusive (timed out after {timeout_s}s)"
+        except (OSError, subprocess.SubprocessError) as exc:
+            return [], f"re-run inconclusive (run error {type(exc).__name__})"
+        if proc.returncode == 0:
+            flaky = list(failed)
+        else:
+            again = set(self._classify_baseline(f"{proc.stdout}\n{proc.stderr}"))
+            if not again or not again <= set(failed):
+                return [], f"re-run inconclusive (rc={proc.returncode})"
+            flaky = [f for f in failed if f not in again]
+        if not flaky:
+            return [], "all failed again on re-run"
+        return flaky, f"{len(flaky)} passed on re-run (flaky): {', '.join(flaky)}"
+
+    def _capture_lint_baseline(
+        self, worktree: Path, inherited: dict[str, object], *, task_id: str
+    ) -> tuple[dict[str, object], tuple[dict[str, object], ...]]:
+        """Record what the declared lint/typecheck legs already report at base (#591), so
+        REVIEW can block only on what the task added. Returns ``(output fields, notices)``.
+
+        Never fatal and never fabricated. A leg that times out, errors, or is red with output
+        that cannot be read contributes nothing and raises a notice, so its findings at REVIEW
+        read as new and block as they always did. A worktree not verifiably clean at intake is
+        skipped outright: a dead run's lint error must not be recorded as pre-existing."""
+        if inherited.get("inherited_changes_count") != 0:
+            return {"baseline_lint": [],
+                    "baseline_lint_note": "skipped: worktree not verifiably clean at intake"}, ()
+        entries: list[str] = []
+        notes: list[str] = []
+        notices: list[dict[str, object]] = []
+        for leg, method in _LINT_BASELINE_LEGS:
+            getter = getattr(self._project, method, None)
+            try:
+                argv = getter() if callable(getter) else None
+            except Exception:  # noqa: BLE001 - a project command surface must never fail setup
+                argv = None
+            if not argv or argv == ["true"]:  # undeclared, or the no-op sentinel
+                continue
+            result = self._lint_leg_baseline(worktree, argv, task_id)
+            notes.append(f"{leg}: {result['note']}")
+            if result["captured"]:
+                entries.extend(result["failures"])
+            else:
+                notices.append({
+                    "notice": "lint_baseline_not_captured",
+                    "leg": leg,
+                    "detail": f"{leg} baseline not captured ({result['note']}); its findings "
+                              "will block at REVIEW even if they were already at base",
+                })
+        fields: dict[str, object] = {
+            "baseline_lint": entries,
+            "baseline_lint_note": "; ".join(notes) or "n/a (no lint or typecheck command)",
+        }
+        return fields, tuple(notices)
+
+    def _lint_leg_baseline(self, worktree: Path, argv: list[str], task_id: str) -> dict:
+        """One leg's result, shared across same-tree tasks the way the test baseline is (#553):
+        a batch on one machine should not run mypy N times over identical code."""
+        keyed = (
+            baseline_cache.compute_key(worktree, argv, self._project)
+            if self._baseline_cache_dir is not None
+            else None
+        )
+        if keyed is None or self._baseline_cache_dir is None:
+            return self._run_lint_leg(worktree, argv)
+        key, tree = keyed
+        result, provenance = baseline_cache.cached_or_run(
+            self._baseline_cache_dir, key, tree=tree, task_id=task_id,
+            run_fn=lambda: self._run_lint_leg(worktree, argv),
+        )
+        if provenance is None:
+            return result
+        return {**result, "note": f"reused from {provenance['source_task']} ({result['note']})"}
+
+    @staticmethod
+    def _run_lint_leg(worktree: Path, argv: list[str]) -> dict:
+        """Actually run one leg and read its findings (the uncached capture)."""
+        try:
+            proc = subprocess.run(  # noqa: S603
+                argv, cwd=worktree, capture_output=True, text=True,
+                timeout=_LINT_BASELINE_TIMEOUT_S,
+            )
+        except Exception as exc:  # noqa: BLE001 - a lint baseline must never fail setup
+            return {"captured": False, "failures": [], "note": f"error ({type(exc).__name__})"}
+        if proc.returncode == 0:
+            return {"captured": True, "failures": [], "note": "green at base"}
+        found = fingerprints(f"{proc.stdout}\n{proc.stderr}", str(worktree))
+        if found is None:
+            return {"captured": False, "failures": [],
+                    "note": f"rc={proc.returncode} with output that could not be read"}
+        return {"captured": True, "failures": found,
+                "note": f"{len(found)} finding(s) already at base"}
 
     def _classify_baseline(self, test_output: str) -> list[str]:
         """Failing-test ids from raw output via the project classifier (best-effort)."""

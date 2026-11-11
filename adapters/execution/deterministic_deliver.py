@@ -6,7 +6,8 @@ opens — or, on a review fix cycle, revalidates and REUSES an OPEN matching PR 
 advisory comment that the branch was re-pushed, #68) — a pull request, deterministically at
 $0, mirroring the DELIVER stage
 template in orchestrator/stages.py (PR title/body from the task id/title/issue; ``Closes #N``
-when an issue number is present; never a duplicate PR).
+when an issue number is present, or ``Part of #N`` for a task that keeps its issue open
+(#613); never a duplicate PR).
 
 Two things the model DELIVER did are deliberately NOT done here:
   - the docstring refresh — a model judgment; a pipeline that wants it keeps model DELIVER;
@@ -26,6 +27,11 @@ import re
 import subprocess
 from collections.abc import Callable
 
+from adapters.github_closing_refs import (
+    closing_numbers,
+    repo_of_pr_url,
+    rewrite_closing_keywords,
+)
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus
 from orchestrator.schemas.work import StageResult, WorkItem
 
@@ -82,6 +88,58 @@ class DeterministicDeliverRunner:
                                mode=ExecutionMode.ENGINE, provider=Provider.NONE)
 
     def _deliver(self, work: WorkItem) -> tuple[dict, tuple[dict[str, object], ...]]:
+        out, notices = self._open_or_reuse_pr(work)
+        ctx = work.context or {}
+        issue = ctx.get("issue_number")
+        if ctx.get("keep_issue_open") and issue is not None:
+            self._enforce_keep_open(str(work.cwd), str(out["pr_url"]), _to_int(_issue_ref(issue)))
+        return out, notices
+
+    def _enforce_keep_open(self, cwd: str, pr_url: str, issue: int) -> None:
+        """Make the delivered PR stop closing ``issue`` on merge, or fail the stage (#613).
+
+        Runs on every path out of DELIVER, because a REUSED PR can carry a body this run did
+        not write. An unreadable answer is not a verdict here: the engine's own check after
+        this stage reads it too and reports it as unverified.
+        """
+        repo = repo_of_pr_url(pr_url)
+        current = self._read_closing_refs(cwd, pr_url, repo)
+        if current is None or issue not in current[0]:
+            return
+        fixed = rewrite_closing_keywords(current[1], issue, repo=repo)
+        if fixed != current[1]:
+            proc = self._run(["gh", "pr", "edit", pr_url, "--body", fixed], cwd)
+            if proc.returncode != 0:
+                raise _DeliverError(
+                    f"could not remove the closing keyword for keep-open issue #{issue} from "
+                    f"{pr_url}: {(proc.stderr or '').strip()[:200]}"
+                )
+        after = self._read_closing_refs(cwd, pr_url, repo)
+        if after is not None and issue in after[0]:
+            raise _DeliverError(
+                f"{pr_url} still closes keep-open issue #{issue} after editing its "
+                "description; remove any manual link to it from the PR's Development section"
+            )
+
+    def _read_closing_refs(
+        self, cwd: str, pr_url: str, repo: str | None
+    ) -> tuple[list[int], str] | None:
+        """(issues the PR closes on merge, its body), or None when that cannot be read."""
+        proc = self._run(
+            ["gh", "pr", "view", pr_url, "--json", "closingIssuesReferences,body"], cwd
+        )
+        if proc.returncode != 0:
+            return None
+        try:
+            payload = json.loads(proc.stdout or "")
+            return (
+                closing_numbers(payload.get("closingIssuesReferences"), repo),
+                str(payload.get("body") or ""),
+            )
+        except (AttributeError, ValueError):
+            return None
+
+    def _open_or_reuse_pr(self, work: WorkItem) -> tuple[dict, tuple[dict[str, object], ...]]:
         cwd = work.cwd
         if not cwd:
             raise _DeliverError("deliver requires the task worktree (cwd); none set")
@@ -359,9 +417,11 @@ def _pr_body(work: WorkItem, ctx: dict) -> str:
     if body:
         lines += ["", body]
     issue = ctx.get("issue_number")
+    keep_open = bool(ctx.get("keep_issue_open")) and issue is not None
     if issue is not None:
-        # Mirror the DELIVER template: a GitHub-issue task closes its issue on merge.
-        lines += ["", f"Closes #{_issue_ref(issue)}"]
+        # Mirror the DELIVER template: a GitHub-issue task closes its issue on merge, unless
+        # the task keeps it open (#613).
+        lines += ["", f"{'Part of' if keep_open else 'Closes'} #{_issue_ref(issue)}"]
     # #232: when #216 composed a batch dependency's branch into this worktree at intake,
     # those commits ride along in this PR's diff until the dependency's own PR merges
     # (the accepted stacked-PR topology). Name them so a reviewer knows which commits are
@@ -375,7 +435,9 @@ def _pr_body(work: WorkItem, ctx: dict) -> str:
             f"({', '.join(f'`{d}`' for d in deps)}) appear in this diff until those PRs "
             "merge. Changes beyond those commits are this task's own._",
         ]
-    return "\n".join(lines)
+    text = "\n".join(lines)
+    # The body above embeds the issue's own text, which can carry the keyword too.
+    return rewrite_closing_keywords(text, _to_int(_issue_ref(issue))) if keep_open else text
 
 
 def _issue_ref(issue: object) -> str:

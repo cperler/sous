@@ -20,10 +20,10 @@ import subprocess
 import tempfile
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Literal, cast
+from typing import Literal, NamedTuple, cast
 
 from .alerting import (
     NOTIFY_RUN_FINALIZED,
@@ -66,9 +66,12 @@ from .file_contention import (
     ClaimEntry,
     ContentionPlan,
     Deferral,
+    ParallelSafeGlobs,
     describe,
     infer_claims_from_text,
+    normalize_parallel_safe_globs,
     plan_deferrals,
+    relax_claims,
     summarize_contention,
 )
 from .gitcmd import run_git
@@ -116,6 +119,7 @@ from .notification_facts import (
     run_duration_s,
     stage_facts,
 )
+from .policy_gate import apply_lint_baseline, hook_accepts_changed_files
 from .port_registry import (
     port_env_for,
     project_needs_ports,
@@ -158,6 +162,7 @@ from .schemas.enums import (
     Provider,
     QualityTier,
     ResultStatus,
+    ReviewBudget,
     RunState,
     Stage,
     StageStatus,
@@ -180,20 +185,32 @@ from .spec_refresh import diff_summary as spec_diff_summary
 from .spec_refresh import fingerprint as spec_fingerprint
 from .stages import STAGE_SPECS, DiffStat, render_prompt, render_review_plan
 from .state_machine import (
+    OPTIMIZE_REVERT_KEY,
     apply_result,
     begin_stage,
     deliver_push_mismatch,
     is_done,
+    keep_open_violation,
     next_stage,
-    no_model_test_surface,
+    no_test_surface,
     pr_not_opened,
+    proving_mutation_count,
     remote_branch_sha,
     reset_for_fix_cycle,
     resume_point,
+    review_proof_gate,
+    surviving_mutant_disposition,
+    unchecked_named_survivors,
     unjudged_tests_notice,
 )
 from .status_store import StatusStore
-from .stream_probe import probe_current_stream, prompt_filename, prompt_relpath
+from .stream_probe import (
+    attempt_stream_paths,
+    probe_current_stream,
+    prompt_filename,
+    prompt_relpath,
+    review_progress_digest,
+)
 from .supervisor_context import DEFAULT_MIN_REMAINING_PCT, SupervisorContext
 from .test_selection import changed_files as test_changed_files
 from .test_selection import select_tests
@@ -245,7 +262,59 @@ _CHILD_PIPELINES: dict[QualityTier, tuple[Stage, ...]] = {
 _IMPLEMENT_TIMEOUTS: dict[ImplementationBudget, int] = {
     ImplementationBudget.STANDARD: 1800,
     ImplementationBudget.SHORT: 900,
+    ImplementationBudget.LONG: 3600,
 }
+
+
+def implement_timeout_s(
+    budget: ImplementationBudget | None, *, spec_timeout_s: int, project_default_s: int | None
+) -> int:
+    """The IMPLEMENT wall-clock limit for a task's ``implementation_budget`` (#615).
+
+    ``short`` is always 15 minutes. ``standard`` (and no budget at all) is the project's
+    declared default, else the stage spec's. ``long`` is 60 minutes, or the project default
+    when that is already longer, so asking for more time can never shorten the limit."""
+    base = project_default_s if project_default_s is not None else spec_timeout_s
+    if budget is ImplementationBudget.SHORT:
+        return _IMPLEMENT_TIMEOUTS[ImplementationBudget.SHORT]
+    if budget is ImplementationBudget.LONG:
+        return max(_IMPLEMENT_TIMEOUTS[ImplementationBudget.LONG], base)
+    return base
+
+
+# #624: REVIEW's long limit, and the diff size (lines added + deleted, from the engine's own
+# ``git diff --numstat``) at which an unpinned task is reviewed on it. prediction#1365's
+# 4,579-line change timed out twice at 10 minutes while still doing real work.
+_REVIEW_LONG_TIMEOUT_S = 1800
+_REVIEW_LONG_DIFF_LINES = 1500
+# The ceiling on ``Task.review_progress`` (#624): it rides every later REVIEW prompt, so a
+# second timeout's digest pushes the oldest text out rather than growing the prompt.
+_REVIEW_PROGRESS_MAX_CHARS = 16000
+
+
+def review_timeout_s(
+    budget: ReviewBudget | None,
+    *,
+    spec_timeout_s: int,
+    project_default_s: int | None,
+    diff_lines: int | None,
+) -> tuple[int, str]:
+    """The REVIEW wall-clock limit for a task (#624), and why it is that.
+
+    ``standard`` (pinned) is the project's declared default, else the stage spec's, and
+    turns diff-size scaling off. ``long`` is 30 minutes, or the project default when that is
+    already longer, so asking for more time never shortens the limit. With no budget, a
+    diff of at least ``_REVIEW_LONG_DIFF_LINES`` changed lines gets the long limit; an
+    unmeasured diff (``None``) gets the default. The reason is one of ``spec_default``,
+    ``project_default``, ``budget_long`` or ``diff_size``."""
+    base = project_default_s if project_default_s is not None else spec_timeout_s
+    base_reason = "project_default" if project_default_s is not None else "spec_default"
+    long_s = max(_REVIEW_LONG_TIMEOUT_S, base)
+    if budget is ReviewBudget.LONG:
+        return long_s, "budget_long"
+    if budget is None and diff_lines is not None and diff_lines >= _REVIEW_LONG_DIFF_LINES:
+        return long_s, "diff_size"
+    return base, base_reason
 
 
 def _hash_preview(value: str | None) -> str | None:
@@ -299,26 +368,77 @@ def _claim_modes(task: Task, paths: Sequence[str]) -> dict[str, str]:
     return {path: task.scope_file_modes.get(path, MODE_REWRITE) for path in paths}
 
 
+def _keep_issue_open_event(run_id: str, task_id: str, label: str | None, *, ts: str) -> dict:
+    """The receipt that a task keeps its issue open (#613), naming what set it: the label that
+    matched, or nothing because someone chose it explicitly."""
+    return {"ts": ts, "type": "keep_issue_open_set", "run_id": run_id, "task_id": task_id,
+            "source": "explicit" if label is None else "label", "label": label}
+
+
+class _InferredClaims(NamedTuple):
+    """Claims guessed from issue text (#428) after the adapter's parallel-safe globs ran
+    (#628): the declaration to store, the paths moved to ``append``, and any rejected globs."""
+
+    declaration: ClaimDeclaration
+    relaxed: list[dict[str, object]]
+    globs_rejected: list[dict[str, object]]
+
+
+def _claims_relaxed_events(
+    run_id: str, task_id: str, relaxed: Sequence[Mapping[str, object]],
+    *, stage: str | None, source: str, ts: str,
+) -> list[dict]:
+    """One ``file_claim_mode_relaxed`` per path an adapter glob moved to ``append`` (#628),
+    so a later merge conflict on that path can be traced to the move. Not warning-grade: on
+    a project that declares the globs, this is the normal case."""
+    return [
+        {"ts": ts, "type": "file_claim_mode_relaxed", "run_id": run_id,
+         "task_id": task_id, "stage": stage, "source": source, **notice}
+        for notice in relaxed
+    ]
+
+
+def _parallel_safe_rejected_events(
+    run_id: str, task_id: str, rejected: Sequence[Mapping[str, object]],
+    *, stage: str | None, ts: str,
+) -> list[dict]:
+    """One warning-grade event per unusable ``parallel_safe_paths`` entry (#628): an adapter
+    whose relaxation silently did nothing would read like a project that never asked for it."""
+    return [
+        {"ts": ts, "type": "parallel_safe_paths_rejected", "level": "warning", "run_id": run_id,
+         "task_id": task_id, "stage": stage, **notice}
+        for notice in rejected
+    ]
+
+
 def _claims_inferred_events(
-    run_id: str, task_id: str, declaration: ClaimDeclaration, *, ts: str
+    run_id: str, task_id: str, inferred: _InferredClaims, *, ts: str
 ) -> list[dict]:
     """The receipt for claims GUESSED from a SCOPE-less task's issue text (#428).
 
     Emitted even when the guess is empty: "looked and the text names no file" and "never
     looked" must not read alike, and only the first one means the task is ungated on
     purpose. A path the guess had to drop is evented the same way a SCOPE-declared one is,
-    with ``stage`` None and ``source`` saying where the path came from.
+    with ``stage`` None and ``source`` saying where the path came from; so is a path the
+    adapter's parallel-safe globs moved to ``append`` (#628).
     """
+    declaration = inferred.declaration
     events: list[dict] = [{
         "ts": ts, "type": "file_claims_inferred", "run_id": run_id, "task_id": task_id,
         "source": "issue_text", "files": list(declaration.claims),
-        "modes": {path: MODE_REWRITE for path in declaration.claims},
+        "modes": {path: declaration.modes.get(path, MODE_REWRITE) for path in declaration.claims},
     }]
     events.extend(
         {"ts": ts, "type": "scope_file_claim_dropped", "run_id": run_id, "task_id": task_id,
          "stage": None, "source": "issue_text", **notice}
         for notice in declaration.notices
     )
+    events.extend(_claims_relaxed_events(
+        run_id, task_id, inferred.relaxed, stage=None, source="issue_text", ts=ts,
+    ))
+    events.extend(_parallel_safe_rejected_events(
+        run_id, task_id, inferred.globs_rejected, stage=None, ts=ts,
+    ))
     return events
 
 
@@ -343,6 +463,9 @@ def _validated_budget(value: float | None, *, field: str, run_id: str) -> float 
 # thousands of lines, but the event/issue only needs the last few for the operator to see
 # what broke. Truncation is never silent — the caller marks a trimmed tail as such.
 _TRUNK_GATE_TAIL_LINES = 40
+# The unit suite's key in ``Engine._project_commands``. IMPLEMENT's denial reads the same joined
+# string the prompt shows the model, so the two cannot name different commands (#626).
+_UNIT_SUITE_LABEL = "test (unit)"
 
 # Bound the post-commit attribution scan (#322). A stage produces a handful of commits; a
 # three-figure range means the anchor was wrong (a stale checkpoint, a rebased branch), and
@@ -393,6 +516,37 @@ _OPTIMIZE_UNRESTORED_VETO = (
     "optimize benchmark gate: a failed measurement reset left the worktree off the stage's "
     "commit and it could not be restored"
 )
+
+# #564: why a confirmed revert happened, in the words later stages read. A pass whose commit broke
+# a benchmark that was green at the anchor stays reverted (the pass itself broke the measurement);
+# a benchmark already broken at the anchor never reaches this note, because it keeps the commit.
+_OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED = (
+    "git could not restore the commit after the benchmark's baseline run, so the worktree stayed "
+    "at the earlier commit and the benchmark never judged the pass"
+)
+_OPTIMIZE_REVERT_CAUSES = {
+    "regressed": "metric slower: a benchmark metric got slower past the tolerance",
+    "failed": "the benchmark ran at the earlier commit but could not run or be read at this "
+              "commit, so the pass broke the measurement",
+}
+
+
+def _optimize_revert_note(block: dict) -> str | None:
+    """The ``optimize_reverted`` context line for a gate verdict, or None if it kept the commit.
+
+    Reads ``block['reverted']``, which is the gate's CONFIRMED answer, so the note never claims a
+    revert that did not happen."""
+    if block.get("reverted") is not True:
+        return None
+    cause = (
+        _OPTIMIZE_REVERT_CAUSE_RESTORE_FAILED if block.get("reason") == "head_restore_failed"
+        else _OPTIMIZE_REVERT_CAUSES.get(str(block.get("status")), "the benchmark gate rejected it")
+    )
+    return (
+        f"the engine reverted OPTIMIZE commit {str(block.get('head'))[:12]} back to "
+        f"{str(block.get('anchor'))[:12]}: {cause}. That commit is not on this branch, so do not "
+        "describe its changes as part of this work."
+    )
 
 
 def _tail(text: str, n_lines: int = _TRUNK_GATE_TAIL_LINES) -> tuple[str, bool]:
@@ -484,6 +638,7 @@ _REVIEW_SUPERSEDING_OUTCOMES: dict[str, int] = {
     "review_rejected_fix_cycle": 1,
     "review_fixup_held": 0,
     "review_rejected_held": 0,
+    "review_timed_out_held": 0,
 }
 
 # The supervisor park/resume pair (#259). Their crash recovery reads the LAST event drawn
@@ -511,6 +666,43 @@ def _ref_safe(s: str) -> str:
     anything outside [word . -] becomes '-', which also rules out the refname-forbidden
     sequences ('..', '@{', '~', '^', ':', '?', '*', '[', space)."""
     return re.sub(r"[^\w.\-]", "-", s) or "x"
+
+
+def _tests_in_flight(tasks: Iterable[Task]) -> list[str]:
+    """The tasks among ``tasks`` holding a dispatch lease on their TEST stage (#642)."""
+    return [
+        t.task_id for t in tasks
+        if t.pending_work_item_id is not None and next_stage(t) is Stage.TEST
+    ]
+
+
+def _hold_tests_for_quiet(live: list[Task], eligible: list[str]) -> list[str]:
+    """Drop from ``eligible`` the TEST retries that must wait for a quiet host (#642).
+
+    A task whose last TEST failed only on infra (``Task.test_wait_for_quiet``) waits while
+    any live task is running TEST. With none running, only the FIRST such waiter in run
+    order is released, so several timed-out suites re-run one at a time instead of
+    overloading the host together again. Pure over docs ``dispatchable`` already loaded:
+    no store reads and no events (the wait was evented once when it began, and the
+    re-dispatch carries ``waited_for_quiet``). A non-waiting task entering TEST is never
+    held, so the wait cannot starve the run: once nothing is in flight, a waiter goes."""
+    eligible_ids = set(eligible)
+    waiting = [
+        t.task_id for t in live
+        if t.task_id in eligible_ids and t.test_wait_for_quiet and next_stage(t) is Stage.TEST
+    ]
+    if not waiting:
+        return eligible
+    held = set(waiting) if _tests_in_flight(live) else set(waiting[1:])
+    return [task_id for task_id in eligible if task_id not in held]
+
+
+def _load_avg_1m() -> float | None:
+    """The host's 1-minute load average, or None where the platform cannot report it."""
+    try:
+        return round(os.getloadavg()[0], 2)
+    except (AttributeError, OSError):
+        return None
 
 
 class Engine:
@@ -823,17 +1015,22 @@ class Engine:
         agent_role: str | None = None,
         quality_tier: str | QualityTier | None = None,
         implementation_budget: str | ImplementationBudget | None = None,
+        review_budget: str | ReviewBudget | None = None,
         max_filed_followups: int | None = None,
         hold_before: Stage | None = None,
+        keep_issue_open: bool | None = None,
     ) -> Task:
         """Register a task. ``pipeline`` is the ordered stage list this task runs;
         omitted, it resolves from the lane preset (design pass §1 — a lane is a named
         pipeline, not the sequencing mechanism). ``deterministic_stages`` marks which of
         those stages run on the $0 ENGINE lane in ADDITION to the globally-deterministic
         intake (#33 — a pipeline opting TEST/DELIVER into the shell runners). Omitted, a
-        task resolved from a lane preset inherits that preset's default (#68): micro/lite
-        run TEST/DELIVER deterministically, FULL keeps model TEST/DELIVER. An explicit
-        pipeline pin opts out of the preset default. ``depends_on``/``provider_tag``
+        task resolved from a lane preset inherits that preset's default (#68/#541): every
+        preset runs TEST deterministically, micro/lite run DELIVER that way too. An empty
+        value is an explicit choice of model stages. A project whose adapter sets
+        ``model_test_stage`` drops TEST from a preset- or cost-derived default; an explicit
+        value always wins over it. An explicit pipeline pin opts out of the preset default.
+        ``depends_on``/``provider_tag``
         override the task source's values — the supervisor's way to supply DAG edges
         and per-task provider routing when the source has no analysis step (the old
         ``82:codex`` tag / ralph dependency analysis, human-supplied). ``model`` pins a
@@ -841,8 +1038,12 @@ class Engine:
         (low/medium/high, #96) that overrides the stage-spec defaults the same way.
         ``agent_role``/``quality_tier``/``implementation_budget`` carry SCOPE-authored
         child controls (#60). The role is resolved through the project adapter; the quality
-        tier selects the child's explicit quality pipeline and the budget selects a 30- or
-        15-minute IMPLEMENT timeout. ``max_filed_followups`` (#191) caps how many
+        tier selects the child's explicit quality pipeline and the budget selects the
+        IMPLEMENT timeout (``implement_timeout_s``). The budget is also the per-task pin
+        ``add-task --implementation-budget`` / a batch plan pass (#615), which a later
+        SCOPE sizing cannot override. ``review_budget`` (#624) pins the REVIEW limit
+        (``review_timeout_s``): ``long`` for a change too large to review in the default,
+        ``standard`` to turn diff-size scaling off. ``max_filed_followups`` (#191) caps how many
         non-blocking review findings THIS task
         files as follow-up issues, overriding the engine-wide default for a task type whose
         expected review surface differs (a micro fix vs a full feature); None inherits the
@@ -884,6 +1085,12 @@ class Engine:
         something to compare against and date. See :meth:`refresh_spec` for the sanctioned,
         audited way to move the snapshot mid-run.
 
+        ``keep_issue_open`` says merging this task's PR does not finish its issue (#613):
+        DELIVER writes ``Part of #N``, and a PR that would close the issue fails the stage.
+        ``None`` follows the project's ``keep_open_labels``; an explicit value wins over them
+        and is pinned, so a later label refresh cannot overrule it. A ``True`` result is
+        evented as ``keep_issue_open_set``, naming where it came from.
+
         A task whose resolved pipeline has no SCOPE stage (micro, lite, a decomposition
         child) cannot declare files for the contention gate (#377), so it registers with
         the paths its issue title and body name (#428): ``scope_files`` is filled by
@@ -896,6 +1103,8 @@ class Engine:
             str(label).strip().casefold() == "meta-authoring" for label in spec.labels
         ):
             hold_before = Stage.DELIVER
+        keep_open_label = None if keep_issue_open is not None else self._keep_open_label(spec.labels)
+        keep_open = keep_issue_open if keep_issue_open is not None else keep_open_label is not None
         deps = list(depends_on) if depends_on is not None else list(spec.depends_on)
         tag = provider_tag if provider_tag is not None else spec.provider_tag
         # Per-task model pin (#84): resolve the alias/id, then validate it against the task's
@@ -924,6 +1133,9 @@ class Engine:
             ImplementationBudget(implementation_budget)
             if implementation_budget is not None else None
         )
+        resolved_review_budget = (
+            ReviewBudget(review_budget) if review_budget is not None else None
+        )
         # Per-task filing cap (#191): validated BEFORE any state is written, like the pins.
         # None inherits the engine default; a negative cap is nonsensical (a cap of 0 already
         # means "file nothing").
@@ -938,6 +1150,7 @@ class Engine:
         route_reason: dict | None = None
         effective_lane = lane or run.lane
         pipeline_pinned = pipeline is not None
+        deterministic_explicit = deterministic_stages is not None
         if pipeline is None and run.route_by_cost:
             est = estimate if estimate is not None else self._estimate_from_labels(spec.labels)
             decision = self.cost_router.route(self._remaining_budget_fraction(run), est)
@@ -946,14 +1159,23 @@ class Engine:
             if deterministic_stages is None:
                 deterministic_stages = decision.deterministic_stages
             route_reason = decision.reason
-        # #68: a task resolved from a lane PRESET (no explicit pipeline pin) adopts that
-        # preset's default deterministic stages — micro/lite run TEST/DELIVER on the $0
-        # ENGINE lane, FULL keeps model TEST/DELIVER. An explicit ``deterministic_stages``
+        # #68/#541: a task resolved from a lane PRESET (no explicit pipeline pin) adopts that
+        # preset's default deterministic stages — TEST on the $0 ENGINE lane everywhere, and
+        # DELIVER too on micro/lite. An explicit ``deterministic_stages``
         # (--deterministic-stages) or a cost-routing decision above already set it and wins;
         # an explicit pipeline pin is a bespoke pipeline that states its own deterministic
         # stages, so the preset default does not reach it.
         if deterministic_stages is None and not pipeline_pinned:
             deterministic_stages = LANE_DETERMINISTIC_STAGES.get(effective_lane, ())
+        # #541: the project-level opt-in to a model TEST. It only edits a default, so a task
+        # that named its stages explicitly keeps them. Baked into the persisted task below, so
+        # no later subcommand has to re-read the adapter.
+        if (
+            not deterministic_explicit
+            and deterministic_stages
+            and getattr(self.project, "model_test_stage", False) is True
+        ):
+            deterministic_stages = tuple(s for s in deterministic_stages if s is not Stage.TEST)
         # #519: the optional OPTIMIZE pass, for a project where speed is part of the product.
         # Applied to whatever pipeline is about to be PERSISTED — lane preset, cost-routed
         # preset, or a decomposition child's quality-tier pipeline — so every path picks the
@@ -976,7 +1198,7 @@ class Engine:
         # model-free guess from its issue text instead; a pipeline WITH SCOPE is left alone,
         # because its SCOPE fold is the only source of its claims.
         inferred_claims = (
-            infer_claims_from_text(spec.title, spec.body)
+            self._infer_claims(spec.title, spec.body)
             if Stage.SCOPE not in resolved_pipeline else None
         )
         # Register the task ref + dependency edge as a locked read-modify-write so a
@@ -1059,6 +1281,7 @@ class Engine:
                 agent_role=agent_role,
                 quality_tier=resolved_quality,
                 implementation_budget=resolved_budget,
+                review_budget=resolved_review_budget,
                 model_pin=model_pin,
                 effort_pin=effort_pin,
                 issue_number=spec.issue_number,
@@ -1067,9 +1290,16 @@ class Engine:
                 pipeline=resolved_pipeline,
                 deterministic_stages=tuple(deterministic_stages or ()),
                 hold_before=hold_before,
+                keep_issue_open=keep_open,
+                keep_issue_open_pinned=keep_issue_open is not None,
                 max_attempts=self.max_attempts,
                 max_filed_followups=max_filed_followups,
-                scope_files=list(inferred_claims.claims) if inferred_claims else [],
+                scope_files=(
+                    list(inferred_claims.declaration.claims) if inferred_claims else []
+                ),
+                scope_file_modes=(
+                    dict(inferred_claims.declaration.modes) if inferred_claims else {}
+                ),
                 scope_files_inferred=inferred_claims is not None,
             )
             self.store.write_task_locked(task)
@@ -1081,6 +1311,11 @@ class Engine:
                 run_id,
                 {"ts": _now(), "type": "task_registration_repaired", "run_id": run_id,
                  "task_id": task_id, "reason": repair_reason},
+            )
+        if keep_open:
+            self.store.append_event(
+                run_id,
+                _keep_issue_open_event(run_id, task_id, keep_open_label, ts=_now()),
             )
         if route_reason is not None:
             # Routing is never silent (#34): record WHY this un-pinned task got its preset
@@ -1106,6 +1341,78 @@ class Engine:
             for event in _claims_inferred_events(run_id, task_id, inferred_claims, ts=_now()):
                 self.store.append_event(run_id, event)
         return task
+
+    def _parallel_safe_globs(self) -> ParallelSafeGlobs:
+        """The project's ``parallel_safe_paths`` globs (#628), or none when it declares none.
+
+        Read through ``getattr`` because the hook is optional. A hook that raises relaxes
+        nothing and comes back as a rejection for the caller to event, so a broken adapter
+        keeps today's serialization and cannot fail ``record()`` or task registration.
+        """
+        hook = getattr(self.project, "parallel_safe_paths", None)
+        if hook is None:
+            return ParallelSafeGlobs((), [])
+        try:
+            value = hook() if callable(hook) else hook
+        except Exception as exc:  # noqa: BLE001 - an adapter hook cannot break a stage
+            return ParallelSafeGlobs((), [{"reason": "hook_raised", "value": repr(exc)[:200]}])
+        return normalize_parallel_safe_globs(value)
+
+    def _infer_claims(self, title: str, body: str) -> _InferredClaims:
+        """Guess a SCOPE-less task's claims (#428) and apply the parallel-safe globs (#628).
+
+        Without the globs, a micro task whose issue merely names a doc would hold ``rewrite``
+        on it and block every task the same globs let run in parallel.
+        """
+        declaration = infer_claims_from_text(title, body)
+        globs = self._parallel_safe_globs()
+        relaxation = relax_claims(declaration.claims, declaration.modes, globs.globs)
+        return _InferredClaims(
+            declaration._replace(modes=relaxation.modes), relaxation.relaxed, globs.rejected,
+        )
+
+    def _project_implement_timeout(self) -> tuple[int | None, str | None]:
+        """The adapter's optional ``implement_timeout_s`` (#615) and, if unusable, why.
+
+        Returns ``(seconds, None)`` for a positive int, ``(None, None)`` when the adapter
+        declares nothing, and ``(None, <repr>)`` for a value the engine ignores, so the
+        caller can event the rejection rather than silently fall back to the default."""
+        raw = getattr(self.project, "implement_timeout_s", None)
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None, repr(raw)[:80]
+        return raw, None
+
+    def _project_review_timeout(self) -> tuple[int | None, str | None]:
+        """The adapter's optional ``review_timeout_s`` (#624) and, if unusable, why.
+
+        Same shape as ``_project_implement_timeout``: ``(seconds, None)`` for a positive
+        int, ``(None, None)`` when undeclared, ``(None, <repr>)`` for a value to event."""
+        raw = getattr(self.project, "review_timeout_s", None)
+        if raw is None:
+            return None, None
+        if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            return None, repr(raw)[:80]
+        return raw, None
+
+    def _keep_open_label(self, labels: Iterable[object]) -> str | None:
+        """The first of ``labels`` the project declares keep-open (#613), else ``None``.
+
+        Read through ``getattr`` because the attribute is optional, and a project with no
+        opinion about it must resolve to "no match" rather than break task registration. A
+        bare string counts as one label, not as a sequence of letters.
+        """
+        declared = getattr(self.project, "keep_open_labels", ())
+        if isinstance(declared, str):
+            declared = (declared,)
+        if not isinstance(declared, list | tuple | set | frozenset):
+            return None
+        wanted = {str(label).strip().casefold() for label in declared}
+        for label in labels:
+            if str(label).strip().casefold() in wanted:
+                return str(label)
+        return None
 
     def _optimize_agent(self) -> str | None:
         """The project's OPTIMIZE agent, or ``None`` when the project has not opted in (#519).
@@ -1177,6 +1484,10 @@ class Engine:
         Semantics chosen over the old ``ready()`` (PENDING/BLOCKED-only, lease-ignoring),
         which was wrong for the scheduler: it excluded RETRYING tasks (a retry must be
         re-dispatched) and ignored the dispatch lease (would re-pick an in-flight task).
+
+        A TEST retry that waits for a quiet host (``Task.test_wait_for_quiet``, #642) is
+        also held out of the set while any live task is running TEST, and only the first
+        such waiter is released when none is (``_hold_tests_for_quiet``).
         """
         self._resume_pending_decompositions(run_id)
         self._complete_ready_umbrellas(run_id)
@@ -1235,7 +1546,17 @@ class Engine:
             out = self._apply_file_contention_gate(
                 run_id, lambda: self._reload_claim_tasks(run_id, live_ids), out
             )
-        return out
+        return _hold_tests_for_quiet(live, out)
+
+    def _sibling_tasks(self, run_id: str, task_id: str) -> list[Task]:
+        """Every other non-terminal task doc in the run, in run order (#642's TEST load
+        reads: the retry hold on the direct path and the dispatch event's in-flight count)."""
+        run = self.store.load_run(run_id)
+        return [
+            self.store.load_task(run_id, ref.task_id)
+            for ref in run.task_refs
+            if ref.task_id != task_id and ref.state not in TERMINAL_TASK_STATES
+        ]
 
     def _reload_claim_tasks(self, run_id: str, task_ids: list[str]) -> list[Task]:
         """Re-read the contention-relevant task docs, in run order, for a gate pass.
@@ -1460,7 +1781,8 @@ class Engine:
     ) -> WorkItem | None:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
-        exhausted, or a declared-file claim held by another live task). Before selecting
+        exhausted, a declared-file claim held by another live task, or a TEST retry
+        waiting for a quiet host, #642). Before selecting
         a stage, a normal dispatch resumes any approved, partially-filed SCOPE
         decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
         leave execution to their children on the run DAG.
@@ -1630,6 +1952,16 @@ class Engine:
             # to dispatch"), but not silent: the gate evented the wait and named its
             # blocker. Admission stamped the claim onto `task` in place, so the dispatch
             # below carries the same doc the gate just wrote.
+            return None
+        # #642: the same TEST-retry hold `dispatchable` applies, so a direct per-task
+        # caller does not re-run an infra-timed-out TEST into the load that timed it out.
+        # Only a flagged task pays the extra reads of its siblings' docs.
+        if (
+            not resume
+            and stage is Stage.TEST
+            and task.test_wait_for_quiet
+            and _tests_in_flight(self._sibling_tasks(run_id, task_id))
+        ):
             return None
 
         spec = STAGE_SPECS[stage]
@@ -1845,17 +2177,36 @@ class Engine:
         # derived — nothing run-level to persist (#206), so re-reading the spec at every
         # dispatch boundary is the whole mechanism.
         tool_policy = None if deterministic else spec.tool_policy
+        project_commands = self._project_commands()
+        # #626: TEST runs the whole suite next, and IMPLEMENT kept timing out waiting on its
+        # own run of it, so IMPLEMENT may not run the project's declared unit command as is.
+        denied_unit_suite = (
+            project_commands.get(_UNIT_SUITE_LABEL)
+            if stage is Stage.IMPLEMENT and not deterministic
+            else None
+        )
+        if denied_unit_suite:
+            tool_policy = (tool_policy or ToolPolicy()).model_copy(
+                update={"denied_commands": (denied_unit_suite,)}
+            )
         # Honesty gate (#272): a lane that cannot translate the posture into a real provider
         # restriction (the interactive shim — its `agent()` call takes no tool argument) still
         # gets the policy on the WorkItem, but declared-but-unenforced must never be silent.
         # Resolved BEFORE the prompt render because #302 made it prompt-affecting: on such a
         # lane the posture is stated in-band, which is the only enforcement available there.
-        unenforced_policy = tool_policy is not None and not self._lane_enforces_tool_policy(lane)
+        unenforced_policy = tool_policy is not None and (
+            not self._lane_enforces_tool_policy(lane)
+            or (bool(tool_policy.denied_commands) and not self._lane_enforces_command_denials(lane))
+        )
         # Permission posture (#304): the lane's declared default, tightened to RESTRICTED by a
         # write-denying stage posture — so `--dangerously-skip-permissions` is a decision made
         # here from (lane, stage), not a constant in the transport. None on the deterministic
         # lane, which runs no model and therefore has no permission gate to set.
         permission_posture = None if deterministic else self._permission_posture(lane, tool_policy)
+        # A model-lane TEST on a cell that re-runs the declared test commands after the model.
+        verifies_test_verdict = (
+            stage is Stage.TEST and not deterministic and self._lane_verifies_test_verdict(lane)
+        )
         prompt = render_prompt(
             stage,
             task_id=task_id,
@@ -1863,8 +2214,9 @@ class Engine:
             body=task.body,
             learnings=learnings,
             context=task.context,
-            project_commands=self._project_commands(),
+            project_commands=project_commands,
             tool_posture_unenforced=unenforced_policy,
+            denied_unit_suite=denied_unit_suite,
             # #390: the reviewer runs commands in this workspace, so tell it in-band when
             # nothing can prove the workspace's toolchain is its own. Stated on EVERY lane
             # with no declared hooks, not only the lane that also fails the #391 capability
@@ -1879,10 +2231,15 @@ class Engine:
             ),
             # A model-lane TEST on a cell that re-runs the declared test commands is told
             # that run decides pass/fail (the cell's ``verifies_test_verdict`` capability).
-            test_verdict_verified=(
-                stage is Stage.TEST and not deterministic
-                and self._lane_verifies_test_verdict(lane)
+            test_verdict_verified=verifies_test_verdict,
+            # #613: DELIVER's keyword comes from the persisted setting, not a rule to remember.
+            keep_open_issue=(
+                task.issue_number if stage is Stage.DELIVER and task.keep_issue_open else None
             ),
+            # #614: a re-review after a survivor-driven fix cycle re-applies the named ones.
+            open_mutants=task.open_mutants if stage is Stage.REVIEW else None,
+            # #624: a REVIEW after a timed-out one continues from what that attempt ran.
+            review_progress=task.review_progress if stage is Stage.REVIEW else None,
         )
         role = task.agent_role if stage is Stage.IMPLEMENT and task.agent_role else spec.agent_role
         agent = self.project.agent_for(stage, role)
@@ -1895,6 +2252,24 @@ class Engine:
             if deterministic
             else self._review_plan_for(task, stage=stage, run=run, lane=lane, util_pct=util_pct)
         )
+        timeout_s = spec.timeout_s
+        if stage is Stage.IMPLEMENT:
+            project_default, rejected = self._project_implement_timeout()
+            if rejected is not None:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "implement_timeout_rejected", "level": "warning",
+                     "run_id": run_id, "task_id": task_id, "stage": stage.value,
+                     "value": rejected,
+                     "reason": "implement_timeout_s must be a positive int; using the default"},
+                )
+            timeout_s = implement_timeout_s(
+                task.implementation_budget,
+                spec_timeout_s=spec.timeout_s,
+                project_default_s=project_default,
+            )
+        elif stage is Stage.REVIEW and not deterministic:
+            timeout_s = self._review_dispatch_timeout(task, run_id, spec_timeout_s=spec.timeout_s)
         work = WorkItem.create(
             id=f"wi-{uuid.uuid4().hex[:12]}",
             run_id=run_id,
@@ -1911,11 +2286,7 @@ class Engine:
             lane_policy=lane,
             created_at=_now(),
             attempt=attempt,
-            timeout_s=(
-                _IMPLEMENT_TIMEOUTS[task.implementation_budget]
-                if stage is Stage.IMPLEMENT and task.implementation_budget is not None
-                else spec.timeout_s
-            ),
+            timeout_s=timeout_s,
             # Run in the task's worktree (folded from intake) so the headless lane stops
             # depending on process CWD. None on intake itself (it creates the worktree).
             cwd=task.context.get("worktree"),
@@ -1937,9 +2308,12 @@ class Engine:
             # Deterministic ENGINE-lane runners (intake/test/deliver) read task context
             # structurally rather than re-parsing their own rendered prompt; model lanes
             # get None (they read the prompt). Same durable state, so it is hash-excluded.
+            # A model TEST whose verdict the lane re-runs gets it too: that re-run is the
+            # deterministic runner, and without baseline_failures/base_sha it counted
+            # inherited red as caused and could never narrow to impacted tests.
             context=(
                 self._deterministic_context(task, stage=stage, run=run)
-                if deterministic
+                if deterministic or verifies_test_verdict
                 else None
             ),
             # #5: the task's per-task port block, exported into the stage subprocess (BOTH
@@ -1955,7 +2329,9 @@ class Engine:
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
             permission_posture=permission_posture,  # #304, hash-excluded for the same reason
-            review_cycle=task.review_cycles,  # #546: names this fix cycle's log files
+            # #546: names this fix cycle's log files. A TEST-driven cycle (#541) restarts the
+            # same stages at attempt 0, so it counts too; the sum only ever grows.
+            review_cycle=task.review_cycles + task.test_fix_cycles,
         )
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
@@ -1975,6 +2351,17 @@ class Engine:
         # be made self-describing — its `stage_dispatched` will never get a matching
         # `stage_recorded`, so a naive counter would over-count dispatches without it.
         superseded_lease: str | None = None
+        # #642: what else was running TEST when this one started, and how loaded the host
+        # was, so a TEST timeout can be attributed from events.jsonl alone. Read before the
+        # lock (a slightly stale count is fine for attribution) and only for TEST.
+        test_load: dict | None = None
+        if stage is Stage.TEST:
+            test_load = {
+                "tests_in_flight": len(_tests_in_flight(self._sibling_tasks(run_id, task_id))),
+                "load_avg_1m": _load_avg_1m(),
+            }
+            if task.test_wait_for_quiet:
+                test_load["waited_for_quiet"] = True
 
         def _commit(t: Task) -> None:
             nonlocal superseded_lease
@@ -1996,6 +2383,8 @@ class Engine:
             t.pending_fallback_model = None  # consumed into this dispatch's model
             t.not_before = None  # cooldown (if any) has elapsed — clear the stamp
             t.salvage_in_place = False  # consumed: this dispatch honored (or ignored) it
+            if stage is Stage.TEST:
+                t.test_wait_for_quiet = False  # #642: consumed by this TEST dispatch
             # Persist the intake KB fold (#72) into the durable context so it survives on
             # disk and renders in the later stages' prompts too (not just this dispatch's).
             if prior_learnings and "prior_learnings" not in t.context:
@@ -2050,6 +2439,9 @@ class Engine:
                 "prompt_chars": len(prompt),
                 "prompt_file": prompt_file,
             }
+            # #642: TEST only, so every other stage's dispatch event stays byte-identical.
+            if test_load is not None:
+                event.update(test_load)
             # Self-describing re-dispatch (#142): stamp the resume marker and the lease it
             # supersedes so a reader can tell a genuine crash-recovery re-lease from a
             # fresh dispatch without joining on `work_item_id` against `stage_recorded`.
@@ -2215,6 +2607,14 @@ class Engine:
         except NoRunnerError:
             return False
 
+    def _lane_enforces_command_denials(self, lane: LanePolicy) -> bool:
+        """Does the resolved lane turn ``ToolPolicy.denied_commands`` into a refusal (#626)?
+        An unregistered lane counts as NOT enforcing, as in ``_lane_enforces_tool_policy``."""
+        try:
+            return self.registry.describe(lane).enforces_command_denials
+        except NoRunnerError:
+            return False
+
     def _lane_verifies_test_verdict(self, lane: LanePolicy) -> bool:
         """Whether the resolved cell lets the declared test commands decide a TEST verdict."""
         try:
@@ -2302,9 +2702,14 @@ class Engine:
 
         The changed files are the task's OWN change: ``base_sha`` is captured by INTAKE
         AFTER any dependency branches are composed in (#216), so ``base_sha``..worktree
-        excludes dep code. Read with the same helper the TEST stage's impacted-test
-        selection uses (committed + uncommitted tracked changes + untracked files), then
-        classified by the pure ``non_code.classify_non_code`` against the project's
+        excludes dep code. On a review fix cycle the range is the CYCLE's own change (#564):
+        ``Task.review_fix_base_sha`` (the commit the rejecting review saw)..worktree, because
+        the first cycle's OPTIMIZE already had its pass over the earlier source change — a
+        cycle that only added a test has nothing new to speed up. With no recorded review
+        commit the range falls back to ``base_sha``; the range used is on the record and the
+        ``optimize_skipped_non_code`` event (``diff_range``/``diff_from``). Read with the same
+        helper the TEST stage's impacted-test selection uses (committed + uncommitted tracked
+        changes + untracked files), then classified by the pure ``non_code.classify_non_code`` against the project's
         ``non_code_globs`` (or the defaults).
 
         Never skips on uncertainty: a missing ``base_sha``/worktree or a failed git read
@@ -2328,26 +2733,33 @@ class Engine:
             return False
         base_sha = task.context.get("base_sha")
         worktree = task.context.get("worktree")
+        # #564: a review fix cycle classifies its own diff, from the commit the rejecting
+        # review saw; otherwise (first cycle, or no recorded commit) the whole task's.
+        diff_from, diff_range = (
+            (task.review_fix_base_sha, "review_fix_cycle") if task.review_fix_base_sha
+            else (base_sha, "base_sha")
+        )
         why: str | None = None
         changed: list[str] | None = None
-        if not base_sha:
+        if not diff_from:
             why = "no base_sha in the task context"
         elif not worktree or not Path(str(worktree)).is_dir():
             why = "task worktree missing"
         else:
             try:
-                changed = test_changed_files(str(worktree), str(base_sha))
+                changed = test_changed_files(str(worktree), str(diff_from))
             except Exception as exc:  # noqa: BLE001 - uncertainty dispatches, never skips
                 why = f"git read raised {type(exc).__name__}: {exc}"
             else:
                 if changed is None:
-                    why = f"git diff against base_sha {str(base_sha)[:12]} failed"
+                    why = f"git diff against {diff_range} {str(diff_from)[:12]} failed"
         if changed is None:
             self.store.append_event(
                 run_id,
                 {"ts": _now(), "type": "optimize_skip_check_failed", "level": "info",
                  "run_id": run_id, "task_id": task.task_id, "stage": Stage.OPTIMIZE.value,
                  "reason": why or "changed files unknown",
+                 "diff_range": diff_range, "diff_from": str(diff_from) if diff_from else None,
                  "detail": "could not tell whether the change is code; dispatching OPTIMIZE"},
             )
             return False
@@ -2360,6 +2772,8 @@ class Engine:
             "changed_files": shown,
             "changed_files_count": len(verdict.non_code),
             "non_code_globs": list(globs),
+            "diff_range": diff_range,
+            "diff_from": str(diff_from),
         }
         now = _now()
 
@@ -2379,6 +2793,8 @@ class Engine:
             rec.lane = ExecutionMode.ENGINE
             rec.cost_usd = 0.0
             rec.output = dict(output)
+            # This cycle ran no pass, so an earlier cycle's revert note is no longer current.
+            t.context.pop(OPTIMIZE_REVERT_KEY, None)
 
         event = {
             "ts": now, "type": "optimize_skipped_non_code", "level": "info",
@@ -2386,6 +2802,7 @@ class Engine:
             "changed_files": shown, "changed_files_count": len(verdict.non_code),
             "changed_files_truncated": len(verdict.non_code) > len(shown),
             "non_code_globs": list(globs),
+            "diff_range": diff_range, "diff_from": str(diff_from),
         }
         try:
             self.store.commit_task_events(run_id, task.task_id, _skip, [event])
@@ -2413,6 +2830,43 @@ class Engine:
         return list(selection.files) if selection.scope == "impacted" else None
 
     # --- multi-agent REVIEW plan (#73) -----------------------------------------
+    def _review_dispatch_timeout(self, task: Task, run_id: str, *, spec_timeout_s: int) -> int:
+        """Pick a model REVIEW dispatch's limit (#624) and event any departure from the spec.
+
+        The diff is measured only when it can matter (no budget on the task), with the same
+        bounded engine-side read the review plan uses; a failed read keeps the default and
+        the event says the diff was unmeasured. An unusable adapter value is evented as
+        ``review_timeout_rejected``; a limit other than the spec's as ``review_timeout_set``."""
+        project_default, rejected = self._project_review_timeout()
+        if rejected is not None:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "review_timeout_rejected", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "value": rejected,
+                 "reason": "review_timeout_s must be a positive int; using the default"},
+            )
+        diff_lines: int | None = None
+        if task.review_budget is None:
+            stat = self._deterministic_diff_stat(task)
+            diff_lines = stat.lines if stat is not None else None
+        seconds, reason = review_timeout_s(
+            task.review_budget,
+            spec_timeout_s=spec_timeout_s,
+            project_default_s=project_default,
+            diff_lines=diff_lines,
+        )
+        if seconds != spec_timeout_s:
+            self.store.append_event(
+                run_id,
+                {"ts": _now(), "type": "review_timeout_set", "run_id": run_id,
+                 "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "timeout_s": seconds, "reason": reason,
+                 "budget": task.review_budget.value if task.review_budget else None,
+                 "diff_lines": diff_lines, "long_diff_lines": _REVIEW_LONG_DIFF_LINES},
+            )
+        return seconds
+
     def _deterministic_diff_stat(self, task: Task) -> DiffStat | None:
         """Measure the change under review with a bounded, best-effort ENGINE-lane git read
         (``git diff --numstat <base_sha>..HEAD`` in the task's worktree).
@@ -2523,6 +2977,9 @@ class Engine:
                 "docs-only" if task.context.get("change_class") == "docs-only" else None
             ),
             diff_stat=self._deterministic_diff_stat(task),
+            no_disposable_workspace=not self._lane_enforces_tool_policy(lane),
+            open_mutants=task.open_mutants,
+            review_progress=task.review_progress,
         )
 
     @staticmethod
@@ -2807,11 +3264,9 @@ class Engine:
             result.lane_used.provider,
         ) in self.registry.sanctioned()
 
-        # Deterministic stage gate (the "verify" half of the collapsed test stage,
-        # target.md §6.1): a runner-reported SUCCESS can still be vetoed by the engine.
-        # Today: the test stage must affirm its tests are meaningful — a green run that
-        # doesn't is downgraded to a failure so it retries-with-learnings instead of
-        # shipping vacuous tests. Cost is still recorded above (the model did run).
+        # Deterministic stage gate: a runner-reported SUCCESS can still be vetoed by the
+        # engine, which downgrades it to a failure so it retries with learnings. Cost is
+        # still recorded above (the model did run).
         gate_error = self._stage_gate(result) if result.status is ResultStatus.SUCCESS else None
         effective = (
             result if gate_error is None
@@ -2916,6 +3371,17 @@ class Engine:
         # overrides the model's approval; the model can't skip a policy gate).
         if effective.stage is Stage.REVIEW and effective.status is ResultStatus.SUCCESS:
             effective = self._merge_policy_findings(run_id, task, effective)
+            # #614: the stopping rule for surviving mutants — the same deterministic seam, so
+            # the verdict below reads a blocking survivor as an issue and every other one as
+            # a noted gap, whatever the reviewer wrote in ``issues``.
+            effective, survivor_events = self._dispose_surviving_mutants(run_id, task, effective)
+            events.extend(survivor_events)
+            # #541: an approval must carry its proof that the tests mean anything. Here, not
+            # in ``_stage_gate``, because only now does a panel review have its folded output.
+            if (proof_error := review_proof_gate(task, effective)) is not None:
+                effective = effective.model_copy(
+                    update={"status": ResultStatus.FAILURE, "error": proof_error}
+                )
         # #520: the OPTIMIZE pass, checked by the harness for REGRESSIONS. The engine runs
         # the project adapter's declared benchmark before and after the stage's commit and
         # strips the checkpoint (plus hard-resets the worktree) when the numbers got slower or
@@ -2937,6 +3403,20 @@ class Engine:
         if effective.stage is Stage.DELIVER and effective.status is ResultStatus.SUCCESS:
             effective, push_event = self._deliver_push_gate(run_id, task, effective)
             events.append(push_event)
+        # #613: a task that keeps its issue open must not hand a human a PR whose merge closes
+        # it. Prose did not hold (three PRs said `Closes` with the keep-open instruction in
+        # their own context), so the engine reads GitHub's answer back. Same veto shape as the
+        # push gate above, and only when that left the result standing.
+        if (
+            effective.stage is Stage.DELIVER
+            and effective.status is ResultStatus.SUCCESS
+            and task.keep_issue_open
+            and task.issue_number is not None
+        ):
+            effective, keep_open_event = self._deliver_keep_open_gate(
+                run_id, task, effective, task.issue_number
+            )
+            events.append(keep_open_event)
         # #227/#414: capture the fixup requests from the canonical review output (including
         # a synthesized panel output) before entering the locked transition — the
         # improvement idea AND any non-blocking finding that asked to be fixed in place.
@@ -2974,6 +3454,8 @@ class Engine:
         review_verdict: dict | None = None
         test_validation: dict[str, object] | None = None
         workspace_origin: dict[str, object] | None = None
+        # #614: the fix cycle's named survivors this REVIEW did not re-apply (evented).
+        named_survivors_unchecked: list[str] = []
         review_fixup_actions: list[dict[str, object]] = []
         fixups_applied: list[ReviewFixup] = []
         review_filings_carried: list[CarriedReviewFiling] = []
@@ -2987,12 +3469,17 @@ class Engine:
         # outside the task lock, keeping "only the engine caller emits" true of the locked
         # mutator too. Nothing is mutated before the check, so the doc is pristine.
         lease_rejection: tuple[Task, tuple[str, str]] | None = None
+        # #628: read the adapter hook before taking the task lock, since it is project code.
+        parallel_safe = (
+            self._parallel_safe_globs() if result.stage is Stage.SCOPE
+            else ParallelSafeGlobs((), [])
+        )
 
         def _commit(t: Task) -> None:
             nonlocal effective, outcome, scope_blocked_reason, review_verdict
             nonlocal test_validation, review_fixup_actions, fixups_applied
             nonlocal review_filings_carried
-            nonlocal workspace_origin
+            nonlocal workspace_origin, named_survivors_unchecked
             nonlocal cooldown_until, cooldown_wait_source, cooldown_budget_charged
             nonlocal provider_reset_at, provider_out_reason, lease_rejection
             # Authoritative lease validation under the task lock (#277): the whole
@@ -3088,7 +3575,8 @@ class Engine:
                     outcome = "stage_rate_limited_cooldown"
             else:
                 fold_notices = apply_result(
-                    t, effective, now=_now(), cost_usd=cost, metered=cost_metered
+                    t, effective, now=_now(), cost_usd=cost, metered=cost_metered,
+                    parallel_safe_paths=parallel_safe.globs,
                 )
                 # #201: a malformed model pr_number/pr_url that validate_assignment dropped at
                 # the fold is no longer invisible — surface each drop as a warning-grade audit
@@ -3122,12 +3610,31 @@ class Engine:
                      "task_id": effective.task_id, "stage": effective.stage.value, **notice}
                     for notice in fold_notices.file_claims
                 )
+                events.extend(_claims_relaxed_events(
+                    run_id, effective.task_id, fold_notices.relaxed_claims,
+                    stage=effective.stage.value, source="scope", ts=_now(),
+                ))
+                # #615: SCOPE sized this task's IMPLEMENT limit. A pinned or unknown value it
+                # could not apply is warning-grade: the task runs on a limit SCOPE disagreed with.
+                events.extend(
+                    {"ts": _now(), "type": "implementation_budget_set", "run_id": run_id,
+                     "task_id": effective.task_id, "stage": effective.stage.value,
+                     **({} if notice["applied"] else {"level": "warning"}), **notice}
+                    for notice in fold_notices.budgets
+                )
+                events.extend(_parallel_safe_rejected_events(
+                    run_id, effective.task_id, parallel_safe.rejected,
+                    stage=effective.stage.value, ts=_now(),
+                ))
                 if effective.status is ResultStatus.SUCCESS:
                     t.error_signatures = []  # streak resets on a clean stage
                     t.rate_limit_waits = 0  # a clean stage refreshes the cooldown budget
                     t.infra_resets = 0  # ... and the infra-reset budget (#14)
                     t.salvage_count = 0  # ... and the salvage-keep budget (#59)
                     t.salvage_in_place = False  # a clean stage leaves nothing to keep
+                    if effective.stage is Stage.REVIEW:
+                        # #624: a REVIEW that returned a result consumed the carried progress.
+                        t.review_progress = None
                     # Session chaining (design pass §2): reuse across SUCCESSFUL stage
                     # transitions only. A runner that reports no ref leaves the prior one
                     # in place (resuming a slightly-stale session is safe: prompts are
@@ -3162,6 +3669,13 @@ class Engine:
                     # #411: and did the reviewer confirm the workspace it ran those
                     # commands in was its own? Same observability-only posture.
                     workspace_origin = self._unconfirmed_workspace_origin(t, effective)
+                    # #614: did this re-review re-apply the survivors the last rejection
+                    # named? Read BEFORE the verdict overwrites or clears the list; a review
+                    # that did not re-check them is evented, never vetoed.
+                    if effective.stage is Stage.REVIEW:
+                        named_survivors_unchecked = unchecked_named_survivors(
+                            t.open_mutants, effective.structured_output or {}
+                        )
                     if scope_blocked_reason is not None:
                         t.state = TaskState.BLOCKED_ON_HUMAN
                         outcome = "scope_not_feasible_held"
@@ -3193,6 +3707,10 @@ class Engine:
                                     for f in review_fixups
                                 ]
                     else:
+                        # #614: an approving (or auto-approved) review closes the survivors
+                        # the last rejection named; a fixup cycle's re-review starts clean.
+                        if effective.stage is Stage.REVIEW:
+                            t.open_mutants = []
                         if review_fixups:
                             outcome, review_fixup_actions = self._apply_review_fixups(
                                 t, review_fixups
@@ -3387,15 +3905,28 @@ class Engine:
                      "title": fixup.title, "fingerprint": fixup.fingerprint,
                      "source": fixup.source}
                 )
-            # #261: nobody judged whether the tests are meaningful (or the reviewer's verdict
-            # was suppressed by the no-model-test-surface exemption). Warning-grade, so a run
-            # that skipped the #13 guarantee SAYS so instead of carrying a `tests_meaningful:
-            # true` nobody earned. Never blocking — the gates stay fail-OPEN.
+            # #261/#541: REVIEW passed without judging or proving the tests (or its verdict
+            # was suppressed by the no-test-surface exemption). Warning-grade, so a run that
+            # skipped the #13 guarantee SAYS so instead of reading like a proven one.
             if test_validation is not None:
                 events.append(
                     {"ts": _now(), "type": "test_validation_skipped", "level": "warning",
                      "run_id": run_id, "task_id": result.task_id,
                      "stage": result.stage.value, **test_validation}
+                )
+            # #614: the re-review was told which survivors opened this fix cycle and did not
+            # re-apply them, so whether the fix closed them is unmeasured. Report-only.
+            if named_survivors_unchecked:
+                events.append(
+                    {"ts": _now(), "type": "named_survivor_unchecked", "level": "warning",
+                     "run_id": run_id, "task_id": result.task_id,
+                     "stage": result.stage.value,
+                     "mutations": list(named_survivors_unchecked),
+                     "reason": (
+                         "the fix cycle named these surviving mutations and this review's "
+                         "mutation_checks re-applied none of them, so whether the fix closed "
+                         "them was not measured (report-only, not a veto)"
+                     )}
                 )
             # #411: the reviewer ran its checks in a workspace nothing could prove was its
             # own, and did not come back with a confirmation. Warning-grade and report-only
@@ -3692,10 +4223,16 @@ class Engine:
                 ref = mapping[local_id]
                 if ref in registered:
                     continue
+                child_pipeline = _CHILD_PIPELINES[child.quality_tier]
                 self.add_task(
                     run_id,
                     ref,
-                    pipeline=_CHILD_PIPELINES[child.quality_tier],
+                    pipeline=child_pipeline,
+                    # A child's pipeline is pinned, so the preset default cannot reach it:
+                    # inherit the parent's choice, including an explicit model TEST (#541).
+                    deterministic_stages=[
+                        s for s in parent.deterministic_stages if s in child_pipeline
+                    ],
                     depends_on=[mapping[dep] for dep in child.depends_on],
                     provider_tag=parent.provider_tag,
                     agent_role=child.agent,
@@ -3850,26 +4387,9 @@ class Engine:
     def _stage_gate(self, result: StageResult) -> str | None:
         """Deterministic per-stage gate over a SUCCESS result; returns a veto reason or None.
 
-        The collapsed test stage folds in the as-built 'test-validate' step (§6.1): a
-        green run is necessary but not sufficient — the tests must actually exercise the
-        change. The runner is asked to self-report ``tests_meaningful``; if it explicitly
-        reports ``false`` we veto (retry-with-learnings) rather than ship vacuous tests.
-
-        Fail-OPEN on a MISSING or NULL field: nothing enforces this soft field on the
-        interactive/headless lanes (no JSON schema), so a model that simply omits it — or a
-        runner that honestly reports ``null`` because it cannot judge meaningfulness (the
-        deterministic ENGINE lane, #261) — must not dead-end otherwise-green work. Only an
-        explicit ``false`` is a veto. An abstention here is not free, though: if REVIEW
-        abstains too, ``record`` emits a warning-grade ``test_validation_skipped`` event so
-        the run never *claims* a verification nobody performed. (A stronger, schema- or
-        independent-reviewer-enforced version is tracked as issue #13.)
-
-        The veto downgrades the result to a FAILURE, so ``apply_result`` never absorbs its
-        outputs — which is why ``_failure_learning`` carries the vetoed attempt's
-        ``validation_notes`` forward into the retry's prompt explicitly (#298), the way a
-        REVIEW rejection carries its blocking ``issues``. The veto string below is
-        load-bearing (``result.error`` → ``error_signature`` → the breaker's identical-
-        failure streak → ``task.last_error``): enrich the learning, not this reason."""
+        SCOPE's child plan must parse and DELIVER must have opened a PR. Whether the tests
+        mean anything is not TEST's to say (#541): see ``state_machine.review_proof_gate``,
+        which ``record`` applies once a panel review has its folded output."""
         if result.stage is Stage.SCOPE:
             try:
                 parse_subtasks(result.structured_output)
@@ -3878,15 +4398,6 @@ class Engine:
             return None
         if result.stage is Stage.DELIVER:
             return pr_not_opened(result.structured_output)
-        if result.stage is not Stage.TEST:
-            return None
-        out = result.structured_output or {}
-        if out.get("tests_meaningful") is False:  # explicit self-report only
-            return (
-                "test-validate gate: the runner reported the tests do not meaningfully "
-                "exercise the change (tests_meaningful=false). Add/adjust assertions so "
-                "the tests would fail if this change regressed."
-            )
         return None
 
     def _deliver_push_gate(
@@ -3950,6 +4461,55 @@ class Engine:
         return failed, {**base, "type": "deliver_push_mismatch", "level": "warning",
                         "remote_sha": remote_sha, "error": veto}
 
+    def _deliver_keep_open_gate(
+        self, run_id: str, task: Task, result: StageResult, issue: int
+    ) -> tuple[StageResult, dict]:
+        """Fail a SUCCESS DELIVER whose PR would close the issue this task keeps open;
+        returns the (possibly vetoed) result and the one audit event to commit with it (#613).
+
+        The PR comes from the stage's own output, because the fold has not absorbed it yet. A
+        violation downgrades the result to FAILURE with the reason as ``error``, so the
+        ordinary retry re-dispatches DELIVER with it as learnings (warning-grade
+        ``deliver_keep_open_violated``). A clean read emits ``deliver_keep_open_verified``.
+        Fail-OPEN when the check cannot run: the result stands and a warning-grade
+        ``deliver_keep_open_unverified`` says nobody checked, so "checked and clean" and
+        "never checked" never read alike. ``_record_completion_pr_evidence`` checks again for
+        a body rewritten after this stage.
+        """
+        pr_url = str((result.structured_output or {}).get("pr_url") or "").strip()
+        base = {"ts": _now(), "run_id": run_id, "task_id": task.task_id,
+                "stage": result.stage.value, "attempt": result.attempt,
+                "issue_number": issue, "pr_url": pr_url or None}
+        closing, problem = (
+            self._read_closing_issues(self.project.task_source, pr_url)
+            if pr_url else (None, "the stage reported no pr_url to check")
+        )
+        if closing is None:
+            return result, {**base, "type": "deliver_keep_open_unverified", "level": "warning",
+                            "error": problem}
+        veto = keep_open_violation(issue, closing)
+        if veto is None:
+            return result, {**base, "type": "deliver_keep_open_verified",
+                            "closing_issues": closing}
+        failed = result.model_copy(update={"status": ResultStatus.FAILURE, "error": veto})
+        return failed, {**base, "type": "deliver_keep_open_violated", "level": "warning",
+                        "closing_issues": closing, "error": veto}
+
+    @staticmethod
+    def _read_closing_issues(
+        task_source: object, pr_url: str
+    ) -> tuple[list[int] | None, str | None]:
+        """(issues the PR closes on merge, None), or (None, why that could not be read).
+        Never raises: a missing or failing hook must read as unverified, not break the
+        stage or the completion it was asked about (#613)."""
+        hook = getattr(task_source, "closing_issue_numbers", None)
+        if not callable(hook):
+            return None, "task source has no closing_issue_numbers hook"
+        try:
+            return [int(number) for number in hook(pr_url)], None
+        except Exception as exc:  # noqa: BLE001 - a failed read is reported, never fatal
+            return None, f"{type(exc).__name__}: {exc}"[:300]
+
     def _scope_not_feasible(self, result: StageResult) -> str | None:
         """Feasibility gate over a completed SCOPE stage (issue #45); returns the
         blocked_reason to park on, or None to proceed.
@@ -3982,13 +4542,27 @@ class Engine:
         blocking?=True}``. Blocking findings join ``issues`` and force
         ``approved=false`` (severity defaults to critical so a repeated policy finding
         can never convergence-auto-approve past the gate); non-blocking ones join
-        ``non_blocking`` and get filed as follow-up issues at finalize."""
+        ``non_blocking`` and get filed as follow-up issues at finalize, unless they carry
+        their own ``disposition`` (``drop`` is noted, not filed).
+
+        #591: a red lint or type finding that carries ``gate_output`` is compared against
+        ``task.baseline_lint`` here, so only what this change added blocks. A
+        ``{"gate_record": {...}}`` entry is not a finding: it becomes a ``policy_gate_result``
+        event, which is how a green benchmark's load and timing reach the run log.
+
+        #634: a hook that accepts ``changed_files`` gets the task's own changed files
+        (``base_sha``..worktree, read once here), or None when they cannot be read, so an
+        adapter can skip a benchmark the change cannot reach. A legacy
+        ``review_findings(*, worktree)`` hook is called exactly as before."""
         hook = getattr(self.project, "review_findings", None)
         if not callable(hook):
             return result
+        worktree = task.context.get("worktree")
+        kwargs: dict[str, object] = {"worktree": worktree}
+        if hook_accepts_changed_files(hook):
+            kwargs["changed_files"] = self._review_changed_files(task)
         try:
-            findings = [f for f in (hook(worktree=task.context.get("worktree")) or [])
-                        if isinstance(f, dict) and str(f.get("description") or "").strip()]
+            raw = [f for f in (hook(**kwargs) or []) if isinstance(f, dict)]
         except Exception as exc:  # noqa: BLE001 - a policy hook must never break record()
             self.store.append_event(
                 run_id,
@@ -3996,6 +4570,18 @@ class Engine:
                  "task_id": task.task_id, "error": str(exc)},
             )
             return result
+        for entry in raw:
+            if isinstance(entry.get("gate_record"), dict):
+                self.store.append_event(
+                    run_id,
+                    {**entry["gate_record"], "ts": _now(), "type": "policy_gate_result",
+                     "run_id": run_id, "task_id": task.task_id},
+                )
+        findings = apply_lint_baseline(
+            [f for f in raw if str(f.get("description") or "").strip()],
+            task.baseline_lint,
+            worktree if isinstance(worktree, str) else None,
+        )
         if not findings:
             return result
         out = dict(result.structured_output or {})
@@ -4004,7 +4590,7 @@ class Engine:
         if blocking:
             issues = list(out.get("issues") or [])
             for f in blocking:
-                issue = {k: v for k, v in f.items() if k != "blocking"}
+                issue = {k: v for k, v in f.items() if k not in ("blocking", "disposition")}
                 issue.setdefault("severity", "critical")  # a policy gate is a hard gate
                 issues.append(issue)
             out["issues"] = issues
@@ -4012,9 +4598,9 @@ class Engine:
         if advisory:
             nb = list(out.get("non_blocking") or [])
             nb.extend(
-                {"title": str(f.get("description"))[:80],
+                {"title": str(f.get("description")).strip().splitlines()[0][:80],
                  "detail": format_review_issue({k: v for k, v in f.items() if k != "blocking"}),
-                 "disposition": "file"}
+                 "disposition": str(f.get("disposition") or "file")}
                 for f in advisory
             )
             out["non_blocking"] = nb
@@ -4025,6 +4611,82 @@ class Engine:
              "findings": [format_review_issue(f)[:200] for f in findings[:10]]},
         )
         return result.model_copy(update={"structured_output": out})
+
+    @staticmethod
+    def _review_changed_files(task: Task) -> list[str] | None:
+        """The task's own changed files for the REVIEW policy hook (#634), or None when they
+        cannot be read. None never narrows anything: the adapter then runs every leg."""
+        base_sha = task.context.get("base_sha")
+        worktree = task.context.get("worktree")
+        if not base_sha or not worktree or not Path(str(worktree)).is_dir():
+            return None
+        try:
+            return test_changed_files(str(worktree), str(base_sha))
+        except Exception:  # noqa: BLE001 - a policy hook's input must never break record()
+            return None
+
+    def _dispose_surviving_mutants(
+        self, run_id: str, task: Task, result: StageResult
+    ) -> tuple[StageResult, list[dict]]:
+        """Apply the #614 stopping rule to a completed REVIEW's ``mutation_checks``.
+
+        The pure ``state_machine.surviving_mutant_disposition`` decides; this fold writes.
+        A survivor flagged ``blocking: true`` WITH a reason joins ``issues`` (deduped by the
+        convergence fingerprint, so a reviewer that also wrote it there does not double it)
+        and forces ``approved=false`` — the same deterministic override a policy finding
+        makes. Every other survivor joins ``non_blocking`` as a ``drop`` entry, deduped the
+        same way against entries already there (a panel may have listed one). A flag with no
+        reason is demoted, and that is evented per entry because it is the reviewer asking for
+        a cycle the engine refused. Returns the result plus the events for the caller's
+        atomic batch (#277); byte-identical and event-free when nothing survived.
+        """
+        if result.stage is not Stage.REVIEW or result.status is not ResultStatus.SUCCESS:
+            return result, []
+        out = dict(result.structured_output or {})
+        blocking, noted, demoted = surviving_mutant_disposition(out)
+        if not (blocking or noted or demoted):
+            return result, []
+        events: list[dict] = [
+            {"ts": _now(), "type": "surviving_mutant_demoted", "level": "warning",
+             "run_id": run_id, "task_id": task.task_id, "stage": result.stage.value,
+             **entry}
+            for entry in demoted
+        ]
+        added_blocking = 0
+        if blocking:
+            raw = out.get("issues")
+            issues = list(raw) if isinstance(raw, list) else []
+            have = {issue_fingerprint(i) for i in issues}
+            for issue in blocking:
+                fp = issue_fingerprint(issue)
+                if fp in have:
+                    continue
+                have.add(fp)
+                issues.append(issue)
+                added_blocking += 1
+            out["issues"] = issues
+            out["approved"] = False  # deterministic override of the model's approval
+        if noted:
+            raw_nb = out.get("non_blocking")
+            nb = list(raw_nb) if isinstance(raw_nb, list) else []
+            have_nb = {
+                issue_fingerprint(str(e.get("title") or "")) for e in nb if isinstance(e, dict)
+            }
+            for gap in noted:
+                fp = issue_fingerprint(gap["title"])
+                if fp in have_nb:
+                    continue
+                have_nb.add(fp)
+                nb.append(gap)
+            out["non_blocking"] = nb
+        events.append(
+            {"ts": _now(), "type": "surviving_mutants_disposed", "run_id": run_id,
+             "task_id": task.task_id, "stage": result.stage.value,
+             "blocking": len(blocking), "noted": len(noted), "demoted": len(demoted),
+             "issues_added": added_blocking,
+             "blocking_mutations": [str(i["mutation"]) for i in blocking]}
+        )
+        return result.model_copy(update={"structured_output": out}), events
 
     # --- OPTIMIZE benchmark gate (#520) -------------------------------------------------
 
@@ -4450,7 +5112,10 @@ class Engine:
         because the git reset it reports is an EXTERNAL side effect already taken — deferring
         the record of a reverted worktree until the locked commit would leave a window where
         the tree and the log disagree. No leg carries raw stdout into the block, so the event
-        is the block verbatim rather than a thinned copy of it."""
+        is the block verbatim rather than a thinned copy of it.
+
+        A confirmed revert also puts ``optimize_reverted`` in the stage output (#564), which
+        the fold carries into every later stage's context with its cause."""
         if revert and worktree and anchor:
             reset = run_git(worktree, "reset", "--hard", anchor)
             if reset.returncode != 0:
@@ -4475,6 +5140,10 @@ class Engine:
         )
         out = dict(result.structured_output or {})
         out["benchmark"] = block
+        # #564: only the engine may say a commit was reverted, so a model's value never folds.
+        out.pop(OPTIMIZE_REVERT_KEY, None)
+        if (revert_note := _optimize_revert_note(block)) is not None:
+            out[OPTIMIZE_REVERT_KEY] = revert_note
         return result.model_copy(update={
             "structured_output": out,
             **({"checkpoint": None} if strip_checkpoint else {}),
@@ -4510,40 +5179,35 @@ class Engine:
         must not hold up an otherwise-approved PR.
 
         Also the independent test-validate half (#13): the reviewer — a different agent
-        from the one that wrote/ran the tests — reports ``tests_meaningful``; an explicit
-        ``false`` REJECTS even an approved review (vacuous-green tests are exactly what
-        the self-graded TEST gate can't catch about itself). Fail-open when omitted.
+        from the one that wrote the tests — reports ``tests_meaningful``; an explicit
+        ``false`` REJECTS even an approved review. A missing or null answer does not reject
+        here: ``state_machine.review_proof_gate`` has already sent an approval without proof
+        back for another review, and one that stated a reason is evented as
+        ``test_validation_skipped``.
 
-        The #13 gate is suppressed for tasks with NO model test surface (#41/#168): i.e.
-        when ``change_class == "docs-only"`` (ENGINE-detected, not model-asserted), when
-        ``Stage.TEST`` is absent from the task's pipeline (micro tasks), or when TEST ran
-        on the deterministic ENGINE lane (opted in via ``deterministic_stages``). A model
-        cannot self-exempt: all three signals are fixed at ``add_task`` time. An explicit
-        ``approved=false`` still rejects normally — the exemption covers only the vacuous-
-        tests criterion, never a substantive reviewer rejection. When the exemption discards
-        an EXPLICIT reviewer ``false``, that suppression is no longer silent: ``record``
-        emits a warning-grade ``test_validation_skipped`` event for it (#261). An OMITTED /
-        null ``tests_meaningful`` still fails open here — and is likewise evented when the
-        TEST stage did not judge it either."""
+        The #13 gate is suppressed for tasks with NO test surface (#41/#168): i.e. when
+        ``change_class == "docs-only"`` (ENGINE-detected, not model-asserted) or when
+        ``Stage.TEST`` is absent from the task's pipeline (micro tasks). A model cannot
+        self-exempt: both signals are engine-set. An explicit ``approved=false`` still
+        rejects normally — the exemption covers only the vacuous-tests criterion, never a
+        substantive reviewer rejection. When the exemption discards an EXPLICIT reviewer
+        ``false``, that suppression is no longer silent: ``record`` emits a warning-grade
+        ``test_validation_skipped`` event for it (#261)."""
         if result.stage is not Stage.REVIEW:
             return None
         out = result.structured_output or {}
         approved_false = out.get("approved") is False  # explicit self-report only
-        # #41/#168: a task with NO model test surface has nothing for the #13 independent
+        # #41/#168: a task with NO test surface has nothing for the #13 independent
         # test-validate gate to bite on, so a `tests_meaningful=false` verdict must NOT reject
         # it for lacking meaningful new tests. Two engine-side, non-fabricatable signals qualify
-        # (both derived from add_task-time state, never from a model's output — so a model can't
-        # self-exempt): (a) #41 a deterministically-detected docs-only change (ENGINE-lane-only
-        # `change_class` tag); (b) #168 the TEST stage did not run on a model lane — absent from
-        # the pipeline (micro) or opted into the deterministic $0 ENGINE runner (#33/#68), so no
-        # model wrote/graded the tests the reviewer would be judging. An explicit `approved=false`
-        # still rejects normally: this relaxes only the tests criterion, never a substantive reject.
-        # The predicate itself is the pure ``state_machine.no_model_test_surface`` so the
+        # (never from a model's output — so a model can't self-exempt): (a) #41 a
+        # deterministically-detected docs-only change (ENGINE-lane-only `change_class` tag);
+        # (b) #168 no TEST stage in the pipeline (micro). An explicit `approved=false` still
+        # rejects normally: this relaxes only the tests criterion, never a substantive reject.
+        # The predicate itself is the pure ``state_machine.no_test_surface`` so the
         # #261 test_validation_skipped notice reads the SAME exemption (it reports when this
         # suppresses an explicit reviewer `false` — no second spelling to drift).
-        tests_vacuous = (
-            out.get("tests_meaningful") is False and not no_model_test_surface(task)
-        )
+        tests_vacuous = out.get("tests_meaningful") is False and not no_test_surface(task)
         if not approved_false and not tests_vacuous:
             return None
         raw = out.get("issues")
@@ -4581,7 +5245,15 @@ class Engine:
             kind = "converged_auto_approved"
         else:
             kind = "rejected"
-        return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints}
+        # #614: the survivors the engine itself promoted to issues, by their verbatim
+        # mutation text — what a fix cycle's re-review is told to re-apply.
+        open_mutants = [
+            str(i["mutation"]) for i in issues
+            if isinstance(i, dict) and i.get("source") == "mutation_check"
+            and str(i.get("mutation") or "").strip()
+        ]
+        return {"kind": kind, "issues_text": issues_text, "fingerprints": fingerprints,
+                "open_mutants": open_mutants}
 
     @staticmethod
     def _review_fixups(result: StageResult) -> list[ReviewFixup]:
@@ -4833,6 +5505,9 @@ class Engine:
         # The convergence key (#15): the NEXT re-review compares its issues against
         # this rejection's fingerprints — a subset (no net-new findings) auto-approves.
         task.last_review_rejection = list(verdict.get("fingerprints") or [])
+        # #614: the surviving mutations behind this rejection, for the re-review to re-apply
+        # (held or cycled, the next REVIEW is the one that checks they closed).
+        task.open_mutants = list(verdict.get("open_mutants") or [])
         # Fix work must not inherit the reviewer's session (same rationale as warm-retry
         # OFF: a rejecting session's context is as likely poisoned as useful).
         task.session_ref = None
@@ -5054,6 +5729,17 @@ class Engine:
         return task.salvage_in_place
 
     def _handle_failure(self, task: Task, result: StageResult, *, run: Run) -> str:
+        """Decide what a FAILED (or otherwise non-successful) stage result does to the task,
+        apply it, and return the outcome name recorded on ``stage_recorded``.
+
+        Order: a rejected invocation fails the task at once; an infra-only failure takes
+        the bounded environment-reset loop (same attempt, no breaker streak); then the
+        circuit breaker or attempt budget fails the task; a red ENGINE-lane TEST reopens
+        IMPLEMENT; anything else retries the stage. An ENGINE-lane TEST that reports
+        ``failure_kinds == ["infra"]`` counts as infra whatever the project's classifier
+        says, and sets ``Task.test_wait_for_quiet`` so its re-run waits until no other
+        task is running TEST (#642).
+        """
         # #375: the provider CLI refused to PARSE the command the harness built (a removed or
         # misspelled flag). Terminal on the FIRST attempt, ahead of every other failure path:
         # the retry would re-send a byte-identical argv, so the whole attempt budget burns in
@@ -5084,20 +5770,43 @@ class Engine:
         # below) it earns an environment reset + a free re-run of the SAME attempt
         # instead of burning the retry budget on a broken runner.
         classified = self._classify_failure(result)
-        infra_only = bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
+        # #642: the ENGINE-lane runner knows when a command timed out or never started, and
+        # says so as ``failure_kinds: ["infra"]``. That is authoritative whatever the
+        # project's classifier makes of the text: a scaffolded classifier only parses
+        # ``FAILED <id>`` lines, so it returned nothing for ``<unit timeout>`` and two
+        # timeouts on an overloaded host tripped the breaker on code that was fine.
+        runner_infra = self._runner_reported_infra(result)
+        infra_only = runner_infra or (
+            bool(classified) and all(f.kind is FailureKind.INFRA for f in classified)
+        )
         if not infra_only:
             task.error_signatures.append(sig)
         baseline = task.context.get("baseline_failures")
         task.learnings.append(
             self._failure_learning(result, failures, classified, infra_only, baseline)
         )
-        if classified:
+        if classified or runner_infra:
+            event: dict = {
+                "ts": _now(), "type": "failure_classified", "run_id": task.run_id,
+                "task_id": task.task_id, "stage": result.stage.value,
+                "kinds": sorted({f.kind.value for f in classified}
+                                | ({FailureKind.INFRA.value} if runner_infra else set())),
+                "infra_only": infra_only,
+            }
+            if runner_infra:  # conditional, so a classifier-only event stays byte-identical
+                event["runner_reported_infra"] = True
+            self.store.append_event(task.run_id, event)
+        # #642: an infra TEST failure is usually a host overloaded by concurrent suites, so
+        # an immediate re-run would hit the same load. Hold the retry (whichever path below
+        # takes it) until no other task is running TEST; ``dispatchable`` enforces it.
+        if runner_infra and not task.test_wait_for_quiet:
+            task.test_wait_for_quiet = True
             self.store.append_event(
                 task.run_id,
-                {"ts": _now(), "type": "failure_classified", "run_id": task.run_id,
+                {"ts": _now(), "type": "test_retry_waiting_for_quiet", "run_id": task.run_id,
                  "task_id": task.task_id, "stage": result.stage.value,
-                 "kinds": sorted({f.kind.value for f in classified}),
-                 "infra_only": infra_only},
+                 "attempt": result.attempt,
+                 "failures": list((result.structured_output or {}).get("failures") or [])[:10]},
             )
 
         # Salvage (#59): before any reset decision, if the failure's KIND doesn't implicate
@@ -5134,6 +5843,15 @@ class Engine:
             self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
             return "stage_infra_reset_retry"
 
+        # #624: a REVIEW that ran out of time was doing real work, not failing at it. Whatever
+        # follows (a retry, or a hold for a human), the next REVIEW gets the long limit and
+        # what this attempt had already run, so it continues instead of starting over.
+        review_timed_out = (
+            result.stage is Stage.REVIEW and result.status is ResultStatus.TIMEOUT
+        )
+        if review_timed_out:
+            self._carry_timed_out_review(task, result)
+
         # Reuse the tested CircuitBreaker over the persisted signature streak.
         breaker = CircuitBreaker(self.breaker_threshold)
         for s in task.error_signatures:
@@ -5141,15 +5859,135 @@ class Engine:
         # result.attempt is trustworthy: content_hash (which includes attempt) was
         # validated against the dispatched WorkItem, so it equals the engine's count.
         attempts_done = result.attempt + 1
+        if (attempts_done >= task.max_attempts or breaker.tripped) and review_timed_out:
+            # #624: no verdict is not a rejected change. Park for a human review the way a
+            # held rejection does (REVIEW FAILED, so approve() re-dispatches it) instead of
+            # failing a task whose code may be fine.
+            task.error_signatures = []
+            rec = task.stages[Stage.REVIEW]
+            rec.status = StageStatus.FAILED
+            rec.error = (
+                f"review timed out on attempt {result.attempt}: no verdict, needs a human "
+                f"review (the code may be fine)"
+            )
+            task.last_error = rec.error
+            task.state = TaskState.BLOCKED_ON_HUMAN
+            self._settle_failed_session(task, result, run=run, infra_only=infra_only,
+                                        retrying=False)
+            return "review_timed_out_held"
         if attempts_done >= task.max_attempts or breaker.tripped:
             task.state = TaskState.FAILED
             task.error_signatures = []  # don't carry a poisoned streak into a re-queue
             # Terminal: no retry follows, so the session is always cleared (retrying=False).
             self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=False)
             return "task_failed_breaker" if breaker.tripped else "task_failed_max_attempts"
+        # #541: a red ENGINE-lane TEST has nothing to retry with. Nobody edits anything between
+        # attempts, so the identical code would go red identically, and no model is there to
+        # fix its own regression the way a model TEST could. The implementer does it instead.
+        if self._red_test_implicates_code(task, result, infra_only=infra_only):
+            if task.test_fix_cycles >= task.max_attempts - 1:
+                task.state = TaskState.FAILED
+                task.error_signatures = []
+                self._settle_failed_session(task, result, run=run, infra_only=infra_only,
+                                            retrying=False)
+                return "task_failed_max_attempts"
+            reset_for_fix_cycle(task, Stage.IMPLEMENT, cause="test")
+            task.test_fix_cycles += 1
+            task.state = TaskState.RETRYING
+            # Same boundary as a review fix cycle: the implementer acts from the learning
+            # above, not from inside a prior stage's session.
+            task.session_ref = None
+            task.session_provider = None
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "test_failed_fix_cycle", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": result.stage.value,
+                 "failures": list((result.structured_output or {}).get("failures") or [])[:10],
+                 "cycles_used": task.test_fix_cycles,
+                 "cycles_budget": task.max_attempts - 1},
+            )
+            return "test_failed_fix_cycle"
         task.state = TaskState.RETRYING
         self._settle_failed_session(task, result, run=run, infra_only=infra_only, retrying=True)
         return "stage_failed_will_retry"
+
+    def _carry_timed_out_review(self, task: Task, result: StageResult) -> None:
+        """Set up the next REVIEW after a timed-out one (#624): raise the task's REVIEW
+        budget to ``long`` and fold a digest of what this attempt ran into
+        ``Task.review_progress`` (appended to an earlier timeout's, newest kept on overflow).
+
+        The digest is read from the attempt's retained streams, which a timed-out dispatch
+        does not report back, so the paths are rebuilt from the dispatch's own (attempt,
+        cycle). Both steps are evented: ``review_budget_raised`` when the budget changed, and
+        ``review_progress_carried`` always, with ``carried: 0`` and a reason when there was
+        nothing to read (an interactive lane, or a stream that never got written)."""
+        previous = task.review_budget
+        if previous is not ReviewBudget.LONG:
+            task.review_budget = ReviewBudget.LONG
+            self.store.append_event(
+                task.run_id,
+                {"ts": _now(), "type": "review_budget_raised", "run_id": task.run_id,
+                 "task_id": task.task_id, "stage": Stage.REVIEW.value,
+                 "attempt": result.attempt,
+                 "from": previous.value if previous is not None else None,
+                 "to": ReviewBudget.LONG.value, "reason": "review_timed_out"},
+            )
+        cycle = task.review_cycles + task.test_fix_cycles
+        root = Path(self.store.root)
+        streams: list[tuple[str, str]] = []
+        unreadable = 0
+        for path in attempt_stream_paths(
+            root, task.task_id, Stage.REVIEW.value, result.attempt, cycle=cycle
+        ):
+            try:
+                text = path.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                unreadable += 1
+                continue
+            label = path.name.removesuffix(".stream.jsonl")
+            streams.append((label, text))
+        digest = review_progress_digest(streams)
+        text = str(digest["text"])
+        event: dict[str, object] = {
+            "ts": _now(), "type": "review_progress_carried", "run_id": task.run_id,
+            "task_id": task.task_id, "stage": Stage.REVIEW.value, "attempt": result.attempt,
+            "streams": len(streams), "unreadable_streams": unreadable,
+            "carried": digest["steps"], "dropped_steps": digest["dropped_steps"],
+            "notes": digest["notes"], "dropped_notes": digest["dropped_notes"],
+        }
+        if not text:
+            event["reason"] = "no_stream" if not streams else "nothing_recorded"
+            event["level"] = "warning"
+        else:
+            section = f"### Attempt {result.attempt}\n{text}"
+            combined = f"{task.review_progress}\n\n{section}" if task.review_progress else section
+            trimmed = 0
+            if len(combined) > _REVIEW_PROGRESS_MAX_CHARS:
+                trimmed = len(combined) - _REVIEW_PROGRESS_MAX_CHARS
+                combined = "[earlier progress cut]\n" + combined[trimmed:]
+            task.review_progress = combined
+            event["chars"] = len(combined)
+            event["trimmed_chars"] = trimmed
+        self.store.append_event(task.run_id, event)
+
+    @staticmethod
+    def _red_test_implicates_code(task: Task, result: StageResult, *, infra_only: bool) -> bool:
+        """Is this a red ENGINE-lane TEST the implementer should fix (#541)?
+
+        True only when the runner reached a verdict about the code: a run that never ran a
+        command reports no failures, and one that only timed out or could not start reports
+        ``infra`` alone. Those keep the ordinary same-stage retry, because the code was never
+        shown to be wrong. A task with no IMPLEMENT stage has nobody to send it to."""
+        if (
+            result.stage is not Stage.TEST
+            or result.status is not ResultStatus.FAILURE
+            or Stage.TEST not in task.deterministic_stages
+            or Stage.IMPLEMENT not in task.pipeline
+            or infra_only
+        ):
+            return False
+        out = result.structured_output or {}
+        return bool(out.get("failures")) and out.get("failure_kinds") != ["infra"]
 
     def _run_infra_reset(self, task: Task) -> str:
         """Shell the project's ``infra_reset`` command in the task's worktree
@@ -5172,6 +6010,19 @@ class Engine:
         except (OSError, subprocess.SubprocessError) as exc:
             return f"error ({type(exc).__name__})"
         return "ok" if proc.returncode == 0 else f"rc={proc.returncode}"
+
+    @staticmethod
+    def _runner_reported_infra(result: StageResult) -> bool:
+        """True when an ENGINE-lane TEST failed ONLY on infra (#642): the deterministic
+        runner records a command that timed out or could not start as a ``<label ...>``
+        failure with ``failure_kinds == ["infra"]``. Limited to the ENGINE lane because
+        there the runner, not a model, wrote ``failure_kinds``."""
+        if result.stage is not Stage.TEST:
+            return False
+        if result.lane_used.execution_mode is not ExecutionMode.ENGINE:
+            return False
+        out = result.structured_output or {}
+        return bool(out.get("failures")) and out.get("failure_kinds") == ["infra"]
 
     def _classify_failure(self, result: StageResult) -> list:
         """Run the project's failure classifier over a failed TEST result's output
@@ -5205,19 +6056,9 @@ class Engine:
         """One failed attempt's learning entry. Richer than a bare error string (the old
         system carried the stage trail + a log tail): the failing-test ids (kind-tagged
         when classified) and a bounded tail of the runner's output, so the retry starts
-        from the failure's substance instead of re-discovering it.
-
-        #298 — the vacuity-rejection asymmetry, closed here: a REVIEW rejection already
-        carries its blocking ``issues`` forward as learnings (``_apply_review_rejection``),
-        which is what makes the fix cycle converge. A TEST vacuity veto
-        (``_stage_gate``, ``tests_meaningful=false``) used to carry NOTHING: the gate
-        downgrades a SUCCESS to a FAILURE, so ``apply_result`` never absorbs the result's
-        outputs and ``validation_notes`` — the only channel naming *why* the attempt
-        rejected — was dropped. The retry then re-derived the diagnosis from scratch, or
-        (worse) passed on a second look and converted a caught vacuity into a shipped one.
-        So a TEST failure whose result explicitly self-reports ``tests_meaningful=false``
-        appends the prior ``validation_notes`` verbatim (bounded) plus the convergence
-        directive: close the named gap, treat already-confirmed coverage as settled."""
+        from the failure's substance instead of re-discovering it. A failed result's outputs
+        are never absorbed into the context, so a red TEST's ``validation_notes``, which carry
+        the runner's output tail, ride along here for the implementer (#541)."""
         lines = [f"{result.stage.value} (attempt {result.attempt}): {result.error or 'failed'}"]
         kind_by_test = {f.test: f.kind.value for f in classified}
         if isinstance(failures, list) and failures:
@@ -5251,45 +6092,17 @@ class Engine:
                 "not a code failure — consider resetting the test environment before "
                 "re-diagnosing the change itself."
             )
-        # #298: a TEST vacuity veto carries its reasoning forward, the way a REVIEW
-        # rejection carries its blocking issues. Bounded to the explicit self-report
-        # (never a missing/null tests_meaningful — #261 made the field tri-state) and to
-        # a non-empty string note, so no empty header is ever emitted.
-        notes = Engine._vacuity_notes(result)
-        if notes is not None:
-            clipped = notes[:1000]
-            suffix = "…" if len(notes) > 1000 else ""
-            lines.append(
-                f"  why the previous attempt rejected — prior validation_notes: "
-                f"{clipped}{suffix}"
-            )
-            lines.append(
-                "  CLOSE the specific gap those notes name — do not merely re-derive it. "
-                "Coverage the notes already confirm ADEQUATE is settled: do not redundantly "
-                "re-verify or re-mutation-test it."
-            )
+        notes = (result.structured_output or {}).get("validation_notes")
+        if result.stage is Stage.TEST and isinstance(notes, str) and notes.strip():
+            notes = notes.strip()
+            prefix = "…" if len(notes) > 1500 else ""
+            lines.append(f"  test run notes: {prefix}{notes[-1500:]}")
         tail = (result.raw_output or "").strip()
         if tail:
             clipped = tail[-500:]
             prefix = "…" if len(tail) > 500 else ""
             lines.append(f"  output tail: {prefix}{clipped}")
         return "\n".join(lines)
-
-    @staticmethod
-    def _vacuity_notes(result: StageResult) -> str | None:
-        """The prior attempt's ``validation_notes`` when — and only when — this failed
-        result is a TEST stage that explicitly self-reported ``tests_meaningful=false``
-        (#298). None for every other stage, for an absent/null tri-state field (#261), and
-        for absent/blank/non-string notes, so the caller emits no empty header."""
-        if result.stage is not Stage.TEST:
-            return None
-        out = result.structured_output or {}
-        if out.get("tests_meaningful") is not False:  # explicit self-report only
-            return None
-        notes = out.get("validation_notes")
-        if not isinstance(notes, str) or not notes.strip():
-            return None
-        return notes.strip()
 
     # --- human approval gate (design pass §4) ----------------------------------
     def hold_for_approval(self, run_id: str, task_id: str, what: str) -> Task:
@@ -6641,16 +7454,21 @@ class Engine:
 
         refreshed_at = _now()
         new_title, new_body = spec.title, spec.body
+        # Read outside the task lock, like the source call above: this runs project code.
+        fresh_inference = (
+            self._infer_claims(new_title, new_body) if task.scope_files_inferred else None
+        )
         new_fingerprint = diff["new_fingerprint"]
         # The diff/guards above ran on a PRE-LOCK read, and the source round-trip between
         # them and the write is long enough for a scheduler tick to dispatch this very task.
         # Both are therefore re-decided inside the mutator against the doc actually being
         # overwritten, and ``applied_diff`` (not the pre-lock one) is what the event reports.
         applied_diff = diff
-        reinferred: ClaimDeclaration | None = None
+        reinferred: _InferredClaims | None = None
+        keep_open_label: str | None = None
 
         def _refresh(t: Task) -> None:
-            nonlocal applied_diff, reinferred
+            nonlocal applied_diff, reinferred, keep_open_label
             # Re-validate under the lock (#311's shape): raising here aborts the transaction
             # before any event append or doc write, so a refused refresh leaves no trace but
             # the caller's error — same outcome as the pre-check, just race-free.
@@ -6669,6 +7487,13 @@ class Engine:
             t.title = new_title
             t.body = new_body
             t.labels = [str(label) for label in (getattr(spec, "labels", None) or [])]
+            # #613: a keep-open label added since registration counts from here on. Only ever
+            # on: removing the label does not reopen the question, and a person's explicit
+            # choice is not the label's to overrule.
+            if not t.keep_issue_open and not t.keep_issue_open_pinned:
+                keep_open_label = self._keep_open_label(t.labels)
+                if keep_open_label is not None:
+                    t.keep_issue_open = True
             t.spec_fingerprint = new_fingerprint
             t.spec_source_updated_at = source_updated_at
             # ``spec_captured_at`` moves too: it dates the copy the prompts render from,
@@ -6679,10 +7504,10 @@ class Engine:
             # #428: claims GUESSED from the old text follow the new text, but only until
             # the gate has admitted the task — a held claim never changes, so a refresh can
             # neither hand back a path mid-task nor grab one another task is waiting for.
-            if t.scope_files_inferred and t.file_claim_acquired_at is None:
-                reinferred = infer_claims_from_text(new_title, new_body)
-                t.scope_files = list(reinferred.claims)
-                t.scope_file_modes = {}
+            if fresh_inference is not None and t.file_claim_acquired_at is None:
+                reinferred = fresh_inference
+                t.scope_files = list(reinferred.declaration.claims)
+                t.scope_file_modes = dict(reinferred.declaration.modes)
 
         # #199 pattern: commit the doc mutation and its audit event as one unit under the
         # per-task lock, so a refreshed snapshot can never exist without its event. The
@@ -6701,6 +7526,9 @@ class Engine:
             }] + (
                 _claims_inferred_events(run_id, task_id, reinferred, ts=refreshed_at)
                 if reinferred is not None else []
+            ) + (
+                [_keep_issue_open_event(run_id, task_id, keep_open_label, ts=refreshed_at)]
+                if keep_open_label is not None else []
             ),
         )
         report["applied"] = True
@@ -6994,6 +7822,19 @@ class Engine:
             if test_out.get("test_scope"):
                 task_status["test_scope"] = test_out["test_scope"]
                 task_status["tests_selected"] = test_out.get("tests_selected")
+            # #541: REVIEW's verdict on the tests, with how many mutations back it, so a pass
+            # nobody proved is visible without opening the stage log.
+            review_rec = task.stages.get(Stage.REVIEW)
+            review_out = (review_rec.output if review_rec is not None else None) or {}
+            if "tests_meaningful" in review_out:
+                task_status["tests_meaningful"] = review_out["tests_meaningful"]
+                task_status["proving_mutations"] = proving_mutation_count(review_out)
+                # #614: and how many survived, split by whether one opened a fix cycle.
+                survivors = surviving_mutant_disposition(review_out)
+                task_status["surviving_mutations"] = (
+                    len(survivors.blocking) + len(survivors.noted)
+                )
+                task_status["blocking_mutations"] = len(survivors.blocking)
             if task.quality_tier is not None:
                 task_status.update({
                     "agent_role": task.agent_role,
@@ -7003,6 +7844,9 @@ class Engine:
                         if task.implementation_budget is not None else None
                     ),
                 })
+            # #624: a raised REVIEW limit (pinned, or after a timeout) is visible in status.
+            if task.review_budget is not None:
+                task_status["review_budget"] = task.review_budget.value
             if task.decomposition_children:
                 task_status["decomposition"] = {
                     "mapping": task.decomposition_mapping,
@@ -7519,6 +8363,10 @@ class Engine:
         # PR with which review cycle re-pushed it (best-effort comment; never load-bearing).
         if task.review_cycles:
             ctx.setdefault("review_cycles", task.review_cycles)
+        # #613: the deterministic DELIVER runner writes `Part of #N` and repairs the PR. Only
+        # when set, so every other task's context stays byte-identical.
+        if task.keep_issue_open:
+            ctx["keep_issue_open"] = True
         # #216: at INTAKE, compose the tree of every COMPLETED DAG dependency into the
         # dependent's worktree. The edge only ORDERS execution; without this the dependent
         # is branched off the run base and its per-PR gate never sees a sibling's shared
@@ -7624,7 +8472,7 @@ class Engine:
         out: dict[str, str] = {}
         for label, getter in (
             ("install", self.project.install_cmd),
-            ("test (unit)", self.project.test_unit_cmd),
+            (_UNIT_SUITE_LABEL, self.project.test_unit_cmd),
             # e2e/shell were declared on the adapter but invisible to prompts — the
             # model could never learn the project HAS an e2e suite. Optional (getattr):
             # a minimal adapter without them still works.
@@ -7840,6 +8688,21 @@ class Engine:
             )
         if state == "MERGED" and not expected_sha:
             reasons.append("MERGED PR cannot be tied to this run without a DELIVER checkpoint")
+        # #613: the DELIVER gate saw the PR body as it stood then; anything that rewrote it
+        # later (a review-stage edit) could bring the keyword back. Report-only, as all of
+        # this check is: the task has already completed.
+        if task.keep_issue_open and task.issue_number is not None:
+            closing, problem = self._read_closing_issues(task_source, task.pr_url)
+            if closing is None:
+                self.store.append_event(
+                    run_id,
+                    {"ts": _now(), "type": "deliver_keep_open_unverified", "level": "warning",
+                     "run_id": run_id, "task_id": task.task_id, "checked_at": "completion",
+                     "issue_number": task.issue_number, "pr_url": task.pr_url,
+                     "error": problem},
+                )
+            elif veto := keep_open_violation(task.issue_number, closing):
+                reasons.append(veto)
         payload = {
             "ts": _now(),
             "type": "completion_pr_invalid" if reasons else "completion_pr_validated",

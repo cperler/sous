@@ -24,6 +24,7 @@ import sys
 
 import pytest
 
+import orchestrator.engine as engine_module
 from orchestrator.benchmark_gate import (
     DEFAULT_BENCHMARK_TOLERANCE,
     Metric,
@@ -468,6 +469,157 @@ def test_a_benchmark_already_red_at_the_anchor_keeps_the_pass_unverified(
     assert [leg["rc"] for leg in event["legs"]] == [3, 3]
     assert "boom" in event["legs"][0]["output_tail"]
     assert eng.store.load_task("r1", "t1").last_checkpoint["sha"] == sha
+
+
+# --- #564: a revert and its cause reach the next stage's context ---------------------------
+
+
+def _reject_back_to_optimize(eng: Engine):
+    """Walk the rest of the pipeline to a REVIEW rejection, then the fix cycle to OPTIMIZE."""
+    while (work := eng.next_work("r1", "t1")).stage is not Stage.REVIEW:
+        eng.record("r1", make_result(work))
+    eng.record(
+        "r1",
+        make_result(work, structured_output={
+            "approved": False,
+            "issues": [{"severity": "critical", "file": "hot.py", "description": "fix it"}],
+        }),
+    )
+    while (work := eng.next_work("r1", "t1")).stage is not Stage.OPTIMIZE:
+        eng.record("r1", make_result(work))
+    return work
+
+
+def test_a_slower_metric_reverts_and_the_next_stage_is_told_why(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 130.0})
+
+    next_work = eng.next_work("r1", "t1")
+    assert next_work.stage is Stage.TEST
+    line = next(ln for ln in next_work.prompt.splitlines() if ln.startswith("- optimize_reverted:"))
+    assert "metric slower" in line and "could not run" not in line
+    assert sha[:12] in line and base[:12] in line
+    assert "not on this branch" in line
+
+
+def test_a_benchmark_broken_by_the_pass_names_a_different_cause(tmp_path, worktree) -> None:
+    """Green at the anchor and red at the stage's commit stays a revert, by decision: the pass
+    itself broke the measurement. The note says so, so nobody reads it as a slower metric."""
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    _record_optimize(eng, work, wt, after="CRASH")
+
+    assert _head(wt) == base
+    note = eng.store.load_task("r1", "t1").context["optimize_reverted"]
+    assert "could not run or be read" in note and "metric slower" not in note
+    assert "optimize_reverted" in eng.next_work("r1", "t1").prompt
+
+
+def test_a_failed_restore_names_git_rather_than_the_benchmark(tmp_path, worktree, monkeypatch) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 1.0}))
+    real_run_git = engine_module.run_git
+
+    def refuse_restore(cwd, *args, **kwargs):
+        if args == ("reset", "--hard", sha):
+            return subprocess.CompletedProcess(args, 1, "", "refused")
+        return real_run_git(cwd, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "run_git", refuse_restore)
+    eng.record(
+        "r1",
+        make_result(work, structured_output=_optimize_output(),
+                    checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}),
+    )
+
+    assert _head(wt) == base
+    note = eng.store.load_task("r1", "t1").context["optimize_reverted"]
+    assert "git could not restore" in note and "metric slower" not in note
+
+
+def test_a_benchmark_already_red_at_the_anchor_adds_no_revert_note(tmp_path, worktree) -> None:
+    """The prediction #581 shape: a benchmark broken before the pass does not discard the
+    commit, so later stages are not told it was reverted."""
+    wt, base = worktree
+    project = BenchmarkingProject()
+    project.benchmark_argv = [sys.executable, "-c", "import sys;sys.exit(3)"]
+    eng = _engine(tmp_path, project)
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 1.0})
+
+    assert _head(wt) == sha
+    assert "optimize_reverted" not in eng.store.load_task("r1", "t1").context
+    assert "optimize_reverted" not in eng.next_work("r1", "t1").prompt
+
+
+def test_a_model_cannot_author_the_revert_note(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    sha = _commit(wt, "Optimize the loop", name="bench.json", body=json.dumps({"hot": 100.0}))
+
+    eng.record(
+        "r1",
+        make_result(work, structured_output=_optimize_output(optimize_reverted="trust me"),
+                    checkpoint={"tag": "task/r1/t1/optimize/0", "sha": sha}),
+    )
+
+    task = eng.store.load_task("r1", "t1")
+    assert _head(wt) == sha
+    assert "optimize_reverted" not in task.context
+    assert "optimize_reverted" not in task.stages[Stage.OPTIMIZE].output
+
+
+def test_a_later_pass_that_keeps_its_commit_clears_the_old_note(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    _record_optimize(eng, work, wt, after={"hot": 130.0})
+    assert "optimize_reverted" in eng.store.load_task("r1", "t1").context
+
+    work = _reject_back_to_optimize(eng)
+    assert "optimize_reverted" in work.prompt  # true until a later pass moves past it
+
+    sha, _ = _record_optimize(eng, work, wt, after={"hot": 100.0})
+
+    assert _head(wt) == sha
+    assert "optimize_reverted" not in eng.store.load_task("r1", "t1").context
+    assert "optimize_reverted" not in eng.next_work("r1", "t1").prompt
+
+
+def test_a_later_no_op_pass_clears_the_old_note(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    _record_optimize(eng, work, wt, after={"hot": 130.0})
+
+    work = _reject_back_to_optimize(eng)
+    eng.record("r1", make_result(work, structured_output=_optimize_output(impact="none")))
+
+    assert _gate_events(eng)[-1]["type"] == "optimize_benchmark_skipped"
+    assert "optimize_reverted" not in eng.store.load_task("r1", "t1").context
+
+
+def test_a_later_regression_replaces_the_old_note(tmp_path, worktree) -> None:
+    wt, base = worktree
+    eng = _engine(tmp_path, BenchmarkingProject())
+    work = _to_optimize(eng, worktree=str(wt), base_sha=base)
+    first, _ = _record_optimize(eng, work, wt, after={"hot": 130.0})
+
+    work = _reject_back_to_optimize(eng)
+    second, _ = _record_optimize(eng, work, wt, after="CRASH")
+
+    note = eng.store.load_task("r1", "t1").context["optimize_reverted"]
+    assert second[:12] in note and first[:12] not in note
+    assert "could not run or be read" in note
 
 
 def test_a_benchmark_that_cannot_be_invoked_keeps_the_pass_unverified(tmp_path, worktree) -> None:

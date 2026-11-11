@@ -22,7 +22,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from pathlib import Path
 
 from .status_store import safe_task_dirname
@@ -55,10 +55,11 @@ def stream_basename(
     survives too — the first call (K=0) keeps the bare name, so the 99%-no-retry case is
     unchanged, and a phase-less (single-call) dispatch names files exactly as it always did.
 
-    A review fix cycle (#546) re-opens IMPLEMENT→…→REVIEW with fresh stage records, so each
-    re-run stage starts again at attempt 0; ``cycle`` (``Task.review_cycles`` at dispatch)
-    inserts ``.cycle<C>`` after the attempt so the re-run never overwrites the earlier
-    pass's files. Cycle 0 keeps the pre-#546 name."""
+    A fix cycle (#546 review, #541 red TEST) re-opens IMPLEMENT→…→REVIEW with fresh stage
+    records, so each re-run stage starts again at attempt 0; ``cycle``
+    (``Task.review_cycles + Task.test_fix_cycles`` at dispatch) inserts ``.cycle<C>`` after
+    the attempt so the re-run never overwrites the earlier pass's files. Cycle 0 keeps the
+    pre-#546 name."""
     stem = f"{stage_value}-attempt{attempt}"
     if cycle:
         stem = f"{stem}.cycle{cycle}"
@@ -455,6 +456,143 @@ def probe_current_stream(
     if p is None:
         return None
     return probe_stream(p, tail_lines=tail_lines, max_line_chars=max_line_chars)
+
+
+# --- what a timed-out attempt had already done (#624) ------------------------------------
+# A timed-out stage returns no structured output, so everything a long REVIEW learned was
+# reachable only by reading its retained stream by hand (prediction#1365 lost two attempts'
+# findings that way). These helpers turn that stream into a bounded digest the retry is
+# given, so it continues instead of starting over. Parse only, like the rest of the module.
+
+_DIGEST_MAX_STEPS = 40
+_DIGEST_MAX_RESULT_CHARS = 400
+_DIGEST_MAX_NOTES = 5
+_DIGEST_MAX_NOTE_CHARS = 600
+_DIGEST_MAX_INPUT_CHARS = 300
+
+
+def attempt_stream_paths(
+    run_root: str | Path, task_id: str, stage_value: str, attempt: int, *, cycle: int = 0
+) -> list[Path]:
+    """Every retained stream of ONE stage attempt: the base call plus any review-panel
+    ``.<phase>`` and schema-retry ``.retry<K>`` sub-calls, in a stable (name) order. Files of
+    another cycle or attempt are excluded by parsing the name, never by prefix alone, since
+    ``review-attempt1`` is also a prefix of ``review-attempt1.cycle2``."""
+    d = stages_dir(run_root, task_id)
+    if not d.is_dir():
+        return []
+    cands = d.glob(f"{stage_value}-attempt{attempt}*.stream.jsonl")
+    return sorted(p for p in cands if _attempt_of(p)[:2] == (cycle, attempt))
+
+
+def _tool_result_text(content: object) -> str:
+    """The text of a claude ``tool_result`` block's ``content`` (a string or text blocks)."""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        return "\n".join(
+            str(c.get("text")) for c in content
+            if isinstance(c, dict) and isinstance(c.get("text"), str)
+        )
+    return ""
+
+
+def _clip(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[:limit] + f"… [{len(text) - limit} chars cut]"
+
+
+def _stream_steps(text: str) -> tuple[list[dict[str, str]], list[str]]:
+    """``(steps, notes)`` from one provider stream: each tool call the model made with its
+    result (claude ``tool_use``/``tool_result`` pairs, codex ``command_execution`` items), in
+    order, and the model's own prose turns. A call whose result never arrived (the one the
+    timeout killed) keeps an empty result."""
+    steps: list[dict[str, str]] = []
+    by_id: dict[str, dict[str, str]] = {}
+    notes: list[str] = []
+    for ev in _iter_stream_objects(text):
+        kind = ev.get("type")
+        if kind == "assistant":
+            prose = _assistant_text(ev)
+            if prose is not None:
+                notes.append(prose)
+            for block in (ev.get("message") or {}).get("content") or []:
+                if not (isinstance(block, dict) and block.get("type") == "tool_use"):
+                    continue
+                raw_input = block.get("input")
+                detail = _pick_detail(raw_input) if isinstance(raw_input, dict) else None
+                step = {"tool": str(block.get("name") or "tool")[:_MAX_TOOL],
+                        "input": detail or "", "result": ""}
+                steps.append(step)
+                if isinstance(block.get("id"), str):
+                    by_id[block["id"]] = step
+        elif kind == "user":
+            for block in (ev.get("message") or {}).get("content") or []:
+                if not (isinstance(block, dict) and block.get("type") == "tool_result"):
+                    continue
+                answered = by_id.get(str(block.get("tool_use_id")))
+                if answered is not None:
+                    prefix = "[error] " if block.get("is_error") else ""
+                    answered["result"] = prefix + _tool_result_text(block.get("content"))
+        elif kind == "item.completed" and isinstance(ev.get("item"), dict):
+            item = ev["item"]
+            if item.get("type") == "command_execution":
+                result = str(item.get("aggregated_output") or "")
+                if item.get("exit_code") not in (None, 0):
+                    result = f"[exit {item.get('exit_code')}] {result}"
+                steps.append({"tool": "command", "input": str(item.get("command") or ""),
+                              "result": result})
+            elif item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+                notes.append(item["text"])
+    return steps, notes
+
+
+def review_progress_digest(
+    streams: Sequence[tuple[str, str]],
+    *,
+    max_steps: int = _DIGEST_MAX_STEPS,
+    max_result_chars: int = _DIGEST_MAX_RESULT_CHARS,
+    max_notes: int = _DIGEST_MAX_NOTES,
+) -> dict[str, object]:
+    """A bounded digest of what a timed-out attempt had done, from its ``(label, text)``
+    streams (#624). Pure: the caller reads the files.
+
+    Keeps the most RECENT ``max_steps`` tool calls across all streams (the latest work is
+    the closest to a verdict) with each input and result clipped, and the last ``max_notes``
+    prose turns. Returns ``{"text", "steps", "dropped_steps", "notes", "dropped_notes"}``;
+    ``text`` is ``""`` when the streams held no tool call and no prose, and a non-empty
+    ``dropped_*`` count says what the bounds cut, so nothing is lost silently."""
+    steps: list[dict[str, str]] = []
+    notes: list[str] = []
+    for label, text in streams:
+        s, n = _stream_steps(text)
+        for step in s:
+            step["label"] = label
+        steps.extend(s)
+        notes.extend(n)
+    dropped_steps = max(0, len(steps) - max_steps)
+    kept = steps[dropped_steps:]
+    dropped_notes = max(0, len(notes) - max_notes)
+    kept_notes = notes[dropped_notes:]
+    if not kept and not kept_notes:
+        return {"text": "", "steps": 0, "dropped_steps": dropped_steps, "notes": 0,
+                "dropped_notes": dropped_notes}
+    labels = {step["label"] for step in kept}
+    lines: list[str] = []
+    if kept:
+        omitted = f"; {dropped_steps} earlier step(s) omitted" if dropped_steps else ""
+        lines.append(f"What it ran, oldest first{omitted}:")
+        for i, step in enumerate(kept, 1):
+            where = f" ({step['label']})" if len(labels) > 1 else ""
+            call = _clip(step["input"], _DIGEST_MAX_INPUT_CHARS)
+            lines.append(f"{i}. {step['tool']}{where}: {call}")
+            result = _clip(step["result"], max_result_chars)
+            lines.append(f"   result: {result}" if result else "   result: (none: cut off)")
+    if kept_notes:
+        lines.append("Its last notes:")
+        lines.extend(f"- {_clip(note, _DIGEST_MAX_NOTE_CHARS)}" for note in kept_notes)
+    return {"text": "\n".join(lines), "steps": len(kept), "dropped_steps": dropped_steps,
+            "notes": len(kept_notes), "dropped_notes": dropped_notes}
 
 
 # --- the tail CLI's read/follow helpers --------------------------------------------------

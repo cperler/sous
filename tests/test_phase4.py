@@ -132,7 +132,7 @@ def _headless_engine(tmp_path) -> tuple[Engine, Registry]:
 def test_headless_run_target_completes_in_process(tmp_path) -> None:
     eng, reg = _headless_engine(tmp_path)
     eng.create_run("r1")
-    eng.add_task("r1", "t1")
+    eng.add_task("r1", "t1", deterministic_stages=())
     status = Scheduler(eng, max_concurrent=1).run("r1", registry_runner(reg))
 
     assert status["tasks"]["t1"]["state"] == "completed"
@@ -155,13 +155,13 @@ def test_conformance_interactive_equals_headless(tmp_path) -> None:
 
     eng_i = Engine(StatusStore(di), CostLedger(di / "c.jsonl"), FakeProject())  # default = interactive
     eng_i.create_run("r")
-    eng_i.add_task("r", "t1")
+    eng_i.add_task("r", "t1", deterministic_stages=())
     while (w := eng_i.next_work("r", "t1")) is not None:
         eng_i.record("r", make_result(w))  # interactive simulated runner
 
     eng_h, reg = _headless_engine(dh)
     eng_h.create_run("r")
-    eng_h.add_task("r", "t1")
+    eng_h.add_task("r", "t1", deterministic_stages=())
     Scheduler(eng_h, max_concurrent=1).run("r", registry_runner(reg))
 
     assert _trajectory(eng_i, "r", "t1") == _trajectory(eng_h, "r", "t1")

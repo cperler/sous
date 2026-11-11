@@ -25,7 +25,7 @@ from orchestrator.cost_ledger import CostLedger
 from orchestrator.engine import Engine
 from orchestrator.schemas.enums import Stage
 from orchestrator.status_store import StatusStore
-from tests.conftest import FakeProject, make_result
+from tests.conftest import REVIEW_PROOF, FakeProject, make_result
 
 
 def _proc(returncode: int, stdout: str = "", stderr: str = "") -> subprocess.CompletedProcess:
@@ -67,6 +67,8 @@ def test_red_lint_blocks_and_carries_the_output(tmp_path, monkeypatch) -> None:
     # The reviewer (and the fix cycle's learnings) must see WHAT failed, not just that it did.
     assert "F401 unused import" in f["description"]
     assert "uv run ruff check ." in f["description"]
+    # #591: the whole output goes to the engine to compare against base.
+    assert f["gate_leg"] == "ruff (lint)" and "F401" in f["gate_output"]
 
 
 def test_red_types_blocks_independently_of_lint(tmp_path, monkeypatch) -> None:
@@ -110,6 +112,13 @@ def test_no_worktree_is_silent(worktree, monkeypatch) -> None:
     assert cfg.review_findings(worktree=worktree) == []
 
 
+def test_gate_output_is_not_capped_like_the_description(tmp_path, monkeypatch) -> None:
+    # Comparing only the tail against base would hide a new finding in the part cut off.
+    noise = "\n".join(f"file{i}.py:1: error: something" for i in range(400))
+    cfg = _config(monkeypatch, {"ruff": _proc(0), "mypy": _proc(1, noise)})
+    assert "file0.py:1" in cfg.review_findings(worktree=str(tmp_path))[0]["gate_output"]
+
+
 # --- the payoff: the engine overrides an approving reviewer ---------------------------
 
 def test_red_gate_overrides_an_approving_review(tmp_path, monkeypatch) -> None:
@@ -139,3 +148,29 @@ def test_red_gate_overrides_an_approving_review(tmp_path, monkeypatch) -> None:
     assert "mypy" in task.learnings[-1]
     events = [e for e in eng.store.read_events("r1") if e["type"] == "policy_findings_merged"]
     assert events and events[0]["blocking"] == 1
+
+
+def test_selfhost_gate_does_not_block_on_ruff_error_already_at_base(tmp_path, monkeypatch) -> None:
+    """End to end through the real adapter: the error was recorded at INTAKE, so an approving
+    review stands."""
+    cfg = _config(monkeypatch, {
+        "ruff": _proc(1, "a.py:9:1: E722 bare\nFound 1 error."), "mypy": _proc(0),
+    })
+
+    class _Project(FakeProject):
+        def review_findings(self, *, worktree=None):  # noqa: ANN001, ARG002
+            return cfg.review_findings(worktree=str(tmp_path))
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), _Project())
+    eng.create_run("r1")
+    eng.add_task("r1", "t1")
+    for _ in range(5):
+        w = eng.next_work("r1", "t1")
+        output = {"branch": "task/t1", "worktree": str(tmp_path), "baseline_captured": True,
+                  "baseline_lint": ["a.py: E722 bare"]} if w.stage is Stage.INTAKE else None
+        eng.record("r1", make_result(w, structured_output=output))
+    w = eng.next_work("r1", "t1")
+    out = eng.record("r1", make_result(w, structured_output={
+        "approved": True, "issues": [], **REVIEW_PROOF,
+    }))
+    assert out["outcome"] == "task_completed"

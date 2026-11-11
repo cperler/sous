@@ -43,18 +43,6 @@ def test_review_prompt_requires_an_explicit_filing_disposition() -> None:
     assert "retrospective ({title, detail, target?}" in prompt
 
 
-def test_test_prompt_probes_hazards_the_implementer_summary_does_not_name() -> None:
-    """#392: TEST derives its meaningfulness probes from the diff, not the implementer's summary.
-
-    Evidence (ff-v1-b19 #94): the TEST stage's mutation list mirrored IMPLEMENT's own
-    summary, so a real coverage gap outside that list was only found at REVIEW.
-    """
-    prompt = STAGE_SPECS[Stage.TEST].template
-    assert "`git diff <base_sha>..HEAD`" in prompt
-    assert "NOT from the implementer's `summary` above" in prompt
-    assert "behavior the diff changes that the summary does NOT mention" in prompt
-
-
 def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> None:
     prompt = STAGE_SPECS[Stage.DELIVER].template
     assert "gh pr view <url> --json state,headRefName,baseRefName" in prompt
@@ -80,10 +68,10 @@ def test_adapters_expose_schema_for() -> None:
 # The payoff: codex full-validation now runs against the REAL canonical schema.
 def test_codex_validates_against_canonical_schema() -> None:
     runner = CodexRunner(
-        transport=lambda w: RawResult(structured_output={"passed": True, "failures": []}),
+        transport=lambda w: RawResult(structured_output={"passed": True}),
         schema_provider=load_stage_schema,  # the engine's canonical schemas
     )
-    # missing the required `tests_meaningful` -> SCHEMA_VIOLATION (schema-enforced test gate)
+    # missing the required `failures` -> SCHEMA_VIOLATION
     assert runner.dispatch(_wi("test")).status is ResultStatus.SCHEMA_VIOLATION
 
 
@@ -97,34 +85,50 @@ def test_codex_accepts_schema_conformant_output() -> None:
     assert runner.dispatch(_wi("test")).status is ResultStatus.SUCCESS
 
 
-def test_codex_accepts_a_null_tests_meaningful_but_not_an_omission() -> None:
-    """#261: `null` is the schema-blessed "I could not judge this" answer (what the
-    deterministic ENGINE-lane runner reports), so it must VALIDATE — while the key staying in
-    `required` keeps a codex model that simply OMITS the judgment a SCHEMA_VIOLATION. Both
-    halves matter: the honest abstention must be expressible without weakening the guarantee.
-    """
-    schema = load_stage_schema("test")
-    assert "tests_meaningful" in schema["required"]  # omission is still a contract violation
+def test_review_requires_a_verdict_and_a_mutation_record_but_may_answer_null() -> None:
+    """#541: tests_meaningful and mutation_checks are REVIEW's required output, so a reviewer
+    that omits them fails the schema before the engine's proof gate ever has to. `null` stays
+    the expressible "no verdict" answer for a change with no test surface."""
+    schema = load_stage_schema("review")
     validator = Draft202012Validator(schema)
-    assert not list(validator.iter_errors({"passed": True, "failures": [],
-                                           "tests_meaningful": None}))
-    for judged in (True, False):
-        assert not list(validator.iter_errors({"passed": True, "failures": [],
-                                               "tests_meaningful": judged}))
-    assert list(validator.iter_errors({"passed": True, "failures": [],
-                                       "tests_meaningful": "maybe"}))  # still typed
+    base = {"approved": True, "issues": []}
+    assert list(validator.iter_errors(base))
+    assert list(validator.iter_errors({**base, "tests_meaningful": True}))
+    assert list(validator.iter_errors({**base, "mutation_checks": []}))
+    assert not list(validator.iter_errors({**base, "tests_meaningful": None, "mutation_checks": []}))
+    check = {"mutation": "a.py:1 drop the guard", "failed_tests": ["t::x"]}
+    assert not list(validator.iter_errors({**base, "tests_meaningful": True,
+                                           "mutation_checks": [check]}))
+    assert list(validator.iter_errors({**base, "tests_meaningful": "maybe",
+                                       "mutation_checks": []}))  # still typed
+    assert list(validator.iter_errors({**base, "tests_meaningful": True,
+                                       "mutation_checks": [{"mutation": "a.py:1"}]}))
+    # The finder contract declares the fields but requires none: only find:tests emits them.
+    findings = load_stage_schema("review_findings")
+    assert {"tests_meaningful", "mutation_checks", "tests_not_checked_reason"} <= set(
+        findings["properties"]
+    )
+    assert "tests_meaningful" not in findings["required"]
+
+
+def test_the_test_schema_no_longer_carries_the_verdict() -> None:
+    schema = load_stage_schema("test")
+    assert "tests_meaningful" not in schema["required"]
+    assert "tests_meaningful" not in schema["properties"]
     runner = CodexRunner(
-        transport=lambda w: RawResult(
-            structured_output={"passed": True, "failures": [], "tests_meaningful": None}
-        ),
+        transport=lambda w: RawResult(structured_output={"passed": True, "failures": []}),
         schema_provider=load_stage_schema,
     )
     assert runner.dispatch(_wi("test")).status is ResultStatus.SUCCESS
-    # The review-side contracts accept the same abstention (the fold emits null when no
-    # find:tests lens judged it).
-    for ref in ("review", "review_findings"):
-        prop = load_stage_schema(ref)["properties"]["tests_meaningful"]
-        assert prop["type"] == ["boolean", "null"]
+
+
+def test_scaffold_schema_copies_match_the_canonical_ones() -> None:
+    from pathlib import Path
+
+    for ref in ("review", "review_findings", "test"):
+        assert (Path("templates/project-default/schemas") / f"{ref}.json").read_text() == (
+            Path("orchestrator/schemas/stages") / f"{ref}.json"
+        ).read_text()
 
 
 def test_codex_rejects_wrong_type_against_canonical() -> None:
@@ -186,3 +190,21 @@ def test_default_outputs_satisfy_their_schemas() -> None:
         schema = load_stage_schema(STAGE_SPECS[stage].schema_ref)
         errors = list(Draft202012Validator(schema).iter_errors(_default_output(stage)))
         assert not errors, f"{stage.value} default output violates its schema: {errors}"
+
+
+def test_review_schemas_accept_the_survivor_blocking_fields_and_the_old_shape() -> None:
+    """#614: `blocking`/`blocking_reason` are optional on a mutation_checks item, in the
+    single-reviewer contract and the find:tests finder contract alike."""
+    base = {"approved": True, "issues": [], "tests_meaningful": True}
+    old = {"mutation": "a.py:1 drop the guard", "failed_tests": []}
+    new = {**old, "blocking": True, "blocking_reason": "the spec requires it"}
+    for ref, wrap in (("review", lambda c: {**base, "mutation_checks": [c]}),
+                      ("review_findings", lambda c: {"findings": [], "mutation_checks": [c]})):
+        validator = Draft202012Validator(load_stage_schema(ref))
+        assert not list(validator.iter_errors(wrap(old)))
+        assert not list(validator.iter_errors(wrap(new)))
+        assert list(validator.iter_errors(wrap({**old, "blocking": "yes"})))
+        assert list(validator.iter_errors(wrap({**old, "blocking_reason": 3})))
+        item = load_stage_schema(ref)["properties"]["mutation_checks"]["items"]
+        assert {"blocking", "blocking_reason"} <= set(item["properties"])
+        assert "blocking" not in item["required"]

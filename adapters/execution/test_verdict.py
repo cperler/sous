@@ -13,9 +13,8 @@ in-process model lanes (headless×claude, any×codex) hand every TEST result to
   ``passed``/``failures`` are replaced by that run's, and a red run downgrades the stage
   to a FAILURE carrying the real failures, so a misreported green can never pass TEST;
 - a model result that TIMED OUT over a clean worktree is settled by the declared run: a
-  green run becomes a SUCCESS with ``tests_meaningful`` null (not judged — REVIEW's
-  independent test-validate judges it, #13/#261) instead of a retry that would time out
-  the same way. A dirty worktree or a red run leaves the timeout as it was;
+  green run becomes a SUCCESS instead of a retry that would time out the same way. A dirty
+  worktree or a red run leaves the timeout as it was;
 - every other status passes through untouched.
 
 The model's tokens, session and stream evidence stay on the result: only the verdict
@@ -61,12 +60,7 @@ def verify_test_verdict(
 def _check_success(work: WorkItem, raw: RawResult, run: TestRun) -> tuple[RawResult, ResultStatus]:
     model_out = dict(raw.structured_output or {})
     run_out = run.out or {}
-    # The runner's own "meaningfulness not judged" line would contradict the model's
-    # judgment, which this result keeps — drop it from the merged notes.
-    run_notes = "; ".join(
-        part for part in str(run_out.get("validation_notes") or run.error or "").split("; ")
-        if not part.startswith("tests_meaningful not judged")
-    )
+    run_notes = str(run_out.get("validation_notes") or run.error or "")
     model_notes = str(model_out.get("validation_notes") or "").strip()
     merged = {
         **model_out,
@@ -104,11 +98,10 @@ def _settle_timeout(work: WorkItem, raw: RawResult, run: TestRun) -> tuple[RawRe
     if not run.ok:
         return raw, ResultStatus.TIMEOUT
     run_out = dict(run.out or {})
-    run_out["tests_meaningful"] = None  # nobody judged it; REVIEW's test-validate will
     run_out["validation_notes"] = (
         "The model TEST stage timed out; the verdict is the engine's run of the project's "
         "declared test commands over the worktree it left (clean, every change committed). "
-        "Meaningfulness was not judged at TEST. " + _VERIFIED_PREFIX
+        + _VERIFIED_PREFIX
         + str(run_out.get("validation_notes") or "")
     )
     run_out.pop("change_class", None)  # an ENGINE-lane fold key; this is a model-lane result

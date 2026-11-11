@@ -3,12 +3,35 @@
   "title": "review",
   "description": "Stage output contract: the PR was reviewed against the task goal and code quality.",
   "type": "object",
-  "required": ["approved", "issues"],
+  "required": ["approved", "issues", "tests_meaningful", "mutation_checks"],
   "properties": {
     "approved": {"type": "boolean"},
     "tests_meaningful": {
       "type": ["boolean", "null"],
-      "description": "independent test-validate verdict (#13): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false rejects the review even when approved — the reviewer is a different agent from the one that wrote the tests, which is the point. Answer it whenever there are tests to read; omit it (or answer null) ONLY when the change has genuinely no test surface. An absent/null answer fails OPEN but is recorded as 'not judged' — never as a pass — and is evented (test_validation_skipped) when the TEST stage did not judge it either (#261)"
+      "description": "independent test-validate verdict (#13/#541): do the change's tests meaningfully exercise it (would they fail if it regressed)? An explicit false rejects the review even when approved. REVIEW is the only stage that judges this. true needs a mutation_checks entry that failed a test, or a tests_not_checked_reason. null means no verdict: only for a change with genuinely no test surface or a check nothing could settle, with tests_not_checked_reason saying why. An approval with neither proof nor reason is sent back by the engine; one with a reason passes and is evented (test_validation_skipped), never recorded as proven"
+    },
+    "mutation_checks": {
+      "type": "array",
+      "description": "#541: the mutations this review applied to prove tests_meaningful (empty when none was run). A structured record, so a missing check is visible rather than hidden behind a pass",
+      "items": {
+        "type": "object",
+        "required": ["mutation", "failed_tests"],
+        "properties": {
+          "mutation": {"type": "string", "description": "file:line and what was changed"},
+          "failed_tests": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "ids of the tests that failed on this mutation; empty means it survived"
+          },
+          "blocking": {"type": "boolean", "description": "#614: whether this SURVIVED mutation (empty failed_tests) opens a fix cycle. The engine, not the reviewer, acts on it: true only when the mutation sits on behaviour the task spec requires or on a guard the project marks money-path/safety, and it needs a non-blank blocking_reason naming which, or the engine demotes it (evented). Every other survivor is reported once as a noted gap in non_blocking, never as a blocking issue. Defaults to false. Ignored on a mutation that failed a test"},
+          "blocking_reason": {"type": "string", "description": "#614: required when blocking is true: the spec requirement or money-path/safety guard this survivor falls on. A blocking survivor with no reason is demoted to a noted gap"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "tests_not_checked_reason": {
+      "type": "string",
+      "description": "#541: why no mutation settled tests_meaningful (no behavioral test surface, an inconclusive workspace, a lane with no disposable workspace). Accepted in place of proof and evented as unproven"
     },
     "workspace_origin": {
       "type": "string",

@@ -14,6 +14,7 @@ import re
 import subprocess
 from collections.abc import Callable
 
+from adapters.github_closing_refs import closing_numbers
 from adapters.project.task_discussion import append_discussion
 from orchestrator.ports.project import TaskSpec
 
@@ -264,6 +265,18 @@ class GitHubIssuesSource:
             "merged_at": data.get("mergedAt"),
             "draft": data.get("isDraft"),
         }
+
+    def closing_issue_numbers(self, pr_url: str) -> list[int]:
+        """The issue numbers in this repo that merging ``pr_url`` would close (#613), as
+        GitHub reports them, so a keyword in any form and a manual link both count.
+
+        Its own ``gh pr view`` rather than a field on ``_PR_VIEW_FIELDS``: a ``gh`` too old
+        for this field must cost one keep-open check, not ``describe_pr`` and the completion
+        evidence of every task. Raises when the answer cannot be read, which the engine
+        reports as unverified.
+        """
+        raw = self._run(["gh", "pr", "view", pr_url, "--json", "closingIssuesReferences"])
+        return closing_numbers(json.loads(raw).get("closingIssuesReferences"), self.repo)
 
     def mark_complete(self, task_id: str, pr_url: str | None = None) -> None:
         num = _issue_number(task_id)

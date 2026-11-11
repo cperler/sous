@@ -92,7 +92,8 @@ def build_registry(
     ``run_log_root`` (the run's status/log dir) wires the #56 stream-teeing wrapper around
     the auto-built provider transports, so each headless/codex call's full raw stdout/stderr
     is retained under ``stages/<task>/`` for post-mortems. It is ignored for an explicitly
-    injected transport (tests wrap their own) and when None (no run dir — no teeing).
+    injected transport (tests wrap their own) and when None (no run dir — no teeing). It
+    also holds the intake runner's shared baseline cache (#553); None => no sharing.
     """
     reg = Registry()
     if include_interactive:
@@ -152,7 +153,10 @@ def build_registry(
     if setup_project is not None:
         from .deterministic_setup import DeterministicSetupRunner
 
-        reg.register_runner(DeterministicSetupRunner(setup_project))
+        # #553: the run dir persists the shared intake baseline cache across subcommands.
+        reg.register_runner(
+            DeterministicSetupRunner(setup_project, baseline_cache_dir=run_log_root)
+        )
     else:
         reg.register_external(
             CapabilityDescriptor(

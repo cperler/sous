@@ -27,6 +27,7 @@ from .enums import (
     ImplementationBudget,
     Provider,
     QualityTier,
+    ReviewBudget,
     RunState,
     Stage,
     StageStatus,
@@ -227,6 +228,9 @@ class Task(_StatusModel):
     agent_role: str | None = None
     quality_tier: QualityTier | None = None
     implementation_budget: ImplementationBudget | None = None
+    # Per-task REVIEW wall-clock budget (#624): an add-task / batch-plan pin, or ``long``
+    # once a REVIEW attempt timed out. Additive field: older task docs load with None.
+    review_budget: ReviewBudget | None = None
     # Per-task model pin (#84): a canonical model id (e.g. "claude-fable-5") that overrides the
     # role default on a model-lane stage so a brainstorm/heavy-architecture task runs on a higher
     # tier. Resolved + provider-validated at add_task (an alias like "fable" is normalized to the
@@ -266,12 +270,19 @@ class Task(_StatusModel):
     # (#33) without flipping the global default for every project — the SAME routing
     # decision (→ ENGINE lane) as intake, just sourced from the task (mirrors how the
     # pipeline itself became per-task in schema v2). Empty by default on the model; add_task
-    # fills it from the lane preset (#68 — micro/lite default to deterministic TEST/DELIVER,
-    # FULL keeps model TEST/DELIVER), so a hand-built/loaded doc keeps exactly its stored set.
+    # fills it from the lane preset (#68/#541 — every preset defaults to deterministic TEST,
+    # micro/lite to deterministic DELIVER too), so a hand-built/loaded doc keeps exactly its
+    # stored set. An empty set is an explicit choice of model stages, and it persists.
     deterministic_stages: tuple[Stage, ...] = ()
     # Optional pre-stage human checkpoint (#71). The task is parked before this stage
     # until that exact gate identity is approved. Additive for backward compatibility.
     hold_before: Stage | None = None
+    # #613: this task's PR is part of its issue, not the end of it, so DELIVER writes
+    # ``Part of #N`` and the engine refuses a PR that would close the issue on merge.
+    # Persisted because every CLI subcommand rebuilds the Engine from defaults. ``_pinned``
+    # records that a person chose the value, so a later label refresh cannot overrule it.
+    keep_issue_open: bool = False
+    keep_issue_open_pinned: bool = False
     # Identity of the currently pending checkpoint; approval consumes and clears it.
     pending_approval_what: str | None = None
     # Checkpoint identities released for this task. Dispatch additionally requires the
@@ -297,13 +308,20 @@ class Task(_StatusModel):
     # whole-context ceiling can evict a key, which would silently un-serialize a run.
     # ``scope_file_modes`` (#426) is the per-path edit mode SCOPE declared, stored ONLY for
     # the non-default (append) paths: an absent entry means ``rewrite``, so a pre-#426 doc
-    # and a task that declared no modes both contend on every path exactly as before.
+    # and a task that declared no modes both contend on every path exactly as before. A path
+    # the adapter's ``parallel_safe_paths`` globs match is stored as append whatever SCOPE
+    # wrote (#628), and that move is evented as ``file_claim_mode_relaxed``.
     # ``scope_files_inferred`` (#428) marks ``scope_files`` as GUESSED from the issue text
     # at registration rather than declared by an approved SCOPE: a pipeline with no SCOPE
     # stage (micro, lite, a decomposition child) has no other source of claims, and without
     # one it would neither wait for nor block anybody. The flag tells a status reader a
     # guess from a declaration, and lets ``refresh_spec`` re-guess before the claim is held.
     # Additive fields: pre-#377 task docs load with the defaults, so no SCHEMA_VERSION bump.
+    # ``baseline_lint`` (#591) is what the declared lint/type tools already reported at
+    # ``base_sha``, as location-free fingerprints (``orchestrator.policy_gate``). REVIEW blocks
+    # only on findings not listed here. Empty means none, or never captured; either way every
+    # finding reads as new, so a missing baseline blocks exactly as it did before #591.
+    baseline_lint: list[str] = Field(default_factory=list)
     scope_files: list[str] = Field(default_factory=list)
     scope_file_modes: dict[str, str] = Field(default_factory=dict)
     scope_files_inferred: bool = False
@@ -326,6 +344,10 @@ class Task(_StatusModel):
     # improvement fixup that re-opens implement→…→review increments this; at the engine's
     # max_review_cycles the task parks BLOCKED_ON_HUMAN instead of looping forever.
     review_cycles: int = 0
+    # Count of times a red ENGINE-lane TEST re-opened implement→…→review (#541). Retrying that
+    # TEST would re-run identical code, so a regression goes back to the implementer instead;
+    # this bounds those trips at ``max_attempts - 1``, after which the task fails.
+    test_fix_cycles: int = 0
     # Fingerprints (file:description, normalized) of the LAST rejection's blocking
     # issues — the convergence key (#15): a re-review whose issues are a subset of
     # these (no net-new findings, none critical) has converged and auto-approves.
@@ -338,6 +360,23 @@ class Task(_StatusModel):
     # ``file`` requests from reviews a fix cycle superseded (#546) — kept here for the same
     # reason as ``review_fixups``: the REVIEW record they came from was reset. Additive.
     carried_review_filings: list[CarriedReviewFiling] = Field(default_factory=list)
+    # The surviving mutations whose blocking findings opened the LAST review fix cycle (#614):
+    # the verbatim ``mutation`` strings, so the re-review is told to re-apply exactly these
+    # instead of sampling a fresh set (which is how correct code cycled). Set by a rejection,
+    # cleared by an approval. Additive: older task docs load with an empty list.
+    open_mutants: list[str] = Field(default_factory=list)
+    # What a timed-out REVIEW attempt had already run (#624): a bounded digest of its commands
+    # and their results, read from the retained stream, so the next REVIEW continues rather
+    # than re-reads everything. Rendered into REVIEW's prompt only; cleared once a REVIEW
+    # returns a result. Additive: older task docs load with None.
+    review_progress: str | None = None
+    # The commit the rejecting REVIEW looked at (#564): ``last_checkpoint.sha`` when a review
+    # re-opened implement→…→review. A fix cycle's OPTIMIZE classifies only the files changed
+    # since this commit, so a cycle that touched only tests does not re-pay for the first
+    # cycle's source change. None = no review fix cycle yet (diff from ``base_sha``). A later
+    # review overwrites it; a TEST fix cycle leaves it, which only widens the range.
+    # Additive: older task docs load with None.
+    review_fix_base_sha: str | None = None
     last_error: str | None = None
     # The WorkItem currently dispatched for this task (validates the returned result).
     pending_work_item_id: str | None = None
@@ -373,6 +412,11 @@ class Task(_StatusModel):
     # retry (#59); consumed by next_work to SUPPRESS the pre-dispatch checkpoint reset so
     # the retry inherits the work. Transient — cleared when the dispatch is committed.
     salvage_in_place: bool = False
+    # #642: set when the deterministic TEST runner reported only an infra failure (a test
+    # command timed out or could not start). The retry then waits until no other task is
+    # running TEST, because the usual cause is concurrent suites overloading the host.
+    # Read by ``dispatchable``/``next_work``; cleared when the TEST is dispatched again.
+    test_wait_for_quiet: bool = False
     # Provider session chaining (design pass §2): set from a SUCCESSFUL StageResult's
     # session_ref, cleared on failure (a failed attempt's context is as likely poisoned
     # as useful — warm retry is deliberately OFF; the eval bench can revisit). Routing

@@ -236,7 +236,7 @@ def test_same_provider_codex_ref_is_reused(tmp_path, project) -> None:
 
     eng = _engine(tmp_path, project)
     eng.create_run("r1", ExecutionLane.FULL)
-    eng.add_task("r1", "t1", provider_tag="codex")
+    eng.add_task("r1", "t1", provider_tag="codex", deterministic_stages=())
     eng.record("r1", make_result(eng.next_work("r1", "t1")))  # intake
     eng.record("r1", make_result(eng.next_work("r1", "t1"), session_ref="c-scope"))  # scope(claude)
     implement = eng.next_work("r1", "t1")

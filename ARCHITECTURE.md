@@ -88,6 +88,11 @@ written.
   adversarial verifier refutes a finding by running the suite. Panel finders/verifiers inherit
   it. `--disallowedTools` is genuinely enforced (the tool is absent from the toolset, not merely
   prompted), independent of the permission gate below.
+  **IMPLEMENT** carries `ToolPolicy.denied_commands` naming the project's declared unit-suite
+  command (#626), because TEST runs it next and waiting on it here caused IMPLEMENT timeouts.
+  Claude translates it to `Bash(<command>)`, which refuses the bare, piped and wrapped forms and
+  leaves targeted runs alone. Codex has no per-command flag, so there the rule is prompt-only and
+  `tool_policy_unenforced` says so (`CapabilityDescriptor.enforces_command_denials`).
 - **REVIEW execution isolation** (#301). Every in-process headless REVIEW transport call runs
   in an independent throwaway local clone seeded with the live worktree payload (including
   ignored dependencies and dirty state, excluding its linked `.git`). The clone has its own
@@ -107,9 +112,9 @@ written.
   bare `python -c` import puts the workspace's cwd first on `sys.path` and so passes while the
   runner imports a sibling worktree — the false green observed live. When
   it declares neither, the skip is now stated to the reviewer in-band (#390) alongside a standing
-  posture that a revert/mutation check the reviewer runs itself CORROBORATES the TEST stage's
-  reported result rather than adjudicating it — an unattributable sandbox result is inconclusive,
-  not a `tests_meaningful: false`. #411 made that in-band block an ORDERING rather than a
+  posture that a mutation check the reviewer runs there is only evidence once the runner is shown
+  to import this checkout — an unattributable sandbox result is inconclusive (recorded in
+  `tests_not_checked_reason`), not a `tests_meaningful: false`. #411 made that in-band block an ORDERING rather than a
   caveat: the runner probe runs FIRST, before any command whose result the review relies on,
   because twenty-odd further retrospectives showed a check framed as a fallback gets skipped
   on a run where nothing looks anomalous. The reviewer reports the outcome as `workspace_origin`
@@ -216,6 +221,9 @@ so its cost and failures are visible without restoring the old opaque quality lo
   never read like one that passed — and the completion note's heading comes off that block's
   real `reverted` flag, so it cannot print "REVERTED" over a commit still on the branch. The
   model's own `measurements` stay in the output as profiling detail and decide nothing.
+  A confirmed revert also folds an engine-written `optimize_reverted` line into the context
+  later stages read (the commit, and why: metric slower vs benchmark broken at that commit),
+  and the next pass that reports no revert, or a non-code skip, clears it (#564).
   Because the opt-in inserts OPTIMIZE into EVERY task's pipeline, a task that changed only
   non-code files would still pay a high-effort dispatch to hear `impact: none`. So at
   dispatch time `next_work` reads the task's own change (`base_sha`..worktree — `base_sha`
@@ -247,6 +255,42 @@ so its cost and failures are visible without restoring the old opaque quality lo
   completion-time PR check (`completion_pr_invalid`) stays as the backstop for what
   this cannot see, such as a PR closed or retargeted after DELIVER.
 
+- **IMPLEMENT's limit follows the task's budget (#615).** `Task.implementation_budget` is pinned
+  by a plan field or `add-task --implementation-budget`, set by a decomposition child, or raised
+  to `long` by SCOPE's own sizing when nothing pinned it (the pure fold returns a notice; the
+  engine emits `implementation_budget_set`). `engine.implement_timeout_s` maps it at dispatch:
+  `short` 900s, `long` max(3600s, project default), otherwise the adapter's optional
+  `implement_timeout_s` or the stage spec's 1800s. An unusable adapter value is evented as
+  `implement_timeout_rejected`.
+
+- **REVIEW's limit follows the task's budget and the diff (#624).** `Task.review_budget` is
+  pinned by a plan field or `add-task --review-budget`. `engine.review_timeout_s` maps it at
+  dispatch: `long` is max(1800s, project default), `standard` is the adapter's optional
+  `review_timeout_s` or the stage spec's 600s, and an unpinned task whose diff (the engine's own
+  `git diff --numstat`, never a model's report) has 1500+ changed lines gets `long`. A limit
+  other than the spec's is evented as `review_timeout_set`. A REVIEW TIMEOUT raises the budget
+  to `long` (`review_budget_raised`) and reads the attempt's retained streams into a bounded
+  digest of the commands it ran and their results (`stream_probe.review_progress_digest`),
+  stored on `Task.review_progress` and rendered only into later REVIEW prompts until a REVIEW
+  returns (`review_progress_carried`, with `carried: 0` and a reason when there was nothing to
+  read). A REVIEW that times out on its last attempt parks BLOCKED_ON_HUMAN as
+  `review_timed_out_held` instead of failing the task: no verdict is not a rejected change.
+
+- **A keep-open task's PR must not close its issue (#613).** `Task.keep_issue_open` is set from a
+  plan field, an `add-task` flag, or the adapter's optional `keep_open_labels` (an explicit value
+  wins and is pinned against a later label refresh; a refresh can only turn a label's match on).
+  Both DELIVER lanes then write `Part of #N`. A prose instruction did not hold, so the check is
+  structural: the engine-lane runner reads `closingIssuesReferences` back and repairs the PR body,
+  and for every lane the engine reads the same answer through the task source's optional
+  `closing_issue_numbers` hook before absorbing a SUCCESS DELIVER. A hit fails the stage
+  (warning-grade `deliver_keep_open_violated`), so the ordinary retry re-dispatches DELIVER with
+  the reason as learnings. A clean read emits `deliver_keep_open_verified`; a read that cannot run
+  leaves the stage green with a warning-grade `deliver_keep_open_unverified`. Completion checks
+  again and reports a hit through `completion_pr_invalid`, for a body rewritten after DELIVER.
+  Decomposition children do not inherit the setting: each child's PR closes its own new issue, and
+  no PR names the parent's. Closing keywords in commit messages are not covered: GitHub honors them
+  at merge, and only the PR description gets repaired.
+
 - **Who writes which docstrings (#382).** IMPLEMENT owns design rationale (why a choice was
   made). DELIVER's `docstring` agent owns API description (contracts, and refreshing docs
   the diff made stale). This needs no prompt text: in 156 post-#381 tasks, IMPLEMENT wrote
@@ -261,21 +305,69 @@ so its cost and failures are visible without restoring the old opaque quality lo
 - **Deterministic stage executors** run on the `engine×none` lane — no model, $0. Intake
   (`deterministic_setup.py`) creates the worktree/branch, reports any uncommitted work a
   REUSED worktree inherited from a previous, dead run (#385 — report-only: never reset,
-  never adopted), and captures the test baseline; `deterministic_test.py` runs the suite and
+  never adopted), and captures the test baseline — once per run for every task that starts
+  from the same clean tree, keyed on (HEAD tree after #216 dep composition, `test_unit_cmd`
+  argv, lockfile hash) and persisted under `<run dir>/baseline-cache/` (#553,
+  `baseline_cache.py`; a reused baseline's note says `reused from #N at tree …`,
+  `ORCHESTRATOR_NO_BASELINE_CACHE` opts out). A red base with at most five parsed failures
+  re-runs just those ids once (#607, only when `test_unit_cmd(ids)` narrows); ones that pass
+  move to `baseline_flaky`, the rest stay in `baseline_failures`, and the cached entry
+  carries the split so sharers inherit it. Deterministic TEST records a failure in
+  `baseline_flaky` as flaky, never caused;
+  `deterministic_test.py` runs the suite and
   classifies failures; `deterministic_deliver.py`
   pushes and opens/reuses the PR. Mechanical work is scripts, not model calls (an LLM asked
   to run `git worktree add` answers in prose and fails schema validation).
+- **TEST is mechanical; REVIEW judges the tests (#541).** TEST runs on the ENGINE lane by default
+  on every lane, FULL included: `LANE_DETERMINISTIC_STAGES` is resolved onto `Task` at `add_task`,
+  decomposition children inherit the parent's set, and a task (`--deterministic-stages none`) or a
+  project (`model_test_stage = True`) can opt back into a model TEST. The runner cannot fix what it
+  finds and retrying it re-runs identical code, so a red run that reached a verdict re-opens
+  IMPLEMENT with the failing ids and output tail as a learning (`test_failed_fix_cycle`, at most
+  `max_attempts - 1` per task, then the task fails). A run that only timed out or could not start
+  (`failure_kinds == ["infra"]`, or no output) keeps the same-stage retry, since the code was
+  never shown to be wrong. Whether the tests mean anything is REVIEW's required output:
+  `tests_meaningful` plus `mutation_checks` (which mutation, which tests failed on it). For a
+  panel, only `find:tests` may report them, and that lens stays on the trivial-diff rung.
+  `state_machine.review_proof_gate` sends an approval on a change with a test surface back for
+  another review unless it has a boolean verdict with a mutation that failed a test or a stated
+  `tests_not_checked_reason`; a stated reason is evented as `test_validation_skipped`
+  (`not_judged`/`unproven`), and `status` shows the verdict and how many mutations back it. A
+  docs-only change or a pipeline with no TEST stage is exempt, as is a `none`-tier child, which has
+  no REVIEW and so no verdict. Interactive REVIEW has no disposable copy, so it is told not to
+  mutate and to state that as the reason.
+- **A surviving mutant has a stopping rule (#614).** Each review samples different mutations,
+  so treating every survivor as a blocking finding re-opened implement→…→review per round on
+  code that was correct every time. A `mutation_checks` entry the tests missed opens a fix
+  cycle only when the reviewer marks it `blocking: true` with a `blocking_reason` naming the
+  spec-required behaviour or money-path/safety guard it falls on; the pure
+  `state_machine.surviving_mutant_disposition` decides, and `Engine._dispose_surviving_mutants`
+  applies it at the same seam as the policy-findings merge, before the verdict is read: a
+  qualifying survivor becomes an `important` issue (`source: mutation_check`) that forces
+  `approved=false`, a flag with no reason is demoted and evented (`surviving_mutant_demoted`),
+  and every other survivor joins `non_blocking` once as a `drop` entry, deduped by fingerprint
+  against what the reviewer already listed. `surviving_mutants_disposed` is the receipt. The
+  rejection persists the blocking survivors' verbatim mutation text on `Task.open_mutants`; the
+  re-review prompt (single reviewer and the `find:tests` lens) carries a "Named survivors to
+  re-check" block telling it to re-apply those first, an approval clears the list, and a
+  re-review whose `mutation_checks` match none of them is evented `named_survivor_unchecked`
+  (report-only). `status` adds `surviving_mutations` / `blocking_mutations` beside
+  `proving_mutations`.
 - **The declared commands decide a model TEST's verdict.** On the in-process model lanes
   (headless×claude, any×codex), `test_verdict.py` re-runs the ENGINE lane's evaluation
   (`DeterministicTestRunner.evaluate`) after the model: a claimed green that the declared
   commands fail becomes a FAILURE with the real failures, and a timeout over a clean
-  worktree is settled by a green declared run (`tests_meaningful` null, left to REVIEW)
-  instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
+  worktree is settled by a green declared run instead of a retry. The cell advertises this as `verifies_test_verdict`, and only then
   does the TEST prompt tell the model to skip whole-suite runs. Motivated by a model that
   ran a parallel-declared suite serially and timed out green code twice. Up to five failing
   unit tests are re-run once (narrowed via `test_unit_cmd(failed)` when the adapter honors
   it, else the whole unit command); failures that do not reproduce are recorded as
-  `flaky_failures` with a `test_flaky_failures_cleared` notice, not counted against the change.
+  `flaky_failures` with a `test_flaky_failures_cleared` notice (`reason: passed_on_rerun`, or
+  `known_flaky_at_base` for a `baseline_flaky` test TEST never re-ran), not counted against the change.
+  The re-run clears them on exit 0, or on a non-zero exit whose parsed failures are all in the
+  baseline (#618). A non-zero exit that parses nothing, or any parsed failure outside the
+  baseline, stays caused. An unnarrowed suite that stops early (`-x`) can stop at a baseline
+  failure before reaching the flaky test; a narrowed re-run has no such gap.
 - **Impacted-only TEST (#558).** An adapter may declare `impacted_tests(changed)` (and
   `test_global_paths`); `orchestrator/test_selection.py` then narrows the unit command to
   `test_unit_cmd(files)` for the tests mapped from the task's diff. Every case it cannot
@@ -349,7 +441,15 @@ never satisfy.
   `max_review_cycles`). Convergence auto-approval (`_review_verdict`): a re-review whose
   blocking issues are a subset of the prior rejection's — no net-new findings — ends the
   loop. Deterministic project policy findings merge in via the `review_findings` hook (#65)
-  and force `approved=false`. An improvement — or a non-blocking finding (#414) —
+  and force `approved=false`, but only for problems the task caused (#591,
+  `orchestrator/policy_gate.py`). INTAKE records what lint and typecheck already report at
+  base as `Task.baseline_lint`, and `_merge_policy_findings` blocks only on findings not in
+  it; the inherited ones are noted, not filed. A red benchmark re-runs once, records load and
+  CPU count on every outcome (`policy_gate_result` event), and blocks only when red twice on
+  a machine that was not overloaded; otherwise it is an `inconclusive` advisory. The engine
+  also passes the task's changed files to a hook that accepts `changed_files` (#634), and
+  when the adapter declares `bench_paths` (profile.toml `[bench] paths`) and the change
+  touches none of them, the benchmark is not run and the record says `skipped`. An improvement — or a non-blocking finding (#414) —
   dispositioned `fixup` uses the same bounded tail reset after REVIEW, carrying the
   requests into IMPLEMENT and re-running delivery on the existing PR; ONE cycle serves the
   whole batch, so a handful of nits cannot exhaust `max_review_cycles`. The task retains
@@ -567,19 +667,28 @@ never satisfy.
   independent additions to one file can at worst conflict textually, which is loud and
   cheap. "Append-only" is a claim about the EDIT, not the file, so the classification comes
   from SCOPE and never from a path glob the engine owns: a glob list would be
-  project-specific policy inside a project-agnostic engine, and belongs to the project
-  adapter if anywhere. `rewrite` is the default in every direction — a bare string, an
-  absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
-  `rewrite` — so the rule can only ever be relaxed by an explicit, well-formed claim, and
-  `scope_file_modes` stores only the non-default entries. `events_audit`'s `contention`
-  block reports what the gate actually cost a run (deferrals, distinct tasks deferred, the
-  most-contended paths, and how many deferrals held an append-only waiter), so the
+  project-specific policy inside a project-agnostic engine. The exception is the adapter's
+  own list (#628): SCOPE almost never declared `append`, even for a doc it only added a
+  section to, so about 11 of 20 hours of contention waiting across 61 runs were
+  markdown-only. The optional `parallel_safe_paths()` hook returns globs (selfhost: `*.md`),
+  and a declared or inferred claim on a matching path is stored as `append` whatever SCOPE
+  wrote, at the SCOPE fold or at registration. Each move is evented as
+  `file_claim_mode_relaxed` (path, glob, source), and an unusable hook or entry as
+  `parallel_safe_paths_rejected`, which relaxes nothing. A `rewrite` on a path the globs do
+  not match still serializes. `rewrite` is otherwise the default in every direction — a bare
+  string, an absent mode, a pre-#426 task doc, and a mode the engine could not parse all mean
+  `rewrite` — so the rule can only be relaxed by an explicit, well-formed claim or an
+  adapter glob, and `scope_file_modes` stores only the non-default entries.
+  `events_audit`'s `contention` block reports what the gate actually cost a run (deferrals,
+  distinct tasks deferred, the most-contended paths, how many deferrals held an append-only
+  waiter, and which paths were relaxed), so the
   strictness stays re-judgeable from any finished run instead of by hand-grepping
   `events.jsonl` — #377 shipped deliberately over-strict pending exactly that data, and
   `docs/reviews/2026-08-29-file-contention-measurement.md` records the first read of it. A
   task whose pipeline has no SCOPE stage (the `micro`/`lite` presets, a decomposition child)
   gets a model-free guess instead (#428): `add_task` runs `infer_claims_from_text` over the
-  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims,
+  issue title and body, keeps the repo-relative file paths it names as `rewrite` claims
+  (unless an adapter glob relaxes them),
   marks them `scope_files_inferred`, and records a `file_claims_inferred` receipt (empty
   when the text names no file). `refresh_spec` re-guesses until the claim is held. The guess
   only knows what the text names and the gate matches exact paths, so a miss leaves that

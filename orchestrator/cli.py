@@ -479,7 +479,9 @@ def main(argv: list[str] | None = None) -> int:
                     help="per-task provider routing tag (the old '82:codex' tag)")
     at.add_argument("--deterministic-stages", default=None,
                     help="comma-separated stages to run on the $0 ENGINE lane instead of a "
-                         "model (e.g. 'test,deliver'); intake is always deterministic (#33)")
+                         "model (e.g. 'test,deliver'), or 'none' to run the preset's "
+                         "deterministic stages on a model, such as a model TEST (#541); "
+                         "intake is always deterministic (#33)")
     at.add_argument("--estimate", default=None,
                     help="rough size hint (small/medium/large or a USD number) — feeds "
                          "cost-aware lane routing on a route-by-cost run (#34)")
@@ -495,6 +497,23 @@ def main(argv: list[str] | None = None) -> int:
                          "on model-lane stages; translated per lane (claude --effort, codex "
                          "model_reasoning_effort). Honored by the capacity downshift like "
                          "--model pins")
+    at.add_argument("--keep-issue-open", action=argparse.BooleanOptionalAction, default=None,
+                    help="merging this task's PR does not finish its issue: DELIVER writes "
+                         "'Part of #N' and refuses a PR that would close it (#613). "
+                         "--no-keep-issue-open overrides a keep-open label; omitted follows "
+                         "the project's keep-open labels")
+    at.add_argument("--implementation-budget", default=None,
+                    choices=["standard", "short", "long"],
+                    help="per-task IMPLEMENT wall-clock budget (#615): 'long' gives a large "
+                         "task 60 minutes instead of the project default (30 unless the "
+                         "adapter sets implement_timeout_s), 'short' 15. Persisted on the "
+                         "task and wins over SCOPE's own sizing; omitted, SCOPE may raise it")
+    at.add_argument("--review-budget", default=None, choices=["standard", "long"],
+                    help="per-task REVIEW wall-clock budget (#624): 'long' gives a large "
+                         "change 30 minutes instead of the project default (10 unless the "
+                         "adapter sets review_timeout_s); 'standard' turns off diff-size "
+                         "scaling. Persisted on the task; omitted, a diff of 1500+ changed "
+                         "lines is reviewed on the long limit")
     at.add_argument("--max-filed-followups", type=int, default=None,
                     help="per-task cap on how many non-blocking review findings are FILED as "
                          "follow-up issues (#191); overrides the engine-wide default for a task "
@@ -1683,21 +1702,34 @@ def main(argv: list[str] | None = None) -> int:
             [d.strip() for d in args.depends_on.split(",") if d.strip()]
             if args.depends_on else None
         )
+        det_arg = getattr(args, "deterministic_stages", None)
         det = (
-            [Stage(s.strip()) for s in args.deterministic_stages.split(",") if s.strip()]
-            if getattr(args, "deterministic_stages", None) else None
+            None if det_arg is None
+            else [Stage(s.strip()) for s in det_arg.split(",")
+                  if s.strip() and s.strip().lower() != "none"]
         )
         task = eng.add_task(args.run, args.task, pipeline=pipeline,
                             depends_on=deps, provider_tag=args.provider_tag,
                             deterministic_stages=det, estimate=args.estimate,
                             model=args.model, effort=args.effort,
-                            max_filed_followups=args.max_filed_followups)
+                            max_filed_followups=args.max_filed_followups,
+                            keep_issue_open=args.keep_issue_open,
+                            implementation_budget=args.implementation_budget,
+                            review_budget=args.review_budget)
         _emit({"added_task": task.task_id, "title": task.title,
                "pipeline": [s.value for s in task.pipeline],
                "deterministic_stages": [s.value for s in task.deterministic_stages],
                "execution_lane": task.execution_lane.value,
                "depends_on": task.depends_on, "provider_tag": task.provider_tag,
-               "model_pin": task.model_pin, "effort_pin": task.effort_pin})
+               "model_pin": task.model_pin, "effort_pin": task.effort_pin,
+               "keep_issue_open": task.keep_issue_open,
+               "implementation_budget": (
+                   task.implementation_budget.value
+                   if task.implementation_budget is not None else None
+               ),
+               "review_budget": (
+                   task.review_budget.value if task.review_budget is not None else None
+               )})
     elif args.cmd == "next":
         # Deterministic stages (intake setup, and any TEST/DELIVER a pipeline opted into
         # the ENGINE lane — #33) run in-process — drain them here so the interactive

@@ -330,6 +330,10 @@ def test_capacity_notice_channels_are_asymmetric() -> None:
         "test (attempt 0): failed\n"
         "  output tail: You've hit your session limit · resets 3:50pm (America/New_York)"
     )
+    assert kb.is_capacity_notice(
+        "simplify (attempt 0): failed\n"
+        "  output tail: You've hit your 5-hour limit · resets 2:10pm (America/New_York)"
+    )
     # (b) the status word as the head line's error text
     assert kb.is_capacity_notice('deliver (attempt 0): rate-limited (429 too many requests)')
     # (c) the same, distilled by the retrospective

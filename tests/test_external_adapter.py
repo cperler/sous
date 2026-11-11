@@ -177,7 +177,7 @@ def test_cli_drives_a_task_end_to_end_on_a_project_owned_adapter(
         return json.loads(out) if out and out != "null" else None
 
     run("init-run", "--lane", "full")
-    run("add-task", "--task", "T1")
+    run("add-task", "--task", "T1", "--deterministic-stages", "none")
     recorded = []
     for _ in range(10):  # safety bound
         work = run("next", "--task", "T1")

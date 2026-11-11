@@ -86,7 +86,7 @@ def test_cost_router_bands_and_nudge() -> None:
     # below FULL, prefer $0 deterministic TEST/DELIVER for whatever the preset runs
     assert set(r.route(0.10).deterministic_stages) == {Stage.TEST, Stage.DELIVER}
     assert set(r.route(0.04).deterministic_stages) == {Stage.DELIVER}  # micro has no TEST
-    assert r.route(1.0).deterministic_stages == ()  # FULL: none forced
+    assert r.route(1.0).deterministic_stages == (Stage.TEST,)  # FULL keeps a model DELIVER
     # a LARGE estimate nudges one band cheaper — but never past the top band
     assert r.route(0.10, estimate="large").lane is ExecutionLane.MICRO
     assert r.route(1.0, estimate="large").lane is ExecutionLane.FULL
@@ -280,10 +280,10 @@ def test_routing_decision_overrides_lane_preset_deterministic_default(tmp_path) 
     # stages come from the ROUTING DECISION, and that wins over the lane preset default.
     # These two only diverge when a lane is pinned explicitly (otherwise effective_lane
     # collapses to the routed lane and both sources compute the same value), so pin FULL —
-    # whose preset default is NO deterministic stages — while a thin budget routes the
-    # pipeline to LITE. The task ends up with $0 TEST/DELIVER from the decision, proving the
-    # decision beat FULL's () preset default.
-    assert LANE_DETERMINISTIC_STAGES[ExecutionLane.FULL] == ()  # FULL preset default: none forced
+    # whose preset default is TEST alone — while a thin budget routes the pipeline to LITE.
+    # The task ends up with $0 TEST/DELIVER from the decision, proving the decision beat FULL's
+    # preset default.
+    assert LANE_DETERMINISTIC_STAGES[ExecutionLane.FULL] == (Stage.TEST,)
     eng = _engine(tmp_path)
     eng.create_run("r1", ExecutionLane.FULL, budget_usd=1.0, route_by_cost=True)
     eng.add_task("r1", "t1")
@@ -292,7 +292,7 @@ def test_routing_decision_overrides_lane_preset_deterministic_default(tmp_path) 
 
     t2 = eng.add_task("r1", "t2", ExecutionLane.FULL)  # explicit FULL lane, but budget is thin
     assert t2.pipeline == LANE_STAGES[ExecutionLane.LITE]  # routing still downgrades the pipeline
-    # the decision's {TEST, DELIVER} won over FULL's () preset default (rung 2 > rung 3)
+    # the decision's {TEST, DELIVER} won over FULL's preset default (rung 2 > rung 3)
     assert set(t2.deterministic_stages) == {Stage.TEST, Stage.DELIVER}
     ev = [e for e in eng.store.read_events("r1") if e["type"] == "lane_routed"
           and e["task_id"] == "t2"]

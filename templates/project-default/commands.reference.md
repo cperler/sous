@@ -24,15 +24,25 @@ puts it on `typecheck_cmd` and leaves `types_cmd` a no-op. Mapping `typecheck` �
 
 Notes:
 - **`bench`** (optional, no stack default) generates `benchmark_cmd()` (#529). The generated
-  REVIEW gate runs it after lint/typecheck: rc 0 passes, rc 1 is a BLOCKING finding carrying
-  the output tail (the timings), and any other rc, a timeout (1800s) or a failure to start
-  is an advisory UNVERIFIED finding, never green. The engine's OPTIMIZE gate (#520) runs the
+  REVIEW gate runs it after lint/typecheck and records the load average and CPU count with
+  every result. rc 0 passes. rc 1 re-runs once and blocks only if both runs are rc 1 on a
+  machine that was not overloaded (1-minute load below the CPU count); otherwise it is an
+  advisory `inconclusive` that is not filed as an issue (#591). Any other first-run rc, a
+  timeout (1800s) or a failure to start is an advisory UNVERIFIED finding, never green. A red
+  benchmark can therefore take two runs inside REVIEW. The engine's OPTIMIZE gate (#520) runs the
   same argv before and after the speed pass and needs rc 0 and a ONE-LINE JSON metrics object
   as the last stdout line, so a benchmark that pretty-prints multi-line JSON needs a compact
   mode. It reverts the pass only on a measured regression (or a benchmark the change broke);
   a pass that leaves the numbers flat is kept. Without `bench` the method is the no-op,
   neither gate runs, and an OPTIMIZE commit is kept marked UNVERIFIED. `benchmark_tolerance`
   is not generated, so the OPTIMIZE gate uses its 5% noise band.
+- **`lint` and `typecheck` at base** (#591): INTAKE runs both at `base_sha` and records what
+  they report. REVIEW blocks only on findings that record does not contain, and reports the
+  rest as an advisory that is not filed. Findings are matched without their line numbers, and
+  a second copy of an inherited error counts as new. Output the gate cannot read blocks, so a
+  tool it does not recognize behaves as if there were no baseline. It reads
+  `path:line[:col]: message`, `path(line,col): message`, and a `message` line followed by
+  `--> path:line:col`.
 - **`non_code_globs`** (optional, not generated): when every file a task changed matches one,
   the engine skips OPTIMIZE with no model call. Unset, it uses
   `orchestrator.non_code.DEFAULT_NON_CODE_GLOBS` (Markdown/reST/AsciiDoc, `docs/**`,
@@ -40,6 +50,10 @@ Notes:
   `(*DEFAULT_NON_CODE_GLOBS, "experiments/**")`. Keep config and data files out of it.
 - A stage's command method should **fail closed** (exit non-zero) until set, so an
   unconfigured run doesn't vacuously pass — see the generated adapter's `test_unit_cmd`.
+- **`test_unit_cmd(files)` narrows on pytest (#618).** A `test_unit` containing a `pytest` token
+  generates a method that appends `files`, so TEST's flaky re-run runs only the failed tests.
+  Any other runner ignores `files`, and the re-run repeats the full command. Keep a pytest
+  `test_unit` free of a pinned test path, or a narrowed run still includes that path.
 - Delete the command methods for layers a project lacks (no e2e → leave the no-op).
 - These are defaults; the interview confirms/overrides them against what's actually in the
   repo (lockfiles, `package.json` scripts, `pyproject.toml`, Makefile targets).

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import json
+import os
 import subprocess
 import sys
 
@@ -141,6 +142,24 @@ def test_generated_adapter_reflects_profile(tmp_path) -> None:
     rp = read_profile(tmp_path / "py_svc" / "profile.toml")
     assert rp.languages == ["python"] and rp.roster["implement"] == "python-backend-developer"
     assert rp.commands["lint"] == ["uv", "run", "python", "-m", "ruff", "check", "."]
+
+
+def test_generated_pytest_unit_command_narrows_on_files(tmp_path) -> None:
+    """#618: TEST's flaky re-run reaches the failed tests only if the adapter takes them."""
+    prof = profile_from_languages("py-narrow", ["python"], MANIFEST)
+    scaffold_adapter("py-narrow", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "py-narrow").get_config()
+    full = ["uv", "run", "python", "-m", "pytest", "-q"]
+    assert cfg.test_unit_cmd() == full
+    assert cfg.test_unit_cmd([]) == full
+    assert cfg.test_unit_cmd(["tests/t.py::test_x"]) == [*full, "tests/t.py::test_x"]
+
+
+def test_generated_non_pytest_unit_command_ignores_files(tmp_path) -> None:
+    prof = profile_from_languages("go-narrow", ["go"], MANIFEST)
+    scaffold_adapter("go-narrow", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "go-narrow").get_config()
+    assert cfg.test_unit_cmd(["pkg/x"]) == cfg.test_unit_cmd() == ["go", "test", "./..."]
 
 
 def test_generated_review_gate_blocks_red_lint_and_overrides_approval(
@@ -687,41 +706,58 @@ def test_profile_bench_renders_benchmark_cmd_and_absent_bench_is_a_noop(tmp_path
     assert _bench_adapter(tmp_path / "b", "nobench-svc", None).benchmark_cmd() == ["true"]
 
 
-def test_generated_benchmark_leg_is_three_way(tmp_path, monkeypatch) -> None:
+def test_generated_benchmark_leg_blocks_only_on_a_confirmed_regression(
+    tmp_path, monkeypatch
+) -> None:
+    """#591: the generated adapter hands the leg to the engine's run_bench_gate and keeps
+    ``_run_bench`` as the function a test or a project can replace. The verdict table itself
+    is pinned in test_policy_gate.py."""
     cfg = _bench_adapter(tmp_path, "bench3-svc", ["bench", "--json"])
     monkeypatch.setattr(
         cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
     )
-    outcome: list[object] = []
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+    monkeypatch.setattr(os, "cpu_count", lambda: 8)
+    outcomes: list[object] = []
     calls: list[list[str]] = []
 
     def fake_bench(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
         calls.append(argv)
-        if isinstance(outcome[0], BaseException):
-            raise outcome[0]
-        return outcome[0]
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return outcome
 
     monkeypatch.setattr(cfg, "_run_bench", fake_bench)
 
-    def findings_for(result: object) -> list[dict]:
-        outcome[:] = [result]
-        return cfg.review_findings(worktree=str(tmp_path))
+    def findings_for(*results: object) -> list[dict]:
+        outcomes[:] = list(results)
+        entries = cfg.review_findings(worktree=str(tmp_path))
+        assert sum("gate_record" in entry for entry in entries) == 1  # recorded every time
+        return [entry for entry in entries if "gate_record" not in entry]
 
-    # rc 0 passes.
-    assert findings_for(subprocess.CompletedProcess(["bench"], 0, "ok", "")) == []
+    def proc(rc: int, out: str = "") -> subprocess.CompletedProcess:
+        return subprocess.CompletedProcess(["bench"], rc, out, "")
+
+    # rc 0 passes, on one run.
+    assert findings_for(proc(0, "ok")) == []
     assert calls == [["bench", "--json"]]
 
-    # rc 1 blocks and carries the timings at the END of noisy output.
+    # Red twice blocks, and carries the timings at the END of noisy output.
     noise = "x" * 3000 + "\nsolve_ms: 412 (budget 300)"
-    (blocking,) = findings_for(subprocess.CompletedProcess(["bench"], 1, noise, ""))
+    (blocking,) = findings_for(proc(1), proc(1, noise))
     assert blocking["blocking"] is True and blocking["severity"] == "critical"
     assert "benchmark gate is RED" in blocking["description"]
     assert "solve_ms: 412 (budget 300)" in blocking["description"]
-    assert len(blocking["description"]) < 2400
+
+    # Red then green does not block.
+    (inconclusive,) = findings_for(proc(1), proc(0))
+    assert inconclusive["blocking"] is False
+    assert "inconclusive" in inconclusive["description"]
 
     # Any other rc, a timeout, or a failure to start is advisory, never green.
     for result in (
-        subprocess.CompletedProcess(["bench"], 2, "", "usage: bench"),
+        proc(2),
         subprocess.TimeoutExpired(["bench"], 1800),
         FileNotFoundError("bench missing"),
     ):
@@ -729,6 +765,23 @@ def test_generated_benchmark_leg_is_three_way(tmp_path, monkeypatch) -> None:
         assert advisory["blocking"] is False, result
         assert advisory["severity"] == "important"
         assert "UNVERIFIED" in advisory["description"]
+
+
+def test_generated_lint_gate_sends_its_output_for_comparison_against_base(
+    tmp_path, monkeypatch
+) -> None:
+    prof = profile_from_languages("lintbase-svc", ["python"], MANIFEST)
+    scaffold_adapter("lintbase-svc", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "lintbase-svc").get_config()
+
+    def fake_run(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
+        rc = 1 if "ruff" in argv else 0
+        return subprocess.CompletedProcess(argv, rc, "a.py:1:1: E722 bare\n", "")
+
+    monkeypatch.setattr(cfg, "_run_gate", fake_run)
+    (finding,) = cfg.review_findings(worktree=str(tmp_path))
+    assert finding["gate_leg"] == "lint"
+    assert finding["gate_output"] == "a.py:1:1: E722 bare\n"
 
 
 def test_benchmark_leg_is_skipped_without_a_bench_command(tmp_path, monkeypatch) -> None:
@@ -781,3 +834,82 @@ def test_rerun_keeps_existing_task_source_against_a_defaulted_profile(tmp_path) 
     incoming = profile_from_languages("svc", ["python"], MANIFEST)
     incoming.task_source = "github-issues"
     assert merge_profiles(existing, incoming, MANIFEST).task_source == "github-issues"
+
+
+def test_bench_paths_round_trip_and_merge(tmp_path) -> None:
+    """#634: profile.toml's [bench] paths survives write/read and a re-scaffold merge."""
+    prof = profile_from_languages("reach-svc", ["python"], MANIFEST)
+    prof.commands["bench"] = ["bench"]
+    prof.bench = {"paths": ["src/taker", "src/shared/*.py"]}
+    scaffold_adapter("reach-svc", tmp_path, profile=prof)
+    rp = read_profile(tmp_path / "reach_svc" / "profile.toml")
+    assert rp.bench == {"paths": ["src/taker", "src/shared/*.py"]}
+    incoming = profile_from_languages("reach-svc", ["python"], MANIFEST)
+    assert merge_profiles(rp, incoming, MANIFEST).bench == rp.bench
+    incoming.bench = {"paths": ["src/new"]}
+    assert merge_profiles(rp, incoming, MANIFEST).bench == {"paths": ["src/new"]}
+    cfg = _import_adapter(tmp_path, "reach-svc").get_config()
+    assert cfg.bench_paths == ("src/taker", "src/shared/*.py")
+
+
+def test_bench_paths_string_value_is_one_path_not_characters(tmp_path) -> None:
+    """#634 review: ``paths = "src/taker"`` (a string, not a list) must read as one path.
+    ``list()`` on it gave single characters, which matched nothing and skipped the benchmark
+    for a change that touches src/taker. A non-list scalar must not crash the read either."""
+    from orchestrator.policy_gate import bench_unreachable
+
+    path = tmp_path / "profile.toml"
+    path.write_text(
+        '[project]\nname = "str-svc"\n\n[bench]\npaths = "src/taker"\ntimeout_s = 1800\n'
+        'mixed = ["a", 1]\n',
+        encoding="utf-8",
+    )
+    rp = read_profile(path)
+    assert rp.bench == {"paths": ["src/taker"]}
+    assert bench_unreachable(["src/taker/x.py"], tuple(rp.bench["paths"])) is None
+    assert bench_unreachable(["tools/x.py"], tuple(rp.bench["paths"])) is not None
+
+
+def test_generated_benchmark_leg_skips_a_change_outside_bench_paths(
+    tmp_path, monkeypatch
+) -> None:
+    prof = profile_from_languages("reach2-svc", ["python"], MANIFEST)
+    prof.commands["bench"] = ["bench"]
+    prof.bench = {"paths": ["src/taker"]}
+    scaffold_adapter("reach2-svc", tmp_path, profile=prof)
+    cfg = _import_adapter(tmp_path, "reach2-svc").get_config()
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+    calls: list[list[str]] = []
+
+    def fake_bench(argv, cwd):  # noqa: ANN001, ARG001 - mirrors the generated subprocess seam
+        calls.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(cfg, "_run_bench", fake_bench)
+
+    (skipped,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["tools/x.py"])
+    assert skipped["gate_record"]["verdict"] == "skipped" and calls == []
+
+    (ran,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["src/taker/book.py"])
+    assert ran["gate_record"]["verdict"] == "passed" and calls == [["bench"]]
+
+    # Not told what changed (an older engine): the benchmark runs as before.
+    (ran,) = cfg.review_findings(worktree=str(tmp_path))
+    assert ran["gate_record"]["verdict"] == "passed" and len(calls) == 2
+
+
+def test_adapter_without_bench_paths_always_runs_the_benchmark(tmp_path, monkeypatch) -> None:
+    cfg = _bench_adapter(tmp_path, "reach3-svc", ["bench"])
+    assert not hasattr(cfg, "bench_paths")
+    monkeypatch.setattr(
+        cfg, "_run_gate", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    monkeypatch.setattr(os, "getloadavg", lambda: (0.0, 0.0, 0.0))
+    monkeypatch.setattr(
+        cfg, "_run_bench", lambda argv, cwd: subprocess.CompletedProcess(argv, 0, "", "")
+    )
+    (ran,) = cfg.review_findings(worktree=str(tmp_path), changed_files=["tools/x.py"])
+    assert ran["gate_record"]["verdict"] == "passed"

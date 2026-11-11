@@ -24,7 +24,7 @@ def test_cli_drives_a_task_to_completion(tmp_path, capsys) -> None:
     base = ["--root", root, "--run", "run1", "--project", "tests.fakeproject"]
 
     _run(capsys, *base, "init-run", "--lane", "full")
-    _run(capsys, *base, "add-task", "--task", "#42")
+    _run(capsys, *base, "add-task", "--task", "#42", "--deterministic-stages", "none")
 
     # supervisor loop: next -> (shim would run agent) -> record. `next` drains the
     # deterministic intake stage in-process, so the supervisor only sees model stages.
@@ -159,7 +159,7 @@ def test_cli_watch_exits_on_terminal_run(tmp_path, capsys) -> None:
     # poll without ever sleeping (a passing test can't block on real time).
     base = ["--root", str(tmp_path), "--run", "w1", "--project", "tests.fakeproject"]
     _run(capsys, *base, "init-run", "--lane", "full")
-    _run(capsys, *base, "add-task", "--task", "#9")
+    _run(capsys, *base, "add-task", "--task", "#9", "--deterministic-stages", "none")
     for _ in range(10):
         work = _run(capsys, *base, "next", "--task", "#9")
         if work is None:
@@ -404,3 +404,16 @@ def test_cli_runs_migrate_previews_then_moves_and_leaves_the_kb(tmp_path, capsys
     # a second apply is a no-op: nothing left to move, nothing overwritten
     again = _run(capsys, "runs-migrate", "--from", str(legacy), "--apply")
     assert again["moved"] == 0 and again["plan"] == []
+
+
+def test_add_task_none_persists_an_explicit_model_test(tmp_path, capsys) -> None:
+    """#541: 'none' must survive to the Task doc: every later subcommand rebuilds the Engine,
+    and an unset value would fall back to the preset's engine TEST."""
+    base = ["--root", str(tmp_path), "--run", "r1", "--project", "tests.fakeproject"]
+    _run(capsys, *base, "init-run", "--lane", "full")
+    added = _run(capsys, *base, "add-task", "--task", "#1", "--deterministic-stages", "none")
+    assert added["deterministic_stages"] == []
+    default = _run(capsys, *base, "add-task", "--task", "#2")
+    assert default["deterministic_stages"] == ["test"]
+    named = _run(capsys, *base, "add-task", "--task", "#3", "--deterministic-stages", "test,deliver")
+    assert named["deterministic_stages"] == ["test", "deliver"]

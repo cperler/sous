@@ -323,14 +323,33 @@ class QualityTier(StrEnum):
 
 
 class ImplementationBudget(StrEnum):
-    """Per-child IMPLEMENT wall-clock budget emitted by SCOPE decomposition.
+    """Per-task IMPLEMENT wall-clock budget.
 
-    The engine maps ``standard`` to 30 minutes and ``short`` to 15 minutes; the
-    selected value is persisted on the task and copied to its implementation work.
+    Set by a SCOPE decomposition child, by SCOPE for a large task it chose not to split,
+    or pinned at ``add-task`` / in a batch plan (#615). The engine maps ``standard`` to
+    the project's IMPLEMENT default (30 minutes unless the adapter declares
+    ``implement_timeout_s``), ``short`` to 15 minutes and ``long`` to 60 minutes (never
+    below the project default). The value is persisted on the task, so every later
+    subcommand reads the same limit.
     """
 
     STANDARD = "standard"
     SHORT = "short"
+    LONG = "long"
+
+
+class ReviewBudget(StrEnum):
+    """Per-task REVIEW wall-clock budget (#624), the REVIEW sibling of ``ImplementationBudget``.
+
+    ``standard`` is the project's REVIEW default (10 minutes unless the adapter declares
+    ``review_timeout_s``) and turns off diff-size scaling. ``long`` is 30 minutes, never
+    below the project default. Unset, a diff large enough is reviewed on the long limit
+    anyway. Pinned at ``add-task`` / in a batch plan, and raised to ``long`` by the engine
+    when a REVIEW attempt times out. Persisted on the task.
+    """
+
+    STANDARD = "standard"
+    LONG = "long"
 
 
 # Lane PRESETS: named pipelines (ported from full/lite/micro). A lane is resolved to a
@@ -349,21 +368,21 @@ LANE_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
 }
 
 # Stages a preset runs on the $0 deterministic ENGINE lane BY DEFAULT (#68, promoting #33's
-# opt-in): the cheaper micro/lite lanes adopt the deterministic TEST/DELIVER runners so the
-# mechanical suite-run and PR-open don't each burn a model call — matching the cost-router's
-# preference (cost_policy._CHEAP_DETERMINISTIC) as the standing default, not just under budget
-# pressure. FULL keeps model TEST/DELIVER (it pays for the extra judgment). A pipeline that
-# opts in KEEPS a model REVIEW (micro/lite do): the deterministic TEST runner never judges
-# meaningfulness, so that veto still lives on a model. Resolved at add_task; an explicit
-# --deterministic-stages (or a cost-routing decision) overrides it. Intersected with the
-# stage set that actually runs, so MICRO (no TEST stage) gets DELIVER only.
-_DETERMINISTIC_BY_DEFAULT: frozenset[Stage] = frozenset({Stage.TEST, Stage.DELIVER})
+# opt-in; #541 for FULL): running the suite is mechanical on every lane, so TEST never burns a
+# model call by default. The meaningfulness judgment a model TEST kept not making is a
+# required REVIEW output instead, so a pipeline that runs deterministic TEST keeps a model
+# REVIEW. The micro/lite presets also adopt the deterministic DELIVER; FULL keeps model DELIVER
+# for its docstring pass. Resolved at add_task; an explicit --deterministic-stages (`none` for
+# model stages), a cost-routing decision, or the project's ``model_test_stage`` opt-in
+# overrides it. Intersected with the stage set that actually runs, so MICRO (no TEST stage)
+# gets DELIVER only.
+_DETERMINISTIC_BY_DEFAULT: dict[ExecutionLane, frozenset[Stage]] = {
+    ExecutionLane.FULL: frozenset({Stage.TEST}),
+    ExecutionLane.LITE: frozenset({Stage.TEST, Stage.DELIVER}),
+    ExecutionLane.MICRO: frozenset({Stage.TEST, Stage.DELIVER}),
+}
 LANE_DETERMINISTIC_STAGES: dict[ExecutionLane, tuple[Stage, ...]] = {
-    lane: (
-        ()
-        if lane is ExecutionLane.FULL
-        else tuple(s for s in stages if s in _DETERMINISTIC_BY_DEFAULT)
-    )
+    lane: tuple(s for s in stages if s in _DETERMINISTIC_BY_DEFAULT[lane])
     for lane, stages in LANE_STAGES.items()
 }
 

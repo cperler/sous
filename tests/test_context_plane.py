@@ -48,8 +48,7 @@ def test_full_run_folds_every_stage_into_context(tmp_path, project) -> None:
     # intake's worktree/branch, implement's summary, test's notes, deliver's pr all folded
     assert ctx["branch"] == "issue-42" and ctx["worktree"] == "/wt/42"
     assert ctx["summary"] == "done" and ctx["files_changed"] == ["a.py"]
-    assert ctx["tests_meaningful"] is True
-    assert ctx["validation_notes"] == "asserts the changed behavior"
+    assert ctx["validation_notes"] == "unit: green"
     assert ctx["pr_url"].endswith("/1234") and ctx["pr_number"] == 1234
     # context survives on the persisted task doc (resume/replay safe)
     assert "plan" in eng.store.load_task("r1", "t1").context
@@ -332,9 +331,9 @@ def test_context_ceiling_evicts_the_fat_key_but_keeps_its_small_siblings() -> No
 
     task = Task(task_id="t", run_id="r", created_at="x", updated_at="x")
     # A single fat test.failures list that alone tips the ceiling, folded ALONGSIDE its
-    # small same-stage siblings (tests_meaningful, validation_notes). Per-KEY eviction must
+    # small same-stage sibling (validation_notes). Per-KEY eviction must
     # shed only the fat `failures` key; whole-stage eviction would have dropped the whole
-    # TEST contribution, needlessly losing the two small siblings.
+    # TEST contribution, needlessly losing the small sibling.
     failures = ["f" * 489 + str(i % 10) for i in range(34)]  # ~16.8KB > ceiling on its own
     _absorb_outputs(
         task,
@@ -342,15 +341,13 @@ def test_context_ceiling_evicts_the_fat_key_but_keeps_its_small_siblings() -> No
             Stage.TEST,
             {
                 "failures": failures,
-                "tests_meaningful": True,
                 "validation_notes": "asserts the changed behavior",
             },
         ),
     )
     assert _context_bytes(task.context) <= _MAX_CONTEXT_BYTES  # ceiling held
     assert "failures" not in task.context  # the FAT key is evicted
-    assert task.context["tests_meaningful"] is True  # small siblings SURVIVE
-    assert task.context["validation_notes"] == "asserts the changed behavior"
+    assert task.context["validation_notes"] == "asserts the changed behavior"  # sibling SURVIVES
 
 
 def test_context_ceiling_tie_break_evicts_latest_pipeline_stage_first() -> None:
@@ -403,8 +400,7 @@ def test_context_ceiling_evicts_across_multiple_passes_via_absorb() -> None:
             Stage.TEST,
             {
                 "failures": failures,
-                "validation_notes": "asserts the changed behavior",
-                "tests_meaningful": True,
+                "validation_notes": "asserts the changed behavior, and its error path",
             },
         ),
     )
@@ -415,8 +411,7 @@ def test_context_ceiling_evicts_across_multiple_passes_via_absorb() -> None:
     assert "plan" not in task.context
     # the lighter fat key and the small same-stage siblings survive the multi-pass sweep.
     assert task.context["files_changed"] == files_changed
-    assert task.context["validation_notes"] == "asserts the changed behavior"
-    assert task.context["tests_meaningful"] is True
+    assert task.context["validation_notes"] == "asserts the changed behavior, and its error path"
 
 
 def test_context_ceiling_eviction_order_is_characterized() -> None:

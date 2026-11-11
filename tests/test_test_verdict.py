@@ -15,6 +15,7 @@ from adapters.execution.deterministic_test import DeterministicTestRunner
 from adapters.execution.headless_claude import HeadlessClaudeRunner
 from adapters.execution.test_verdict import verify_test_verdict
 from adapters.execution.transport import RawResult
+from adapters.project.selfhost.classifier import SelfHostClassifier
 from orchestrator.failure_classifier import Failure
 from orchestrator.schemas.enums import ExecutionMode, Provider, ResultStatus, Stage
 from orchestrator.schemas.work import LanePolicy, WorkItem
@@ -62,11 +63,11 @@ def _repo(tmp_path):
     return tmp_path
 
 
-def _wi(cwd, stage=Stage.TEST, checkpoint_tag=None) -> WorkItem:
+def _wi(cwd, stage=Stage.TEST, checkpoint_tag=None, baseline_failures=()) -> WorkItem:
     return WorkItem.create(
         id="wi-1", run_id="r1", task_id="#42", stage=stage, prompt="p", schema_ref="test",
         model="sonnet", lane_policy=_HEADLESS, created_at="now", cwd=str(cwd),
-        context={"baseline_failures": []}, checkpoint_tag=checkpoint_tag,
+        context={"baseline_failures": list(baseline_failures)}, checkpoint_tag=checkpoint_tag,
     )
 
 
@@ -92,16 +93,14 @@ def test_a_claimed_green_that_the_declared_commands_fail_becomes_a_failure(tmp_p
     assert any(n["notice"] == "test_verdict_overridden" for n in raw.execution_notices)
 
 
-def test_a_claimed_green_the_declared_commands_confirm_keeps_the_models_judgment(tmp_path) -> None:
+def test_a_claimed_green_the_declared_commands_confirm_keeps_the_models_notes(tmp_path) -> None:
     raw, status = verify_test_verdict(_wi(_repo(tmp_path)), _model_green(),
                                       ResultStatus.SUCCESS, _GREEN)
     assert status is ResultStatus.SUCCESS
     out = raw.structured_output
     assert out["passed"] is True and out["failures"] == []
-    assert out["tests_meaningful"] is True  # meaningfulness stays the model's call
     assert "mutation check failed the new test" in out["validation_notes"]
     assert "Engine re-ran the project's declared test commands" in out["validation_notes"]
-    assert "tests_meaningful not judged" not in out["validation_notes"]
     assert out["test_scope"] == "full"
 
 
@@ -112,7 +111,7 @@ def test_a_timeout_over_a_clean_worktree_is_settled_green_by_the_declared_comman
     assert status is ResultStatus.SUCCESS
     assert raw.exit_code == 0 and raw.error is None
     assert raw.structured_output["passed"] is True
-    assert raw.structured_output["tests_meaningful"] is None  # not judged; REVIEW judges
+    assert "tests_meaningful" not in raw.structured_output  # REVIEW's output, not TEST's
     assert "timed out" in raw.structured_output["validation_notes"]
     assert raw.checkpoint and raw.checkpoint["tag"] == "ckpt-test"
     assert any(n["notice"] == "test_timeout_settled_by_declared_commands"
@@ -206,7 +205,179 @@ def test_many_failures_are_not_rerun(tmp_path) -> None:
     assert run.ok is False and len(run.out["failures"]) == 6
 
 
+_BASE_RED = "tests/t.py::test_base"
+_FLAKY = "tests/t.py::test_timing"
+
+
+def _first_run_then(marker, rerun: str) -> _Proj:
+    """A full suite with one baseline and one other failure, then ``rerun`` on later runs."""
+    return _Proj(["sh", "-c", f"if [ -f {marker} ]; then {rerun}; fi; touch {marker}; "
+                              f"echo 'FAILED {_BASE_RED}'; echo 'FAILED {_FLAKY}'; exit 1"])
+
+
+def _evaluate_beside_baseline(tmp_path, proj):
+    return DeterministicTestRunner(proj).evaluate(
+        _wi(_repo(tmp_path / "repo"), baseline_failures=[_BASE_RED]))
+
+
+def test_a_flaky_failure_beside_a_baseline_failure_clears_on_a_full_rerun(tmp_path) -> None:
+    """#618: the full re-run exits 1 on the baseline failure whatever the flaky test did."""
+    proj = _first_run_then(tmp_path / "ran", f"echo 'FAILED {_BASE_RED}'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is True and run.out["failures"] == []
+    assert run.out["flaky_failures"] == [_FLAKY]
+    assert any(n["notice"] == "test_flaky_failures_cleared" for n in run.notices)
+    assert "1 inherited baseline failure(s) excluded" in run.out["validation_notes"]
+
+
+def test_a_repeated_failure_beside_a_baseline_failure_stays_caused(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran",
+                           f"echo 'FAILED {_BASE_RED}'; echo 'FAILED {_FLAKY}'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+    assert "re-ran the unit command once; still red" in run.out["validation_notes"]
+
+
+def test_a_rerun_crash_with_no_parsed_failures_stays_caused(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran", "echo 'Segmentation fault'; exit 139")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+
+
+def test_a_new_failure_in_the_rerun_stays_caused_and_is_named(tmp_path) -> None:
+    proj = _first_run_then(tmp_path / "ran",
+                           f"echo 'FAILED {_BASE_RED}'; echo 'FAILED tests/t.py::test_new'; exit 1")
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+    assert ("the re-run also failed, outside the baseline: tests/t.py::test_new"
+            in run.out["validation_notes"])
+
+
+def test_a_parsed_collection_error_in_the_rerun_stays_caused(tmp_path) -> None:
+    """The failed test is absent from the re-run, but it never ran, so it has not passed."""
+    proj = _first_run_then(tmp_path / "ran", "echo 'ERROR tests/t.py - ImportError'; exit 2")
+    proj.classifier = SelfHostClassifier()
+    run = _evaluate_beside_baseline(tmp_path, proj)
+    assert run.ok is False and run.out["failures"] == [_FLAKY]
+    assert "flaky_failures" not in run.out
+
+
+class _NarrowingProj(_Proj):
+    """A suite that fails while whole, and records the ids it is narrowed to."""
+
+    def __init__(self, recorded) -> None:
+        super().__init__(["sh", "-c", f"echo 'FAILED {_FLAKY}'; exit 1"])
+        self._recorded = recorded
+
+    def test_unit_cmd(self, files=None):
+        if not files:
+            return self._unit
+        return ["sh", "-c", f'printf "%s\\n" "$@" > {self._recorded}', "sh", *files]
+
+
+def test_an_adapter_that_narrows_reruns_only_the_failed_tests(tmp_path) -> None:
+    recorded = tmp_path / "rerun-ids"
+    run = DeterministicTestRunner(_NarrowingProj(recorded)).evaluate(_wi(_repo(tmp_path / "repo")))
+    assert run.ok is True and run.out["flaky_failures"] == [_FLAKY]
+    assert recorded.read_text().splitlines() == [_FLAKY]
+    assert "passed when the failed test(s) was re-run once" in run.out["validation_notes"]
+
+
 def test_a_worktree_missing_on_disk_is_not_verified(tmp_path) -> None:
     green = _model_green()
     assert verify_test_verdict(_wi(tmp_path / "gone"), green, ResultStatus.SUCCESS, _RED) == (
         green, ResultStatus.SUCCESS)
+
+
+def _at_test(eng, run: str, task: str):
+    """Walk ``task`` to its TEST dispatch, recording every earlier stage green."""
+    from tests.conftest import make_result
+
+    work = eng.next_work(run, task)
+    while work is not None and work.stage is not Stage.TEST:
+        eng.record(run, make_result(work))
+        work = eng.next_work(run, task)
+    return work
+
+
+def test_a_verifying_model_test_carries_the_intake_baseline(tmp_path, project) -> None:
+    """Prediction run pred-1154-1155-1156-653: a model TEST went red twice on a test
+    intake had recorded as failing at base, because the verdict re-run got no context —
+    no baseline_failures to exclude, no base_sha to narrow the suite by."""
+    from orchestrator.cost_ledger import CostLedger
+    from orchestrator.engine import Engine
+    from orchestrator.schemas.enums import ExecutionLane
+    from orchestrator.status_store import StatusStore
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", deterministic_stages=())
+    eng.store.update_task("r1", "t1", lambda t: t.context.update(
+        base_sha="abc123", baseline_failures=["tests/t.py::test_x"]))
+    eng._lane_verifies_test_verdict = lambda lane: True  # type: ignore[method-assign]
+
+    work = _at_test(eng, "r1", "t1")
+
+    assert work is not None and work.lane_policy.execution_mode is not ExecutionMode.ENGINE
+    assert work.context is not None
+    assert work.context["baseline_failures"] == ["tests/t.py::test_x"]
+    assert work.context["base_sha"] == "abc123"
+
+
+def test_a_non_verifying_model_test_still_gets_no_context(tmp_path, project) -> None:
+    from orchestrator.cost_ledger import CostLedger
+    from orchestrator.engine import Engine
+    from orchestrator.schemas.enums import ExecutionLane
+    from orchestrator.status_store import StatusStore
+
+    eng = Engine(StatusStore(tmp_path), CostLedger(tmp_path / "c.jsonl"), project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "t1", deterministic_stages=())
+    eng._lane_verifies_test_verdict = lambda lane: False  # type: ignore[method-assign]
+
+    work = _at_test(eng, "r1", "t1")
+
+    assert work is not None and work.context is None
+
+
+def _flaky_reasons(run) -> dict[str, list[str]]:
+    return {n["reason"]: n["failures"] for n in run.notices
+            if n["notice"] == "test_flaky_failures_cleared"}
+
+
+def test_a_failure_already_flaky_at_base_is_not_caused_and_not_rerun(tmp_path) -> None:
+    """#607: INTAKE saw this test fail at base and pass on its re-run (``baseline_flaky``).
+    The same failure in TEST is recorded flaky without spending a re-run, never caused."""
+    marker = tmp_path / "ran"
+    proj = _Proj(["sh", "-c", f"echo x >> {marker}; echo 'FAILED {_FLAKY}'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_failures": [], "baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is True and run.out["failures"] == []
+    assert run.out["flaky_failures"] == [_FLAKY]
+    assert "already known flaky at base" in run.out["validation_notes"]
+    assert len(marker.read_text().splitlines()) == 1  # no re-run
+    assert _flaky_reasons(run) == {"known_flaky_at_base": [_FLAKY]}
+
+
+def test_a_known_flaky_test_does_not_excuse_a_different_failure(tmp_path) -> None:
+    proj = _Proj(["sh", "-c", f"echo 'FAILED {_FLAKY}'; echo 'FAILED tests/t.py::test_x'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is False and run.out["failures"] == ["tests/t.py::test_x"]
+
+
+def test_flaky_notices_keep_a_base_flaky_test_apart_from_one_that_passed_on_rerun(tmp_path) -> None:
+    """#607: one run with both kinds of flaky failure events each under its own reason."""
+    marker, other = tmp_path / "ran", "tests/t.py::test_other"
+    proj = _Proj(["sh", "-c", f"if [ -f {marker} ]; then exit 0; fi; touch {marker}; "
+                              f"echo 'FAILED {_FLAKY}'; echo 'FAILED {other}'; exit 1"])
+    wi = _wi(_repo(tmp_path / "repo"))
+    wi = wi.model_copy(update={"context": {"baseline_flaky": [_FLAKY]}})
+    run = DeterministicTestRunner(proj).evaluate(wi)
+    assert run.ok is True and sorted(run.out["flaky_failures"]) == sorted([_FLAKY, other])
+    assert _flaky_reasons(run) == {"known_flaky_at_base": [_FLAKY], "passed_on_rerun": [other]}

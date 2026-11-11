@@ -119,6 +119,7 @@ _FAILURE_KIND_TAG_RE = re.compile(r"\[(" + "|".join(sorted(_FAILURE_KIND_VALUES)
 # ``result.error``, and nowhere a task's own subject matter can reach.
 _PROVIDER_LIMIT_NOTICE_MARKERS = (
     "hit your session limit", "hit your usage limit",
+    "hit your 5-hour limit", "hit your weekly limit",
     "session limit reached", "usage limit reached",
 )
 _HEAD_LIMIT_PREFIXES = (

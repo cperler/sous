@@ -209,6 +209,7 @@ class ReviewIsolation:
         )
         if remote.returncode != 0:
             raise _IsolationError((remote.stderr.strip() or "could not remove clone origin")[:300])
+        ReviewIsolation._copy_remote_refs(source, destination)
 
         try:
             excluded = {path.parts[0] for path in fresh_install_paths(project or object())}
@@ -268,6 +269,33 @@ class ReviewIsolation:
             raise _IsolationError(
                 f"review dependency install failed (rc={proc.returncode}): {detail}"
             )
+
+    @staticmethod
+    def _copy_remote_refs(source: Path, destination: Path) -> None:
+        """Give the review copy the live worktree's remote-tracking refs (`origin/main`, ...).
+
+        Removing the clone's origin also deletes `refs/remotes/origin/*`, and the refs the clone
+        made there named the live repo's LOCAL branches, not its remote. A project test that asks
+        `git merge-base --is-ancestor <sha> origin/main` then fails in every review for a reason
+        the change never caused. The copied refs are plain refs: with no remote configured they
+        resolve as `origin/main` and give nothing to push to. Symbolic `HEAD` refs are skipped.
+        """
+        listed = ReviewIsolation._run_git(
+            ["git", "-C", str(source), "for-each-ref", "--format=%(objectname) %(refname)",
+             "refs/remotes/"]
+        )
+        if listed.returncode != 0:
+            raise _IsolationError(
+                (listed.stderr.strip() or "could not list remote-tracking refs")[:300])
+        for line in listed.stdout.splitlines():
+            sha, _, ref = line.partition(" ")
+            if not ref or ref.endswith("/HEAD"):
+                continue
+            made = ReviewIsolation._run_git(
+                ["git", "-C", str(destination), "update-ref", ref, sha])
+            if made.returncode != 0:
+                raise _IsolationError(
+                    (made.stderr.strip() or f"could not copy {ref}")[:300])
 
     @staticmethod
     def _run_git(argv: list[str]) -> subprocess.CompletedProcess[str]:

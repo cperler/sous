@@ -32,7 +32,12 @@
           }
         ]
       },
-      "description": "repo-relative paths this task expects to MODIFY (not merely read); the engine serializes tasks whose declared files collide (#377). Optional: a task that declares nothing neither defers nor blocks. An entry may be a bare path string (equivalent to mode 'rewrite') or an object declaring the edit KIND (#426): mode 'append' means the edit ONLY adds a self-contained block (a new test case, a new doc section) and touches no existing line, shared constant or signature in that file, so two append-declaring tasks are not serialized against each other. Default to 'rewrite' when unsure."
+      "description": "repo-relative paths this task expects to MODIFY (not merely read); the engine serializes tasks whose declared files collide (#377). Optional: a task that declares nothing neither defers nor blocks. An entry may be a bare path string (equivalent to mode 'rewrite') or an object declaring the edit KIND (#426): mode 'append' means the edit ONLY adds a self-contained block (a new doc section, entry or row, or a new test case) and touches no existing line, shared constant or signature in that file, so two append-declaring tasks are not serialized against each other. Mode 'rewrite' is for edits that change existing lines; default to it when unsure on a code file. A path the project marks parallel-safe is treated as 'append' whatever is declared here (#628)."
+    },
+    "implementation_budget": {
+      "type": "string",
+      "enum": ["standard", "long"],
+      "description": "IMPLEMENT's wall-clock limit for a task SCOPE does NOT decompose (#615): 'long' (60 minutes) for a large change that must still ship whole; 'standard' or absent keeps the project default. A budget pinned at add-task or in a batch plan wins over this."
     },
     "subtasks": {
       "type": "array",
@@ -46,7 +51,7 @@
           "description": {"type": "string", "minLength": 1},
           "agent": {"type": ["string", "null"]},
           "quality_tier": {"type": "string", "enum": ["full", "light", "none"], "default": "full"},
-          "implementation_budget": {"type": "string", "enum": ["standard", "short"], "default": "standard"},
+          "implementation_budget": {"type": "string", "enum": ["standard", "short", "long"], "default": "standard"},
           "depends_on": {"type": "array", "items": {"type": "string"}, "default": []}
         },
         "additionalProperties": false

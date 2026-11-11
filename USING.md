@@ -320,8 +320,52 @@ The `pipeline` per task is the main cost dial:
 - `full` — risky, cross-cutting, or ambiguous (the example's t4, where being wrong is
   expensive).
 
+Every lane runs TEST with no model by default: the engine runs your declared test commands, and
+a real failure goes back to IMPLEMENT. REVIEW judges whether the tests mean anything, by applying
+a mutation and recording which tests failed on it. To use a model TEST anyway, pass
+`--deterministic-stages none` on a task (`"deterministic_stages": []` in a batch plan), or set
+`model_test_stage = True` on your project adapter for every task.
+
 Optional per-task pins: `model` (e.g. `fable` for architecture-heavy design work) and
 `effort`.
+
+### Giving a large task more IMPLEMENT time
+
+IMPLEMENT stops after 30 minutes by default. Set `"implementation_budget": "long"` on a plan task
+(`add-task --implementation-budget long`) to allow 60 minutes, or `short` for 15. A project can
+change its own default with `implement_timeout_s = 2700` on the adapter; `long` never comes out
+below that default. Without a pin, SCOPE may return `implementation_budget: long` for a large task
+it chose not to split; each choice it makes is evented as `implementation_budget_set` (#615).
+
+### Giving a large change more REVIEW time
+
+REVIEW stops after 10 minutes by default. A change of 1500 or more changed lines gets 30 minutes
+automatically. Set `"review_budget": "long"` on a plan task (`add-task --review-budget long`) to
+always allow 30 minutes, or `standard` to keep 10 minutes whatever the diff size. A project can
+change its own default with `review_timeout_s = 1200` on the adapter; `long` never comes out
+below that default.
+
+When REVIEW times out, the retry gets the long limit and a summary of the commands the timed-out
+attempt ran and their results, so it continues rather than starts over. If REVIEW times out on
+its last attempt, the task is held for a human review instead of failing: the change has no
+verdict yet, and the code may be fine. `orchestrator approve` re-runs REVIEW (#624).
+
+### Keeping an issue open past the merge
+
+Set `"keep_issue_open": true` on a plan task (`add-task --keep-issue-open`) when merging its PR
+does not finish the issue: a reading after a release, a server change still to make, data still
+to arrive. To apply it to a whole class of issue, declare `keep_open_labels = ("experiment",)`
+on your project adapter; `false` (`--no-keep-issue-open`) overrides a label for one task.
+
+DELIVER then writes `Part of #N` instead of `Closes #N`, on the model and engine lanes alike.
+After DELIVER the engine reads the PR's closing references back from GitHub, and a PR that would
+still close the issue fails the stage and retries (`deliver_keep_open_violated`). The check runs
+again at completion, where a hit marks the delivery invalid. If it cannot read the answer you
+get a warning-grade `deliver_keep_open_unverified`, not a pass.
+
+A commit message containing a closing keyword (`Fixes #N`) is not covered: GitHub honors it at
+merge, and the runner only repairs the PR description. If a keep-open issue closes anyway, look
+there first.
 
 ### Two rules learned the hard way
 
@@ -454,7 +498,8 @@ conflicts the engine avoided.
 
 When a PR closes multiple issues, the deliver stage writes a comma-list (`Closes #7, #8`).
 **GitHub honors only the first ref.** The rest stay open silently and look like unfinished
-work forever. List the issues and confirm — don't trust the PR body.
+work forever. List the issues and confirm — don't trust the PR body. A task planned with
+`keep_issue_open` says `Part of #N` and should still be open afterwards.
 
 ### Clean up — but never the run logs
 

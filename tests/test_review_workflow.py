@@ -27,7 +27,7 @@ from orchestrator.review_workflow import (
 )
 from orchestrator.schemas.enums import Stage, TaskState
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 # --------------------------------------------------------------------------- helpers
 
@@ -309,7 +309,8 @@ def test_improvement_and_retrospective_take_the_first_in_lens_order() -> None:
 def test_absent_improvement_and_retrospective_keys_are_omitted() -> None:
     """Matching today's single-reviewer shape: the keys simply are not there."""
     review, _, _ = synthesize(_panel({"find:code": {"findings": []}}))
-    assert set(review) == {"approved", "issues", "non_blocking", "tests_meaningful"}
+    assert set(review) == {"approved", "issues", "non_blocking", "tests_meaningful",
+                           "mutation_checks"}
 
 
 def test_tolerates_unvalidated_lane_shapes() -> None:
@@ -361,10 +362,38 @@ def test_malformed_sub_results_root_folds_to_an_empty_panel() -> None:
     for bad in ("nope", [1, 2], 7):
         review, notices, _ = synthesize(bad)
         assert review == {"approved": True, "issues": [], "non_blocking": [],
-                          "tests_meaningful": None}  # #261: no lens judged → no claim
+                          "tests_meaningful": None,  # #261: no lens judged → no claim
+                          "mutation_checks": []}
         assert _kinds(notices) == ["sub_results_malformed"]
     empty, notices, _ = synthesize({})
     assert empty["approved"] is True and notices == ()
+
+
+def test_test_proof_is_find_tests_alone_and_tolerates_malformed_input() -> None:
+    """#541: the same one-lens rule tests_meaningful has, for the proof behind it."""
+    check = {"mutation": "a.py:1", "failed_tests": ["t::x"]}
+    review, notices, _ = synthesize(_panel({
+        "find:tests": {"findings": [], "tests_meaningful": True, "mutation_checks": [check],
+                       "tests_not_checked_reason": " partly inconclusive "},
+    }))
+    assert review["mutation_checks"] == [check]
+    assert review["tests_not_checked_reason"] == "partly inconclusive"
+    assert notices == ()
+
+    review, notices, _ = synthesize(_panel({
+        "find:code": {"findings": [], "mutation_checks": [check],
+                      "tests_not_checked_reason": "not my lens"},
+    }))
+    assert review["mutation_checks"] == []
+    assert "tests_not_checked_reason" not in review
+    assert _kinds(notices) == ["tests_meaningful_ignored", "tests_meaningful_ignored"]
+
+    for bad in ("ran some", [check, "oops"]):
+        review, notices, _ = synthesize(_panel({
+            "find:tests": {"findings": [], "mutation_checks": bad},
+        }))
+        assert all(isinstance(c, dict) for c in review["mutation_checks"])
+        assert _kinds(notices) == ["tests_meaningful_ignored"]
 
 
 def test_lens_order_is_the_designed_one() -> None:
@@ -417,7 +446,7 @@ def test_synthesized_rejection_records_identically_to_a_hand_written_review(
 
 def test_synthesized_approval_records_identically_and_completes(tmp_path, project) -> None:
     panel = _panel({"find:code": {"findings": [CRITICAL, SUGGESTION]},
-                    "find:tests": {"findings": [], "tests_meaningful": True}},
+                    "find:tests": {"findings": [], "tests_meaningful": True, **REVIEW_PROOF}},
                    [_verdict(CRITICAL, "refuted", "the guard is three lines up")])
     folded, _, _ = synthesize(panel)
     assert folded["approved"] is True
@@ -717,7 +746,8 @@ def test_panel_summary_never_leaks_into_review_json() -> None:
         {"find:code": {"findings": [CRITICAL]}}, None,
         [{"notice": "verifier_cap", "detail": "capped", "count": 2}],
     ))
-    assert set(folded.review) == {"approved", "issues", "non_blocking", "tests_meaningful"}
+    assert set(folded.review) == {"approved", "issues", "non_blocking", "tests_meaningful",
+                                  "mutation_checks"}
     assert folded.review["issues"] == [CRITICAL]
     assert folded.review["issues"][0] is CRITICAL
     assert "found_by" not in folded.review["issues"][0]
@@ -893,7 +923,9 @@ def test_a_non_list_notices_field_does_not_crash_record(tmp_path, project) -> No
     eng = _engine(tmp_path, project)
     eng.create_run("r1")
     eng.add_task("r1", "t1")
-    panel = _panel_with_notices({"find:code": {"findings": []}}, None, 7)
+    panel = _panel_with_notices(
+        {"find:code": {"findings": []}, "find:tests": {"findings": [], **REVIEW_PROOF}}, None, 7,
+    )
     out = eng.record("r1", make_result(_advance_to_review(eng), sub_results=panel))
     assert out["outcome"] == "task_completed"
     assert _panel_notices(eng) == []
@@ -962,3 +994,18 @@ def test_status_surfaces_panel_notices_per_task(tmp_path, project) -> None:
     assert audit["notices"] == 3
     assert audit["by_notice"] == {"verifier_cap": 1, "verifier_inconclusive": 2}
     assert audit["by_task"] == {"t1": {"verifier_cap": 1, "verifier_inconclusive": 2}}
+
+
+def test_survivor_blocking_fields_pass_through_from_find_tests_verbatim() -> None:
+    """#614: the fold carries `blocking`/`blocking_reason` on a find:tests check untouched, so
+    the engine's stopping rule reads a panel review exactly as it reads a single one."""
+    survivor = {"mutation": "a.py:9 drop the guard", "failed_tests": [],
+                "blocking": True, "blocking_reason": "spec requires the refusal"}
+    review, notices, _ = synthesize(_panel({
+        "find:tests": {"findings": [], "tests_meaningful": True,
+                       "mutation_checks": [{"mutation": "a.py:1", "failed_tests": ["t::x"]},
+                                           survivor]},
+    }))
+    assert review["mutation_checks"][1] == survivor
+    assert review["approved"] is True  # the fold does not apply the rule; the engine does
+    assert notices == ()

@@ -48,7 +48,7 @@ from orchestrator.stages import (
     render_review_plan,
 )
 from orchestrator.status_store import StatusStore
-from tests.conftest import make_result
+from tests.conftest import REVIEW_PROOF, make_result
 
 _UNVERIFIED_MARKER = "toolchain origin was NOT verified"
 
@@ -59,13 +59,13 @@ def _review_prompt(**kw) -> str:
 
 # --- (a) the mutation-check trust posture ------------------------------------------------
 
-def test_single_reviewer_is_told_its_mutation_check_only_corroborates() -> None:
-    """The pre-#390 wording covered ONE direction (a mutation that fails to fail) and framed
-    the check as decisive. Both halves are load-bearing: b24 #145 saw the same command pass
-    and fail alternately."""
+def test_single_reviewer_is_told_a_mutation_check_can_lie_in_either_direction() -> None:
+    """The pre-#390 wording covered ONE direction (a mutation that fails to fail). Both
+    halves matter: b24 #145 saw the same command pass and fail alternately. An inconclusive
+    check now goes in tests_not_checked_reason (#541)."""
     prompt = _review_prompt()
     assert _MUTATION_CHECK_TRUST in prompt
-    assert "CORROBORATES" in prompt
+    assert "`tests_not_checked_reason`" in _MUTATION_CHECK_TRUST
     assert "spurious failure" in prompt  # the false-FAILURE direction, not just false-pass
     assert "INCONCLUSIVE" in prompt
 
@@ -196,6 +196,16 @@ def test_the_origin_check_is_stated_once_and_composed_by_both_directives() -> No
     assert _RUNNER_ORIGIN_CHECK in _WORKTREE_ORIGIN_UNVERIFIED_DIRECTIVE
 
 
+def test_a_result_flipping_mutation_counts_as_origin_proof() -> None:
+    """pred-1159-1175-1178-1182 #1175: the runner-side `__file__` print came out empty under
+    pytest's output capture, while reverting the fix in the workspace failed 10 tests. Only a
+    runner importing this checkout sees such a flip, so it is accepted as the same proof — and
+    a mutation that changes nothing is explicitly not, since it cannot tell the trees apart."""
+    assert "`-s`" in _RUNNER_ORIGIN_CHECK
+    assert "FLIPS a runner result" in _RUNNER_ORIGIN_CHECK
+    assert "changes nothing proves nothing" in _RUNNER_ORIGIN_CHECK
+
+
 def test_unverified_workspace_orders_the_check_before_any_relied_on_command() -> None:
     """ff-batch-20260903-1724 #232: the reviewer DID have the probe available and caught a real
     sibling-worktree mismatch with it — but only by chance, because #390 framed it as a
@@ -250,7 +260,7 @@ def _review_events(tmp_path, project, structured_output):
 
 
 def _approved(**extra):
-    return {"approved": True, "issues": [], "tests_meaningful": True, **extra}
+    return {"approved": True, "issues": [], **REVIEW_PROOF, "tests_meaningful": True, **extra}
 
 
 def test_omitted_workspace_origin_events_on_an_unverified_review(tmp_path, project) -> None:
