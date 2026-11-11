@@ -7,8 +7,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 _DISCUSSION_COMMENT_CAP = 20
-_DISCUSSION_COMMENT_CHARS = 4_000
-_DISCUSSION_TOTAL_CHARS = 16_000
+_DISCUSSION_COMMENT_CHARS = 12_000
+_DISCUSSION_TOTAL_CHARS = 48_000
 _PROGRESS_COMMENT_MARKER = re.compile(r"<!--\s*orchestrator:progress(?::|\s|-->)", re.I)
 
 
