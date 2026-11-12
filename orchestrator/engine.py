@@ -1785,7 +1785,10 @@ class Engine:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
         exhausted, a declared-file claim held by another live task, or a TEST retry
-        waiting for a quiet host, #642). Before selecting
+        waiting for a quiet host, #642). A fresh DELIVER first syncs the task's moved base
+        into its worktree (#585): a clean merge re-opens TEST, a conflict re-opens IMPLEMENT,
+        and repeated conflicts park the task, so this can return None or a different stage
+        than DELIVER. Before selecting
         a stage, a normal dispatch resumes any approved, partially-filed SCOPE
         decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
         leave execution to their children on the run DAG.
@@ -2851,14 +2854,15 @@ class Engine:
         """Merge the task's moved base into its worktree before DELIVER (#585), and return
         ``(action, task)``.
 
-        ``dispatch``: the branch already contains the base, or the sync was skipped (no
-        remote, failed fetch, dirty tree, ...), so DELIVER dispatches as before. ``reenter``:
-        a clean merge re-opened TEST (or, with no TEST in the pipeline, nothing needed
-        re-opening), or a conflict re-opened IMPLEMENT with the conflicting paths as a
-        learning. ``parked``: conflicts reached ``max_attempts - 1`` cycles, or there is no
-        IMPLEMENT to resolve them, so the task waits for a human (BLOCKED_ON_HUMAN, not
-        FAILED, since the work is intact). ``raced``: the task moved under us, and the
-        normal path takes over.
+        ``dispatch``: DELIVER dispatches as before. The branch already contains the base, the
+        sync was skipped (no remote, failed fetch, dirty tree, ...), or a clean merge
+        happened in a pipeline with no TEST stage to re-run. ``reenter``: a clean merge
+        re-opened TEST, or a conflict re-opened IMPLEMENT with the conflicting paths as a
+        learning, so the caller resolves the next stage again. ``parked``: conflicts reached
+        ``max_attempts - 1`` cycles, or there is no IMPLEMENT to resolve them, so the task
+        waits for a human (BLOCKED_ON_HUMAN, not FAILED, since the work is intact).
+        ``raced``: the task moved under us; the caller returns None and the next tick starts
+        from the task's current state.
 
         Every call emits one ``base_sync`` event naming the outcome. When the recorded
         ``base_sha`` is an ancestor of the base tip it is moved to the tip
