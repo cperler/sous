@@ -32,6 +32,9 @@ from .alerting import (
     NOTIFY_TASK_FAILED,
     release_commands,
 )
+from .base_sync import CONFLICT as BASE_SYNC_CONFLICT
+from .base_sync import SYNCED as BASE_SYNC_SYNCED
+from .base_sync import BaseSyncOutcome, sync_base
 from .benchmark_gate import (
     DEFAULT_BENCHMARK_TOLERANCE,
     compare_benchmarks,
@@ -1782,7 +1785,10 @@ class Engine:
         """Emit the task's next dispatchable WorkItem, or None when there is nothing to
         dispatch (terminal/parked task, decomposition umbrella, budget pause, pipeline
         exhausted, a declared-file claim held by another live task, or a TEST retry
-        waiting for a quiet host, #642). Before selecting
+        waiting for a quiet host, #642). A fresh DELIVER first syncs the task's moved base
+        into its worktree (#585): a clean merge re-opens TEST, a conflict re-opens IMPLEMENT,
+        and repeated conflicts park the task, so this can return None or a different stage
+        than DELIVER. Before selecting
         a stage, a normal dispatch resumes any approved, partially-filed SCOPE
         decomposition so its parent cannot advance into IMPLEMENT; completed umbrellas
         leave execution to their children on the run DAG.
@@ -1930,6 +1936,28 @@ class Engine:
                 supervisor_min_remaining_pct=supervisor_min_remaining_pct,
                 supervisor_resume_command=supervisor_resume_command,
             )
+        # #585: before a fresh DELIVER, bring the branch up to date with its base. Trunk
+        # moving mid-run used to fail the task at DELIVER with the work intact. A clean merge
+        # re-runs TEST over the merged tree, a conflict re-opens IMPLEMENT, and either way the
+        # re-entry below dispatches whatever stage is now next. Placed after the hold gate
+        # (a hold before DELIVER parks first) and only for a task with a worktree.
+        if (
+            stage is Stage.DELIVER
+            and not resume
+            and task.stages[stage].status is StageStatus.PENDING
+            and task.context.get("worktree")
+        ):
+            action, task = self._sync_base_before_deliver(run_id, task)
+            if action == "reenter":
+                return self.next_work(
+                    run_id, task_id,
+                    util_pct=util_pct,
+                    supervisor_context=supervisor_context,
+                    supervisor_min_remaining_pct=supervisor_min_remaining_pct,
+                    supervisor_resume_command=supervisor_resume_command,
+                )
+            if action != "dispatch":
+                return None
         # Declared-file contention (#377). `dispatchable` already filters a deferred
         # waiter out of the ready set, but — as with the terminal and BLOCKED_ON_HUMAN
         # guards above — next_work must be self-safe for direct callers: `orchestrator
@@ -2329,9 +2357,10 @@ class Engine:
             # #272: dispatch metadata like cwd/env — hash-excluded (see the field docstring).
             tool_policy=tool_policy,
             permission_posture=permission_posture,  # #304, hash-excluded for the same reason
-            # #546: names this fix cycle's log files. A TEST-driven cycle (#541) restarts the
-            # same stages at attempt 0, so it counts too; the sum only ever grows.
-            review_cycle=task.review_cycles + task.test_fix_cycles,
+            # #546: names this fix cycle's log files. A TEST-driven cycle (#541) and a
+            # base-sync re-run (#585) restart the same stages at attempt 0, so they count
+            # too; the sum only ever grows.
+            review_cycle=task.review_cycles + task.test_fix_cycles + task.base_sync_cycles,
         )
         # #314: persist the prompt that produced this dispatch, and fingerprint it, BEFORE
         # the commit below — evidence-first, matching commit_task_events' events-before-doc
@@ -2810,6 +2839,140 @@ class Engine:
             return False
         return True
 
+    def _project_base_branch(self) -> str | None:
+        """The project's declared base branch (an optional ``base_branch`` attribute or
+        zero-argument method), or None to let the sync read ``origin/HEAD``. Not part of the
+        versioned contract: an adapter without it, or one whose hook raises, gets None."""
+        value = getattr(self.project, "base_branch", None)
+        try:
+            value = value() if callable(value) else value
+        except Exception:  # noqa: BLE001 - an optional hook must never break a dispatch
+            return None
+        return value.strip() if isinstance(value, str) and value.strip() else None
+
+    def _sync_base_before_deliver(self, run_id: str, task: Task) -> tuple[str, Task]:
+        """Merge the task's moved base into its worktree before DELIVER (#585), and return
+        ``(action, task)``.
+
+        ``dispatch``: DELIVER dispatches as before. The branch already contains the base, the
+        sync was skipped (no remote, failed fetch, dirty tree, ...), or a clean merge
+        happened in a pipeline with no TEST stage to re-run. ``reenter``: a clean merge
+        re-opened TEST, or a conflict re-opened IMPLEMENT with the conflicting paths as a
+        learning, so the caller resolves the next stage again. ``parked``: conflicts reached
+        ``max_attempts - 1`` cycles, or there is no IMPLEMENT to resolve them, so the task
+        waits for a human (BLOCKED_ON_HUMAN, not FAILED, since the work is intact).
+        ``raced``: the task moved under us; the caller returns None and the next tick starts
+        from the task's current state.
+
+        Every call emits one ``base_sync`` event naming the outcome. When the recorded
+        ``base_sha`` is an ancestor of the base tip it is moved to the tip
+        (``base_sha_from``/``base_sha_to`` on the event), so later ``base_sha..HEAD`` reads
+        (test selection, diff stat, the non-code check) still see only the task's change."""
+        worktree = str(task.context.get("worktree") or "")
+        old_base = str(task.context.get("base_sha") or "") or None
+        sync: BaseSyncOutcome = sync_base(
+            worktree, base_sha=old_base, project_base=self._project_base_branch()
+        )
+        conflict = sync.outcome == BASE_SYNC_CONFLICT
+        if conflict and (
+            task.base_sync_conflicts >= task.max_attempts - 1
+            or Stage.IMPLEMENT not in task.pipeline
+        ):
+            action = "parked"
+        elif conflict:
+            action = "reopen_implement"
+        elif sync.outcome == BASE_SYNC_SYNCED and Stage.TEST in task.pipeline:
+            action = "rerun_test"
+        else:
+            action = "deliver"
+        event: dict = {
+            "ts": _now(), "type": "base_sync",
+            "level": "warning" if sync.outcome in (BASE_SYNC_CONFLICT, "skipped") else "info",
+            "run_id": run_id, "task_id": task.task_id, "stage": Stage.DELIVER.value,
+            "outcome": sync.outcome, "action": action, "base_ref": sync.base_ref,
+            "base_tip": sync.base_tip, "head_before": sync.head_before,
+            "head_after": sync.head_after,
+        }
+        if sync.reason:
+            event["reason"] = sync.reason
+        if conflict:
+            event["conflicts"] = list(sync.conflicts)
+            event["conflicts_count"] = sync.conflicts_count
+        if sync.advance_base_sha:
+            event["base_sha_from"] = old_base
+            event["base_sha_to"] = sync.advance_base_sha
+        reason = (
+            f"merging {sync.base_ref} into the task branch conflicts in "
+            f"{sync.conflicts_count} file(s): {', '.join(sync.conflicts)}"
+        )
+        events: list[dict] = [event]
+        if action == "parked":
+            why = (
+                "no IMPLEMENT stage to resolve them" if Stage.IMPLEMENT not in task.pipeline
+                else f"{task.base_sync_conflicts} conflict cycle(s) already spent"
+            )
+            events += [
+                {"ts": _now(), "type": "base_sync_exhausted", "level": "warning",
+                 "run_id": run_id, "task_id": task.task_id, "stage": Stage.DELIVER.value,
+                 "base_ref": sync.base_ref, "conflicts": list(sync.conflicts),
+                 "conflicts_used": task.base_sync_conflicts,
+                 "conflicts_budget": task.max_attempts - 1, "detail": why},
+                {"ts": _now(), "type": "held_for_approval", "run_id": run_id,
+                 "task_id": task.task_id, "what": "base_sync:deliver"},
+            ]
+
+        def _apply(t: Task) -> None:
+            if (
+                t.pending_work_item_id is not None
+                or next_stage(t) is not Stage.DELIVER
+                or t.stages[Stage.DELIVER].status is not StageStatus.PENDING
+            ):
+                raise _SkipRaced
+            if sync.advance_base_sha:
+                t.context["base_sha"] = sync.advance_base_sha
+            if action == "rerun_test":
+                reset_for_fix_cycle(t, Stage.TEST, cause="base sync")
+                t.base_sync_cycles += 1
+            elif action == "reopen_implement":
+                reset_for_fix_cycle(t, Stage.IMPLEMENT, cause="base sync")
+                t.base_sync_cycles += 1
+                t.base_sync_conflicts += 1
+                t.learnings.append(
+                    f"base sync before DELIVER: {reason}. The engine aborted its merge. In "
+                    f"the task worktree run `git fetch origin` and `git merge {sync.base_ref}`, "
+                    "resolve those conflicts keeping both the base's changes and this task's, "
+                    "and commit the merge."
+                )
+                # Same boundary as a test fix cycle: act from the learning, not a session.
+                t.session_ref = None
+                t.session_provider = None
+                t.state = TaskState.RETRYING
+            elif action == "parked":
+                t.state = TaskState.BLOCKED_ON_HUMAN
+                t.pending_approval_what = "base_sync:deliver"
+                t.last_error = (
+                    f"base sync before DELIVER: {reason}. Merge {sync.base_ref} into the "
+                    "task branch by hand, then approve to deliver."
+                )
+
+        try:
+            task = self.store.commit_task_events(run_id, task.task_id, _apply, events)
+        except _SkipRaced:
+            self.store.append_event(run_id, {**event, "action": "raced"})
+            return "raced", task
+        if action == "reopen_implement":
+            self._set_ref_state(run_id, task.task_id, TaskState.RETRYING)
+        if action == "parked":
+            self._set_ref_state(run_id, task.task_id, TaskState.BLOCKED_ON_HUMAN)
+            self._notify_blocked(
+                run_id, task, stage=Stage.DELIVER, gate="base_sync",
+                reason=f"base sync before DELIVER: {reason}",
+            )
+            return "parked", task
+        if action in ("rerun_test", "reopen_implement"):
+            return "reenter", task
+        return "dispatch", task
+
     def _impacted_tests_for_prompt(self, task: Task) -> list[str] | None:
         """The impacted test files for a model-lane TEST prompt (#558), or None.
 
@@ -3100,7 +3263,9 @@ class Engine:
 
         WHICH commits: ``<previous checkpoint or base_sha>..<this stage's checkpoint sha>``
         in the task's own worktree — exactly the commits this stage added, so each new commit
-        is scanned once rather than the whole branch being re-scanned every stage.
+        is scanned once rather than the whole branch being re-scanned every stage. Only the
+        first-parent line is read, so trunk commits that the pre-DELIVER base sync (#585)
+        merged in are not reported as this run's.
 
         REPORT-ONLY, never amend — that is how the "rewrite already-pushed history" hazard is
         avoided rather than merely survived. DELIVER pushes its branch BEFORE its checkpoint
@@ -3147,9 +3312,12 @@ class Engine:
             return
         rev = f"{since}..{head}"
         try:
+            # --first-parent: the pre-DELIVER base sync (#585) merges trunk into the task
+            # branch, and the commits it brings in are other people's, trailers and all.
+            # Only the branch's own line (its commits and that merge) is this run's.
             proc = subprocess.run(  # noqa: S603
-                ["git", "log", f"-n{_ATTRIBUTION_SCAN_COMMIT_CAP + 1}",  # noqa: S607
-                 "--format=%H%x1f%B%x1e", rev],
+                ["git", "log", "--first-parent",  # noqa: S607
+                 f"-n{_ATTRIBUTION_SCAN_COMMIT_CAP + 1}", "--format=%H%x1f%B%x1e", rev],
                 cwd=str(worktree), capture_output=True, text=True, timeout=30,
             )
         except (OSError, subprocess.SubprocessError) as exc:
@@ -5932,7 +6100,7 @@ class Engine:
                  "from": previous.value if previous is not None else None,
                  "to": ReviewBudget.LONG.value, "reason": "review_timed_out"},
             )
-        cycle = task.review_cycles + task.test_fix_cycles
+        cycle = task.review_cycles + task.test_fix_cycles + task.base_sync_cycles
         root = Path(self.store.root)
         streams: list[tuple[str, str]] = []
         unreadable = 0

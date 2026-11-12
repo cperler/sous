@@ -47,7 +47,17 @@ def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> Non
     prompt = STAGE_SPECS[Stage.DELIVER].template
     assert "gh pr view <url> --json state,headRefName,baseRefName" in prompt
     assert "reuse it only when it is OPEN and its head is the task branch" in prompt
-    assert "do not merge/rebase after TEST" in prompt
+    assert "do not merge or rebase here" in prompt
+
+
+def test_deliver_prompt_scopes_the_ancestor_refusal_to_a_replacement_pr() -> None:
+    """#585: the model read the replacement-only ancestor check as applying to every
+    delivery, and refused first PRs whenever trunk had moved. The engine syncs the base
+    before DELIVER now, so the prompt must say a first delivery is never refused."""
+    prompt = STAGE_SPECS[Stage.DELIVER].template
+    assert "applies ONLY to that replacement case" in prompt
+    assert "A first delivery (no pr_url in the context) is never refused" in prompt
+    assert "do not merge/rebase after TEST" not in prompt
 
 
 def test_local_override_wins(tmp_path) -> None:
