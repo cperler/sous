@@ -348,6 +348,13 @@ class Task(_StatusModel):
     # TEST would re-run identical code, so a regression goes back to the implementer instead;
     # this bounds those trips at ``max_attempts - 1``, after which the task fails.
     test_fix_cycles: int = 0
+    # Times the pre-DELIVER base sync (#585) re-opened the pipeline: a clean merge of a moved
+    # base re-runs TEST, a conflicting one re-opens IMPLEMENT. Counted into the dispatch's
+    # log-file cycle so a re-run never overwrites the earlier pass's files.
+    base_sync_cycles: int = 0
+    # Of those, the conflicts. Bounded at ``max_attempts - 1``; the next conflict parks the
+    # task for a human instead of failing it, because the work itself is intact.
+    base_sync_conflicts: int = 0
     # Fingerprints (file:description, normalized) of the LAST rejection's blocking
     # issues — the convergence key (#15): a re-review whose issues are a subset of
     # these (no net-new findings, none critical) has converged and auto-approves.
