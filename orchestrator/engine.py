@@ -4349,10 +4349,16 @@ class Engine:
 
         by_id = {task.id: task for task in tasks}
         mapping = dict(parent.decomposition_mapping)
+        child_dependencies: dict[str, list[str]] = {}
         try:
             for local_id in topological_order(tasks):
                 child = by_id[local_id]
-                dep_refs = [mapping[dep] for dep in child.depends_on]
+                # INTAKE composes direct dependencies in this order. The parent's task
+                # snapshot still carries its original edges after the run graph is parked.
+                dep_refs = list(dict.fromkeys(
+                    [*parent.depends_on, *(mapping[dep] for dep in child.depends_on)]
+                ))
+                child_dependencies[local_id] = dep_refs
                 if local_id not in mapping:
                     marker = f"Decomposition-key: {parent.task_id}/{local_id}"
                     controls = (
@@ -4401,7 +4407,7 @@ class Engine:
                     deterministic_stages=[
                         s for s in parent.deterministic_stages if s in child_pipeline
                     ],
-                    depends_on=[mapping[dep] for dep in child.depends_on],
+                    depends_on=child_dependencies[local_id],
                     provider_tag=parent.provider_tag,
                     agent_role=child.agent,
                     quality_tier=child.quality_tier,

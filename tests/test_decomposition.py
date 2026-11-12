@@ -157,6 +157,39 @@ def test_scope_emits_children_with_controls_and_existing_dag(tmp_path, project) 
     assert ("parent", None) in source.completed
 
 
+def test_decomposition_children_compose_the_parents_dependencies(tmp_path, project) -> None:
+    source = CreatingSource()
+    project._task_source = source
+    eng = _engine(tmp_path, project)
+    eng.create_run("r1", ExecutionLane.FULL)
+    eng.add_task("r1", "upstream")
+    eng.add_task(
+        "r1", "parent", pipeline=[Stage.SCOPE, Stage.IMPLEMENT], depends_on=["upstream"]
+    )
+
+    def complete_upstream(task) -> None:
+        task.state = TaskState.COMPLETED
+        task.context["branch"] = "task/upstream"
+
+    eng.store.update_task("r1", "upstream", complete_upstream)
+    result = eng.record(
+        "r1", make_result(eng.next_work("r1", "parent"), structured_output=_scope_output())
+    )
+    assert result["outcome"] == "task_decomposed"
+    assert eng.store.load_run("r1").dependency_graph == {
+        "upstream": [],
+        "parent": ["child-2", "child-3"],
+        "child-1": ["upstream"],
+        "child-2": ["upstream"],
+        "child-3": ["upstream", "child-1"],
+    }
+    assert "Depends-on: upstream, child-1" in source.created["child-3"].body
+
+    work = eng.next_work("r1", "child-1")
+    assert work is not None and work.stage is Stage.INTAKE
+    assert work.context["dep_branches"] == ["task/upstream"]
+
+
 def test_failed_child_cascades_only_its_dependents(tmp_path, project) -> None:
     eng, _source = _decompose(tmp_path, project)
     eng.record("r1", make_result(eng.next_work("r1", "child-1")))  # intake
