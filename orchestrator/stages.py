@@ -480,20 +480,23 @@ _DOCS_ONLY_DIRECTIVE = (
 # the old wording exactly, got the right answer from `python -c`, and then ran every mutation
 # check against a sibling worktree's source anyway.
 #
-# A result-flipping mutation is accepted as the same proof (prediction pred-1159-1175-1178-1182
-# #1175, kb lk-37a566121365): the `__file__` print came out empty under pytest's capture, while
-# reverting the fix in the workspace failed 10 tests — evidence only this checkout's import gives.
+# A result-flipping mutation leads (#1175, #1857, #959 in prediction runs): a printed
+# `__file__` came out empty three times, under pytest's capture, xdist, or a conftest that
+# swallows `-s` output, while reverting or mutating this workspace's source and watching a
+# test flip settled origin every time. The print probe stays only as a fallback that WRITES
+# the path to a file, because only a file survives every capture mode (prediction #959).
 _RUNNER_ORIGIN_CHECK = (
-    "resolve an exercised module's `__file__` FROM INSIDE THE TEST RUNNER — a collected test "
-    "that prints it, run by the project's own test command — and confirm that path lies under "
-    "this workspace. A bare `python -c \"import pkg; print(pkg.__file__)\"` is NOT that check "
-    "and can agree with this workspace while the runner does not: `python -c` puts your cwd "
-    "first on `sys.path`, so it reports the local copy while the runner (different rootdir, "
-    "different install) imports another worktree's. (The runner captures output: pass `-s` "
-    "to pytest or the print comes out empty.) A mutation of this workspace's source that "
-    "FLIPS a runner result (a passing test now fails) is equal proof, since only a runner "
-    "importing this checkout can see it; name the mutation. A mutation that changes nothing "
-    "proves nothing about origin."
+    "prove the test runner imports THIS workspace's source. The primary proof: mutate this "
+    "workspace's source so a runner result FLIPS (a passing test now fails), run by the "
+    "project's own test command, and name the mutation; only a runner importing this "
+    "checkout can see it. A mutation that changes nothing proves nothing about origin. "
+    "Fallback when no mutation flips: a collected test, run by the project's test command, "
+    "that WRITES an exercised module's `__file__` to a file (printed output can be swallowed "
+    "by the runner's capture), then confirm that path lies under this workspace. A bare "
+    "`python -c \"import pkg; print(pkg.__file__)\"` is NOT that check and can agree with "
+    "this workspace while the runner does not: `python -c` puts your cwd first on "
+    "`sys.path`, so it reports the local copy while the runner (different rootdir, "
+    "different install) imports another worktree's."
 )
 
 

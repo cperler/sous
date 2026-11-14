@@ -201,9 +201,18 @@ def test_a_result_flipping_mutation_counts_as_origin_proof() -> None:
     pytest's output capture, while reverting the fix in the workspace failed 10 tests. Only a
     runner importing this checkout sees such a flip, so it is accepted as the same proof — and
     a mutation that changes nothing is explicitly not, since it cannot tell the trees apart."""
-    assert "`-s`" in _RUNNER_ORIGIN_CHECK
-    assert "FLIPS a runner result" in _RUNNER_ORIGIN_CHECK
+    assert "FLIPS" in _RUNNER_ORIGIN_CHECK
     assert "changes nothing proves nothing" in _RUNNER_ORIGIN_CHECK
+
+
+def test_the_mutation_flip_leads_and_the_probe_writes_to_a_file() -> None:
+    """The print probe came back empty three times (prediction #1175, #1857, #959: capture,
+    xdist, a conftest swallowing `-s`) while a flipping mutation worked each time. So the flip
+    is named first, and the fallback probe WRITES the path to a file instead of printing it."""
+    text = _RUNNER_ORIGIN_CHECK
+    assert text.index("FLIPS") < text.index("Fallback")
+    assert "WRITES" in text
+    assert "`-s`" not in text
 
 
 def test_unverified_workspace_orders_the_check_before_any_relied_on_command() -> None:

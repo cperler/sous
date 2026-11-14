@@ -252,7 +252,7 @@ def test_review_prompt_requires_a_recorded_mutation_and_scopes_the_carve_out() -
     assert "## Reporting tests_meaningful" in prompt
     # #390 replaced the one-direction mutation sentence this used to assert; its own
     # regression coverage lives in tests/test_review_worktree_trust.py.
-    assert "resolve an exercised module's `__file__`" in prompt
+    assert "prove the test runner imports THIS workspace's source" in prompt
     assert "JUDGE `tests_meaningful` whenever this change has tests you can read" in prompt
     assert "Answer null ONLY when there is genuinely NO test surface" in prompt
     assert "reads as a rejection" in prompt  # the #144 misfire guard is NOT relaxed
