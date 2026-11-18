@@ -50,14 +50,15 @@ def test_deliver_prompt_never_treats_a_recorded_pr_url_as_live_evidence() -> Non
     assert "do not merge or rebase here" in prompt
 
 
-def test_deliver_prompt_scopes_the_ancestor_refusal_to_a_replacement_pr() -> None:
-    """#585: the model read the replacement-only ancestor check as applying to every
-    delivery, and refused first PRs whenever trunk had moved. The engine syncs the base
-    before DELIVER now, so the prompt must say a first delivery is never refused."""
+def test_deliver_prompt_carries_no_ancestor_refusal() -> None:
+    """#585 then #669: the model read the ancestor check as applying to every delivery and
+    refused first PRs whenever trunk had moved (prediction#1780). The engine syncs the base
+    before every DELIVER and the deterministic runner enforces the replacement-PR check in
+    code, so the prompt no longer tells the model to refuse for a moved base at all."""
     prompt = STAGE_SPECS[Stage.DELIVER].template
-    assert "applies ONLY to that replacement case" in prompt
-    assert "A first delivery (no pr_url in the context) is never refused" in prompt
-    assert "do not merge/rebase after TEST" not in prompt
+    assert "ancestor" not in prompt
+    assert "refuse" not in prompt
+    assert "do not merge or rebase here" in prompt
 
 
 def test_local_override_wins(tmp_path) -> None:

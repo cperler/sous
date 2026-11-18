@@ -275,11 +275,7 @@ STAGE_SPECS: dict[Stage, StageSpec] = {
             "is CLOSED/MERGED or names another head, look for another OPEN PR for the "
             "task branch; otherwise open a replacement against the recorded current "
             "base. Before this stage the engine merges the current base into the task "
-            "branch and re-runs its tests (#585), so do not merge or rebase here. The "
-            "ancestor check applies ONLY to that replacement case (a recorded pr_url that "
-            "is CLOSED/MERGED): fetch the base and, if it is not an ancestor of HEAD, "
-            "refuse and say the branch must sync the base. A first delivery (no pr_url in "
-            "the context) is never refused for a moved base. "
+            "branch and re-runs its tests (#585), so do not merge or rebase here. "
             "Never open a duplicate.\n"
             "Return: pr_number, pr_url."
         ),
