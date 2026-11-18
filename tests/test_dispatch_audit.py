@@ -112,13 +112,16 @@ def test_continuity_rate_is_derivable_from_events_alone(tmp_path, project) -> No
     dispatched = [e for e in raw if e["type"] == "stage_dispatched"]
     resumed = [e for e in dispatched if e["session_ref"]]
     assert len(dispatched) > 2
-    # the first dispatch is necessarily cold; every later one chains the minted ref
-    assert len(resumed) == len(dispatched) - 1
+    # the first dispatch is necessarily cold, and REVIEW deliberately so (#542: the reviewer
+    # never continues the implementer's conversation); every other one chains the minted ref
+    fresh = [e["stage"] for e in dispatched if not e["session_ref"]]
+    assert fresh == [dispatched[0]["stage"], "review"]
+    assert len(resumed) == len(dispatched) - 2
     assert all("session_ref" in e for e in dispatched)  # no key-absent holes to guess at
 
     audit = eng.events_audit("r1")["continuity"]
     assert audit["known"] == len(dispatched) and audit["unknown"] == 0
-    assert audit["resumed"] == len(resumed) and audit["fresh"] == 1
+    assert audit["resumed"] == len(resumed) and audit["fresh"] == 2
     assert audit["rate"] == len(resumed) / len(dispatched)
 
 

@@ -436,6 +436,12 @@ class Task(_StatusModel):
     # untagged wildcard), so a claude ref is never fed to codex or the reverse. Set alongside
     # session_ref on SUCCESS; cleared with it on failure/reject.
     session_provider: Provider | None = None
+    # Which STAGE produced the current session_ref (#542). REVIEW must not continue the
+    # implementer's conversation — the reviewer is meant to be independent of the author — so
+    # next_work hands REVIEW a ref only when REVIEW itself minted it (a warm retry of
+    # REVIEW's own failed attempt). Set and cleared alongside session_ref/session_provider.
+    # Additive field: a pre-#542 task doc loads as None, which REVIEW treats as "not mine".
+    session_stage: Stage | None = None
     # Cross-provider fallthrough (#7): stages the engine has re-routed OFF codex onto claude
     # because the codex provider was persistently out (CLI missing / auth expired / floor
     # rate-limit with the wait budget spent). The Router routes any stage in this set to
