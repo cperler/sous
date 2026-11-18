@@ -223,6 +223,16 @@ def _now() -> str:
     return datetime.now(UTC).isoformat()
 
 
+def _session_resumable_by(stage: Stage, session_stage: Stage | None) -> bool:
+    """Whether a dispatch of ``stage`` may resume a session minted by ``session_stage`` (#542).
+
+    Every stage chains the task's session except REVIEW, which resumes only a session REVIEW
+    itself produced (a warm retry of its own failed attempt). Resuming the implementer's
+    conversation would hand the reviewer the author's reasoning, which is exactly what an
+    independent review exists to avoid. ``None`` (an untagged, pre-#542 ref) is not REVIEW's."""
+    return stage is not Stage.REVIEW or session_stage is Stage.REVIEW
+
+
 def _elapsed_s(started_at: str | None) -> float | None:
     """Wall-clock seconds since an ISO stage-start stamp, for a cost-ledger row an
     operator path synthesizes for a dispatch that never reported back (``abandon``,
@@ -2324,10 +2334,14 @@ class Engine:
             # fallback-to-fresh, never a correctness problem. Provider-gated (#9): a
             # session id is provider-specific, so it only rides a stage whose lane
             # provider matches the ref's owner (NONE = untagged wildcard) — a claude ref
-            # is never handed to codex or the reverse.
+            # is never handed to codex or the reverse. Stage-gated (#542): REVIEW never
+            # resumes the implementer's conversation — the reviewer is meant to be independent
+            # of the author, so it starts fresh from the rendered prompt and the diff. Only a
+            # warm retry of REVIEW's OWN failed attempt resumes (see _session_resumable_by).
             session_ref=(
                 task.session_ref
                 if task.session_provider in (None, Provider.NONE, lane.provider)
+                and _session_resumable_by(stage, task.session_stage)
                 else None
             ),
             checkpoint_tag=checkpoint_tag,
@@ -2946,6 +2960,7 @@ class Engine:
                 # Same boundary as a test fix cycle: act from the learning, not a session.
                 t.session_ref = None
                 t.session_provider = None
+                t.session_stage = None
                 t.state = TaskState.RETRYING
             elif action == "parked":
                 t.state = TaskState.BLOCKED_ON_HUMAN
@@ -3812,6 +3827,7 @@ class Engine:
                         # Tag the ref with the provider that produced it (#9) so a later stage
                         # on the other provider won't try to resume a foreign session.
                         t.session_provider = effective.lane_used.provider
+                        t.session_stage = effective.stage
                     # Checkpoint anchor (design pass §3): SUCCESS only — a failed or
                     # gate-vetoed attempt's commits must never become a reset target.
                     if effective.checkpoint:
@@ -5614,6 +5630,7 @@ class Engine:
         # durable instruction, not continue inside the reviewer context that proposed it.
         task.session_ref = None
         task.session_provider = None
+        task.session_stage = None
         reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
         if not reset:  # defensive counterpart to the pipeline membership guard above
             reason = "could not reset the pipeline from IMPLEMENT"
@@ -5686,6 +5703,7 @@ class Engine:
         # OFF: a rejecting session's context is as likely poisoned as useful).
         task.session_ref = None
         task.session_provider = None
+        task.session_stage = None
         if task.review_cycles < self.max_review_cycles:
             reset = reset_for_fix_cycle(task, Stage.IMPLEMENT)
             if reset:
@@ -5737,6 +5755,7 @@ class Engine:
         # The codex session must NOT ride onto the claude dispatch (#9).
         task.session_ref = None
         task.session_provider = None
+        task.session_stage = None
         task.pending_fallback_model = None  # claude starts fresh at its role default
         task.not_before = None
         task.rate_limit_waits = 0  # a different provider — a fresh cooldown budget
@@ -5849,6 +5868,12 @@ class Engine:
             # There must actually BE a session to carry — else "keep" is a no-op that would
             # emit a misleading warm_retry_used event (e.g. a deterministic/first stage).
             and bool(result.session_ref or task.session_ref)
+            # #542: the kept ref must be one next_work will actually hand the retry — a
+            # REVIEW that reported no ref of its own would otherwise "keep" the implementer's
+            # session and event a warmth next_work then drops.
+            and _session_resumable_by(
+                result.stage, result.stage if result.session_ref else task.session_stage
+            )
             and self._work_not_implicated(result, infra_only=infra_only)
             and self._warm_session_provider_ok(task, result)
             and self._warm_worktree_ok(task, result)
@@ -5856,6 +5881,7 @@ class Engine:
         if not keep:
             task.session_ref = None
             task.session_provider = None
+            task.session_stage = None
             return
         # Keep warm. Prefer the failed dispatch's OWN reported ref (the same-stage session it
         # was mid-work in); if the runner reported none, leave the threaded-in ref in place
@@ -5863,6 +5889,7 @@ class Engine:
         if result.session_ref:
             task.session_ref = result.session_ref
             task.session_provider = result.lane_used.provider
+            task.session_stage = result.stage
         kind = result.status.value
         task.learnings.append(
             f"{result.stage.value} (attempt {result.attempt}): WARM RETRY — you are resuming "
@@ -6072,6 +6099,7 @@ class Engine:
             # above, not from inside a prior stage's session.
             task.session_ref = None
             task.session_provider = None
+            task.session_stage = None
             self.store.append_event(
                 task.run_id,
                 {"ts": _now(), "type": "test_failed_fix_cycle", "run_id": task.run_id,

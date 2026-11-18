@@ -353,6 +353,20 @@ so its cost and failures are visible without restoring the old opaque quality lo
   re-review whose `mutation_checks` match none of them is evented `named_survivor_unchecked`
   (report-only). `status` adds `surviving_mutations` / `blocking_mutations` beside
   `proving_mutations`.
+- **REVIEW starts a fresh provider session (#542).** Sessions chain across successful stages
+  via `--resume`, which used to make REVIEW a continuation of the implementer's conversation.
+  `next_work` now hands REVIEW a ref only when REVIEW itself minted it (`Task.session_stage`,
+  set and cleared with `session_ref`): a warm retry of REVIEW's own failed attempt resumes,
+  nothing else does, and the warm-retry policy declines to "keep" a session REVIEW would not
+  be given. The cost is REVIEW's cache hits; `events_audit`'s continuity block counts it as
+  a fresh dispatch.
+- **Mutation checks fail loudly (#542 part d).** `orchestrator mutation-check -C <workspace>
+  --mutate FILE:LINE:REPLACEMENT -- <test argv>` (`orchestrator/mutation_check.py`) runs the
+  test argv without a shell, unmutated first, then with the line replaced, and restores the
+  file's bytes and mtime. Each run is classified from pytest's summary line and exit code; a
+  run that collected nothing, hit a usage error, printed no pass/fail count or timed out exits
+  2 as `not_checked`, never as a survivor. The REVIEW template names the command by the
+  absolute path of the engine's console script.
 - **The declared commands decide a model TEST's verdict.** On the in-process model lanes
   (headless×claude, any×codex), `test_verdict.py` re-runs the ENGINE lane's evaluation
   (`DeterministicTestRunner.evaluate`) after the model: a claimed green that the declared

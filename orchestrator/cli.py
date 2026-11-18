@@ -814,6 +814,23 @@ def main(argv: list[str] | None = None) -> int:
     bsc.add_argument("--project", default=argparse.SUPPRESS,
                      help="project-config module/dir supplying the task source (may also "
                           "precede 'brainstorm')")
+    mc = sub.add_parser(
+        "mutation-check",
+        help="REVIEW's mutation check as one command (#542): run the test command (argv after "
+             "--, no shell) unmutated first, then with one line mutated, and restore the file. "
+             "Prints one JSON object; exits 2, never a survivor, when a run collected no tests, "
+             "hit a usage error, printed no pass/fail count, or timed out")
+    mc.add_argument("-C", "--cwd", default=".",
+                    help="workspace to run in; --mutate paths are relative to it")
+    mc.add_argument("--mutate", default=None, metavar="FILE:LINE:REPLACEMENT",
+                    help="replace the text of 1-indexed LINE (its indentation is kept unless "
+                         "REPLACEMENT starts with whitespace); omit to run only the baseline")
+    mc.add_argument("--timeout", type=float, default=None,
+                    help="per-run budget in seconds (default 90); a run over it is reported "
+                         "as timeout, not as killed or survived")
+    mc.add_argument("test_argv", nargs=argparse.REMAINDER,
+                    help="-- then the project's test command and test paths, e.g. "
+                         "-- uv run pytest tests/test_a.py tests/test_b.py")
     mg = sub.add_parser("runs-migrate",
                         help="move pre-#523 run dirs out of a legacy runs/ root into the dated "
                              "default layout <runs root>/<project>/<YYYY-MM-DD>/<run>/. "
@@ -1111,6 +1128,31 @@ def main(argv: list[str] | None = None) -> int:
             )[-args.limit:]
             _emit({"path": str(path), "count": len(entries), "entries": entries})
         return 0
+
+    if args.cmd == "mutation-check":
+        from .mutation_check import DEFAULT_TIMEOUT_S, Mutation, mutation_check
+
+        test_argv = list(args.test_argv)
+        if test_argv[:1] == ["--"]:
+            test_argv = test_argv[1:]
+        try:
+            mutation = Mutation.parse(args.mutate) if args.mutate else None
+        except ValueError as exc:
+            p.error(str(exc))
+        code, report = mutation_check(
+            test_argv, cwd=Path(args.cwd).resolve(), mutation=mutation,
+            timeout_s=args.timeout if args.timeout is not None else DEFAULT_TIMEOUT_S,
+        )
+        _emit(report)
+        if report.get("outcome") == "not_checked":
+            failed = report.get("failed_run")
+            run = report.get("mutated_run" if failed == "mutation" else "baseline")
+            tail = run.get("tail", "") if isinstance(run, dict) else ""
+            print(f"mutation-check: NOT CHECKED — {failed} run: {report.get('reason')}. "
+                  "This is not a surviving mutation.", file=sys.stderr)
+            if tail:
+                print(tail, file=sys.stderr)
+        return code
 
     if args.cmd == "runs-migrate":
         # Opt-in relocation of a legacy runs/ root into the dated layout (#523). Preview by

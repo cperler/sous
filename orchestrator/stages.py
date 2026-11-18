@@ -8,8 +8,10 @@ prompts stay repo-agnostic and the same engine drives any project.
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from pathlib import Path
 
 from .model_table import Role
 from .schemas.enums import STAGE_ORDER, Effort, Stage
@@ -500,6 +502,24 @@ _RUNNER_ORIGIN_CHECK = (
 )
 
 
+# #542 (d): the mutation check as ONE command, so "no tests ran" can never read as a survivor
+# (zsh's unsplit `pytest $T`, an `-n auto` that collected nothing, a grep printing nothing).
+# Named by the absolute path of the engine's own console script, because a review workspace
+# of another project has no `orchestrator` on its PATH.
+def _orchestrator_cli() -> str:
+    script = Path(sys.executable).with_name("orchestrator")
+    return str(script) if script.is_file() else "orchestrator"
+
+
+_MUTATION_CHECK_COMMAND = (
+    f"Run each mutation with `{_orchestrator_cli()} mutation-check -C <workspace> --mutate "
+    "FILE:LINE:REPLACEMENT -- <the project's test command> <test paths>`: it runs the "
+    "unmutated baseline first, restores the file, and exits 2 with `not_checked` when a run "
+    "collected no tests, hit a usage error, printed no pass/fail count, or timed out. A "
+    "`not_checked` run is not a surviving mutation."
+)
+
+
 # #390: the trust posture for a revert/mutation check the REVIEWER runs itself. Six
 # retrospectives across four runs report one failure mode: a review workspace whose
 # environment was provisioned by COPY resolves the package to a SIBLING worktree's absolute
@@ -519,7 +539,7 @@ _MUTATION_CHECK_TRUST = (
     + _RUNNER_ORIGIN_CHECK + " If you cannot confirm it that way, or identical invocations "
     "disagree, the check is INCONCLUSIVE: say so in `tests_not_checked_reason`, fall back to "
     "reading the tests, and do not answer `tests_meaningful: false` or raise a blocking issue "
-    "on its strength alone."
+    "on its strength alone. " + _MUTATION_CHECK_COMMAND
 )
 
 
