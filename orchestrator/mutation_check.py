@@ -29,6 +29,7 @@ from __future__ import annotations
 import contextlib
 import os
 import re
+import shlex
 import signal
 import subprocess
 import time
@@ -180,6 +181,21 @@ def _apply(original: str, mutation: Mutation) -> tuple[str, str, str]:
     return "".join(lines), body, new_body
 
 
+def split_quoted_command(argv: list[str], *, cwd: Path) -> list[str]:
+    """Split a whole test command passed as ONE quoted word (``-- "uv run pytest -q t.py"``).
+
+    Every model REVIEW in pred-2041-2116 did this first: the run has no shell, so the single
+    word was taken as a program name and every check came back ``usage_error``. Only a lone
+    word that contains whitespace and names no existing file is split; a command already in
+    separate words is untouched, so an unsplit path list after a real program still fails
+    loudly (sous#542)."""
+    if len(argv) != 1 or not argv[0].split()[1:]:
+        return argv
+    if (cwd / argv[0]).exists():
+        return argv
+    return shlex.split(argv[0])
+
+
 def mutation_check(
     argv: list[str], *, cwd: Path, mutation: Mutation | None = None,
     timeout_s: float = DEFAULT_TIMEOUT_S,
@@ -189,6 +205,7 @@ def mutation_check(
     ``outcome`` is ``killed`` / ``survived`` (a verdict, exit 0), ``baseline_passed`` (no
     mutation given, exit 0), or ``not_checked`` (exit 2) with ``failed_run`` and ``reason``
     naming which run could not be read and why."""
+    argv = split_quoted_command(argv, cwd=cwd)
     if not argv:
         return EXIT_NOT_CHECKED, {"outcome": "not_checked", "failed_run": None,
                                   "reason": "no test command given after --"}

@@ -21,6 +21,7 @@ from orchestrator.mutation_check import (
     classify_run,
     mutation_check,
     parse_summary,
+    split_quoted_command,
 )
 
 SOURCE = "def add(a, b):\n    return a + b\n"
@@ -182,6 +183,25 @@ def test_cli_reports_a_killed_mutant(proj: Path, capsys) -> None:
                    "--", *_pytest("tests/test_calc.py")])
     assert rc == 0
     assert json.loads(capsys.readouterr().out)["outcome"] == "killed"
+
+
+def test_cli_splits_a_command_quoted_as_one_word(proj: Path, capsys) -> None:
+    """pred-2041-2116: three reviewers passed ``-- "<test command>"`` as one word and every
+    check read usage_error. The quoted command now runs as if written out word by word."""
+    quoted = " ".join(_pytest("tests/test_calc.py"))
+    rc = cli.main(["mutation-check", "-C", str(proj), "--mutate", "calc.py:2:return a - b",
+                   "--", quoted])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "killed"
+
+
+def test_split_leaves_separate_words_and_real_paths_alone(tmp_path: Path) -> None:
+    words = ["pytest", "tests/a b.py"]
+    assert split_quoted_command(words, cwd=tmp_path) == words
+    assert split_quoted_command(["pytest"], cwd=tmp_path) == ["pytest"]
+    (tmp_path / "my runner").write_text("")
+    assert split_quoted_command(["my runner"], cwd=tmp_path) == ["my runner"]
+    assert split_quoted_command(["uv run pytest -q"], cwd=tmp_path) == ["uv", "run", "pytest", "-q"]
 
 
 def test_review_prompt_names_the_command() -> None:
