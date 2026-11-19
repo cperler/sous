@@ -182,18 +182,20 @@ def _apply(original: str, mutation: Mutation) -> tuple[str, str, str]:
 
 
 def split_quoted_command(argv: list[str], *, cwd: Path) -> list[str]:
-    """Split a whole test command passed as ONE quoted word (``-- "uv run pytest -q t.py"``).
+    """Split a test command whose program part was passed as ONE quoted word.
 
-    Every model REVIEW in pred-2041-2116 did this first: the run has no shell, so the single
-    word was taken as a program name and every check came back ``usage_error``. Only a lone
-    word that contains whitespace and names no existing file is split; a command already in
-    separate words is untouched, so an unsplit path list after a real program still fails
-    loudly (sous#542)."""
-    if len(argv) != 1 or not argv[0].split()[1:]:
+    ``-- "uv run pytest -q" tests/t.py`` and ``-- "uv run pytest -q t.py"`` both arrive with a
+    first word holding the whole command. The run has no shell, so that word was taken as a
+    program name and the check came back ``usage_error`` -- every REVIEW in pred-2041-2116
+    (lone word) and the #2112/#1533 REVIEWs in pred-maint-1118 (quoted command plus a test
+    path). Only the FIRST word is split, and only when it contains whitespace and names no
+    existing file; the words after it are kept as given, so an unsplit path list after a real
+    program still fails loudly (sous#542)."""
+    if not argv or not argv[0].split()[1:]:
         return argv
     if (cwd / argv[0]).exists():
         return argv
-    return shlex.split(argv[0])
+    return [*shlex.split(argv[0]), *argv[1:]]
 
 
 def mutation_check(

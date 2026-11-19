@@ -202,6 +202,23 @@ def test_split_leaves_separate_words_and_real_paths_alone(tmp_path: Path) -> Non
     (tmp_path / "my runner").write_text("")
     assert split_quoted_command(["my runner"], cwd=tmp_path) == ["my runner"]
     assert split_quoted_command(["uv run pytest -q"], cwd=tmp_path) == ["uv", "run", "pytest", "-q"]
+    assert split_quoted_command(["pytest", "a.py b.py"], cwd=tmp_path) == ["pytest", "a.py b.py"]
+
+
+def test_split_a_quoted_command_followed_by_test_paths(tmp_path: Path) -> None:
+    """pred-maint-1118: the #2112 and #1533 reviewers passed ``-- "$T" tests/x.py`` -- the
+    command quoted as one word, then a path -- and read usage_error, because only a LONE
+    quoted word was split. The first word now splits whatever follows it."""
+    got = split_quoted_command(["uv run python -m pytest -q", "tests/x.py"], cwd=tmp_path)
+    assert got == ["uv", "run", "python", "-m", "pytest", "-q", "tests/x.py"]
+
+
+def test_cli_splits_a_quoted_command_followed_by_a_path(proj: Path, capsys) -> None:
+    quoted = " ".join(_pytest("tests/test_calc.py")[:-1])
+    rc = cli.main(["mutation-check", "-C", str(proj), "--mutate", "calc.py:2:return a - b",
+                   "--", quoted, "tests/test_calc.py"])
+    assert rc == 0
+    assert json.loads(capsys.readouterr().out)["outcome"] == "killed"
 
 
 def test_review_prompt_names_the_command() -> None:
