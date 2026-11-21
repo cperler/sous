@@ -16,6 +16,9 @@ survived".
   tests, exited with a usage error, printed no pass/fail count, or timed out is reported as
   an error (exit 2, one JSON object naming which run and why) — never as a survivor;
 * the mutated file is restored in ``finally`` and re-read to confirm it is byte-identical.
+* a mutated ``.py`` file must still compile, checked before any run: a replacement aimed
+  one line off (diff hunk numbers, pred-night-1120 #621 and #2136) broke the syntax, the
+  test run then failed at collection, and that read as a killed mutant.
 
 The count parsing follows pytest's terminal summary (``3 passed, 1 failed in 0.12s``,
 ``no tests ran in 0.01s``) and its exit codes (4 usage error, 5 no tests collected). That is
@@ -228,6 +231,13 @@ def mutation_check(
             return not_checked("mutation", f"bad --mutate: {exc}")
         report["mutation"] = {"file": mutation.file, "line": mutation.line,
                               "original": old_line, "mutated": new_line}
+        if target.suffix == ".py":
+            try:
+                compile(mutated_text, str(target), "exec")
+            except SyntaxError as exc:  # IndentationError included
+                return not_checked(
+                    "mutation", f"mutated {mutation.file} does not compile ({exc.__class__.__name__}"
+                    f": {exc.msg}, line {exc.lineno}); re-read the live line numbers")
 
     baseline = run_tests(argv, cwd=cwd, timeout_s=timeout_s)
     report["baseline"] = asdict(baseline)

@@ -166,6 +166,21 @@ def test_a_mutation_that_changes_nothing_is_refused(proj: Path) -> None:
     assert "does not change" in str(report["reason"])
 
 
+def test_a_mutation_that_breaks_the_syntax_is_not_checked_never_killed(proj: Path) -> None:
+    """pred-night-1120 #621/#2136: a replacement aimed one line off broke the indentation, the
+    run failed at collection, and the tool called it killed. It is refused before any run."""
+    code, report = mutation_check(_pytest("tests/test_calc.py"), cwd=proj,
+                                  mutation=Mutation("calc.py", 2, "return a - b"))
+    assert report["outcome"] == "killed"  # control: an indented replacement is fine
+    code, report = mutation_check(_pytest("tests/test_calc.py"), cwd=proj,
+                                  mutation=Mutation("calc.py", 1, "return a - b"))
+    assert code == EXIT_NOT_CHECKED
+    assert report["failed_run"] == "mutation"
+    assert "does not compile" in str(report["reason"])
+    assert "baseline" not in report
+    assert (proj / "calc.py").read_text() == SOURCE
+
+
 # --- CLI --------------------------------------------------------------------------------
 
 def test_cli_prints_json_and_exits_2_with_a_loud_stderr(proj: Path, capsys) -> None:
